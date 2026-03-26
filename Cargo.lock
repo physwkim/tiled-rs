@@ -4241,7 +4241,6 @@ dependencies = [
  "axum",
  "bytes",
  "indexmap",
- "reqwest",
  "serde",
  "serde_json",
  "tempfile",

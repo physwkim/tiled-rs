@@ -27,6 +27,10 @@ pub enum Command {
         /// Start with a demo dataset
         #[arg(long)]
         demo: bool,
+
+        /// Public base URL for generated links (default: derived from host/port)
+        #[arg(long)]
+        public_url: Option<String>,
     },
 
     /// Database management commands
@@ -79,19 +83,36 @@ fn build_demo_tree() -> MapAdapter {
 
     // 1D array of floats
     let data_1d: Vec<f64> = (0..100).map(|i| (i as f64) * 0.1).collect();
-    let arr_1d = ArrayAdapter::from_f64_1d(&data_1d, serde_json::json!({"description": "A 1D array of 100 floats"}));
+    let arr_1d = ArrayAdapter::from_f64_1d(
+        &data_1d,
+        serde_json::json!({"description": "A 1D array of 100 floats"}),
+    );
     mapping.insert("small_1d".to_string(), AnyAdapter::Array(Box::new(arr_1d)));
 
     // 2D array of floats
     let data_2d: Vec<f64> = (0..200).map(|i| (i as f64) * 0.5).collect();
-    let arr_2d = ArrayAdapter::from_f64_2d(&data_2d, 10, 20, serde_json::json!({"description": "A 10x20 array of floats"}));
-    mapping.insert("medium_2d".to_string(), AnyAdapter::Array(Box::new(arr_2d)));
+    let arr_2d = ArrayAdapter::from_f64_2d(
+        &data_2d,
+        10,
+        20,
+        serde_json::json!({"description": "A 10x20 array of floats"}),
+    );
+    mapping.insert(
+        "medium_2d".to_string(),
+        AnyAdapter::Array(Box::new(arr_2d)),
+    );
 
     // Nested container
     let mut inner_mapping = IndexMap::new();
     let inner_data: Vec<f64> = (0..50).map(|i| i as f64).collect();
-    let inner_arr = ArrayAdapter::from_f64_1d(&inner_data, serde_json::json!({"element": "Cu", "edge": "K"}));
-    inner_mapping.insert("spectrum".to_string(), AnyAdapter::Array(Box::new(inner_arr)));
+    let inner_arr = ArrayAdapter::from_f64_1d(
+        &inner_data,
+        serde_json::json!({"element": "Cu", "edge": "K"}),
+    );
+    inner_mapping.insert(
+        "spectrum".to_string(),
+        AnyAdapter::Array(Box::new(inner_arr)),
+    );
 
     let inner_container = MapAdapter::new(
         inner_mapping,
@@ -117,6 +138,7 @@ pub async fn run(command: Command) -> Result<()> {
             host,
             port,
             demo,
+            public_url,
         } => {
             if let Some(ref config) = config {
                 tracing::info!("Using config: {config}");
@@ -126,13 +148,26 @@ pub async fn run(command: Command) -> Result<()> {
                 tracing::info!("Starting with demo dataset");
                 Arc::new(build_demo_tree())
             } else if config.is_some() {
-                anyhow::bail!("Config-based serving not yet implemented. Use --demo for a demo server.");
+                anyhow::bail!(
+                    "Config-based serving not yet implemented. Use --demo for a demo server."
+                );
             } else {
                 anyhow::bail!("Either --config or --demo must be specified");
             };
 
             let registry = Arc::new(tiled_serialization::default_registry());
-            let base_url = format!("http://{host}:{port}");
+
+            // Derive the public-facing base URL for links.
+            // If --public-url is provided, use that directly.
+            // Otherwise, translate 0.0.0.0 to localhost so links are reachable.
+            let base_url = public_url.unwrap_or_else(|| {
+                let link_host = if host == "0.0.0.0" || host == "::" {
+                    "localhost"
+                } else {
+                    &host
+                };
+                format!("http://{link_host}:{port}")
+            });
 
             let state = tiled_server::AppState {
                 root_tree,
@@ -142,6 +177,7 @@ pub async fn run(command: Command) -> Result<()> {
                     .map(String::from)
                     .collect(),
                 base_url,
+                allow_origins: Vec::new(), // empty = permissive in dev mode
             };
 
             let app = tiled_server::build_app(state);
@@ -153,25 +189,21 @@ pub async fn run(command: Command) -> Result<()> {
         }
         Command::Catalog { command } => match command {
             CatalogCommand::Init { uri } => {
-                tracing::info!("Initializing catalog database: {uri}");
-                todo!("Catalog init not yet implemented")
+                anyhow::bail!("'catalog init' is not yet implemented (uri: {uri})")
             }
             CatalogCommand::UpgradeDatabase { uri } => {
-                tracing::info!("Upgrading catalog database: {uri}");
-                todo!("Catalog upgrade not yet implemented")
+                anyhow::bail!("'catalog upgrade-database' is not yet implemented (uri: {uri})")
             }
         },
         Command::ApiKey { command } => match command {
-            ApiKeyCommand::Create { note } => {
-                tracing::info!("Creating API key (note: {:?})", note);
-                todo!("API key create not yet implemented")
+            ApiKeyCommand::Create { note: _ } => {
+                anyhow::bail!("'api-key create' is not yet implemented")
             }
             ApiKeyCommand::List => {
-                todo!("API key list not yet implemented")
+                anyhow::bail!("'api-key list' is not yet implemented")
             }
-            ApiKeyCommand::Revoke { first_eight } => {
-                tracing::info!("Revoking API key: {first_eight}");
-                todo!("API key revoke not yet implemented")
+            ApiKeyCommand::Revoke { first_eight: _ } => {
+                anyhow::bail!("'api-key revoke' is not yet implemented")
             }
         },
     }

@@ -12,4 +12,6 @@ pub struct AppState {
     pub serialization_registry: Arc<SerializationRegistry>,
     pub query_names: Vec<String>,
     pub base_url: String,
+    /// Allowed CORS origins. Empty = permissive (all origins).
+    pub allow_origins: Vec<String>,
 }

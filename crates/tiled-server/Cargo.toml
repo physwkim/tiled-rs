@@ -21,7 +21,6 @@ arrow = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-reqwest = { workspace = true }
 tokio = { workspace = true }
 indexmap = { workspace = true }
 tiled-core = { workspace = true }
@@ -29,3 +28,5 @@ tiled-adapters = { workspace = true }
 tiled-serialization = { workspace = true }
 serde_json = { workspace = true }
 axum = { workspace = true }
+tower = { workspace = true }
+bytes = { workspace = true }

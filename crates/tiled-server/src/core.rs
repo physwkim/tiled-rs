@@ -51,32 +51,29 @@ pub fn walk_tree<'a>(
 }
 
 /// Compute ancestors list from a path.
+///
+/// For a node at path "a/b/c", returns `["", "a", "a/b"]` — the paths of
+/// each ancestor container from root downward, matching the Python wire format.
+/// Root node itself has no ancestors (returns `[]`).
 pub fn ancestors_from_path(path: &str) -> Vec<String> {
     let path = path.trim_matches('/');
     if path.is_empty() {
         return vec![];
     }
     let parts: Vec<&str> = path.split('/').collect();
-    let mut ancestors = Vec::new();
+    // For N path segments there are N ancestors (root + each intermediate).
+    // "a"       → [""]
+    // "a/b"     → ["", "a"]
+    // "a/b/c"   → ["", "a", "a/b"]
+    let mut ancestors = Vec::with_capacity(parts.len());
     for i in 0..parts.len() {
         if i == 0 {
-            ancestors.push(String::new()); // root
+            ancestors.push(String::new());
         } else {
             ancestors.push(parts[..i].join("/"));
         }
     }
-    // Actually, Python ancestors are the path segments leading to this node
-    // For a node at "a/b/c", ancestors = ["", "a", "a/b"] (the paths of parent containers)
-    // Simplified: just return parent path segments
-    let mut result = vec![];
-    for i in 0..parts.len() {
-        if i == 0 {
-            // root ancestor is empty string
-        } else {
-            result.push(parts[i - 1].to_string());
-        }
-    }
-    result
+    ancestors
 }
 
 /// Construct a Resource for a given adapter.
