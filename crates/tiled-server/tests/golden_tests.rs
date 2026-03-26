@@ -57,6 +57,27 @@ fn build_app() -> axum::Router {
             .collect(),
         base_url: Some("http://localhost:8000".to_string()),
         cors_policy: tiled_server::state::CorsOriginPolicy::Permissive,
+        trust_forwarded_headers: false,
+    };
+
+    tiled_server::build_app(state)
+}
+
+/// Helper: build app with no static base_url and given trust_forwarded_headers setting.
+fn build_app_dynamic(trust_forwarded: bool) -> axum::Router {
+    let root_tree: Arc<dyn tiled_core::adapters::ContainerAdapter> = Arc::new(build_test_tree());
+    let registry = Arc::new(tiled_serialization::default_registry());
+
+    let state = tiled_server::AppState {
+        root_tree,
+        serialization_registry: registry,
+        query_names: Query::all_query_names()
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        base_url: None,
+        cors_policy: tiled_server::state::CorsOriginPolicy::AllowList(Vec::new()),
+        trust_forwarded_headers: trust_forwarded,
     };
 
     tiled_server::build_app(state)
@@ -336,23 +357,9 @@ async fn test_links_use_configured_base_url() {
 
 #[tokio::test]
 async fn test_links_derived_from_host_header() {
-    // Build an app with NO static base_url — links should derive from Host header.
-    let root_tree: Arc<dyn tiled_core::adapters::ContainerAdapter> = Arc::new(build_test_tree());
-    let registry = Arc::new(tiled_serialization::default_registry());
+    // No static base_url — links derive from Host header.
+    let app = build_app_dynamic(false);
 
-    let state = tiled_server::AppState {
-        root_tree,
-        serialization_registry: registry,
-        query_names: Query::all_query_names()
-            .into_iter()
-            .map(String::from)
-            .collect(),
-        base_url: None,
-        cors_policy: tiled_server::state::CorsOriginPolicy::Permissive,
-    };
-    let app = tiled_server::build_app(state);
-
-    // Send request with a custom Host header
     let req = Request::builder()
         .uri("/api/v1/metadata/")
         .header("host", "data.example.com:9000")
@@ -372,24 +379,39 @@ async fn test_links_derived_from_host_header() {
 }
 
 #[tokio::test]
-async fn test_links_derived_from_forwarded_headers() {
-    // Build an app with NO static base_url — links should derive from forwarded headers.
-    let root_tree: Arc<dyn tiled_core::adapters::ContainerAdapter> = Arc::new(build_test_tree());
-    let registry = Arc::new(tiled_serialization::default_registry());
+async fn test_forwarded_headers_ignored_without_trust() {
+    // trust_forwarded_headers = false — X-Forwarded-* must be ignored.
+    let app = build_app_dynamic(false);
 
-    let state = tiled_server::AppState {
-        root_tree,
-        serialization_registry: registry,
-        query_names: Query::all_query_names()
-            .into_iter()
-            .map(String::from)
-            .collect(),
-        base_url: None,
-        cors_policy: tiled_server::state::CorsOriginPolicy::Permissive,
-    };
-    let app = tiled_server::build_app(state);
+    let req = Request::builder()
+        .uri("/api/v1/metadata/")
+        .header("host", "internal:8000")
+        .header("x-forwarded-host", "evil.example.com")
+        .header("x-forwarded-proto", "https")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
 
-    // Simulate a reverse proxy setting X-Forwarded-Host and X-Forwarded-Proto
+    let self_link = body["data"]["links"]["self"].as_str().unwrap();
+    assert!(
+        self_link.starts_with("http://internal:8000/"),
+        "without trust, forwarded headers should be ignored, got: {self_link}"
+    );
+    assert!(
+        !self_link.contains("evil.example.com"),
+        "must not use spoofed X-Forwarded-Host, got: {self_link}"
+    );
+}
+
+#[tokio::test]
+async fn test_forwarded_headers_used_with_trust() {
+    // trust_forwarded_headers = true — X-Forwarded-* should be honoured.
+    let app = build_app_dynamic(true);
+
     let req = Request::builder()
         .uri("/api/v1/metadata/")
         .header("host", "internal:8000")
@@ -406,6 +428,6 @@ async fn test_links_derived_from_forwarded_headers() {
     let self_link = body["data"]["links"]["self"].as_str().unwrap();
     assert!(
         self_link.starts_with("https://public.example.com/"),
-        "links should use X-Forwarded-Host/Proto, got: {self_link}"
+        "with trust, should use X-Forwarded-Host/Proto, got: {self_link}"
     );
 }

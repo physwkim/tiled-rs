@@ -33,18 +33,26 @@ pub enum Command {
         #[arg(long)]
         public_url: Option<String>,
 
-        /// Allowed CORS origins (repeatable). Omit for permissive in --demo mode.
+        /// Allowed CORS origins (repeatable). Use '*' for permissive.
+        /// Default: same-origin only.
         #[arg(long = "allow-origin")]
         allow_origins: Vec<String>,
+
+        /// Trust X-Forwarded-Host/Proto headers from reverse proxies.
+        /// Only enable behind a trusted proxy.
+        #[arg(long)]
+        trust_proxy: bool,
     },
 
-    /// Database management commands
+    /// Database management commands (not yet implemented)
+    #[command(hide = true)]
     Catalog {
         #[command(subcommand)]
         command: CatalogCommand,
     },
 
-    /// API key management
+    /// API key management (not yet implemented)
+    #[command(hide = true)]
     ApiKey {
         #[command(subcommand)]
         command: ApiKeyCommand,
@@ -145,6 +153,7 @@ pub async fn run(command: Command) -> Result<()> {
             demo,
             public_url,
             allow_origins,
+            trust_proxy,
         } => {
             if config.is_some() {
                 anyhow::bail!(
@@ -161,11 +170,12 @@ pub async fn run(command: Command) -> Result<()> {
 
             let registry = Arc::new(tiled_serialization::default_registry());
 
-            // CORS policy: explicit --allow-origin wins; otherwise permissive in demo mode.
-            let cors_policy = if !allow_origins.is_empty() {
-                CorsOriginPolicy::AllowList(allow_origins)
-            } else if demo {
+            // CORS: explicit '*' = permissive, explicit origins = allow-list,
+            // default (nothing specified) = same-origin only.
+            let cors_policy = if allow_origins.iter().any(|o| o == "*") {
                 CorsOriginPolicy::Permissive
+            } else if !allow_origins.is_empty() {
+                CorsOriginPolicy::AllowList(allow_origins)
             } else {
                 CorsOriginPolicy::AllowList(Vec::new())
             };
@@ -179,6 +189,7 @@ pub async fn run(command: Command) -> Result<()> {
                     .collect(),
                 base_url: public_url,
                 cors_policy,
+                trust_forwarded_headers: trust_proxy,
             };
 
             let app = tiled_server::build_app(state);
