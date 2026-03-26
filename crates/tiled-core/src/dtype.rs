@@ -155,26 +155,22 @@ impl BuiltinDType {
 
     /// Construct from a numpy dtype string like `"<f8"`, `">i4"`, `"<M8[ns]"`.
     pub fn from_numpy_str(s: &str) -> Result<Self> {
-        if s.is_empty() {
-            return Err(TiledError::InvalidDType("Empty dtype string".into()));
-        }
-
-        let chars: Vec<char> = s.chars().collect();
-        if chars.len() < 3 {
+        // Dtype strings are ASCII: "<f8", ">i4", "<M8[ns]" — safe to index bytes.
+        let bytes = s.as_bytes();
+        if bytes.len() < 3 {
             return Err(TiledError::InvalidDType(format!(
                 "Dtype string too short: '{s}'"
             )));
         }
 
-        let endianness = Endianness::from_numpy_char(chars[0])?;
-        let kind = Kind::from_numpy_char(chars[1])?;
+        let endianness = Endianness::from_numpy_char(bytes[0] as char)?;
+        let kind = Kind::from_numpy_char(bytes[1] as char)?;
 
-        // Parse size and optional datetime units
-        let rest: String = chars[2..].iter().collect();
+        let rest = &s[2..];
         let (size_str, dt_units) = if let Some(bracket_pos) = rest.find('[') {
             (&rest[..bracket_pos], Some(rest[bracket_pos..].to_string()))
         } else {
-            (rest.as_str(), None)
+            (rest, None)
         };
 
         let size: usize = size_str.parse().map_err(|_| {

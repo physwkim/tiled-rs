@@ -132,17 +132,9 @@ impl ArrayStructure {
             .filter_map(|v| v.as_u64().map(|n| n as usize))
             .collect();
 
-        let dims = value.get("dims").and_then(|v| {
-            if v.is_null() {
-                None
-            } else {
-                v.as_array().map(|arr| {
-                    arr.iter()
-                        .filter_map(|x| x.as_str().map(String::from))
-                        .collect()
-                })
-            }
-        });
+        let dims = value.get("dims").filter(|v| !v.is_null())
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|x| x.as_str().map(String::from)).collect());
 
         let resizable = value
             .get("resizable")
@@ -294,23 +286,15 @@ impl SparseStructure {
             .filter_map(|v| v.as_u64().map(|n| n as usize))
             .collect();
 
-        let data_type = value.get("data_type").and_then(|v| {
-            if v.is_null() {
-                None
-            } else {
-                DType::from_json(v).ok()
-            }
-        });
+        let data_type = value
+            .get("data_type")
+            .filter(|v| !v.is_null())
+            .and_then(|v| DType::from_json(v).ok());
 
         let coord_data_type = value
             .get("coord_data_type")
-            .and_then(|v| {
-                if v.is_null() {
-                    None
-                } else {
-                    BuiltinDType::from_json(v).ok()
-                }
-            })
+            .filter(|v| !v.is_null())
+            .and_then(|v| BuiltinDType::from_json(v).ok())
             .or_else(|| {
                 Some(BuiltinDType::new(
                     Endianness::Little,
@@ -319,17 +303,9 @@ impl SparseStructure {
                 ))
             });
 
-        let dims = value.get("dims").and_then(|v| {
-            if v.is_null() {
-                None
-            } else {
-                v.as_array().map(|arr| {
-                    arr.iter()
-                        .filter_map(|x| x.as_str().map(String::from))
-                        .collect()
-                })
-            }
-        });
+        let dims = value.get("dims").filter(|v| !v.is_null())
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|x| x.as_str().map(String::from)).collect());
 
         let resizable = value
             .get("resizable")

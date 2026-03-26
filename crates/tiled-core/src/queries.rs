@@ -345,23 +345,20 @@ static FILTER_PARAM_PATTERN: std::sync::LazyLock<regex::Regex> = std::sync::Lazy
 ///
 /// Parses pairs like `("filter[eq][condition][key]", "color")` into `Query` variants.
 pub fn decode_query_filters(params: &[(String, String)]) -> Vec<Query> {
-    // Group params by query name
     let mut groups: HashMap<String, HashMap<String, String>> = HashMap::new();
     for (key, value) in params {
         if let Some(caps) = FILTER_PARAM_PATTERN.captures(key) {
-            let name = caps[1].to_string();
-            let field = caps[2].to_string();
-            groups.entry(name).or_default().insert(field, value.clone());
+            groups
+                .entry(caps[1].to_string())
+                .or_default()
+                .insert(caps[2].to_string(), value.clone());
         }
     }
 
-    let mut queries = Vec::new();
-    for (name, fields) in &groups {
-        if let Some(q) = decode_single_query(name, fields) {
-            queries.push(q);
-        }
-    }
-    queries
+    groups
+        .iter()
+        .filter_map(|(name, fields)| decode_single_query(name, fields))
+        .collect()
 }
 
 fn decode_single_query(name: &str, fields: &HashMap<String, String>) -> Option<Query> {
