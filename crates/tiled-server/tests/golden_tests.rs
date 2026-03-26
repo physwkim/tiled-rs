@@ -47,7 +47,6 @@ fn build_test_tree() -> MapAdapter {
 fn build_app() -> axum::Router {
     let root_tree: Arc<dyn tiled_core::adapters::ContainerAdapter> = Arc::new(build_test_tree());
     let registry = Arc::new(tiled_serialization::default_registry());
-    let base_url = "http://localhost:8000".to_string();
 
     let state = tiled_server::AppState {
         root_tree,
@@ -56,8 +55,8 @@ fn build_app() -> axum::Router {
             .into_iter()
             .map(String::from)
             .collect(),
-        base_url,
-        allow_origins: Vec::new(),
+        base_url: Some("http://localhost:8000".to_string()),
+        cors_policy: tiled_server::state::CorsOriginPolicy::Permissive,
     };
 
     tiled_server::build_app(state)
@@ -332,5 +331,81 @@ async fn test_links_use_configured_base_url() {
     assert!(
         !self_link.contains("0.0.0.0"),
         "links must not contain 0.0.0.0, got: {self_link}"
+    );
+}
+
+#[tokio::test]
+async fn test_links_derived_from_host_header() {
+    // Build an app with NO static base_url — links should derive from Host header.
+    let root_tree: Arc<dyn tiled_core::adapters::ContainerAdapter> = Arc::new(build_test_tree());
+    let registry = Arc::new(tiled_serialization::default_registry());
+
+    let state = tiled_server::AppState {
+        root_tree,
+        serialization_registry: registry,
+        query_names: Query::all_query_names()
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        base_url: None,
+        cors_policy: tiled_server::state::CorsOriginPolicy::Permissive,
+    };
+    let app = tiled_server::build_app(state);
+
+    // Send request with a custom Host header
+    let req = Request::builder()
+        .uri("/api/v1/metadata/")
+        .header("host", "data.example.com:9000")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+
+    let self_link = body["data"]["links"]["self"].as_str().unwrap();
+    assert!(
+        self_link.starts_with("http://data.example.com:9000/"),
+        "links should derive from Host header, got: {self_link}"
+    );
+}
+
+#[tokio::test]
+async fn test_links_derived_from_forwarded_headers() {
+    // Build an app with NO static base_url — links should derive from forwarded headers.
+    let root_tree: Arc<dyn tiled_core::adapters::ContainerAdapter> = Arc::new(build_test_tree());
+    let registry = Arc::new(tiled_serialization::default_registry());
+
+    let state = tiled_server::AppState {
+        root_tree,
+        serialization_registry: registry,
+        query_names: Query::all_query_names()
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        base_url: None,
+        cors_policy: tiled_server::state::CorsOriginPolicy::Permissive,
+    };
+    let app = tiled_server::build_app(state);
+
+    // Simulate a reverse proxy setting X-Forwarded-Host and X-Forwarded-Proto
+    let req = Request::builder()
+        .uri("/api/v1/metadata/")
+        .header("host", "internal:8000")
+        .header("x-forwarded-host", "public.example.com")
+        .header("x-forwarded-proto", "https")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+
+    let self_link = body["data"]["links"]["self"].as_str().unwrap();
+    assert!(
+        self_link.starts_with("https://public.example.com/"),
+        "links should use X-Forwarded-Host/Proto, got: {self_link}"
     );
 }

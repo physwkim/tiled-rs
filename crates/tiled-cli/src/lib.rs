@@ -7,13 +7,14 @@ use indexmap::IndexMap;
 use tiled_adapters::{ArrayAdapter, MapAdapter};
 use tiled_core::adapters::AnyAdapter;
 use tiled_core::queries::Query;
+use tiled_server::state::CorsOriginPolicy;
 
 #[derive(Subcommand)]
 pub enum Command {
     /// Start the Tiled server
     Serve {
-        /// Path to configuration file
-        #[arg(short, long)]
+        /// Path to configuration file (not yet implemented)
+        #[arg(short, long, hide = true)]
         config: Option<String>,
 
         /// Host to bind to
@@ -28,9 +29,13 @@ pub enum Command {
         #[arg(long)]
         demo: bool,
 
-        /// Public base URL for generated links (default: derived from host/port)
+        /// Public base URL for generated links (default: derived from request Host header)
         #[arg(long)]
         public_url: Option<String>,
+
+        /// Allowed CORS origins (repeatable). Omit for permissive in --demo mode.
+        #[arg(long = "allow-origin")]
+        allow_origins: Vec<String>,
     },
 
     /// Database management commands
@@ -139,35 +144,31 @@ pub async fn run(command: Command) -> Result<()> {
             port,
             demo,
             public_url,
+            allow_origins,
         } => {
-            if let Some(ref config) = config {
-                tracing::info!("Using config: {config}");
+            if config.is_some() {
+                anyhow::bail!(
+                    "Config-based serving not yet implemented. Use --demo for a demo server."
+                );
             }
 
             let root_tree: Arc<dyn tiled_core::adapters::ContainerAdapter> = if demo {
                 tracing::info!("Starting with demo dataset");
                 Arc::new(build_demo_tree())
-            } else if config.is_some() {
-                anyhow::bail!(
-                    "Config-based serving not yet implemented. Use --demo for a demo server."
-                );
             } else {
-                anyhow::bail!("Either --config or --demo must be specified");
+                anyhow::bail!("--demo is required (config-based serving is not yet implemented)");
             };
 
             let registry = Arc::new(tiled_serialization::default_registry());
 
-            // Derive the public-facing base URL for links.
-            // If --public-url is provided, use that directly.
-            // Otherwise, translate 0.0.0.0 to localhost so links are reachable.
-            let base_url = public_url.unwrap_or_else(|| {
-                let link_host = if host == "0.0.0.0" || host == "::" {
-                    "localhost"
-                } else {
-                    &host
-                };
-                format!("http://{link_host}:{port}")
-            });
+            // CORS policy: explicit --allow-origin wins; otherwise permissive in demo mode.
+            let cors_policy = if !allow_origins.is_empty() {
+                CorsOriginPolicy::AllowList(allow_origins)
+            } else if demo {
+                CorsOriginPolicy::Permissive
+            } else {
+                CorsOriginPolicy::AllowList(Vec::new())
+            };
 
             let state = tiled_server::AppState {
                 root_tree,
@@ -176,8 +177,8 @@ pub async fn run(command: Command) -> Result<()> {
                     .into_iter()
                     .map(String::from)
                     .collect(),
-                base_url,
-                allow_origins: Vec::new(), // empty = permissive in dev mode
+                base_url: public_url,
+                cors_policy,
             };
 
             let app = tiled_server::build_app(state);

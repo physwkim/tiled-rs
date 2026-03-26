@@ -21,7 +21,8 @@ use crate::state::AppState;
 // GET /api/v1/ — About endpoint
 // ---------------------------------------------------------------------------
 
-pub async fn about(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn about(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    let base_url = state.resolve_base_url(&headers);
     let formats = state.serialization_registry.all_formats();
     let aliases = state.serialization_registry.all_aliases();
 
@@ -37,7 +38,7 @@ pub async fn about(State(state): State<AppState>) -> impl IntoResponse {
             links: None,
         },
         links: HashMap::from([
-            ("self".into(), format!("{}/api/v1/", state.base_url)),
+            ("self".into(), format!("{base_url}/api/v1/")),
             (
                 "documentation".into(),
                 "https://blueskyproject.io/tiled".into(),
@@ -58,29 +59,33 @@ pub async fn about(State(state): State<AppState>) -> impl IntoResponse {
 
 pub async fn metadata_root(
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, ServerError> {
-    metadata_inner(state, String::new()).await
+    metadata_inner(state, String::new(), headers).await
 }
 
 pub async fn metadata(
     State(state): State<AppState>,
     Path(path): Path<String>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, ServerError> {
-    metadata_inner(state, path).await
+    metadata_inner(state, path, headers).await
 }
 
 async fn metadata_inner(
     state: AppState,
     path: String,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, ServerError> {
+    let base_url = state.resolve_base_url(&headers);
     let path = path.trim_matches('/');
 
     let resource = if path.is_empty() {
-        core::construct_root_resource(state.root_tree.as_ref(), &state.base_url)
+        core::construct_root_resource(state.root_tree.as_ref(), &base_url)
     } else {
         let adapter = core::walk_tree(state.root_tree.as_ref(), path)?;
         let id = path.rsplit('/').next().unwrap_or(path);
-        core::construct_resource(adapter, id, path, &state.base_url)
+        core::construct_resource(adapter, id, path, &base_url)
     };
 
     let resp: Response<Resource> = Response {
@@ -100,23 +105,27 @@ async fn metadata_inner(
 pub async fn search_root(
     State(state): State<AppState>,
     Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, ServerError> {
-    search_inner(state, String::new(), params).await
+    search_inner(state, String::new(), params, headers).await
 }
 
 pub async fn search(
     State(state): State<AppState>,
     Path(path): Path<String>,
     Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, ServerError> {
-    search_inner(state, path, params).await
+    search_inner(state, path, params, headers).await
 }
 
 async fn search_inner(
     state: AppState,
     path: String,
     params: HashMap<String, String>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, ServerError> {
+    let base_url = state.resolve_base_url(&headers);
     let path = path.trim_matches('/');
 
     // Parse pagination params
@@ -145,7 +154,7 @@ async fn search_inner(
         }
     };
 
-    let resp = core::construct_entries_response(container, path, &state.base_url, offset, limit);
+    let resp = core::construct_entries_response(container, path, &base_url, offset, limit);
 
     Ok(Json(resp))
 }

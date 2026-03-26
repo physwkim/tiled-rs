@@ -8,22 +8,22 @@ use axum::Router;
 use tower_http::cors::CorsLayer;
 
 use crate::router;
-use crate::state::AppState;
+use crate::state::{AppState, CorsOriginPolicy};
 
 /// Build the Axum application with all routes attached.
 pub fn build_app(state: AppState) -> Router {
-    let cors = if state.allow_origins.is_empty() {
-        CorsLayer::permissive()
-    } else {
-        let origins: Vec<HeaderValue> = state
-            .allow_origins
-            .iter()
-            .filter_map(|o| o.parse().ok())
-            .collect();
-        CorsLayer::new()
-            .allow_origin(origins)
-            .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
-            .allow_headers(tower_http::cors::Any)
+    let cors = match &state.cors_policy {
+        CorsOriginPolicy::Permissive => CorsLayer::permissive(),
+        CorsOriginPolicy::AllowList(origins) => {
+            let parsed: Vec<HeaderValue> = origins
+                .iter()
+                .filter_map(|o| o.parse().ok())
+                .collect();
+            CorsLayer::new()
+                .allow_origin(parsed)
+                .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
+                .allow_headers(tower_http::cors::Any)
+        }
     };
 
     Router::new()
