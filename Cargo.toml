@@ -1,0 +1,142 @@
+[workspace]
+members = [
+    "crates/tiled-core",
+    "crates/tiled-catalog",
+    "crates/tiled-adapters",
+    "crates/tiled-serialization",
+    "crates/tiled-auth",
+    "crates/tiled-access",
+    "crates/tiled-server",
+    "crates/tiled-client",
+    "crates/tiled-cli",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "BSD-3-Clause"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+rmp-serde = "1"
+
+# HTTP server
+axum = { version = "0.8", features = ["ws", "multipart"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "compression-gzip", "compression-zstd"] }
+
+# HTTP client
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+
+# Database
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "postgres", "json", "uuid", "chrono", "migrate"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Authentication
+jsonwebtoken = "9"
+
+# Arrow / Parquet
+arrow = { version = "54", features = ["ipc", "json", "csv", "prettyprint"] }
+parquet = { version = "54", features = ["arrow", "async"] }
+
+# N-dimensional arrays
+ndarray = "0.16"
+bytes = "1"
+
+# Compression
+flate2 = "1"
+zstd = "0.13"
+lz4_flex = "0.11"
+
+# Metrics
+metrics = "0.24"
+metrics-exporter-prometheus = "0.16"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Async trait
+async-trait = "0.1"
+
+# Concurrent data structures
+dashmap = "6"
+
+# Security
+subtle = "2"
+
+# Base64
+base64 = "0.22"
+
+# Regex
+regex = "1"
+
+# Futures
+futures = "0.3"
+tokio-stream = "0.1"
+
+# Testing
+tempfile = "3"
+
+# Image formats (feature-gated)
+tiff = "0.9"
+image = "0.25"
+
+# HDF5 (feature-gated)
+hdf5 = "0.8"
+
+# Zarr
+zarrs = "0.20"
+object_store = { version = "0.11", features = ["aws", "gcp", "azure"] }
+
+# CSV
+csv = "1"
+
+# Ordered maps
+indexmap = { version = "2", features = ["serde"] }
+
+# Redis
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
+
+# Internal crates
+tiled-core = { path = "crates/tiled-core" }
+tiled-catalog = { path = "crates/tiled-catalog" }
+tiled-adapters = { path = "crates/tiled-adapters" }
+tiled-serialization = { path = "crates/tiled-serialization" }
+tiled-auth = { path = "crates/tiled-auth" }
+tiled-access = { path = "crates/tiled-access" }
+tiled-server = { path = "crates/tiled-server" }
+tiled-client = { path = "crates/tiled-client" }
+tiled-cli = { path = "crates/tiled-cli" }
+
+[package]
+name = "tiled"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tiled-core = { workspace = true }
+tiled-server = { workspace = true }
+tiled-cli = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }

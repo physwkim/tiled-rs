@@ -1,0 +1,16 @@
+[package]
+name = "tiled-client"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tiled-core = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+bytes = { workspace = true }
+arrow = { workspace = true }

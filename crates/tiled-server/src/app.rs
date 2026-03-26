@@ -1,0 +1,27 @@
+//! Application builder — constructs the Axum Router with all routes.
+//!
+//! Corresponds to `tiled/server/app.py`.
+
+use axum::routing::get;
+use axum::Router;
+use tower_http::cors::CorsLayer;
+
+use crate::router;
+use crate::state::AppState;
+
+/// Build the Axum application with all routes attached.
+pub fn build_app(state: AppState) -> Router {
+    Router::new()
+        .route("/api/v1/", get(router::about))
+        .route("/api/v1/metadata/", get(router::metadata_root))
+        .route("/api/v1/metadata/{*path}", get(router::metadata))
+        .route("/api/v1/search/", get(router::search_root))
+        .route("/api/v1/search/{*path}", get(router::search))
+        .route("/api/v1/array/block/{*path}", get(router::array_block))
+        .route(
+            "/api/v1/table/partition/{*path}",
+            get(router::table_partition),
+        )
+        .layer(CorsLayer::permissive())
+        .with_state(state)
+}

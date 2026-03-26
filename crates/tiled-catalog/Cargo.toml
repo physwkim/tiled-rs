@@ -1,0 +1,16 @@
+[package]
+name = "tiled-catalog"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tiled-core = { workspace = true }
+sqlx = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
