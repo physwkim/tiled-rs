@@ -19,7 +19,6 @@ serde_json = { workspace = true }
 bytes = { workspace = true }
 arrow = { workspace = true }
 thiserror = { workspace = true }
-anyhow = { workspace = true }
 dashmap = { workspace = true }
 flate2 = { workspace = true }
 zstd = { workspace = true }

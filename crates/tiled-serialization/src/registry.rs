@@ -9,9 +9,12 @@ use dashmap::DashMap;
 
 use tiled_core::structures::StructureFamily;
 
+/// Serialization error type.
+pub type SerializeError = Box<dyn std::error::Error + Send + Sync>;
+
 /// A serializer function that converts raw data + metadata into bytes.
 pub type SerializerFn =
-    Box<dyn Fn(&[u8], &serde_json::Value) -> Result<bytes::Bytes, anyhow::Error> + Send + Sync>;
+    Box<dyn Fn(&[u8], &serde_json::Value) -> Result<bytes::Bytes, SerializeError> + Send + Sync>;
 
 /// Registry mapping (StructureFamily, media_type) → serializer.
 pub struct SerializationRegistry {

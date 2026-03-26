@@ -431,3 +431,24 @@ async fn test_forwarded_headers_used_with_trust() {
         "with trust, should use X-Forwarded-Host/Proto, got: {self_link}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Health / Ready
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_health_endpoint() {
+    let app = build_app();
+    let (status, body) = get_json(&app, "/health").await;
+    assert_eq!(status, 200);
+    assert_eq!(body["status"], "ok");
+}
+
+#[tokio::test]
+async fn test_ready_endpoint() {
+    let app = build_app();
+    let (status, body) = get_json(&app, "/ready").await;
+    assert_eq!(status, 200);
+    assert_eq!(body["status"], "ok");
+    assert!(body["nodes"].as_u64().unwrap() > 0);
+}

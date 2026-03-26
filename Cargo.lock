@@ -4089,7 +4089,6 @@ name = "tiled-access"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "async-trait",
  "serde",
  "serde_json",
  "thiserror",
@@ -4100,9 +4099,7 @@ dependencies = [
 name = "tiled-adapters"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "arrow",
- "async-trait",
  "bytes",
  "csv",
  "hdf5",
@@ -4125,7 +4122,6 @@ name = "tiled-auth"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "async-trait",
  "base64",
  "chrono",
  "jsonwebtoken",
@@ -4145,7 +4141,6 @@ name = "tiled-catalog"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "async-trait",
  "chrono",
  "serde",
  "serde_json",
@@ -4197,9 +4192,7 @@ dependencies = [
 name = "tiled-core"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "arrow",
- "async-trait",
  "base64",
  "bytes",
  "chrono",
@@ -4214,7 +4207,6 @@ dependencies = [
 name = "tiled-serialization"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "arrow",
  "bytes",
  "csv",
@@ -4236,7 +4228,6 @@ dependencies = [
 name = "tiled-server"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "arrow",
  "axum",
  "bytes",

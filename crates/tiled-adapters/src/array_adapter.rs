@@ -2,10 +2,9 @@
 //!
 //! Corresponds to `tiled/adapters/array.py:ArrayAdapter`.
 
-use async_trait::async_trait;
 use bytes::Bytes;
 
-use tiled_core::adapters::{ArrayAdapterRead, BaseAdapter};
+use tiled_core::adapters::{ArrayAdapterRead, BaseAdapter, BoxFuture};
 use tiled_core::dtype::{BuiltinDType, DynNDArray};
 use tiled_core::error::{Result, TiledError};
 use tiled_core::ndslice::NDSlice;
@@ -103,18 +102,26 @@ impl BaseAdapter for ArrayAdapter {
     }
 }
 
-#[async_trait]
 impl ArrayAdapterRead for ArrayAdapter {
     fn structure(&self) -> &ArrayStructure {
         &self.structure
     }
 
-    async fn read(&self, _slice: &NDSlice) -> Result<DynNDArray> {
-        // For now, return the full array (slice application is a future enhancement)
-        Ok(self.array.clone())
+    fn read<'a>(&'a self, _slice: &'a NDSlice) -> BoxFuture<'a, Result<DynNDArray>> {
+        Box::pin(async move { Ok(self.array.clone()) })
     }
 
-    async fn read_block(&self, block: &[usize], _slice: &NDSlice) -> Result<DynNDArray> {
+    fn read_block<'a>(
+        &'a self,
+        block: &'a [usize],
+        _slice: &'a NDSlice,
+    ) -> BoxFuture<'a, Result<DynNDArray>> {
+        Box::pin(async move { self.read_block_inner(block) })
+    }
+}
+
+impl ArrayAdapter {
+    fn read_block_inner(&self, block: &[usize]) -> Result<DynNDArray> {
         // Compute the byte range for the requested block
         let ndim = self.structure.shape.len();
         if block.len() != ndim {

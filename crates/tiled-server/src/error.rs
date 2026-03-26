@@ -52,6 +52,7 @@ impl From<tiled_core::TiledError> for ServerError {
             tiled_core::TiledError::NotFound(msg) => Self::NotFound(msg),
             tiled_core::TiledError::Validation(msg) => Self::Validation(msg),
             tiled_core::TiledError::UnsupportedMediaType(msg) => Self::UnsupportedMediaType(msg),
+            tiled_core::TiledError::Internal(msg) => Self::Internal(msg),
             other => Self::Internal(other.to_string()),
         }
     }

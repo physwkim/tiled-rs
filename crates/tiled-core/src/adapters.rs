@@ -1,10 +1,13 @@
 //! Adapter trait hierarchy for the five data structure families.
 //!
 //! Corresponds to `tiled/adapters/protocols.py`.
+//!
+//! Traits used as `dyn` trait objects use explicit `Pin<Box<dyn Future>>` returns
+//! instead of `#[async_trait]` to eliminate the proc-macro dependency.
 
 use std::collections::HashMap;
-
-use async_trait::async_trait;
+use std::future::Future;
+use std::pin::Pin;
 
 use crate::dtype::{ArrowTable, DynNDArray};
 use crate::error::Result;
@@ -14,6 +17,9 @@ use crate::structures::{
     TableStructure,
 };
 
+/// Boxed future type alias for async trait methods (dyn-safe).
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
 /// Base trait that all adapters must implement.
 pub trait BaseAdapter: Send + Sync {
     fn structure_family(&self) -> StructureFamily;
@@ -22,43 +28,61 @@ pub trait BaseAdapter: Send + Sync {
 }
 
 // ---------------------------------------------------------------------------
-// Array
+// Array (dyn-used → explicit Pin<Box<dyn Future>>)
 // ---------------------------------------------------------------------------
 
-#[async_trait]
 pub trait ArrayAdapterRead: BaseAdapter {
     fn structure(&self) -> &ArrayStructure;
-    async fn read(&self, slice: &NDSlice) -> Result<DynNDArray>;
-    async fn read_block(&self, block: &[usize], slice: &NDSlice) -> Result<DynNDArray>;
+
+    fn read<'a>(
+        &'a self,
+        slice: &'a NDSlice,
+    ) -> BoxFuture<'a, Result<DynNDArray>>;
+
+    fn read_block<'a>(
+        &'a self,
+        block: &'a [usize],
+        slice: &'a NDSlice,
+    ) -> BoxFuture<'a, Result<DynNDArray>>;
 }
 
-#[async_trait]
 pub trait ArrayAdapterWrite: ArrayAdapterRead {
-    async fn write_block(&self, data: DynNDArray, block: &[usize]) -> Result<()>;
+    fn write_block<'a>(
+        &'a self,
+        data: DynNDArray,
+        block: &'a [usize],
+    ) -> BoxFuture<'a, Result<()>>;
 }
 
 // ---------------------------------------------------------------------------
-// Table
+// Table (dyn-used)
 // ---------------------------------------------------------------------------
 
-#[async_trait]
 pub trait TableAdapterRead: BaseAdapter {
     fn structure(&self) -> &TableStructure;
-    async fn read(&self, fields: Option<&[String]>) -> Result<ArrowTable>;
-    async fn read_partition(
-        &self,
+
+    fn read<'a>(
+        &'a self,
+        fields: Option<&'a [String]>,
+    ) -> BoxFuture<'a, Result<ArrowTable>>;
+
+    fn read_partition<'a>(
+        &'a self,
         partition: usize,
-        fields: Option<&[String]>,
-    ) -> Result<ArrowTable>;
+        fields: Option<&'a [String]>,
+    ) -> BoxFuture<'a, Result<ArrowTable>>;
 }
 
-#[async_trait]
 pub trait TableAdapterWrite: TableAdapterRead {
-    async fn write_partition(&self, data: ArrowTable, partition: usize) -> Result<()>;
+    fn write_partition<'a>(
+        &'a self,
+        data: ArrowTable,
+        partition: usize,
+    ) -> BoxFuture<'a, Result<()>>;
 }
 
 // ---------------------------------------------------------------------------
-// Sparse
+// Sparse (dyn-used)
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
@@ -67,34 +91,44 @@ pub struct SparseData {
     pub data: DynNDArray,
 }
 
-#[async_trait]
 pub trait SparseAdapterRead: BaseAdapter {
     fn structure(&self) -> &SparseStructure;
-    async fn read(&self, slice: &NDSlice) -> Result<SparseData>;
-    async fn read_block(&self, block: &[usize]) -> Result<SparseData>;
+
+    fn read<'a>(
+        &'a self,
+        slice: &'a NDSlice,
+    ) -> BoxFuture<'a, Result<SparseData>>;
+
+    fn read_block<'a>(
+        &'a self,
+        block: &'a [usize],
+    ) -> BoxFuture<'a, Result<SparseData>>;
 }
 
 // ---------------------------------------------------------------------------
-// Awkward
+// Awkward (dyn-used)
 // ---------------------------------------------------------------------------
 
-#[async_trait]
 pub trait AwkwardAdapterRead: BaseAdapter {
     fn structure(&self) -> &AwkwardStructure;
-    async fn read(&self) -> Result<HashMap<String, bytes::Bytes>>;
-    async fn read_buffers(
-        &self,
-        form_keys: Option<&[String]>,
-    ) -> Result<HashMap<String, bytes::Bytes>>;
+
+    fn read(&self) -> BoxFuture<'_, Result<HashMap<String, bytes::Bytes>>>;
+
+    fn read_buffers<'a>(
+        &'a self,
+        form_keys: Option<&'a [String]>,
+    ) -> BoxFuture<'a, Result<HashMap<String, bytes::Bytes>>>;
 }
 
-#[async_trait]
 pub trait AwkwardAdapterWrite: AwkwardAdapterRead {
-    async fn write(&self, buffers: HashMap<String, bytes::Bytes>) -> Result<()>;
+    fn write(
+        &self,
+        buffers: HashMap<String, bytes::Bytes>,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
 }
 
 // ---------------------------------------------------------------------------
-// Container
+// Container (sync — no async methods)
 // ---------------------------------------------------------------------------
 
 pub trait ContainerAdapter: BaseAdapter {
@@ -154,7 +188,6 @@ impl AnyAdapter {
         }
     }
 
-    /// Get the structure as a JSON value (type depends on family).
     pub fn structure_json(&self) -> Option<serde_json::Value> {
         match self {
             Self::Array(a) => serde_json::to_value(a.structure()).ok(),

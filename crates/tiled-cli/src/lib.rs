@@ -144,6 +144,17 @@ fn build_demo_tree() -> MapAdapter {
     )
 }
 
+async fn shutdown_signal() {
+    let ctrl_c = tokio::signal::ctrl_c();
+    let mut sigterm =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler");
+    tokio::select! {
+        _ = ctrl_c => tracing::info!("Received SIGINT, shutting down gracefully"),
+        _ = sigterm.recv() => tracing::info!("Received SIGTERM, shutting down gracefully"),
+    }
+}
+
 pub async fn run(command: Command) -> Result<()> {
     match command {
         Command::Serve {
@@ -196,7 +207,9 @@ pub async fn run(command: Command) -> Result<()> {
 
             let listener = tokio::net::TcpListener::bind(format!("{host}:{port}")).await?;
             tracing::info!("Tiled server listening on {host}:{port}");
-            axum::serve(listener, app).await?;
+            axum::serve(listener, app)
+                .with_graceful_shutdown(shutdown_signal())
+                .await?;
             Ok(())
         }
         Command::Catalog { command } => match command {

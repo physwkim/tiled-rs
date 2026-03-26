@@ -1,6 +1,4 @@
 //! Route handlers for the Tiled API.
-//!
-//! Corresponds to `tiled/server/router.py`.
 
 use std::collections::HashMap;
 
@@ -11,18 +9,31 @@ use axum::Json;
 
 use tiled_core::adapters::{AnyAdapter, ContainerAdapter};
 use tiled_core::links;
-use tiled_core::schemas::{About, AboutAuthentication, Resource, Response};
+use tiled_core::schemas::{About, AboutAuthentication, Response};
 
 use crate::core;
 use crate::error::ServerError;
+use crate::extractors::BaseUrl;
 use crate::state::AppState;
 
 // ---------------------------------------------------------------------------
-// GET /api/v1/ — About endpoint
+// Operational endpoints
 // ---------------------------------------------------------------------------
 
-pub async fn about(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    let base_url = state.resolve_base_url(&headers);
+pub async fn health() -> impl IntoResponse {
+    Json(serde_json::json!({"status": "ok"}))
+}
+
+pub async fn ready(State(state): State<AppState>) -> impl IntoResponse {
+    let count = state.root_tree.len();
+    Json(serde_json::json!({"status": "ok", "nodes": count}))
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/ — About
+// ---------------------------------------------------------------------------
+
+pub async fn about(State(state): State<AppState>, BaseUrl(base_url): BaseUrl) -> impl IntoResponse {
     let formats = state.serialization_registry.all_formats();
     let aliases = state.serialization_registry.all_aliases();
 
@@ -54,30 +65,21 @@ pub async fn about(State(state): State<AppState>, headers: HeaderMap) -> impl In
 }
 
 // ---------------------------------------------------------------------------
-// GET /api/v1/metadata/{*path} — Single node metadata
+// GET /api/v1/metadata/{*path}
 // ---------------------------------------------------------------------------
 
 pub async fn metadata_root(
-    State(state): State<AppState>,
-    headers: HeaderMap,
+    state: State<AppState>,
+    base_url: BaseUrl,
 ) -> Result<impl IntoResponse, ServerError> {
-    metadata_inner(state, String::new(), headers).await
+    metadata(state, Path(String::new()), base_url).await
 }
 
 pub async fn metadata(
     State(state): State<AppState>,
     Path(path): Path<String>,
-    headers: HeaderMap,
+    BaseUrl(base_url): BaseUrl,
 ) -> Result<impl IntoResponse, ServerError> {
-    metadata_inner(state, path, headers).await
-}
-
-async fn metadata_inner(
-    state: AppState,
-    path: String,
-    headers: HeaderMap,
-) -> Result<impl IntoResponse, ServerError> {
-    let base_url = state.resolve_base_url(&headers);
     let path = path.trim_matches('/');
 
     let resource = if path.is_empty() {
@@ -88,47 +90,34 @@ async fn metadata_inner(
         core::construct_resource(adapter, id, path, &base_url)
     };
 
-    let resp: Response<Resource> = Response {
+    Ok(Json(Response {
         data: Some(resource),
         error: None,
         links: None,
         meta: None,
-    };
-
-    Ok(Json(resp))
+    }))
 }
 
 // ---------------------------------------------------------------------------
-// GET /api/v1/search/{*path} — Browse/search container
+// GET /api/v1/search/{*path}
 // ---------------------------------------------------------------------------
 
 pub async fn search_root(
-    State(state): State<AppState>,
-    Query(params): Query<HashMap<String, String>>,
-    headers: HeaderMap,
+    state: State<AppState>,
+    params: Query<HashMap<String, String>>,
+    base_url: BaseUrl,
 ) -> Result<impl IntoResponse, ServerError> {
-    search_inner(state, String::new(), params, headers).await
+    search(state, Path(String::new()), params, base_url).await
 }
 
 pub async fn search(
     State(state): State<AppState>,
     Path(path): Path<String>,
     Query(params): Query<HashMap<String, String>>,
-    headers: HeaderMap,
+    BaseUrl(base_url): BaseUrl,
 ) -> Result<impl IntoResponse, ServerError> {
-    search_inner(state, path, params, headers).await
-}
-
-async fn search_inner(
-    state: AppState,
-    path: String,
-    params: HashMap<String, String>,
-    headers: HeaderMap,
-) -> Result<impl IntoResponse, ServerError> {
-    let base_url = state.resolve_base_url(&headers);
     let path = path.trim_matches('/');
 
-    // Parse pagination params
     let offset: usize = params
         .get("page[offset]")
         .and_then(|v| v.parse().ok())
@@ -139,7 +128,6 @@ async fn search_inner(
         .unwrap_or(links::DEFAULT_PAGE_SIZE)
         .min(links::MAX_PAGE_SIZE);
 
-    // Find the container
     let container: &dyn ContainerAdapter = if path.is_empty() {
         state.root_tree.as_ref()
     } else {
@@ -155,12 +143,11 @@ async fn search_inner(
     };
 
     let resp = core::construct_entries_response(container, path, &base_url, offset, limit);
-
     Ok(Json(resp))
 }
 
 // ---------------------------------------------------------------------------
-// GET /api/v1/array/block/{*path} — Array block data
+// GET /api/v1/array/block/{*path}
 // ---------------------------------------------------------------------------
 
 pub async fn array_block(
@@ -181,7 +168,6 @@ pub async fn array_block(
         }
     };
 
-    // Parse block parameter (comma-separated indices)
     let block_str = params.get("block").map(|s| s.as_str()).unwrap_or("");
     let block: Vec<usize> = if block_str.is_empty() {
         vec![0; array_adapter.structure().ndim()]
@@ -202,7 +188,6 @@ pub async fn array_block(
         .await
         .map_err(ServerError::from)?;
 
-    // Content negotiation
     let accept = headers
         .get("accept")
         .and_then(|v| v.to_str().ok())
@@ -238,7 +223,7 @@ pub async fn array_block(
 }
 
 // ---------------------------------------------------------------------------
-// GET /api/v1/table/partition/{*path} — Table partition data
+// GET /api/v1/table/partition/{*path}
 // ---------------------------------------------------------------------------
 
 pub async fn table_partition(
@@ -263,7 +248,6 @@ pub async fn table_partition(
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
 
-    // Parse optional field selection
     let fields: Option<Vec<String>> = params.get("field").map(|f| {
         f.split(',').map(|s| s.trim().to_string()).collect()
     });
@@ -273,7 +257,6 @@ pub async fn table_partition(
         .await
         .map_err(ServerError::from)?;
 
-    // Serialize as Arrow IPC
     let mut buf = Vec::new();
     {
         let mut writer =

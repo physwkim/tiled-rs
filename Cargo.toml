@@ -29,7 +29,7 @@ rmp-serde = "1"
 
 # HTTP server
 axum = { version = "0.8", features = ["ws", "multipart"] }
-tower = { version = "0.5", features = ["util"] }
+tower = { version = "0.5", features = ["util", "timeout"] }
 tower-http = { version = "0.6", features = ["cors", "trace", "compression-gzip", "compression-zstd"] }
 
 # HTTP client
@@ -72,9 +72,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Error handling
 thiserror = "2"
 anyhow = "1"
-
-# Async trait
-async-trait = "0.1"
 
 # Concurrent data structures
 dashmap = "6"

@@ -11,6 +11,7 @@ use tiled_core::schemas::{
 use crate::error::ServerError;
 
 /// Walk the adapter tree to find a node at the given path.
+#[tracing::instrument(skip(root))]
 pub fn walk_tree<'a>(
     root: &'a dyn ContainerAdapter,
     path: &str,

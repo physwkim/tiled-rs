@@ -26,6 +26,9 @@ pub enum TiledError {
     #[error("Database error: {0}")]
     Database(String),
 
+    #[error("Internal error: {0}")]
+    Internal(String),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -34,9 +37,6 @@ pub enum TiledError {
 
     #[error("Arrow error: {0}")]
     Arrow(#[from] arrow::error::ArrowError),
-
-    #[error("{0}")]
-    Other(#[from] anyhow::Error),
 }
 
 pub type Result<T> = std::result::Result<T, TiledError>;
