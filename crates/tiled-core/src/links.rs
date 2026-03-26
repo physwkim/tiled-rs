@@ -2,90 +2,65 @@
 //!
 //! Corresponds to `tiled/links.py` and `tiled/server/core.py:126-152`.
 
-use crate::schemas::PaginationLinks;
+use crate::schemas::{NodeLinks, PaginationLinks};
 use crate::structures::StructureFamily;
 
-/// Default page size for paginated responses.
 pub const DEFAULT_PAGE_SIZE: usize = 100;
-
-/// Maximum page size allowed.
 pub const MAX_PAGE_SIZE: usize = 300;
-
-/// Maximum depth for recursive container browsing.
 pub const DEPTH_LIMIT: usize = 5;
 
-/// Generate links for a node based on its structure family.
-///
-/// Returns a `serde_json::Value` containing the appropriate link fields.
-pub fn links_for_node(
-    family: StructureFamily,
-    base_url: &str,
-    path: &str,
-) -> serde_json::Value {
+/// Generate links for a node, returning a `NodeLinks` directly (no JSON round-trip).
+pub fn links_for_node(family: StructureFamily, base_url: &str, path: &str) -> NodeLinks {
     let base = base_url.trim_end_matches('/');
-    let path_trimmed = path.trim_start_matches('/');
+    let p = path.trim_start_matches('/');
 
-    let self_link = if path_trimmed.is_empty() {
+    let self_link = if p.is_empty() {
         format!("{base}/api/v1/metadata/")
     } else {
-        format!("{base}/api/v1/metadata/{path_trimmed}")
+        format!("{base}/api/v1/metadata/{p}")
+    };
+
+    let mut links = NodeLinks {
+        self_link: Some(self_link),
+        ..Default::default()
     };
 
     match family {
         StructureFamily::Container => {
-            let search = if path_trimmed.is_empty() {
+            links.search = Some(if p.is_empty() {
                 format!("{base}/api/v1/search/")
             } else {
-                format!("{base}/api/v1/search/{path_trimmed}")
-            };
-            let full = if path_trimmed.is_empty() {
+                format!("{base}/api/v1/search/{p}")
+            });
+            links.full = Some(if p.is_empty() {
                 format!("{base}/api/v1/entries/")
             } else {
-                format!("{base}/api/v1/entries/{path_trimmed}")
-            };
-            serde_json::json!({
-                "self": self_link,
-                "search": search,
-                "full": full,
-            })
+                format!("{base}/api/v1/entries/{p}")
+            });
         }
-        StructureFamily::Array => {
-            let block = format!("{base}/api/v1/array/block/{path_trimmed}");
-            let full = format!("{base}/api/v1/array/full/{path_trimmed}");
-            serde_json::json!({
-                "self": self_link,
-                "full": full,
-                "block": block,
-            })
+        StructureFamily::Array | StructureFamily::Sparse => {
+            links.full = Some(format!("{base}/api/v1/array/full/{p}"));
+            links
+                .extra
+                .insert("block".into(), format!("{base}/api/v1/array/block/{p}"));
         }
         StructureFamily::Table => {
-            let partition = format!("{base}/api/v1/table/partition/{path_trimmed}");
-            let full = format!("{base}/api/v1/table/full/{path_trimmed}");
-            serde_json::json!({
-                "self": self_link,
-                "full": full,
-                "partition": partition,
-            })
-        }
-        StructureFamily::Sparse => {
-            let block = format!("{base}/api/v1/array/block/{path_trimmed}");
-            let full = format!("{base}/api/v1/array/full/{path_trimmed}");
-            serde_json::json!({
-                "self": self_link,
-                "full": full,
-                "block": block,
-            })
+            links.full = Some(format!("{base}/api/v1/table/full/{p}"));
+            links.extra.insert(
+                "partition".into(),
+                format!("{base}/api/v1/table/partition/{p}"),
+            );
         }
         StructureFamily::Awkward => {
-            let buffers = format!("{base}/api/v1/awkward/buffers/{path_trimmed}");
-            let full = format!("{base}/api/v1/awkward/full/{path_trimmed}");
-            serde_json::json!({
-                "self": self_link,
-                "full": full,
-                "buffers": buffers,
-            })
+            links.full = Some(format!("{base}/api/v1/awkward/full/{p}"));
+            links.extra.insert(
+                "buffers".into(),
+                format!("{base}/api/v1/awkward/buffers/{p}"),
+            );
         }
     }
+
+    links
 }
 
 /// Generate pagination links for a search/browse response.
@@ -98,46 +73,28 @@ pub fn pagination_links(
     count: usize,
 ) -> PaginationLinks {
     let base = base_url.trim_end_matches('/');
-    let path_trimmed = path.trim_start_matches('/');
+    let p = path.trim_start_matches('/');
 
     let make_url = |o: usize, l: usize| -> String {
-        if path_trimmed.is_empty() {
+        if p.is_empty() {
             format!("{base}/api/v1/{route}/?page[offset]={o}&page[limit]={l}")
         } else {
-            format!("{base}/api/v1/{route}/{path_trimmed}?page[offset]={o}&page[limit]={l}")
+            format!("{base}/api/v1/{route}/{p}?page[offset]={o}&page[limit]={l}")
         }
     };
 
-    let self_link = make_url(offset, limit);
-
-    let first = Some(make_url(0, limit));
-
-    let last = if count > 0 {
-        let last_offset = ((count.saturating_sub(1)) / limit) * limit;
-        Some(make_url(last_offset, limit))
+    let last_offset = if count > 0 {
+        ((count - 1) / limit) * limit
     } else {
-        Some(make_url(0, limit))
-    };
-
-    let next = if offset + limit < count {
-        Some(make_url(offset + limit, limit))
-    } else {
-        None
-    };
-
-    let prev = if offset > 0 {
-        let prev_offset = offset.saturating_sub(limit);
-        Some(make_url(prev_offset, limit))
-    } else {
-        None
+        0
     };
 
     PaginationLinks {
-        self_link,
-        first,
-        last,
-        next,
-        prev,
+        self_link: make_url(offset, limit),
+        first: Some(make_url(0, limit)),
+        last: Some(make_url(last_offset, limit)),
+        next: (offset + limit < count).then(|| make_url(offset + limit, limit)),
+        prev: (offset > 0).then(|| make_url(offset.saturating_sub(limit), limit)),
     }
 }
 
@@ -148,20 +105,20 @@ mod tests {
     #[test]
     fn test_links_for_container_root() {
         let links = links_for_node(StructureFamily::Container, "http://localhost:8000", "");
-        assert_eq!(links["self"], "http://localhost:8000/api/v1/metadata/");
-        assert_eq!(links["search"], "http://localhost:8000/api/v1/search/");
+        assert_eq!(links.self_link.as_deref(), Some("http://localhost:8000/api/v1/metadata/"));
+        assert_eq!(links.search.as_deref(), Some("http://localhost:8000/api/v1/search/"));
     }
 
     #[test]
     fn test_links_for_array() {
         let links = links_for_node(StructureFamily::Array, "http://localhost:8000", "my_array");
         assert_eq!(
-            links["self"],
-            "http://localhost:8000/api/v1/metadata/my_array"
+            links.self_link.as_deref(),
+            Some("http://localhost:8000/api/v1/metadata/my_array")
         );
         assert_eq!(
-            links["block"],
-            "http://localhost:8000/api/v1/array/block/my_array"
+            links.extra.get("block").map(|s| s.as_str()),
+            Some("http://localhost:8000/api/v1/array/block/my_array")
         );
     }
 
@@ -169,8 +126,8 @@ mod tests {
     fn test_links_for_table() {
         let links = links_for_node(StructureFamily::Table, "http://localhost:8000", "my_table");
         assert_eq!(
-            links["partition"],
-            "http://localhost:8000/api/v1/table/partition/my_table"
+            links.extra.get("partition").map(|s| s.as_str()),
+            Some("http://localhost:8000/api/v1/table/partition/my_table")
         );
     }
 

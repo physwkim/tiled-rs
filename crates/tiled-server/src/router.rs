@@ -182,7 +182,7 @@ pub async fn array_block(
     };
 
     // Parse block parameter (comma-separated indices)
-    let block_str = params.get("block").cloned().unwrap_or_default();
+    let block_str = params.get("block").map(|s| s.as_str()).unwrap_or("");
     let block: Vec<usize> = if block_str.is_empty() {
         vec![0; array_adapter.structure().ndim()]
     } else {
@@ -215,34 +215,26 @@ pub async fn array_block(
     )
     .unwrap_or_else(|| "application/octet-stream".to_string());
 
-    if let Some(serializer) =
+    let body = if let Some(serializer) =
         state
             .serialization_registry
             .dispatch(tiled_core::structures::StructureFamily::Array, &media_type)
     {
-        let metadata = serde_json::json!({
+        let ser_meta = serde_json::json!({
             "itemsize": data.dtype.element_size(),
-            "kind": data.dtype.kind.to_numpy_char().to_string(),
+            "kind": String::from(data.dtype.kind.to_numpy_char()),
         });
-        let bytes = serializer(&data.data, &metadata)
-            .map_err(|e| ServerError::Internal(e.to_string()))?;
-
-        Ok((
-            [(axum::http::header::CONTENT_TYPE, media_type)],
-            bytes.to_vec(),
-        )
-            .into_response())
+        serializer(&data.data, &ser_meta)
+            .map_err(|e| ServerError::Internal(e.to_string()))?
     } else {
-        // Fallback: return raw bytes
-        Ok((
-            [(
-                axum::http::header::CONTENT_TYPE,
-                "application/octet-stream".to_string(),
-            )],
-            data.data.to_vec(),
-        )
-            .into_response())
-    }
+        data.data
+    };
+
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, media_type)],
+        body,
+    )
+        .into_response())
 }
 
 // ---------------------------------------------------------------------------

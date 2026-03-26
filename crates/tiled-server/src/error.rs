@@ -27,13 +27,12 @@ impl std::fmt::Display for ServerError {
 
 impl IntoResponse for ServerError {
     fn into_response(self) -> Response {
-        let (status, code, message) = match &self {
-            Self::NotFound(msg) => (StatusCode::NOT_FOUND, 404, msg.clone()),
-            Self::Validation(msg) => (StatusCode::UNPROCESSABLE_ENTITY, 422, msg.clone()),
-            Self::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, 500, msg.clone()),
-            Self::UnsupportedMediaType(msg) => {
-                (StatusCode::UNSUPPORTED_MEDIA_TYPE, 415, msg.clone())
-            }
+        // Consume self — no clone needed.
+        let (status, code, message) = match self {
+            Self::NotFound(msg) => (StatusCode::NOT_FOUND, 404, msg),
+            Self::Validation(msg) => (StatusCode::UNPROCESSABLE_ENTITY, 422, msg),
+            Self::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, 500, msg),
+            Self::UnsupportedMediaType(msg) => (StatusCode::UNSUPPORTED_MEDIA_TYPE, 415, msg),
         };
 
         let body = schemas::Response::<()> {

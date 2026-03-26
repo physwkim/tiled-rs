@@ -19,7 +19,7 @@ license = "BSD-3-Clause"
 
 [workspace.dependencies]
 # Async runtime
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

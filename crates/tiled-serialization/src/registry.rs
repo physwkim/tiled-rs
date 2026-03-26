@@ -15,8 +15,8 @@ pub type SerializerFn =
 
 /// Registry mapping (StructureFamily, media_type) → serializer.
 pub struct SerializationRegistry {
-    lookup: DashMap<(StructureFamily, String), Arc<SerializerFn>>,
-    aliases: DashMap<String, String>,
+    lookup: DashMap<(StructureFamily, Arc<str>), Arc<SerializerFn>>,
+    aliases: DashMap<Arc<str>, Arc<str>>,
 }
 
 impl SerializationRegistry {
@@ -27,7 +27,6 @@ impl SerializationRegistry {
         }
     }
 
-    /// Register a serializer for a (family, media_type) pair.
     pub fn register(
         &self,
         family: StructureFamily,
@@ -35,13 +34,12 @@ impl SerializationRegistry {
         serializer: SerializerFn,
     ) {
         self.lookup
-            .insert((family, media_type.to_string()), Arc::new(serializer));
+            .insert((family, Arc::from(media_type)), Arc::new(serializer));
     }
 
-    /// Register a file extension alias for a media type.
     pub fn register_alias(&self, extension: &str, media_type: &str) {
         self.aliases
-            .insert(extension.to_string(), media_type.to_string());
+            .insert(Arc::from(extension), Arc::from(media_type));
     }
 
     /// Dispatch: get the serializer for a given (family, media_type).
@@ -50,9 +48,11 @@ impl SerializationRegistry {
         family: StructureFamily,
         media_type: &str,
     ) -> Option<Arc<SerializerFn>> {
+        // Avoid allocating a key by scanning — the lookup table is small.
         self.lookup
-            .get(&(family, media_type.to_string()))
-            .map(|r| r.value().clone())
+            .iter()
+            .find(|entry| entry.key().0 == family && &*entry.key().1 == media_type)
+            .map(|entry| entry.value().clone())
     }
 
     /// Get all registered media types for a given structure family.
@@ -60,7 +60,7 @@ impl SerializationRegistry {
         self.lookup
             .iter()
             .filter(|entry| entry.key().0 == family)
-            .map(|entry| entry.key().1.clone())
+            .map(|entry| entry.key().1.to_string())
             .collect()
     }
 
@@ -69,11 +69,9 @@ impl SerializationRegistry {
         let media_types = self.media_types(family);
         let mut result: HashMap<String, Vec<String>> = HashMap::new();
         for entry in self.aliases.iter() {
-            if media_types.contains(entry.value()) {
-                result
-                    .entry(entry.value().clone())
-                    .or_default()
-                    .push(entry.key().clone());
+            let mt = entry.value().to_string();
+            if media_types.iter().any(|m| m == &mt) {
+                result.entry(mt).or_default().push(entry.key().to_string());
             }
         }
         result
@@ -81,40 +79,47 @@ impl SerializationRegistry {
 
     /// Resolve an extension alias to a media type.
     pub fn resolve_alias(&self, extension: &str) -> Option<String> {
-        self.aliases.get(extension).map(|r| r.value().clone())
+        self.aliases
+            .iter()
+            .find(|entry| &**entry.key() == extension)
+            .map(|entry| entry.value().to_string())
     }
 
     /// Get all formats as a HashMap (family_name → Vec<media_type>).
     pub fn all_formats(&self) -> HashMap<String, Vec<String>> {
-        let mut formats = HashMap::new();
-        for family in &[
+        let families = [
             StructureFamily::Array,
             StructureFamily::Table,
             StructureFamily::Sparse,
             StructureFamily::Awkward,
             StructureFamily::Container,
-        ] {
-            formats.insert(family.to_string(), self.media_types(*family));
-        }
-        formats
+        ];
+        families
+            .iter()
+            .map(|f| (f.to_string(), self.media_types(*f)))
+            .collect()
     }
 
     /// Get all aliases grouped by family.
     pub fn all_aliases(&self) -> HashMap<String, HashMap<String, Vec<String>>> {
-        let mut result = HashMap::new();
-        for family in &[
+        let families = [
             StructureFamily::Array,
             StructureFamily::Table,
             StructureFamily::Sparse,
             StructureFamily::Awkward,
             StructureFamily::Container,
-        ] {
-            let family_aliases = self.aliases(*family);
-            if !family_aliases.is_empty() {
-                result.insert(family.to_string(), family_aliases);
-            }
-        }
-        result
+        ];
+        families
+            .iter()
+            .filter_map(|f| {
+                let a = self.aliases(*f);
+                if a.is_empty() {
+                    None
+                } else {
+                    Some((f.to_string(), a))
+                }
+            })
+            .collect()
     }
 }
 
@@ -130,18 +135,16 @@ pub fn resolve_media_type(
     family: StructureFamily,
     registry: &SerializationRegistry,
 ) -> Option<String> {
-    // Check for explicit media types in Accept header
     let available = registry.media_types(family);
     for part in accept.split(',') {
         let media_type = part.trim().split(';').next().unwrap_or("").trim();
         if media_type == "*/*" {
             return default_media_type(family);
         }
-        if available.contains(&media_type.to_string()) {
+        if available.iter().any(|m| m == media_type) {
             return Some(media_type.to_string());
         }
     }
-    // Fallback to default
     default_media_type(family)
 }
 
@@ -150,9 +153,7 @@ fn default_media_type(family: StructureFamily) -> Option<String> {
         StructureFamily::Array | StructureFamily::Sparse => {
             Some(tiled_core::media_type::mime::OCTET_STREAM.to_string())
         }
-        StructureFamily::Table => {
-            Some(tiled_core::media_type::mime::ARROW_FILE.to_string())
-        }
+        StructureFamily::Table => Some(tiled_core::media_type::mime::ARROW_FILE.to_string()),
         _ => None,
     }
 }
