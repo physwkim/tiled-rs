@@ -137,6 +137,29 @@ fn build_demo_tree() -> MapAdapter {
         AnyAdapter::Container(Box::new(inner_container)),
     );
 
+    // Larger arrays for benchmarking
+    let large_1d: Vec<f64> = (0..100_000).map(|i| (i as f64) * 0.001).collect();
+    let arr_large_1d = ArrayAdapter::from_f64_1d(
+        &large_1d,
+        serde_json::json!({"description": "100k element array"}),
+    );
+    mapping.insert(
+        "large_1d".to_string(),
+        AnyAdapter::Array(Box::new(arr_large_1d)),
+    );
+
+    let large_2d: Vec<f64> = (0..1_000_000).map(|i| (i as f64) * 0.001).collect();
+    let arr_large_2d = ArrayAdapter::from_f64_2d(
+        &large_2d,
+        1000,
+        1000,
+        serde_json::json!({"description": "1000x1000 array"}),
+    );
+    mapping.insert(
+        "large_2d".to_string(),
+        AnyAdapter::Array(Box::new(arr_large_2d)),
+    );
+
     MapAdapter::new(
         mapping,
         serde_json::json!({"description": "Tiled demo catalog"}),
