@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [features]
-default = ["npy"]
+default = ["npy", "hdf5"]
 npy = ["dep:ndarray"]
 hdf5 = ["dep:hdf5"]
 tiff = ["dep:tiff", "dep:image"]

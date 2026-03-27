@@ -98,8 +98,8 @@ tempfile = "3"
 tiff = "0.9"
 image = "0.25"
 
-# HDF5 (feature-gated)
-hdf5 = "0.8"
+# HDF5 (feature-gated) — hdf5-metno with static build (no system libhdf5 needed)
+hdf5 = { package = "hdf5-metno", version = "0.12", features = ["static"] }
 
 # Zarr
 zarrs = "0.20"
