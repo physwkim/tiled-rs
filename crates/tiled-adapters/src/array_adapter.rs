@@ -245,4 +245,56 @@ mod tests {
         let result = adapter.read(&slice).await.unwrap();
         assert_eq!(result.shape, vec![4, 5]);
     }
+
+    #[tokio::test]
+    async fn test_read_block_wrong_ndim() {
+        let data: Vec<f64> = (0..10).map(|i| i as f64).collect();
+        let adapter = ArrayAdapter::from_f64_1d(&data, serde_json::json!({}));
+        let slice = NDSlice::empty();
+
+        // 1D array but 2 block indices → error
+        let err = adapter.read_block(&[0, 0], &slice).await;
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("Expected 1 block indices"));
+    }
+
+    #[tokio::test]
+    async fn test_read_block_out_of_range() {
+        let data: Vec<f64> = (0..10).map(|i| i as f64).collect();
+        let adapter = ArrayAdapter::from_f64_1d(&data, serde_json::json!({}));
+        let slice = NDSlice::empty();
+
+        // Block index 1 but only 1 chunk → out of range
+        let err = adapter.read_block(&[1], &slice).await;
+        assert!(err.is_err());
+        assert!(err.unwrap_err().to_string().contains("out of range"));
+    }
+
+    #[tokio::test]
+    async fn test_empty_array() {
+        let adapter = ArrayAdapter::from_f64_1d(&[], serde_json::json!({}));
+        assert_eq!(adapter.structure().shape, vec![0]);
+
+        let slice = NDSlice::empty();
+        let result = adapter.read(&slice).await.unwrap();
+        assert_eq!(result.len(), 0);
+        assert_eq!(result.nbytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_2d_block_data_correctness() {
+        // 4x5 array, single chunk — block [0,0] should return all data
+        let data: Vec<f64> = (0..20).map(|i| i as f64).collect();
+        let adapter = ArrayAdapter::from_f64_2d(&data, 4, 5, serde_json::json!({}));
+        let slice = NDSlice::empty();
+
+        let block = adapter.read_block(&[0, 0], &slice).await.unwrap();
+        assert_eq!(block.shape, vec![4, 5]);
+
+        // Verify first and last values
+        let first = f64::from_le_bytes(block.data[0..8].try_into().unwrap());
+        let last = f64::from_le_bytes(block.data[152..160].try_into().unwrap());
+        assert_eq!(first, 0.0);
+        assert_eq!(last, 19.0);
+    }
 }

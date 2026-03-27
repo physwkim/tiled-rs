@@ -452,3 +452,69 @@ async fn test_ready_endpoint() {
     assert_eq!(body["status"], "ok");
     assert!(body["nodes"].as_u64().unwrap() > 0);
 }
+
+// ---------------------------------------------------------------------------
+// Edge cases
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_empty_container() {
+    // Build app with an empty root container
+    let root = MapAdapter::new(IndexMap::new(), serde_json::json!({}), vec![]);
+    let root_tree: Arc<dyn tiled_core::adapters::ContainerAdapter> = Arc::new(root);
+    let registry = Arc::new(tiled_serialization::default_registry());
+    let state = tiled_server::AppState {
+        root_tree,
+        serialization_registry: registry,
+        query_names: vec![],
+        base_url: Some("http://localhost:8000".to_string()),
+        cors_policy: tiled_server::state::CorsOriginPolicy::Permissive,
+        trust_forwarded_headers: false,
+    };
+    let app = tiled_server::build_app(state);
+
+    // Metadata: count=0
+    let (status, body) = get_json(&app, "/api/v1/metadata/").await;
+    assert_eq!(status, 200);
+    assert_eq!(body["data"]["attributes"]["structure"]["count"], 0);
+
+    // Search: empty data array
+    let (status, body) = get_json(&app, "/api/v1/search/").await;
+    assert_eq!(status, 200);
+    assert_eq!(body["data"].as_array().unwrap().len(), 0);
+    assert_eq!(body["meta"]["count"], 0);
+}
+
+#[tokio::test]
+async fn test_search_on_non_container() {
+    let app = build_app();
+    // some_array is an array, not a container — search should fail
+    let (status, body) = get_json(&app, "/api/v1/search/some_array").await;
+    assert_eq!(status, 422);
+    assert!(body["error"]["message"].as_str().unwrap().contains("not a container"));
+}
+
+#[tokio::test]
+async fn test_block_wrong_dimension_count() {
+    let app = build_app();
+    // some_array is 1D but we pass 2 block indices
+    let (status, body) = get_json(&app, "/api/v1/array/block/some_array?block=0,0").await;
+    assert_eq!(status, 422);
+    assert!(body["error"]["message"].as_str().unwrap().contains("block indices"));
+}
+
+#[tokio::test]
+async fn test_deeply_nested_not_found() {
+    let app = build_app();
+    let (status, _) = get_json(&app, "/api/v1/metadata/subgroup/nonexistent/deep/path").await;
+    assert_eq!(status, 404);
+}
+
+#[tokio::test]
+async fn test_traverse_through_non_container() {
+    let app = build_app();
+    // some_array is a leaf — can't traverse further
+    let (status, body) = get_json(&app, "/api/v1/metadata/some_array/child").await;
+    assert_eq!(status, 404);
+    assert!(body["error"]["message"].as_str().unwrap().contains("not a container"));
+}
