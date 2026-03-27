@@ -5,7 +5,7 @@ use clap::Subcommand;
 use indexmap::IndexMap;
 
 use tiled_adapters::{ArrayAdapter, MapAdapter};
-use tiled_core::adapters::AnyAdapter;
+use tiled_core::adapters::{AnyAdapter, ContainerAdapter};
 use tiled_core::queries::Query;
 use tiled_server::state::CorsOriginPolicy;
 
@@ -46,6 +46,10 @@ pub enum Command {
         /// Single-user API key. Also reads TILED_SINGLE_USER_API_KEY env var.
         #[arg(long, env = "TILED_SINGLE_USER_API_KEY")]
         api_key: Option<String>,
+
+        /// MongoDB URI for Bluesky data (e.g. mongodb://localhost:27017/my_database)
+        #[arg(long)]
+        mongo_uri: Option<String>,
     },
 
     /// Database management commands (not yet implemented)
@@ -200,6 +204,7 @@ pub async fn run(command: Command) -> Result<()> {
             allow_origins,
             trust_proxy,
             api_key,
+            mongo_uri,
         } => {
             if config.is_some() {
                 anyhow::bail!(
@@ -207,12 +212,21 @@ pub async fn run(command: Command) -> Result<()> {
                 );
             }
 
-            let root_tree: Arc<dyn tiled_core::adapters::ContainerAdapter> = if demo {
-                tracing::info!("Starting with demo dataset");
-                Arc::new(build_demo_tree())
-            } else {
-                anyhow::bail!("--demo is required (config-based serving is not yet implemented)");
-            };
+            let root_tree: Arc<dyn tiled_core::adapters::ContainerAdapter> =
+                if let Some(ref uri) = mongo_uri {
+                    tracing::info!("Connecting to MongoDB: {uri}");
+                    let catalog = tiled_mongo::MongoCatalog::from_uri(uri)
+                        .map_err(|e| anyhow::anyhow!("MongoDB connection failed: {e}"))?;
+                    tracing::info!("MongoDB catalog loaded ({} runs)", catalog.len());
+                    Arc::new(catalog)
+                } else if demo {
+                    tracing::info!("Starting with demo dataset");
+                    Arc::new(build_demo_tree())
+                } else {
+                    anyhow::bail!(
+                        "Specify --demo or --mongo-uri to start the server"
+                    );
+                };
 
             let registry = Arc::new(tiled_serialization::default_registry());
 

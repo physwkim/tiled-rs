@@ -9,6 +9,7 @@ members = [
     "crates/tiled-server",
     "crates/tiled-client",
     "crates/tiled-cli",
+    "crates/tiled-mongo",
 ]
 resolver = "3"
 
@@ -109,6 +110,9 @@ csv = "1"
 # Ordered maps
 indexmap = { version = "2", features = ["serde"] }
 
+# MongoDB
+mongodb = { version = "3", features = ["sync"] }
+
 # Redis
 redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
 
@@ -122,6 +126,7 @@ tiled-access = { path = "crates/tiled-access" }
 tiled-server = { path = "crates/tiled-server" }
 tiled-client = { path = "crates/tiled-client" }
 tiled-cli = { path = "crates/tiled-cli" }
+tiled-mongo = { path = "crates/tiled-mongo" }
 
 [package]
 name = "tiled"

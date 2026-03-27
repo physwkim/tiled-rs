@@ -19,3 +19,4 @@ tracing-subscriber = { workspace = true }
 indexmap = { workspace = true }
 bytes = { workspace = true }
 axum = { workspace = true }
+tiled-mongo = { workspace = true }

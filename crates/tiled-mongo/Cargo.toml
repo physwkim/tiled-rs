@@ -1,0 +1,15 @@
+[package]
+name = "tiled-mongo"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tiled-core = { workspace = true }
+mongodb = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+bytes = { workspace = true }
+indexmap = { workspace = true }
+thiserror = { workspace = true }
