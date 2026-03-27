@@ -33,9 +33,9 @@ pub fn links_for_node(family: StructureFamily, base_url: &str, path: &str) -> No
                 format!("{base}/api/v1/search/{p}")
             });
             links.full = Some(if p.is_empty() {
-                format!("{base}/api/v1/entries/")
+                format!("{base}/api/v1/search/")
             } else {
-                format!("{base}/api/v1/entries/{p}")
+                format!("{base}/api/v1/search/{p}")
             });
         }
         StructureFamily::Array | StructureFamily::Sparse => {

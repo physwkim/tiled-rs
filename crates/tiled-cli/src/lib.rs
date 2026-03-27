@@ -146,12 +146,19 @@ fn build_demo_tree() -> MapAdapter {
 
 async fn shutdown_signal() {
     let ctrl_c = tokio::signal::ctrl_c();
-    let mut sigterm =
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("failed to install SIGTERM handler");
-    tokio::select! {
-        _ = ctrl_c => tracing::info!("Received SIGINT, shutting down gracefully"),
-        _ = sigterm.recv() => tracing::info!("Received SIGTERM, shutting down gracefully"),
+
+    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        Ok(mut sigterm) => {
+            tokio::select! {
+                _ = ctrl_c => tracing::info!("Received SIGINT, shutting down gracefully"),
+                _ = sigterm.recv() => tracing::info!("Received SIGTERM, shutting down gracefully"),
+            }
+        }
+        Err(e) => {
+            tracing::warn!("Could not install SIGTERM handler: {e}, using SIGINT only");
+            let _ = ctrl_c.await;
+            tracing::info!("Received SIGINT, shutting down gracefully");
+        }
     }
 }
 

@@ -70,7 +70,14 @@ impl ArrayAdapter {
         cols: usize,
         metadata: serde_json::Value,
     ) -> Self {
-        assert_eq!(data.len(), rows * cols);
+        assert_eq!(
+            data.len(),
+            rows * cols,
+            "data length {} != rows({}) * cols({})",
+            data.len(),
+            rows,
+            cols
+        );
         let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
         let dtype = BuiltinDType::new(
             tiled_core::dtype::Endianness::Little,
@@ -122,7 +129,6 @@ impl ArrayAdapterRead for ArrayAdapter {
 
 impl ArrayAdapter {
     fn read_block_inner(&self, block: &[usize]) -> Result<DynNDArray> {
-        // Compute the byte range for the requested block
         let ndim = self.structure.shape.len();
         if block.len() != ndim {
             return Err(TiledError::Validation(format!(
@@ -130,8 +136,13 @@ impl ArrayAdapter {
                 block.len()
             )));
         }
+        if self.structure.chunks.len() != ndim {
+            return Err(TiledError::Validation(format!(
+                "Malformed structure: chunks has {} dims, shape has {ndim}",
+                self.structure.chunks.len()
+            )));
+        }
 
-        // Compute the start/end indices for each dimension based on chunk sizes
         let mut start = vec![0usize; ndim];
         let mut end = vec![0usize; ndim];
         for dim in 0..ndim {
@@ -176,18 +187,9 @@ impl ArrayAdapter {
                 out.extend_from_slice(&self.array.data[row_byte_start..row_byte_end]);
             }
         } else {
-            // For higher dimensions, fall back to returning full array data for the block
-            // This is a simplification; full N-D block extraction would require recursive striding
-            // For demo purposes, this handles the common 1D and 2D cases.
-            let byte_start = 0;
-            let byte_end = total_elements * element_size;
-            if byte_end <= self.array.data.len() {
-                out.extend_from_slice(&self.array.data[byte_start..byte_end]);
-            } else {
-                return Err(TiledError::Validation(
-                    "Block extraction not supported for >2D arrays with multiple chunks".into(),
-                ));
-            }
+            return Err(TiledError::Validation(format!(
+                "Block extraction for {ndim}D arrays is not yet supported"
+            )));
         }
 
         Ok(DynNDArray::new(

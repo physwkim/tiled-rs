@@ -121,7 +121,7 @@ pub fn construct_root_resource(root: &dyn ContainerAdapter, base_url: &str) -> R
             structure_family: Some(root.structure_family()),
             specs: Some(root.specs().to_vec()),
             metadata: Some(root.metadata().clone()),
-            structure: Some(serde_json::to_value(ns).unwrap_or_default()),
+            structure: Some(serde_json::to_value(&ns).expect("NodeStructure is always serializable")),
             access_blob: None,
             sorting: Some(default_sorting()),
             data_sources: None,
@@ -162,7 +162,7 @@ pub fn construct_entries_response(
     Response {
         data: Some(entries),
         error: None,
-        links: Some(serde_json::to_value(pagination).unwrap_or_default()),
-        meta: Some(serde_json::to_value(ContainerMeta { count }).unwrap_or_default()),
+        links: Some(serde_json::to_value(&pagination).expect("PaginationLinks is always serializable")),
+        meta: Some(serde_json::to_value(&ContainerMeta { count }).expect("ContainerMeta is always serializable")),
     }
 }

@@ -29,6 +29,9 @@ pub fn register_array_serializers(registry: &SerializationRegistry) {
                 .get("itemsize")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(8) as usize;
+            if itemsize == 0 {
+                return Err("itemsize must be > 0".into());
+            }
             let kind = metadata
                 .get("kind")
                 .and_then(|v| v.as_str())
