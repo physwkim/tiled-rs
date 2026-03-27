@@ -128,6 +128,14 @@ pub async fn search(
         .unwrap_or(links::DEFAULT_PAGE_SIZE)
         .min(links::MAX_PAGE_SIZE);
 
+    // Parse query filters from URL params
+    let filter_params: Vec<(String, String)> = params
+        .iter()
+        .filter(|(k, _)| k.starts_with("filter["))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let queries = tiled_core::queries::decode_query_filters(&filter_params);
+
     let container: &dyn ContainerAdapter = if path.is_empty() {
         state.root_tree.as_ref()
     } else {
@@ -142,7 +150,9 @@ pub async fn search(
         }
     };
 
-    let resp = core::construct_entries_response(container, path, &base_url, offset, limit);
+    let resp = core::construct_entries_response(
+        container, path, &base_url, offset, limit, &queries,
+    );
     Ok(Json(resp))
 }
 

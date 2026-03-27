@@ -7,6 +7,7 @@ use std::sync::{Arc, OnceLock};
 use indexmap::IndexMap;
 
 use tiled_core::adapters::{AnyAdapter, BaseAdapter, ContainerAdapter};
+use tiled_core::queries::Query;
 use tiled_core::schemas::{SortDirection, SortingItem};
 use tiled_core::structures::{ContainerStructure, Spec, StructureFamily};
 
@@ -106,6 +107,38 @@ impl ContainerAdapter for MapAdapter {
     #[inline]
     fn len(&self) -> usize {
         self.mapping.len()
+    }
+
+    fn search(&self, queries: &[Query]) -> Vec<String> {
+        if queries.is_empty() {
+            return self.keys();
+        }
+        self.mapping
+            .iter()
+            .filter(|(_, adapter)| queries.iter().all(|q| matches_query(adapter, q)))
+            .map(|(k, _)| k.clone())
+            .collect()
+    }
+}
+
+/// Check if an adapter matches a single query against its metadata.
+fn matches_query(adapter: &AnyAdapter, query: &Query) -> bool {
+    let meta = adapter.metadata();
+    match query {
+        Query::FullText(ft) => {
+            let text = meta.to_string();
+            text.contains(&ft.text)
+        }
+        Query::Eq(eq) => meta.get(&eq.key).is_some_and(|v| v == &eq.value),
+        Query::NotEq(neq) => meta.get(&neq.key).is_none_or(|v| v != &neq.value),
+        Query::KeyPresent(kp) => meta.get(&kp.key).is_some() == kp.exists,
+        Query::Contains(c) => meta
+            .get(&c.key)
+            .and_then(|v| v.as_array())
+            .is_some_and(|arr| arr.contains(&c.value)),
+        Query::StructureFamily(sf) => adapter.structure_family() == sf.value,
+        // Other query types pass through (no filtering) for in-memory adapter
+        _ => true,
     }
 }
 

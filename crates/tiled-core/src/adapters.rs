@@ -140,6 +140,11 @@ pub trait ContainerAdapter: BaseAdapter {
     fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// Search/filter children. Default: return all keys (no filtering).
+    fn search(&self, _queries: &[crate::queries::Query]) -> Vec<String> {
+        self.keys()
+    }
 }
 
 // ---------------------------------------------------------------------------

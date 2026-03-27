@@ -137,12 +137,14 @@ pub fn construct_entries_response(
     base_url: &str,
     offset: usize,
     limit: usize,
+    queries: &[tiled_core::queries::Query],
 ) -> Response<Vec<Resource>> {
-    let count = container.len();
-    let keys = container.keys();
+    // Apply search filters to get matching keys, then paginate.
+    let matched_keys = container.search(queries);
+    let count = matched_keys.len();
     let path_trimmed = path.trim_matches('/');
 
-    let entries: Vec<Resource> = keys
+    let entries: Vec<Resource> = matched_keys
         .iter()
         .skip(offset)
         .take(limit)
