@@ -2,7 +2,9 @@
 
 use std::time::Duration;
 
+use axum::extract::State;
 use axum::http::{HeaderValue, Method, StatusCode};
+use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::Router;
 use tower_http::compression::CompressionLayer;
@@ -28,11 +30,15 @@ pub fn build_app(state: AppState) -> Router {
         }
     };
 
-    Router::new()
-        // Operational endpoints
+    let needs_auth = state.api_key.is_some();
+
+    let mut app = Router::new()
+        // Operational endpoints (never require auth)
         .route("/health", get(router::health))
-        .route("/ready", get(router::ready))
-        // API endpoints
+        .route("/ready", get(router::ready));
+
+    // API endpoints
+    let api = Router::new()
         .route("/api/v1/", get(router::about))
         .route("/api/v1/metadata/", get(router::metadata_root))
         .route("/api/v1/metadata/{*path}", get(router::metadata))
@@ -42,28 +48,68 @@ pub fn build_app(state: AppState) -> Router {
         .route(
             "/api/v1/table/partition/{*path}",
             get(router::table_partition),
-        )
-        // Middleware stack (outermost → innermost)
-        .layer(axum::middleware::from_fn(timeout_middleware))
+        );
+
+    // Apply auth middleware only to API routes when api_key is set
+    app = if needs_auth {
+        app.merge(api.layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            api_key_middleware,
+        )))
+    } else {
+        app.merge(api)
+    };
+
+    app.layer(axum::middleware::from_fn(timeout_middleware))
         .layer(CompressionLayer::new())
         .layer(TraceLayer::new_for_http())
         .layer(cors)
         .with_state(state)
 }
 
-/// Request timeout middleware that returns 408 on timeout.
+/// API key authentication middleware.
+///
+/// Checks `?api_key=` query param or `Authorization: Apikey <key>` header.
+async fn api_key_middleware(
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let expected = match &state.api_key {
+        Some(key) => key,
+        None => return next.run(request).await,
+    };
+
+    // Check query parameter: ?api_key=<key>
+    if let Some(query) = request.uri().query() {
+        for pair in query.split('&') {
+            if let Some(value) = pair.strip_prefix("api_key=")
+                && value == expected
+            {
+                return next.run(request).await;
+            }
+        }
+    }
+
+    // Check Authorization header: "Apikey <key>"
+    if let Some(auth) = request.headers().get("authorization")
+        && let Ok(auth_str) = auth.to_str()
+        && let Some(key) = auth_str.strip_prefix("Apikey ")
+        && key == expected
+    {
+        return next.run(request).await;
+    }
+
+    (StatusCode::UNAUTHORIZED, "Invalid or missing API key").into_response()
+}
+
+/// Request timeout middleware.
 async fn timeout_middleware(
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     match tokio::time::timeout(Duration::from_secs(30), next.run(request)).await {
         Ok(response) => response,
-        Err(_elapsed) => (
-            StatusCode::REQUEST_TIMEOUT,
-            "Request timed out",
-        )
-            .into_response(),
+        Err(_) => (StatusCode::REQUEST_TIMEOUT, "Request timed out").into_response(),
     }
 }
-
-use axum::response::IntoResponse;

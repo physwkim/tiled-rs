@@ -42,6 +42,10 @@ pub enum Command {
         /// Only enable behind a trusted proxy.
         #[arg(long)]
         trust_proxy: bool,
+
+        /// Single-user API key. Also reads TILED_SINGLE_USER_API_KEY env var.
+        #[arg(long, env = "TILED_SINGLE_USER_API_KEY")]
+        api_key: Option<String>,
     },
 
     /// Database management commands (not yet implemented)
@@ -195,6 +199,7 @@ pub async fn run(command: Command) -> Result<()> {
             public_url,
             allow_origins,
             trust_proxy,
+            api_key,
         } => {
             if config.is_some() {
                 anyhow::bail!(
@@ -221,6 +226,12 @@ pub async fn run(command: Command) -> Result<()> {
                 CorsOriginPolicy::AllowList(Vec::new())
             };
 
+            if api_key.is_some() {
+                tracing::info!("API key authentication enabled");
+            } else {
+                tracing::info!("Anonymous access (no API key)");
+            }
+
             let state = tiled_server::AppState {
                 root_tree,
                 serialization_registry: registry,
@@ -231,6 +242,7 @@ pub async fn run(command: Command) -> Result<()> {
                 base_url: public_url,
                 cors_policy,
                 trust_forwarded_headers: trust_proxy,
+                api_key,
             };
 
             let app = tiled_server::build_app(state);

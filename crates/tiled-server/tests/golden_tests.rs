@@ -58,6 +58,7 @@ fn build_app() -> axum::Router {
         base_url: Some("http://localhost:8000".to_string()),
         cors_policy: tiled_server::state::CorsOriginPolicy::Permissive,
         trust_forwarded_headers: false,
+        api_key: None,
     };
 
     tiled_server::build_app(state)
@@ -78,6 +79,7 @@ fn build_app_dynamic(trust_forwarded: bool) -> axum::Router {
         base_url: None,
         cors_policy: tiled_server::state::CorsOriginPolicy::AllowList(Vec::new()),
         trust_forwarded_headers: trust_forwarded,
+        api_key: None,
     };
 
     tiled_server::build_app(state)
@@ -470,6 +472,7 @@ async fn test_empty_container() {
         base_url: Some("http://localhost:8000".to_string()),
         cors_policy: tiled_server::state::CorsOriginPolicy::Permissive,
         trust_forwarded_headers: false,
+        api_key: None,
     };
     let app = tiled_server::build_app(state);
 
@@ -517,4 +520,65 @@ async fn test_traverse_through_non_container() {
     let (status, body) = get_json(&app, "/api/v1/metadata/some_array/child").await;
     assert_eq!(status, 404);
     assert!(body["error"]["message"].as_str().unwrap().contains("not a container"));
+}
+
+// ---------------------------------------------------------------------------
+// API key authentication
+// ---------------------------------------------------------------------------
+
+fn build_app_with_api_key(key: &str) -> axum::Router {
+    let root_tree: Arc<dyn tiled_core::adapters::ContainerAdapter> = Arc::new(build_test_tree());
+    let registry = Arc::new(tiled_serialization::default_registry());
+
+    let state = tiled_server::AppState {
+        root_tree,
+        serialization_registry: registry,
+        query_names: vec![],
+        base_url: Some("http://localhost:8000".to_string()),
+        cors_policy: tiled_server::state::CorsOriginPolicy::Permissive,
+        trust_forwarded_headers: false,
+        api_key: Some(key.to_string()),
+    };
+
+    tiled_server::build_app(state)
+}
+
+#[tokio::test]
+async fn test_api_key_rejects_without_key() {
+    let app = build_app_with_api_key("secret123");
+    let (status, _) = get(&app, "/api/v1/").await;
+    assert_eq!(status, 401);
+}
+
+#[tokio::test]
+async fn test_api_key_accepts_query_param() {
+    let app = build_app_with_api_key("secret123");
+    let (status, _) = get(&app, "/api/v1/?api_key=secret123").await;
+    assert_eq!(status, 200);
+}
+
+#[tokio::test]
+async fn test_api_key_accepts_header() {
+    let app = build_app_with_api_key("secret123");
+    let req = Request::builder()
+        .uri("/api/v1/")
+        .header("authorization", "Apikey secret123")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 200);
+}
+
+#[tokio::test]
+async fn test_api_key_rejects_wrong_key() {
+    let app = build_app_with_api_key("secret123");
+    let (status, _) = get(&app, "/api/v1/?api_key=wrong").await;
+    assert_eq!(status, 401);
+}
+
+#[tokio::test]
+async fn test_health_bypasses_auth() {
+    let app = build_app_with_api_key("secret123");
+    let (status, _) = get_json(&app, "/health").await;
+    assert_eq!(status, 200);
 }
