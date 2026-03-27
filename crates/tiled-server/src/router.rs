@@ -291,3 +291,73 @@ pub async fn table_partition(
     )
         .into_response())
 }
+
+// ---------------------------------------------------------------------------
+// GET /documents/{*path} — Stream Bluesky documents (databroker compat)
+// ---------------------------------------------------------------------------
+
+pub async fn get_documents(
+    State(state): State<AppState>,
+    Path(path): Path<String>,
+) -> Result<impl IntoResponse, ServerError> {
+    let path = path.trim_matches('/');
+
+    // Walk to the run node.
+    let adapter = if path.is_empty() {
+        return Err(ServerError::Validation(
+            "Path to a BlueskyRun is required".into(),
+        ));
+    } else {
+        core::walk_tree(state.root_tree.as_ref(), path)?
+    };
+
+    // The run must be a container (BlueskyRun).
+    let run = adapter.as_container().ok_or_else(|| {
+        ServerError::Validation("This is not a BlueskyRun".into())
+    })?;
+
+    // Build a JSON-seq response with the run's metadata as documents.
+    // Format: {"name": "start", "doc": {...}}\n{"name": "stop", "doc": {...}}\n
+    let meta = run.metadata();
+    let mut lines = Vec::new();
+
+    // Emit start document.
+    if let Some(start) = meta.get("start") {
+        let line = serde_json::json!({"name": "start", "doc": start});
+        lines.push(serde_json::to_string(&line).unwrap_or_default());
+    }
+
+    // Emit descriptor documents from each stream.
+    for stream_key in run.keys() {
+        if let Some(AnyAdapter::Container(stream)) = run.get(&stream_key) {
+            let stream_meta = stream.metadata();
+            if let Some(descriptors) = stream_meta.get("descriptors") {
+                if let Some(arr) = descriptors.as_array() {
+                    for desc in arr {
+                        let line = serde_json::json!({"name": "descriptor", "doc": desc});
+                        lines.push(serde_json::to_string(&line).unwrap_or_default());
+                    }
+                }
+            }
+        }
+    }
+
+    // Emit stop document.
+    if let Some(stop) = meta.get("stop") {
+        if !stop.is_null() {
+            let line = serde_json::json!({"name": "stop", "doc": stop});
+            lines.push(serde_json::to_string(&line).unwrap_or_default());
+        }
+    }
+
+    let body = lines.join("\n") + "\n";
+
+    Ok((
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "application/json-seq".to_string(),
+        )],
+        body,
+    )
+        .into_response())
+}

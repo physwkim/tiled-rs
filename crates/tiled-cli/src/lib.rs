@@ -1,3 +1,5 @@
+mod config;
+
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -13,8 +15,8 @@ use tiled_server::state::CorsOriginPolicy;
 pub enum Command {
     /// Start the Tiled server
     Serve {
-        /// Path to configuration file (not yet implemented)
-        #[arg(short, long, hide = true)]
+        /// Path to configuration file (YAML)
+        #[arg(short, long)]
         config: Option<String>,
 
         /// Host to bind to
@@ -206,14 +208,21 @@ pub async fn run(command: Command) -> Result<()> {
             api_key,
             mongo_uri,
         } => {
-            if config.is_some() {
-                anyhow::bail!(
-                    "Config-based serving not yet implemented. Use --demo for a demo server."
-                );
-            }
+            // Load config file if provided.
+            let file_config = config
+                .as_deref()
+                .map(config::TiledConfig::from_file)
+                .transpose()?;
+
+            // Resolve MongoDB URI: CLI flag > config file.
+            let resolved_mongo_uri = mongo_uri
+                .or_else(|| file_config.as_ref().and_then(|c| c.mongo_uri().map(String::from)));
+
+            // Resolve API key: CLI flag > config file > env var.
+            let api_key = api_key.or_else(|| file_config.as_ref().and_then(|c| c.api_key()));
 
             let root_tree: Arc<dyn tiled_core::adapters::ContainerAdapter> =
-                if let Some(ref uri) = mongo_uri {
+                if let Some(ref uri) = resolved_mongo_uri {
                     tracing::info!("Connecting to MongoDB: {uri}");
                     let catalog = tiled_mongo::MongoCatalog::from_uri(uri)
                         .map_err(|e| anyhow::anyhow!("MongoDB connection failed: {e}"))?;
@@ -224,7 +233,7 @@ pub async fn run(command: Command) -> Result<()> {
                     Arc::new(build_demo_tree())
                 } else {
                     anyhow::bail!(
-                        "Specify --demo or --mongo-uri to start the server"
+                        "Specify --demo, --mongo-uri, or --config to start the server"
                     );
                 };
 

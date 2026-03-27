@@ -48,7 +48,9 @@ pub fn build_app(state: AppState) -> Router {
         .route(
             "/api/v1/table/partition/{*path}",
             get(router::table_partition),
-        );
+        )
+        // Bluesky document streaming (databroker compat)
+        .route("/documents/{*path}", get(router::get_documents));
 
     // Apply auth middleware only to API routes when api_key is set
     app = if needs_auth {
