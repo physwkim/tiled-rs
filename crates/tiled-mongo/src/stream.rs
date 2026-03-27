@@ -1,9 +1,9 @@
-//! Event stream adapter — exposes "data" and "timestamps" sub-containers.
+//! Event stream adapter — exposes data columns as array adapters.
 //!
-//! Corresponds to `databroker.mongo_normalized.BlueskyEventStream` (partially)
-//! and `DatasetFromDocuments`.
+//! Detects whether each column is inline (scalar in MongoDB) or external
+//! (datum_id referencing files via Resource/Datum).
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use indexmap::IndexMap;
 use mongodb::bson::Document;
@@ -13,6 +13,7 @@ use tiled_core::adapters::{AnyAdapter, BaseAdapter, ContainerAdapter};
 use tiled_core::structures::{ContainerStructure, Spec, StructureFamily};
 
 use crate::array_col::ArrayColumnAdapter;
+use crate::filler::Filler;
 
 /// An event stream (e.g. "primary") containing data columns.
 pub struct EventStreamAdapter {
@@ -22,7 +23,7 @@ pub struct EventStreamAdapter {
     cutoff_seq_num: usize,
     metadata: serde_json::Value,
     specs: Vec<Spec>,
-    /// Lazily loaded data columns.
+    filler: Option<Arc<Filler>>,
     columns: OnceLock<IndexMap<String, AnyAdapter>>,
 }
 
@@ -32,6 +33,7 @@ impl EventStreamAdapter {
         stream_name: String,
         descriptors: Vec<Document>,
         cutoff_seq_num: usize,
+        filler: Option<Arc<Filler>>,
     ) -> Self {
         let descriptor_meta: Vec<serde_json::Value> = descriptors
             .iter()
@@ -50,6 +52,7 @@ impl EventStreamAdapter {
             cutoff_seq_num,
             metadata,
             specs: vec![Spec::new("xarray_dataset")],
+            filler,
             columns: OnceLock::new(),
         }
     }
@@ -71,7 +74,7 @@ impl EventStreamAdapter {
 
             let num_events = self.cutoff_seq_num - 1;
 
-            // Add "time" coordinate column.
+            // Add "time" coordinate column (always inline).
             let time_col = ArrayColumnAdapter::new_time(
                 self.db.clone(),
                 descriptor_uids.clone(),
@@ -101,6 +104,10 @@ impl EventStreamAdapter {
                         .get_str("dtype")
                         .unwrap_or("number");
 
+                    // Check if this field has external data.
+                    let is_external = field_meta.get_str("external").is_ok()
+                        || field_meta.contains_key("external");
+
                     let col = ArrayColumnAdapter::new_data(
                         self.db.clone(),
                         descriptor_uids.clone(),
@@ -108,6 +115,8 @@ impl EventStreamAdapter {
                         num_events,
                         shape,
                         dtype_str.to_string(),
+                        is_external,
+                        if is_external { self.filler.clone() } else { None },
                     );
                     mapping.insert(key.clone(), AnyAdapter::Array(Box::new(col)));
                 }

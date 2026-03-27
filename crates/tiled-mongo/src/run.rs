@@ -2,7 +2,7 @@
 //!
 //! Corresponds to `databroker.mongo_normalized.BlueskyRun`.
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use indexmap::IndexMap;
 use mongodb::bson::{doc, Document};
@@ -11,6 +11,8 @@ use mongodb::sync::Database;
 use tiled_core::adapters::{AnyAdapter, BaseAdapter, ContainerAdapter};
 use tiled_core::structures::{ContainerStructure, Spec, StructureFamily};
 
+use crate::filler::Filler;
+use crate::handler::HandlerRegistry;
 use crate::stream::EventStreamAdapter;
 
 /// A single Bluesky experimental run.
@@ -20,12 +22,25 @@ pub struct BlueskyRunAdapter {
     stop_doc: Option<Document>,
     metadata: serde_json::Value,
     specs: Vec<Spec>,
-    /// Lazily loaded streams (e.g. "primary", "baseline").
+    handler_registry: Arc<HandlerRegistry>,
     streams: OnceLock<IndexMap<String, AnyAdapter>>,
 }
 
 impl BlueskyRunAdapter {
-    pub fn new(db: Database, start_doc: Document, stop_doc: Option<Document>) -> Self {
+    pub fn new(
+        db: Database,
+        start_doc: Document,
+        stop_doc: Option<Document>,
+    ) -> Self {
+        Self::with_handlers(db, start_doc, stop_doc, Arc::new(HandlerRegistry::new()))
+    }
+
+    pub fn with_handlers(
+        db: Database,
+        start_doc: Document,
+        stop_doc: Option<Document>,
+        handler_registry: Arc<HandlerRegistry>,
+    ) -> Self {
         // Build metadata as {"start": {...}, "stop": {...}}
         let start_json: serde_json::Value =
             mongodb::bson::from_document(start_doc.clone()).unwrap_or_default();
@@ -45,6 +60,7 @@ impl BlueskyRunAdapter {
             stop_doc,
             metadata,
             specs: vec![Spec::with_version("BlueskyRun", "1")],
+            handler_registry,
             streams: OnceLock::new(),
         }
     }
@@ -58,7 +74,12 @@ impl BlueskyRunAdapter {
             let mut mapping = IndexMap::new();
             let uid = self.uid().to_string();
 
-            // Find all event_descriptors for this run, grouped by stream name.
+            // Create filler for external data resolution.
+            let filler = Arc::new(Filler::new(
+                self.db.clone(),
+                self.handler_registry.clone(),
+            ));
+
             let collection = self.db.collection::<Document>("event_descriptor");
             if let Ok(cursor) = collection.find(doc! { "run_start": &uid }).run() {
                 let mut descriptors_by_stream: IndexMap<String, Vec<Document>> =
@@ -94,6 +115,7 @@ impl BlueskyRunAdapter {
                         stream_name.clone(),
                         descriptors,
                         cutoff_seq_num,
+                        Some(filler.clone()),
                     );
                     mapping.insert(stream_name, AnyAdapter::Container(Box::new(stream)));
                 }

@@ -3,6 +3,12 @@ name = "tiled-mongo"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = ["npy"]
+npy = ["dep:ndarray"]
+hdf5 = ["dep:hdf5"]
+tiff = ["dep:tiff", "dep:image"]
+
 [dependencies]
 tiled-core = { workspace = true }
 mongodb = { workspace = true }
@@ -13,3 +19,9 @@ tracing = { workspace = true }
 bytes = { workspace = true }
 indexmap = { workspace = true }
 thiserror = { workspace = true }
+
+# File handlers (feature-gated)
+ndarray = { workspace = true, optional = true }
+hdf5 = { workspace = true, optional = true }
+tiff = { workspace = true, optional = true }
+image = { workspace = true, optional = true }
