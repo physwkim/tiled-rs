@@ -17,6 +17,7 @@ use tiled_core::structures::{ArrayStructure, Spec, StructureFamily};
 use crate::filler::Filler;
 
 /// A single array column backed by MongoDB event documents.
+#[derive(Clone)]
 pub struct ArrayColumnAdapter {
     db: Database,
     descriptor_uids: Vec<String>,
@@ -278,30 +279,26 @@ impl ArrayAdapterRead for ArrayColumnAdapter {
 
     fn read<'a>(&'a self, _slice: &'a NDSlice) -> BoxFuture<'a, Result<DynNDArray>> {
         Box::pin(async move {
-            if self.is_time {
-                let values = self.fetch_time_column()?;
-                let raw: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-                Ok(DynNDArray::new(
-                    bytes::Bytes::from(raw),
-                    self.dtype.clone(),
-                    self.shape.clone(),
-                ))
-            } else if self.is_external {
-                let raw = self.fetch_external_column()?;
-                Ok(DynNDArray::new(
-                    bytes::Bytes::from(raw),
-                    self.dtype.clone(),
-                    self.shape.clone(),
-                ))
-            } else {
-                let values = self.fetch_inline_column()?;
-                let raw: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-                Ok(DynNDArray::new(
-                    bytes::Bytes::from(raw),
-                    self.dtype.clone(),
-                    self.shape.clone(),
-                ))
-            }
+            // Move a clone of self onto the blocking thread pool so the
+            // synchronous MongoDB queries don't pin an async worker thread.
+            let me = self.clone();
+            let dtype = me.dtype.clone();
+            let shape = me.shape.clone();
+            let raw = tokio::task::spawn_blocking(move || -> std::result::Result<Vec<u8>, TiledError> {
+                if me.is_time {
+                    let values = me.fetch_time_column()?;
+                    Ok(values.iter().flat_map(|v| v.to_le_bytes()).collect())
+                } else if me.is_external {
+                    me.fetch_external_column()
+                } else {
+                    let values = me.fetch_inline_column()?;
+                    Ok(values.iter().flat_map(|v| v.to_le_bytes()).collect())
+                }
+            })
+            .await
+            .map_err(|e| TiledError::Internal(format!("blocking read: {e}")))??;
+
+            Ok(DynNDArray::new(bytes::Bytes::from(raw), dtype, shape))
         })
     }
 
