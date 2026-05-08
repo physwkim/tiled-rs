@@ -35,8 +35,17 @@ pub struct PathSegments(pub Vec<String>);
 impl PathSegments {
     /// Build segments from the request's raw path, after stripping the given
     /// prefix (typically `/api/v1/metadata/` or similar).
+    ///
+    /// Uses `find` rather than `strip_prefix` so the same handlers work
+    /// when the server is mounted under a path prefix (`/tiled/api/v1/…`).
+    /// Falls back to splitting the whole path if the prefix is absent —
+    /// shouldn't happen in practice because axum only routes requests that
+    /// already match.
     pub fn from_raw_path(raw_path: &str, prefix: &str) -> Self {
-        let stripped = raw_path.strip_prefix(prefix).unwrap_or(raw_path);
+        let stripped = match raw_path.find(prefix) {
+            Some(idx) => &raw_path[idx + prefix.len()..],
+            None => raw_path,
+        };
         let segments = stripped
             .split('/')
             .filter(|s| !s.is_empty())

@@ -65,7 +65,6 @@ impl EventStreamAdapter {
                 return mapping;
             }
 
-            let descriptor = &self.descriptors[0];
             let descriptor_uids: Vec<String> = self
                 .descriptors
                 .iter()
@@ -79,12 +78,21 @@ impl EventStreamAdapter {
                 ArrayColumnAdapter::new_time(self.db.clone(), descriptor_uids.clone(), num_events);
             mapping.insert("time".to_string(), AnyAdapter::Array(Box::new(time_col)));
 
-            // Add data columns from data_keys.
-            if let Ok(data_keys) = descriptor.get_document("data_keys") {
+            // Aggregate data_keys across every descriptor in the stream.
+            // A run that swaps descriptors mid-stream still exposes every
+            // declared field; the FIRST descriptor that mentions a key wins
+            // (matches IndexMap insertion-order semantics — later
+            // descriptors don't shadow earlier ones).
+            for descriptor in &self.descriptors {
+                let Ok(data_keys) = descriptor.get_document("data_keys") else {
+                    continue;
+                };
                 for (key, value) in data_keys {
-                    let field_meta = match value.as_document() {
-                        Some(d) => d,
-                        None => continue,
+                    if mapping.contains_key(key) {
+                        continue;
+                    }
+                    let Some(field_meta) = value.as_document() else {
+                        continue;
                     };
 
                     let shape: Vec<usize> = field_meta
@@ -99,7 +107,6 @@ impl EventStreamAdapter {
 
                     let dtype_str = field_meta.get_str("dtype").unwrap_or("number");
 
-                    // Check if this field has external data.
                     let is_external = field_meta.get_str("external").is_ok()
                         || field_meta.contains_key("external");
 
