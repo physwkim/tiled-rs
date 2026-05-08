@@ -8,6 +8,10 @@ use std::sync::Arc;
 use mongodb::bson::{Bson, Document, doc};
 use mongodb::sync::Database;
 
+/// Chunk size along the first (event) axis. Bounds memory per response;
+/// chosen to fit a few MB of f64 frames on average.
+const ROW_CHUNK: usize = 1024;
+
 use tiled_core::adapters::{ArrayAdapterRead, BaseAdapter, BoxFuture};
 use tiled_core::dtype::{BuiltinDType, DType, DynNDArray, Endianness, Kind};
 use tiled_core::error::{Result, TiledError};
@@ -40,7 +44,7 @@ impl ArrayColumnAdapter {
     pub fn new_time(db: Database, descriptor_uids: Vec<String>, num_events: usize) -> Self {
         let dtype = BuiltinDType::new(Endianness::Little, Kind::Float, 8);
         let shape = vec![num_events];
-        let chunks = vec![vec![num_events]];
+        let chunks = vec![row_chunks(num_events)];
         let structure = ArrayStructure {
             data_type: DType::Builtin(dtype.clone()),
             chunks,
@@ -81,7 +85,13 @@ impl ArrayColumnAdapter {
         let mut shape = vec![num_events];
         shape.extend(&inner_shape);
 
-        let chunks: Vec<Vec<usize>> = shape.iter().map(|&s| vec![s]).collect();
+        // First axis (events) is chunked by ROW_CHUNK; inner axes remain a
+        // single chunk per dim (we don't split inside a frame).
+        let mut chunks: Vec<Vec<usize>> = Vec::with_capacity(shape.len());
+        chunks.push(row_chunks(num_events));
+        for &s in &inner_shape {
+            chunks.push(vec![s]);
+        }
 
         let mut dims = vec!["time".to_string()];
         for i in 0..inner_shape.len() {
@@ -112,17 +122,21 @@ impl ArrayColumnAdapter {
         }
     }
 
-    /// Fetch the time coordinate column from MongoDB.
-    /// Fetch (seq_num, value) pairs for a projected event field. Pairs come
-    /// out **possibly with gaps** — the caller must scatter them into a
-    /// fixed-size column indexed by `seq_num - 1`.
-    fn fetch_seq_value_pairs(&self, project: &Document, push_path: &str) -> Result<Vec<(i64, f64)>> {
+    /// Fetch (seq_num, value) pairs in `[seq_start, seq_end_excl)`.
+    /// Caller scatters into a fixed-size column.
+    fn fetch_seq_value_pairs(
+        &self,
+        project: &Document,
+        push_path: &str,
+        seq_start: i64,
+        seq_end_excl: i64,
+    ) -> Result<Vec<(i64, f64)>> {
         let collection = self.db.collection::<Document>("event");
         let pipeline = vec![
             doc! {
                 "$match": {
                     "descriptor": { "$in": &self.descriptor_uids },
-                    "seq_num": { "$gte": 1, "$lt": (self.num_events + 1) as i64 },
+                    "seq_num": { "$gte": seq_start, "$lt": seq_end_excl },
                 }
             },
             doc! { "$project": project.clone() },
@@ -159,28 +173,40 @@ impl ArrayColumnAdapter {
         Ok(out)
     }
 
-    /// Scatter `(seq_num, value)` pairs into a column of length `num_events`.
-    /// Missing seq_nums become `NaN` so the column shape always matches the
-    /// declared structure shape.
-    fn scatter_pairs(&self, pairs: Vec<(i64, f64)>) -> Vec<f64> {
-        let mut col = vec![f64::NAN; self.num_events];
+    /// Scatter `(seq_num, value)` pairs into a `len`-element column with the
+    /// row indexed by `seq_num - seq_offset - 1`. Missing seq_nums stay
+    /// `NaN`, preserving the declared shape regardless of MongoDB gaps.
+    fn scatter_pairs(&self, pairs: Vec<(i64, f64)>, seq_offset: i64, len: usize) -> Vec<f64> {
+        let mut col = vec![f64::NAN; len];
         for (seq, value) in pairs {
-            let idx = (seq - 1) as usize;
-            if idx < col.len() {
-                col[idx] = value;
+            let idx = (seq - seq_offset - 1) as i64;
+            if idx >= 0 && (idx as usize) < col.len() {
+                col[idx as usize] = value;
             }
         }
         col
     }
 
     fn fetch_time_column(&self) -> Result<Vec<f64>> {
-        let project = doc! {"descriptor": 1, "seq_num": 1, "time": 1};
-        let pairs = self.fetch_seq_value_pairs(&project, "$doc.time")?;
-        Ok(self.scatter_pairs(pairs))
+        self.fetch_time_column_range(0, self.num_events)
     }
 
-    /// Fetch inline scalar data column from MongoDB.
+    fn fetch_time_column_range(&self, row_start: usize, row_end: usize) -> Result<Vec<f64>> {
+        let project = doc! {"descriptor": 1, "seq_num": 1, "time": 1};
+        let pairs = self.fetch_seq_value_pairs(
+            &project,
+            "$doc.time",
+            (row_start as i64) + 1,
+            (row_end as i64) + 1,
+        )?;
+        Ok(self.scatter_pairs(pairs, row_start as i64, row_end - row_start))
+    }
+
     fn fetch_inline_column(&self) -> Result<Vec<f64>> {
+        self.fetch_inline_column_range(0, self.num_events)
+    }
+
+    fn fetch_inline_column_range(&self, row_start: usize, row_end: usize) -> Result<Vec<f64>> {
         let field_path = format!("data.{}", self.field_name);
         let push_path = format!("$doc.data.{}", self.field_name);
         let project = doc! {
@@ -189,12 +215,21 @@ impl ArrayColumnAdapter {
             "time": 1,
             &field_path: 1,
         };
-        let pairs = self.fetch_seq_value_pairs(&project, &push_path)?;
-        Ok(self.scatter_pairs(pairs))
+        let pairs = self.fetch_seq_value_pairs(
+            &project,
+            &push_path,
+            (row_start as i64) + 1,
+            (row_end as i64) + 1,
+        )?;
+        Ok(self.scatter_pairs(pairs, row_start as i64, row_end - row_start))
+    }
+
+    fn fetch_external_column(&self) -> Result<Vec<u8>> {
+        self.fetch_external_column_range(0, self.num_events)
     }
 
     /// Fetch external data column: get datum_ids from MongoDB, then fill via handlers.
-    fn fetch_external_column(&self) -> Result<Vec<u8>> {
+    fn fetch_external_column_range(&self, row_start: usize, row_end: usize) -> Result<Vec<u8>> {
         let filler = self
             .filler
             .as_ref()
@@ -208,7 +243,7 @@ impl ArrayColumnAdapter {
             doc! {
                 "$match": {
                     "descriptor": { "$in": &self.descriptor_uids },
-                    "seq_num": { "$gte": 1, "$lt": (self.num_events + 1) as i64 },
+                    "seq_num": { "$gte": (row_start as i64) + 1, "$lt": (row_end as i64) + 1 },
                 }
             },
             doc! {
@@ -305,13 +340,9 @@ impl ArrayAdapterRead for ArrayColumnAdapter {
     fn read_block<'a>(
         &'a self,
         block: &'a [usize],
-        slice: &'a NDSlice,
+        _slice: &'a NDSlice,
     ) -> BoxFuture<'a, Result<DynNDArray>> {
         Box::pin(async move {
-            // Each dim is a single chunk equal to the full extent (see
-            // ArrayColumnAdapter::new_*), so the only valid block index is
-            // all zeros. Reject everything else instead of silently
-            // returning the full column.
             if block.len() != self.shape.len() {
                 return Err(TiledError::Validation(format!(
                     "expected {} block indices, got {}",
@@ -319,14 +350,66 @@ impl ArrayAdapterRead for ArrayColumnAdapter {
                     block.len()
                 )));
             }
-            if block.iter().any(|&b| b != 0) {
+            // Inner axes are single-chunked; only block[0] (events) varies.
+            for (axis, &b) in block.iter().enumerate().skip(1) {
+                if b != 0 {
+                    return Err(TiledError::Validation(format!(
+                        "axis {axis} is a single chunk; valid block index is 0, got {b}"
+                    )));
+                }
+            }
+
+            let row_chunks = &self.structure.chunks[0];
+            let block0 = block[0];
+            if block0 >= row_chunks.len() {
                 return Err(TiledError::Validation(format!(
-                    "ArrayColumnAdapter has a single chunk per dimension; valid block index is all zeros, got {block:?}"
+                    "row block {block0} out of range ({} chunks)",
+                    row_chunks.len()
                 )));
             }
-            self.read(slice).await
+            let row_start: usize = row_chunks[..block0].iter().sum();
+            let row_end = row_start + row_chunks[block0];
+
+            // Move the chunk fetch onto the blocking pool — same pattern as
+            // `read`, but bounded to the requested row range.
+            let me = self.clone();
+            let dtype = me.dtype.clone();
+            let mut block_shape = me.shape.clone();
+            block_shape[0] = row_end - row_start;
+            let raw =
+                tokio::task::spawn_blocking(move || -> std::result::Result<Vec<u8>, TiledError> {
+                    if me.is_time {
+                        let values = me.fetch_time_column_range(row_start, row_end)?;
+                        Ok(values.iter().flat_map(|v| v.to_le_bytes()).collect())
+                    } else if me.is_external {
+                        me.fetch_external_column_range(row_start, row_end)
+                    } else {
+                        let values = me.fetch_inline_column_range(row_start, row_end)?;
+                        Ok(values.iter().flat_map(|v| v.to_le_bytes()).collect())
+                    }
+                })
+                .await
+                .map_err(|e| TiledError::Internal(format!("blocking read_block: {e}")))??;
+
+            Ok(DynNDArray::new(bytes::Bytes::from(raw), dtype, block_shape))
         })
     }
+}
+
+/// Build a chunk-size list for `num_events` along axis 0.
+///
+/// `[ROW_CHUNK, ROW_CHUNK, …, remainder]`. Empty for `num_events == 0`.
+fn row_chunks(num_events: usize) -> Vec<usize> {
+    if num_events == 0 {
+        return vec![];
+    }
+    let full = num_events / ROW_CHUNK;
+    let rem = num_events % ROW_CHUNK;
+    let mut chunks = vec![ROW_CHUNK; full];
+    if rem > 0 {
+        chunks.push(rem);
+    }
+    chunks
 }
 
 /// Map Bluesky dtype strings to Rust BuiltinDType.
