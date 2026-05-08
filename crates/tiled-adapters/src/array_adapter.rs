@@ -64,34 +64,49 @@ impl ArrayAdapter {
     }
 
     /// Create a 2D array from a flat slice of f64 values with given shape.
+    ///
+    /// Panics on shape mismatch, since this is a constructor convenience —
+    /// for non-trusted input use [`ArrayAdapter::from_f64_2d_checked`].
     pub fn from_f64_2d(
         data: &[f64],
         rows: usize,
         cols: usize,
         metadata: serde_json::Value,
     ) -> Self {
-        assert_eq!(
-            data.len(),
-            rows * cols,
-            "data length {} != rows({}) * cols({})",
-            data.len(),
-            rows,
-            cols
-        );
+        Self::from_f64_2d_checked(data, rows, cols, metadata).expect("rows*cols == data.len()")
+    }
+
+    /// Like [`from_f64_2d`] but returns `Err` on shape mismatch instead of
+    /// panicking.
+    pub fn from_f64_2d_checked(
+        data: &[f64],
+        rows: usize,
+        cols: usize,
+        metadata: serde_json::Value,
+    ) -> std::result::Result<Self, TiledError> {
+        let need = rows
+            .checked_mul(cols)
+            .ok_or_else(|| TiledError::Validation("rows * cols overflowed usize".into()))?;
+        if data.len() != need {
+            return Err(TiledError::Validation(format!(
+                "data length {} != rows({rows}) * cols({cols}) = {need}",
+                data.len()
+            )));
+        }
         let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
         let dtype = BuiltinDType::new(
             tiled_core::dtype::Endianness::Little,
             tiled_core::dtype::Kind::Float,
             8,
         );
-        Self::from_array(
+        Ok(Self::from_array(
             Bytes::from(bytes),
             dtype,
             vec![rows, cols],
             vec![vec![rows], vec![cols]],
             metadata,
             vec![],
-        )
+        ))
     }
 }
 
@@ -174,29 +189,61 @@ impl ArrayAdapter {
             return Ok(DynNDArray::new(data, self.array.dtype.clone(), block_shape));
         }
 
-        // General case: extract block from C-contiguous array
+        // General N-D extraction from a C-contiguous source array.
         let total_elements: usize = block_shape.iter().product();
         let mut out = Vec::with_capacity(total_elements * element_size);
 
-        // For 2D: iterate rows in the block, copy each row segment
-        if ndim == 2 {
-            let row_stride = self.structure.shape[1] * element_size;
-            for row in start[0]..end[0] {
-                let row_byte_start = row * row_stride + start[1] * element_size;
-                let row_byte_end = row * row_stride + end[1] * element_size;
-                out.extend_from_slice(&self.array.data[row_byte_start..row_byte_end]);
-            }
-        } else {
-            return Err(TiledError::Validation(format!(
-                "Block extraction for {ndim}D arrays is not yet supported"
-            )));
+        // C-order strides over the parent shape (in elements).
+        let parent_shape = &self.structure.shape;
+        let mut parent_strides = vec![1usize; ndim];
+        for i in (0..ndim - 1).rev() {
+            parent_strides[i] = parent_strides[i + 1] * parent_shape[i + 1];
         }
 
-        Ok(DynNDArray::new(
-            Bytes::from(out),
-            self.array.dtype.clone(),
-            block_shape,
-        ))
+        // Iterate every contiguous row of the block (last axis is contiguous).
+        // Outer indices range over block_shape[..ndim-1]; for each tuple we
+        // copy `block_shape[ndim-1]` elements from the source.
+        let outer_dims = ndim - 1;
+        let last_count = block_shape[outer_dims];
+        let last_byte_run = last_count * element_size;
+
+        // Mixed-radix index over outer dims.
+        let mut idx = vec![0usize; outer_dims];
+        loop {
+            // Compute the source linear element offset for (start + idx, start[last]).
+            let mut elem_offset = 0usize;
+            for d in 0..outer_dims {
+                elem_offset += (start[d] + idx[d]) * parent_strides[d];
+            }
+            elem_offset += start[outer_dims] * parent_strides[outer_dims];
+            let byte_offset = elem_offset * element_size;
+            let end_byte = byte_offset + last_byte_run;
+            if end_byte > self.array.data.len() {
+                return Err(TiledError::Validation(format!(
+                    "block extraction reads past array end (offset {end_byte}, data {} bytes)",
+                    self.array.data.len()
+                )));
+            }
+            out.extend_from_slice(&self.array.data[byte_offset..end_byte]);
+
+            // Increment outer index, last-axis-most-significant style.
+            let mut d = outer_dims;
+            loop {
+                if d == 0 {
+                    return Ok(DynNDArray::new(
+                        Bytes::from(out),
+                        self.array.dtype.clone(),
+                        block_shape,
+                    ));
+                }
+                d -= 1;
+                idx[d] += 1;
+                if idx[d] < block_shape[d] {
+                    break;
+                }
+                idx[d] = 0;
+            }
+        }
     }
 }
 

@@ -24,6 +24,7 @@ pub struct BlueskyRunAdapter {
     specs: Vec<Spec>,
     handler_registry: Arc<HandlerRegistry>,
     streams: OnceLock<IndexMap<String, AnyAdapter>>,
+    structure_cache: OnceLock<ContainerStructure>,
 }
 
 impl BlueskyRunAdapter {
@@ -58,6 +59,7 @@ impl BlueskyRunAdapter {
             specs: vec![Spec::with_version("BlueskyRun", "1")],
             handler_registry,
             streams: OnceLock::new(),
+            structure_cache: OnceLock::new(),
         }
     }
 
@@ -127,8 +129,9 @@ impl BaseAdapter for BlueskyRunAdapter {
 
 impl ContainerAdapter for BlueskyRunAdapter {
     fn structure(&self) -> &ContainerStructure {
-        let keys: Vec<String> = self.load_streams().keys().cloned().collect();
-        Box::leak(Box::new(ContainerStructure { keys }))
+        self.structure_cache.get_or_init(|| ContainerStructure {
+            keys: self.load_streams().keys().cloned().collect(),
+        })
     }
 
     fn get(&self, key: &str) -> Option<&AnyAdapter> {

@@ -25,6 +25,7 @@ pub struct EventStreamAdapter {
     specs: Vec<Spec>,
     filler: Option<Arc<Filler>>,
     columns: OnceLock<IndexMap<String, AnyAdapter>>,
+    structure_cache: OnceLock<ContainerStructure>,
 }
 
 impl EventStreamAdapter {
@@ -54,6 +55,7 @@ impl EventStreamAdapter {
             specs: vec![Spec::new("xarray_dataset")],
             filler,
             columns: OnceLock::new(),
+            structure_cache: OnceLock::new(),
         }
     }
 
@@ -142,8 +144,9 @@ impl BaseAdapter for EventStreamAdapter {
 
 impl ContainerAdapter for EventStreamAdapter {
     fn structure(&self) -> &ContainerStructure {
-        let keys: Vec<String> = self.load_columns().keys().cloned().collect();
-        Box::leak(Box::new(ContainerStructure { keys }))
+        self.structure_cache.get_or_init(|| ContainerStructure {
+            keys: self.load_columns().keys().cloned().collect(),
+        })
     }
 
     fn get(&self, key: &str) -> Option<&AnyAdapter> {

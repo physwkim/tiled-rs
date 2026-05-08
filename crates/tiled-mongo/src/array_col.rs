@@ -319,11 +319,28 @@ impl ArrayAdapterRead for ArrayColumnAdapter {
 
     fn read_block<'a>(
         &'a self,
-        _block: &'a [usize],
-        _slice: &'a NDSlice,
+        block: &'a [usize],
+        slice: &'a NDSlice,
     ) -> BoxFuture<'a, Result<DynNDArray>> {
-        // Return full column for any block (proper chunking is future work).
-        self.read(_slice)
+        Box::pin(async move {
+            // Each dim is a single chunk equal to the full extent (see
+            // ArrayColumnAdapter::new_*), so the only valid block index is
+            // all zeros. Reject everything else instead of silently
+            // returning the full column.
+            if block.len() != self.shape.len() {
+                return Err(TiledError::Validation(format!(
+                    "expected {} block indices, got {}",
+                    self.shape.len(),
+                    block.len()
+                )));
+            }
+            if block.iter().any(|&b| b != 0) {
+                return Err(TiledError::Validation(format!(
+                    "ArrayColumnAdapter has a single chunk per dimension; valid block index is all zeros, got {block:?}"
+                )));
+            }
+            self.read(slice).await
+        })
     }
 }
 

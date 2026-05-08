@@ -27,16 +27,18 @@ pub fn links_for_node(family: StructureFamily, base_url: &str, path: &str) -> No
 
     match family {
         StructureFamily::Container => {
-            links.search = Some(if p.is_empty() {
+            let search = if p.is_empty() {
                 format!("{base}/api/v1/search/")
             } else {
                 format!("{base}/api/v1/search/{p}")
-            });
-            links.full = Some(if p.is_empty() {
-                format!("{base}/api/v1/search/")
+            };
+            let full = if p.is_empty() {
+                format!("{base}/api/v1/container/full/")
             } else {
-                format!("{base}/api/v1/search/{p}")
-            });
+                format!("{base}/api/v1/container/full/{p}")
+            };
+            links.search = Some(search);
+            links.full = Some(full);
         }
         StructureFamily::Array | StructureFamily::Sparse => {
             links.full = Some(format!("{base}/api/v1/array/full/{p}"));
