@@ -1,0 +1,113 @@
+//! `TableClient` — read tabular data via the Arrow IPC partition endpoint.
+//!
+//! Mirrors `tiled/client/dataframe.py`. The Python client switches between
+//! pandas and dask; we hand back Arrow `RecordBatch`es so the caller picks
+//! their own format (polars, datafusion, ndarray::ArrowArray, …).
+
+use std::io::Cursor;
+
+use arrow::array::RecordBatch;
+use arrow::ipc::reader::FileReader;
+use tiled_core::structures::TableStructure;
+use url::Url;
+
+use crate::base::{BaseClient, Item, ParsedStructure};
+use crate::context::Context;
+use crate::error::{ClientError, Result};
+use crate::utils::{ARROW_FILE_MIME_TYPE, retry};
+
+/// A single partition decoded into Arrow record batches.
+#[derive(Debug, Clone)]
+pub struct TablePartition {
+    pub schema: arrow::datatypes::SchemaRef,
+    pub batches: Vec<RecordBatch>,
+}
+
+/// Client over a `table` node.
+#[derive(Debug, Clone)]
+pub struct TableClient {
+    base: BaseClient,
+}
+
+impl TableClient {
+    pub fn from_item(context: Context, item: Item, include_data_sources: bool) -> Result<Self> {
+        let base = BaseClient::new(context, item, include_data_sources)?;
+        if !matches!(base.structure(), ParsedStructure::Table(_)) {
+            return Err(ClientError::StructureMismatch {
+                expected: "table".into(),
+                got: base
+                    .structure_family()
+                    .map(|f| f.to_string())
+                    .unwrap_or_else(|| "unknown".into()),
+            });
+        }
+        Ok(Self { base })
+    }
+
+    pub fn base(&self) -> &BaseClient {
+        &self.base
+    }
+
+    pub fn structure(&self) -> &TableStructure {
+        match self.base.structure() {
+            ParsedStructure::Table(s) => s,
+            _ => unreachable!("TableClient guards on construction"),
+        }
+    }
+
+    /// Column names of the table.
+    pub fn columns(&self) -> &[String] {
+        &self.structure().columns
+    }
+
+    /// Number of partitions.
+    pub fn npartitions(&self) -> usize {
+        self.structure().npartitions
+    }
+
+    /// Read one partition as Arrow record batches. Optional column projection
+    /// matches the server's `field=` query parameter.
+    pub async fn read_partition(
+        &self,
+        partition: usize,
+        columns: Option<&[&str]>,
+    ) -> Result<TablePartition> {
+        let link = self.base.require_link("partition")?;
+        let mut url = Url::parse(link)?;
+        {
+            let mut q = url.query_pairs_mut();
+            q.append_pair("partition", &partition.to_string());
+            if let Some(cols) = columns {
+                if !cols.is_empty() {
+                    q.append_pair("field", &cols.join(","));
+                }
+            }
+        }
+        let bytes = retry(|| async {
+            self.base
+                .context
+                .get_bytes(&url, ARROW_FILE_MIME_TYPE)
+                .await
+        })
+        .await?;
+
+        let cursor = Cursor::new(bytes.to_vec());
+        let reader = FileReader::try_new(cursor, None)?;
+        let schema = reader.schema();
+        let mut batches = Vec::new();
+        for batch in reader {
+            batches.push(batch?);
+        }
+        Ok(TablePartition { schema, batches })
+    }
+
+    /// Read every partition, in order.
+    pub async fn read(&self, columns: Option<&[&str]>) -> Result<Vec<TablePartition>> {
+        let n = self.npartitions();
+        let mut out = Vec::with_capacity(n);
+        for p in 0..n {
+            out.push(self.read_partition(p, columns).await?);
+        }
+        Ok(out)
+    }
+}

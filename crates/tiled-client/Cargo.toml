@@ -5,12 +5,45 @@ edition.workspace = true
 
 [dependencies]
 tiled-core = { workspace = true }
-reqwest = { workspace = true }
+reqwest = { workspace = true, features = ["cookies"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+rmp-serde = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["fs", "macros", "rt-multi-thread", "sync", "time", "io-util"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+futures = { workspace = true }
 tracing = { workspace = true }
 bytes = { workspace = true }
 arrow = { workspace = true }
+parquet = { workspace = true }
+sqlx = { workspace = true }
+url = "2"
+async-trait = "0.1"
+dirs = "5"
+http = "1"
+rpassword = "7"
+webbrowser = "1"
+walkdir = "2"
+regex = { workspace = true }
+percent-encoding = "2"
+chrono = { workspace = true }
+csv = { workspace = true }
+serde_bytes = "0.11"
+notify = "7"
+mime_guess = "2"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[features]
+default = []
+
+[dev-dependencies]
+tiled-server = { workspace = true }
+tiled-adapters = { workspace = true }
+tiled-serialization = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tempfile = { workspace = true }
+indexmap = { workspace = true }
+axum = { workspace = true }
