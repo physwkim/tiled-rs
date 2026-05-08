@@ -93,12 +93,28 @@ fn unzip_named_buffers(
     let cursor = Cursor::new(zipped.to_vec());
     let mut zip = zip::ZipArchive::new(cursor)
         .map_err(|e| ClientError::Invalid(format!("awkward zip open: {e}")))?;
+    // Cap declared per-entry size so a malicious response can't drive the
+    // process to abort via `Vec::with_capacity`. 1 GiB per entry is well
+    // beyond any legitimate awkward payload chunk; tighten further if a
+    // real workload disagrees.
+    const MAX_ENTRY_SIZE: u64 = 1 << 30;
     for i in 0..zip.len() {
         let mut entry = zip
             .by_index(i)
             .map_err(|e| ClientError::Invalid(format!("awkward zip entry {i}: {e}")))?;
         let name = entry.name().to_string();
-        let mut buf = Vec::with_capacity(entry.size() as usize);
+        let declared = entry.size();
+        if declared > MAX_ENTRY_SIZE {
+            return Err(ClientError::Invalid(format!(
+                "awkward zip entry {name}: declared size {declared} exceeds {MAX_ENTRY_SIZE}",
+            )));
+        }
+        let mut buf: Vec<u8> = Vec::new();
+        // try_reserve so an inflated size can't trigger an allocation
+        // abort even within the cap.
+        buf.try_reserve(declared as usize).map_err(|e| {
+            ClientError::Invalid(format!("awkward zip alloc {name} ({declared}B): {e}"))
+        })?;
         entry
             .read_to_end(&mut buf)
             .map_err(|e| ClientError::Invalid(format!("awkward zip read {name}: {e}")))?;
