@@ -359,16 +359,16 @@ impl ArrayAdapterRead for ArrayColumnAdapter {
                 }
             }
 
-            let row_chunks = &self.structure.chunks[0];
+            let chunk_sizes = &self.structure.chunks[0];
             let block0 = block[0];
-            if block0 >= row_chunks.len() {
+            if block0 >= chunk_sizes.len() {
                 return Err(TiledError::Validation(format!(
                     "row block {block0} out of range ({} chunks)",
-                    row_chunks.len()
+                    chunk_sizes.len()
                 )));
             }
-            let row_start: usize = row_chunks[..block0].iter().sum();
-            let row_end = row_start + row_chunks[block0];
+            let row_start: usize = chunk_sizes[..block0].iter().sum();
+            let row_end = row_start + chunk_sizes[block0];
 
             // Move the chunk fetch onto the blocking pool — same pattern as
             // `read`, but bounded to the requested row range.
