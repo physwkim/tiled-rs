@@ -31,7 +31,18 @@ impl IntoResponse for ServerError {
         let (status, code, message) = match self {
             Self::NotFound(msg) => (StatusCode::NOT_FOUND, 404, msg),
             Self::Validation(msg) => (StatusCode::UNPROCESSABLE_ENTITY, 422, msg),
-            Self::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, 500, msg),
+            // Internal errors carry MongoDB driver text, filesystem paths,
+            // and similar details that should not reach unauthenticated
+            // clients. Log the full message server-side and return a
+            // generic body so operators still see the root cause in logs.
+            Self::Internal(msg) => {
+                tracing::error!(target: "tiled.server", "internal error: {msg}");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    500,
+                    "Internal server error".to_string(),
+                )
+            }
             Self::UnsupportedMediaType(msg) => (StatusCode::UNSUPPORTED_MEDIA_TYPE, 415, msg),
         };
 
