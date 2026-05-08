@@ -462,16 +462,24 @@ async fn walk_and_register(node: &ContainerClient, path: &Path, settings: &Setti
         .map_err(|e| ClientError::Invalid(format!("readdir entry: {e}")))?
     {
         let p = entry.path();
-        if !(settings.filter)(&p) {
-            continue;
-        }
         let ft = entry
             .file_type()
             .await
             .map_err(|e| ClientError::Invalid(format!("file_type {}: {e}", p.display())))?;
         if ft.is_dir() {
-            directories.push(p);
+            // Always descend into directories that pass the hidden-name
+            // check. A user-supplied `filter` typically targets file
+            // extensions (e.g. ".csv"), and applying it to directories
+            // would short-circuit the walk before ever reaching the
+            // matching files inside. Mirror Python tiled's fix
+            // (bluesky/tiled#1370).
+            if default_filter(&p) {
+                directories.push(p);
+            }
         } else {
+            if !(settings.filter)(&p) {
+                continue;
+            }
             files.push(p);
         }
     }
