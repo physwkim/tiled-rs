@@ -176,10 +176,10 @@ impl ArrayColumnAdapter {
     /// Scatter `(seq_num, value)` pairs into a `len`-element column with the
     /// row indexed by `seq_num - seq_offset - 1`. Missing seq_nums stay
     /// `NaN`, preserving the declared shape regardless of MongoDB gaps.
-    fn scatter_pairs(&self, pairs: Vec<(i64, f64)>, seq_offset: i64, len: usize) -> Vec<f64> {
+    fn scatter_pairs(pairs: Vec<(i64, f64)>, seq_offset: i64, len: usize) -> Vec<f64> {
         let mut col = vec![f64::NAN; len];
         for (seq, value) in pairs {
-            let idx = (seq - seq_offset - 1) as i64;
+            let idx = seq - seq_offset - 1;
             if idx >= 0 && (idx as usize) < col.len() {
                 col[idx as usize] = value;
             }
@@ -199,7 +199,7 @@ impl ArrayColumnAdapter {
             (row_start as i64) + 1,
             (row_end as i64) + 1,
         )?;
-        Ok(self.scatter_pairs(pairs, row_start as i64, row_end - row_start))
+        Ok(Self::scatter_pairs(pairs, row_start as i64, row_end - row_start))
     }
 
     fn fetch_inline_column(&self) -> Result<Vec<f64>> {
@@ -221,7 +221,7 @@ impl ArrayColumnAdapter {
             (row_start as i64) + 1,
             (row_end as i64) + 1,
         )?;
-        Ok(self.scatter_pairs(pairs, row_start as i64, row_end - row_start))
+        Ok(Self::scatter_pairs(pairs, row_start as i64, row_end - row_start))
     }
 
     fn fetch_external_column(&self) -> Result<Vec<u8>> {

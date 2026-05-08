@@ -24,6 +24,24 @@ fn segments_from_uri(uri: &axum::http::Uri, prefix: &str) -> Vec<String> {
     PathSegments::from_raw_path(uri.path(), prefix).0
 }
 
+/// Run `walk_tree` on the blocking pool for its side effect of warming any
+/// lazy adapter caches (e.g. `tiled_mongo::MongoCatalog::load_runs`). The
+/// caller can then do the real walk synchronously in async context — by
+/// then `OnceLock`-cached children are present and `get()` is O(1).
+///
+/// Returns the same path-not-found error the caller would see from a
+/// direct walk, so handlers can `?` it before re-walking.
+async fn pre_warm_walk(state: &AppState, segments: &[String]) -> Result<(), ServerError> {
+    let state = state.clone();
+    let segments = segments.to_vec();
+    tokio::task::spawn_blocking(move || -> Result<(), ServerError> {
+        let _ = core::walk_tree(state.root_tree.as_ref(), &segments)?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| ServerError::Internal(format!("blocking walk: {e}")))?
+}
+
 // ---------------------------------------------------------------------------
 // Operational endpoints
 // ---------------------------------------------------------------------------
@@ -218,6 +236,7 @@ pub async fn array_block(
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ServerError> {
     let segments = segments_from_uri(&uri, "/api/v1/array/block/");
+    pre_warm_walk(&state, &segments).await?;
 
     let adapter = core::walk_tree(state.root_tree.as_ref(), &segments)?;
     let array_adapter = match adapter {
@@ -295,6 +314,7 @@ pub async fn table_partition(
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<impl IntoResponse, ServerError> {
     let segments = segments_from_uri(&uri, "/api/v1/table/partition/");
+    pre_warm_walk(&state, &segments).await?;
 
     let adapter = core::walk_tree(state.root_tree.as_ref(), &segments)?;
     let table_adapter = match adapter {
@@ -359,6 +379,7 @@ pub async fn get_documents(
             "Path to a BlueskyRun is required".into(),
         ));
     }
+    pre_warm_walk(&state, &segments).await?;
 
     let adapter = core::walk_tree(state.root_tree.as_ref(), &segments)?;
 
@@ -445,7 +466,6 @@ pub async fn register(
 ) -> Result<impl IntoResponse, ServerError> {
     let segments = segments_from_uri(&uri, "/api/v1/register/");
     let path = segments.join("/");
-    let path = path.trim_matches('/');
     // Generate a synthetic ID from the request payload's structure_family +
     // a hash of the metadata. Real implementations would allocate via the
     // catalog database.
@@ -479,12 +499,16 @@ pub async fn register(
     Ok((axum::http::StatusCode::CREATED, Json(resp)))
 }
 
-/// Tiny seed for synthetic IDs — uses the wall clock so collisions across
-/// requests are vanishingly unlikely without dragging in a full RNG dep.
+/// Tiny seed for synthetic IDs — wall clock plus a process-wide atomic
+/// counter so concurrent POSTs that fire within the same nanosecond still
+/// produce distinct ids.
 fn fastrand_seed() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
+        .unwrap_or(0);
+    nanos ^ COUNTER.fetch_add(1, Ordering::Relaxed)
 }
