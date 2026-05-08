@@ -98,11 +98,13 @@ pub async fn about(State(state): State<AppState>, BaseUrl(base_url): BaseUrl) ->
 pub async fn metadata_root(
     state: State<AppState>,
     base_url: BaseUrl,
+    auth: crate::AuthContext,
 ) -> Result<impl IntoResponse, ServerError> {
     metadata(
         state,
         OriginalUri("/api/v1/metadata/".parse().expect("static URI")),
         base_url,
+        auth,
     )
     .await
 }
@@ -111,7 +113,9 @@ pub async fn metadata(
     State(state): State<AppState>,
     OriginalUri(uri): OriginalUri,
     BaseUrl(base_url): BaseUrl,
+    auth: crate::AuthContext,
 ) -> Result<impl IntoResponse, ServerError> {
+    auth.require(tiled_auth::Scope::ReadMetadata)?;
     // Use the raw URI path so a key containing `%2F` survives as one
     // segment rather than being split apart by axum's `Path<String>` (which
     // percent-decodes before splitting).
@@ -161,12 +165,14 @@ pub async fn search_root(
     state: State<AppState>,
     params: Query<HashMap<String, String>>,
     base_url: BaseUrl,
+    auth: crate::AuthContext,
 ) -> Result<impl IntoResponse, ServerError> {
     search(
         state,
         OriginalUri("/api/v1/search/".parse().expect("static URI")),
         params,
         base_url,
+        auth,
     )
     .await
 }
@@ -176,7 +182,9 @@ pub async fn search(
     OriginalUri(uri): OriginalUri,
     Query(params): Query<HashMap<String, String>>,
     BaseUrl(base_url): BaseUrl,
+    auth: crate::AuthContext,
 ) -> Result<impl IntoResponse, ServerError> {
+    auth.require(tiled_auth::Scope::ReadMetadata)?;
     let segments = segments_from_uri(&uri, "/api/v1/search/");
 
     let offset: usize = params
@@ -315,7 +323,9 @@ pub async fn array_block(
     OriginalUri(uri): OriginalUri,
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
+    auth: crate::AuthContext,
 ) -> Result<impl IntoResponse, ServerError> {
+    auth.require(tiled_auth::Scope::ReadData)?;
     let segments = segments_from_uri(&uri, "/api/v1/array/block/");
     pre_warm_walk(&state, &segments).await?;
 
@@ -393,7 +403,9 @@ pub async fn table_partition(
     State(state): State<AppState>,
     OriginalUri(uri): OriginalUri,
     Query(params): Query<HashMap<String, String>>,
+    auth: crate::AuthContext,
 ) -> Result<impl IntoResponse, ServerError> {
+    auth.require(tiled_auth::Scope::ReadData)?;
     let segments = segments_from_uri(&uri, "/api/v1/table/partition/");
     pre_warm_walk(&state, &segments).await?;
 
@@ -453,7 +465,9 @@ pub async fn table_partition(
 pub async fn get_documents(
     State(state): State<AppState>,
     OriginalUri(uri): OriginalUri,
+    auth: crate::AuthContext,
 ) -> Result<impl IntoResponse, ServerError> {
+    auth.require(tiled_auth::Scope::ReadData)?;
     let segments = segments_from_uri(&uri, "/documents/");
     if segments.is_empty() {
         return Err(ServerError::Validation(
@@ -528,12 +542,14 @@ pub async fn get_documents(
 pub async fn register_root(
     state: State<AppState>,
     base_url: BaseUrl,
+    auth: crate::AuthContext,
     body: Json<tiled_core::schemas::PostMetadataRequest>,
 ) -> Result<impl IntoResponse, ServerError> {
     register(
         state,
         OriginalUri("/api/v1/register/".parse().expect("static URI")),
         base_url,
+        auth,
         body,
     )
     .await
@@ -543,8 +559,11 @@ pub async fn register(
     State(state): State<AppState>,
     OriginalUri(uri): OriginalUri,
     BaseUrl(base_url): BaseUrl,
+    auth: crate::AuthContext,
     Json(req): Json<tiled_core::schemas::PostMetadataRequest>,
 ) -> Result<impl IntoResponse, ServerError> {
+    auth.require(tiled_auth::Scope::Register)
+        .or_else(|_| auth.require(tiled_auth::Scope::WriteMetadata))?;
     let segments = segments_from_uri(&uri, "/api/v1/register/");
     let path = segments.join("/");
     // Prefer the top-level `key` (Python tiled wire format, used by cirrus),
@@ -703,8 +722,10 @@ pub async fn patch_metadata(
     State(state): State<AppState>,
     OriginalUri(uri): OriginalUri,
     BaseUrl(base_url): BaseUrl,
+    auth: crate::AuthContext,
     Json(req): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, ServerError> {
+    auth.require(tiled_auth::Scope::WriteMetadata)?;
     let segments = segments_from_uri(&uri, "/api/v1/metadata/");
     let catalog = state
         .catalog
@@ -753,8 +774,11 @@ pub async fn patch_metadata(
 pub async fn put_data_source(
     State(state): State<AppState>,
     OriginalUri(uri): OriginalUri,
+    auth: crate::AuthContext,
     Json(req): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, ServerError> {
+    auth.require(tiled_auth::Scope::WriteData)
+        .or_else(|_| auth.require(tiled_auth::Scope::WriteMetadata))?;
     let segments = segments_from_uri(&uri, "/api/v1/data_source/");
     let catalog = state
         .catalog
@@ -809,7 +833,9 @@ pub async fn put_data_source(
 pub async fn delete_metadata(
     State(state): State<AppState>,
     OriginalUri(uri): OriginalUri,
+    auth: crate::AuthContext,
 ) -> Result<impl IntoResponse, ServerError> {
+    auth.require(tiled_auth::Scope::DeleteNode)?;
     let segments = segments_from_uri(&uri, "/api/v1/metadata/");
     let catalog = state
         .catalog

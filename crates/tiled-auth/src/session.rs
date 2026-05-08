@@ -105,6 +105,26 @@ impl AuthDb {
         }
     }
 
+    /// Mark every session belonging to `principal_id` revoked — used when
+    /// the user clicks "logout everywhere".
+    pub async fn revoke_all_sessions(&self, principal_id: i64) -> Result<()> {
+        match self.pool() {
+            AuthPool::Sqlite(pool) => {
+                sqlx::query("UPDATE sessions SET revoked = 1 WHERE principal_id = ?")
+                    .bind(principal_id)
+                    .execute(pool)
+                    .await?;
+            }
+            AuthPool::Postgres(pool) => {
+                sqlx::query("UPDATE sessions SET revoked = TRUE WHERE principal_id = $1")
+                    .bind(principal_id)
+                    .execute(pool)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
     /// Mark a session row revoked. Idempotent.
     pub async fn revoke_session(&self, uuid: &str) -> Result<()> {
         match self.pool() {

@@ -12,6 +12,8 @@ pub enum ServerError {
     Validation(String),
     Internal(String),
     UnsupportedMediaType(String),
+    Unauthorized(String),
+    Forbidden(String),
 }
 
 impl std::fmt::Display for ServerError {
@@ -21,6 +23,8 @@ impl std::fmt::Display for ServerError {
             Self::Validation(msg) => write!(f, "Validation error: {msg}"),
             Self::Internal(msg) => write!(f, "Internal error: {msg}"),
             Self::UnsupportedMediaType(msg) => write!(f, "Unsupported media type: {msg}"),
+            Self::Unauthorized(msg) => write!(f, "Unauthorized: {msg}"),
+            Self::Forbidden(msg) => write!(f, "Forbidden: {msg}"),
         }
     }
 }
@@ -44,6 +48,8 @@ impl IntoResponse for ServerError {
                 )
             }
             Self::UnsupportedMediaType(msg) => (StatusCode::UNSUPPORTED_MEDIA_TYPE, 415, msg),
+            Self::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, 401, msg),
+            Self::Forbidden(msg) => (StatusCode::FORBIDDEN, 403, msg),
         };
 
         let body = schemas::Response::<()> {

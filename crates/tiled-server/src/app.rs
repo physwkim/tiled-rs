@@ -1,5 +1,6 @@
 //! Application builder — constructs the Axum Router with all routes.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
@@ -11,6 +12,10 @@ use tower_http::compression::CompressionLayer;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
+use tiled_auth::ScopeSet;
+
+use crate::auth_context::{AuthContext, AuthKind};
+use crate::auth_router;
 use crate::router;
 use crate::state::{AppState, CorsOriginPolicy};
 
@@ -27,14 +32,41 @@ pub fn build_app(state: AppState) -> Router {
         }
     };
 
-    let needs_auth = state.api_key.is_some();
-
     let mut app = Router::new()
         // Operational endpoints (never require auth)
         .route("/health", get(router::health))
         .route("/ready", get(router::ready));
 
-    // API endpoints
+    // Auth endpoints — exempt from the auth middleware (you can't login
+    // through a wall that demands a login token).
+    let auth_routes = Router::new()
+        .route("/api/v1/auth/{provider}/login", post(auth_router::login))
+        .route("/api/v1/auth/refresh", post(auth_router::refresh))
+        .route("/api/v1/auth/logout", post(auth_router::logout))
+        .route("/api/v1/auth/whoami", get(auth_router::whoami))
+        .route(
+            "/api/v1/auth/device/initiate",
+            post(auth_router::device_initiate),
+        )
+        .route(
+            "/api/v1/auth/device/token",
+            post(auth_router::device_token),
+        )
+        .route(
+            "/api/v1/auth/device/approve",
+            post(auth_router::device_approve),
+        )
+        .route(
+            "/api/v1/auth/apikeys",
+            get(auth_router::api_key_list).post(auth_router::api_key_create),
+        )
+        .route(
+            "/api/v1/auth/apikeys/{first_eight}",
+            delete(auth_router::api_key_revoke),
+        );
+
+    // Data API endpoints — auth middleware always runs and either
+    // populates AuthContext or returns 401.
     let api = Router::new()
         .route("/api/v1/", get(router::about))
         .route("/api/v1/metadata/", get(router::metadata_root))
@@ -46,25 +78,20 @@ pub fn build_app(state: AppState) -> Router {
             "/api/v1/table/partition/{*path}",
             get(router::table_partition),
         )
-        // Write endpoints — backed by tiled-catalog when one is configured;
-        // otherwise the register handlers fall through to accept-only mode.
         .route("/api/v1/register/", post(router::register_root))
         .route("/api/v1/register/{*path}", post(router::register))
         .route("/api/v1/metadata/{*path}", patch(router::patch_metadata))
         .route("/api/v1/metadata/{*path}", delete(router::delete_metadata))
         .route("/api/v1/data_source/{*path}", put(router::put_data_source))
-        // Bluesky document streaming (databroker compat)
         .route("/documents/{*path}", get(router::get_documents));
 
-    // Apply auth middleware only to API routes when api_key is set
-    app = if needs_auth {
-        app.merge(api.layer(axum::middleware::from_fn_with_state(
+    let api = api
+        .merge(auth_routes)
+        .layer(axum::middleware::from_fn_with_state(
             state.clone(),
-            api_key_middleware,
-        )))
-    } else {
-        app.merge(api)
-    };
+            auth_middleware,
+        ));
+    app = app.merge(api);
 
     app.layer(axum::middleware::from_fn(timeout_middleware))
         .layer(CompressionLayer::new())
@@ -73,54 +100,183 @@ pub fn build_app(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// API key authentication middleware.
+/// Universal auth middleware.
 ///
-/// Checks `?api_key=` query param or `Authorization: Apikey <key>` header.
-async fn api_key_middleware(
+/// Resolves the request's credentials in order of precedence:
+/// 1. `Authorization: Bearer <jwt>` — multi-user session token via the
+///    auth DB.
+/// 2. `Authorization: Apikey <key>` (or `?api_key=...`) — multi-user API
+///    key via the auth DB; falls back to the single-user CLI flag.
+/// 3. Trusted proxy header (`X-Forwarded-User`) — only when
+///    `trust_forwarded_headers` is on AND a proxied authenticator is
+///    registered.
+/// 4. Anonymous — when no auth backend is configured at all, traffic
+///    passes through with full scopes (existing behaviour for demo /
+///    Mongo deployments).
+///
+/// The resolved `AuthContext` is inserted into the request extensions so
+/// downstream handlers can use the `AuthContext` extractor.
+async fn auth_middleware(
     State(state): State<AppState>,
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    use subtle::ConstantTimeEq;
-    let expected = match &state.api_key {
-        Some(key) if !key.is_empty() => key,
-        // Empty `Some("")` would otherwise let `?api_key=` or
-        // `Authorization: Apikey ` pass the ct_eq below, so refuse all
-        // requests defensively. The CLI rejects this at startup; this
-        // covers library users that construct `AppState` directly.
-        Some(_) => {
-            return (StatusCode::UNAUTHORIZED, "Server misconfigured: empty api_key").into_response();
+    // Pre-extract everything we need from the request so resolve_auth
+    // doesn't borrow from `request` itself; that simplifies the borrow
+    // graph for the future and lets axum's trait inference see a Send
+    // future.
+    let headers = request.headers().clone();
+    let query = request.uri().query().unwrap_or("").to_string();
+    let ctx = match resolve_auth_owned(&state, &headers, &query).await {
+        Ok(c) => c,
+        Err(resp) => return resp,
+    };
+    let mut request = request;
+    request.extensions_mut().insert(ctx);
+    next.run(request).await
+}
+
+async fn resolve_auth_owned(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    query: &str,
+) -> Result<AuthContext, axum::response::Response> {
+    resolve_auth_inner(state, headers, query).await
+}
+
+async fn resolve_auth_inner(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    query: &str,
+) -> Result<AuthContext, axum::response::Response> {
+    // ---- 1. Bearer JWT ----
+    if let (Some(db), Some(issuer)) = (state.auth_db.as_ref(), state.issuer.as_ref()) {
+        if let Some(auth) = headers.get("authorization").and_then(|v| v.to_str().ok())
+            && let Some(token) = auth.strip_prefix("Bearer ")
+        {
+            return match issuer.verify_access(token) {
+                Ok(claims) => {
+                    // Honour session revocation in real time.
+                    let session = match db.lookup_session(&claims.sid).await {
+                        Ok(s) => s,
+                        Err(_) => return Err(unauthorized("session not found")),
+                    };
+                    if session.revoked {
+                        return Err(unauthorized("session revoked"));
+                    }
+                    if session.expiration_time <= chrono::Utc::now() {
+                        return Err(unauthorized("session expired"));
+                    }
+                    db.touch_session(&claims.sid).await.ok();
+                    let principal = match db
+                        .get_principal(session.principal_id)
+                        .await
+                    {
+                        Ok(Some(p)) => Arc::new(p),
+                        _ => return Err(unauthorized("principal not found")),
+                    };
+                    Ok(AuthContext {
+                        principal: Some(principal),
+                        scopes: claims.scopes.intersect(&session.scopes),
+                        kind: AuthKind::Session,
+                    })
+                }
+                Err(_) => Err(unauthorized("invalid bearer token")),
+            };
         }
-        None => return next.run(request).await,
-    };
+    }
 
-    // Constant-time compare: a plain `==` on strings short-circuits on the
-    // first differing byte and leaks the prefix length to a timing attacker.
-    let ct_eq = |candidate: &[u8]| -> bool {
-        candidate.ct_eq(expected.as_bytes()).into()
-    };
+    // ---- 2. Apikey (multi-user → single-user fallback) ----
+    let api_key_value = extract_api_key(headers, query);
+    if let Some(key) = api_key_value {
+        if let Some(db) = state.auth_db.as_ref() {
+            if let Ok(record) = db.verify_api_key(&key).await {
+                let principal = match db.get_principal(record.principal_id).await {
+                    Ok(Some(p)) => Arc::new(p),
+                    _ => return Err(unauthorized("principal vanished")),
+                };
+                return Ok(AuthContext {
+                    principal: Some(principal),
+                    scopes: record.scopes,
+                    kind: AuthKind::ApiKey,
+                });
+            }
+        }
+        if let Some(expected) = state.api_key.as_ref() {
+            if expected.is_empty() {
+                return Err(unauthorized("server misconfigured: empty api_key"));
+            }
+            use subtle::ConstantTimeEq;
+            if key.as_bytes().ct_eq(expected.as_bytes()).into() {
+                return Ok(AuthContext {
+                    principal: None,
+                    scopes: ScopeSet::full(),
+                    kind: AuthKind::SingleUserKey,
+                });
+            }
+        }
+        return Err(unauthorized("invalid api key"));
+    }
 
-    // Check query parameter: ?api_key=<key>
-    if let Some(query) = request.uri().query() {
-        for pair in query.split('&') {
-            if let Some(value) = pair.strip_prefix("api_key=")
-                && ct_eq(value.as_bytes())
-            {
-                return next.run(request).await;
+    // ---- 3. Proxied header ----
+    if state.trust_forwarded_headers {
+        if let (Some(prox), Some(db)) = (
+            state.proxied_header_auth.as_ref(),
+            state.auth_db.as_ref(),
+        ) {
+            if let Some(subject) = prox.extract(headers) {
+                let (principal, identity) = match db
+                    .ensure_principal(&subject.provider, &subject.sub)
+                    .await
+                {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::error!(target: "tiled.auth", "proxied principal: {e}");
+                        return Err(unauthorized("proxied principal lookup failed"));
+                    }
+                };
+                db.touch_identity_login(identity.id).await.ok();
+                return Ok(AuthContext {
+                    principal: Some(Arc::new(principal)),
+                    scopes: ScopeSet::full(),
+                    kind: AuthKind::Proxied,
+                });
             }
         }
     }
 
-    // Check Authorization header: "Apikey <key>"
-    if let Some(auth) = request.headers().get("authorization")
-        && let Ok(auth_str) = auth.to_str()
-        && let Some(key) = auth_str.strip_prefix("Apikey ")
-        && ct_eq(key.as_bytes())
-    {
-        return next.run(request).await;
+    // ---- 4. Anonymous fallback ----
+    // No auth backend configured at all: behaviour matches pre-multi-user
+    // tiled-rs — full access. Operators that want to lock the server down
+    // configure single-user `api_key` or wire the auth DB.
+    let no_auth_configured =
+        state.api_key.is_none() && state.auth_db.is_none();
+    if no_auth_configured {
+        return Ok(AuthContext {
+            principal: None,
+            scopes: ScopeSet::full(),
+            kind: AuthKind::Anonymous,
+        });
     }
+    Err(unauthorized("authentication required"))
+}
 
-    (StatusCode::UNAUTHORIZED, "Invalid or missing API key").into_response()
+fn extract_api_key(headers: &axum::http::HeaderMap, query: &str) -> Option<String> {
+    if let Some(auth) = headers.get("authorization").and_then(|v| v.to_str().ok())
+        && let Some(key) = auth.strip_prefix("Apikey ")
+    {
+        return Some(key.to_string());
+    }
+    for pair in query.split('&') {
+        if let Some(v) = pair.strip_prefix("api_key=") {
+            return Some(v.to_string());
+        }
+    }
+    None
+}
+
+fn unauthorized(msg: &str) -> axum::response::Response {
+    (StatusCode::UNAUTHORIZED, msg.to_string()).into_response()
 }
 
 /// Request timeout middleware.

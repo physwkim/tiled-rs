@@ -36,10 +36,6 @@ async fn build_test_app() -> (axum::Router, tempfile::TempDir) {
         trust_forwarded_headers: false,
         api_key: None,
         catalog: Some(catalog),
-        auth_db: None,
-        issuer: None,
-        authenticators: vec![],
-        proxied_header_auth: None,
     };
     (tiled_server::build_app(state), dir)
 }

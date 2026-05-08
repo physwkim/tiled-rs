@@ -327,6 +327,10 @@ pub async fn run(command: Command) -> Result<()> {
                 trust_forwarded_headers: trust_proxy,
                 api_key,
                 catalog: catalog_handle,
+                auth_db: None,
+                issuer: None,
+                authenticators: vec![],
+                proxied_header_auth: None,
             };
 
             let app = tiled_server::build_app(state);

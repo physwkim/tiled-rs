@@ -54,10 +54,6 @@ async fn spawn_server(api_key: Option<String>) -> String {
         trust_forwarded_headers: false,
         api_key,
         catalog: None,
-        auth_db: None,
-        issuer: None,
-        authenticators: vec![],
-        proxied_header_auth: None,
     };
 
     let app = tiled_server::build_app(state);

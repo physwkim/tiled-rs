@@ -8,6 +8,7 @@ tiled-core = { workspace = true }
 tiled-adapters = { workspace = true }
 tiled-serialization = { workspace = true }
 tiled-catalog = { workspace = true }
+tiled-auth = { workspace = true }
 axum = { workspace = true }
 tower = { workspace = true }
 tower-http = { workspace = true }
@@ -20,6 +21,7 @@ bytes = { workspace = true }
 arrow = { workspace = true }
 percent-encoding = "2"
 subtle = { workspace = true }
+chrono = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

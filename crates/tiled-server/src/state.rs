@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use tiled_auth::{AuthDb, Authenticator, Issuer};
 use tiled_core::adapters::ContainerAdapter;
 use tiled_serialization::SerializationRegistry;
 
@@ -28,6 +29,20 @@ pub struct AppState {
     /// `DELETE /metadata`) operate against it; without it those
     /// endpoints return 501 Not Implemented.
     pub catalog: Option<tiled_catalog::Catalog>,
+
+    /// Optional auth backend. When present, the server runs in multi-user
+    /// mode: API keys are looked up in this DB, JWTs are issued/verified
+    /// by `issuer`, and authenticators handle login. When `None`, the
+    /// server falls back to single-user `api_key` (or anonymous).
+    pub auth_db: Option<AuthDb>,
+    /// JWT issuer paired with `auth_db`. Always `Some` when `auth_db` is.
+    pub issuer: Option<Issuer>,
+    /// Username/password authenticators keyed by their public name (which
+    /// becomes the `/auth/{name}/login` mount point).
+    pub authenticators: Vec<Arc<dyn Authenticator>>,
+    /// Optional proxy-header authenticator. Honoured only when
+    /// `trust_forwarded_headers` is also true.
+    pub proxied_header_auth: Option<Arc<tiled_auth::ProxiedHeaderAuthenticator>>,
 }
 
 impl AppState {
