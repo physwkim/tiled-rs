@@ -23,8 +23,10 @@ pub fn register_array_serializers(registry: &SerializationRegistry) {
         StructureFamily::Array,
         mime::CSV,
         Box::new(|data: &[u8], metadata: &serde_json::Value| {
-            // Simple CSV: one value per line for 1D, or rows for 2D
-            // metadata should contain "shape" and "dtype" info
+            // metadata shape: {"itemsize": N, "kind": "f"|"i"|"u", "shape": [...]}
+            // 1-D → one value per line
+            // 2-D → rows of comma-separated values (matches Python tiled CSV)
+            // ND  → flatten to 1-D row-major (Python tiled fallback)
             let itemsize = metadata
                 .get("itemsize")
                 .and_then(|v| v.as_u64())
@@ -33,42 +35,65 @@ pub fn register_array_serializers(registry: &SerializationRegistry) {
                 return Err("itemsize must be > 0".into());
             }
             let kind = metadata.get("kind").and_then(|v| v.as_str()).unwrap_or("f");
+            let shape: Vec<usize> = metadata
+                .get("shape")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_u64().map(|n| n as usize)).collect())
+                .unwrap_or_default();
 
-            let mut output = String::new();
+            let format_value = |bytes: &[u8]| -> String {
+                match (kind, itemsize) {
+                    ("f", 8) => f64::from_le_bytes(bytes.try_into().unwrap_or([0; 8])).to_string(),
+                    ("f", 4) => f32::from_le_bytes(bytes.try_into().unwrap_or([0; 4])).to_string(),
+                    ("i", 8) => i64::from_le_bytes(bytes.try_into().unwrap_or([0; 8])).to_string(),
+                    ("i", 4) => i32::from_le_bytes(bytes.try_into().unwrap_or([0; 4])).to_string(),
+                    ("i", 2) => i16::from_le_bytes(bytes.try_into().unwrap_or([0; 2])).to_string(),
+                    ("i", 1) => i8::from_le_bytes(bytes.try_into().unwrap_or([0; 1])).to_string(),
+                    ("u", 8) => u64::from_le_bytes(bytes.try_into().unwrap_or([0; 8])).to_string(),
+                    ("u", 4) => u32::from_le_bytes(bytes.try_into().unwrap_or([0; 4])).to_string(),
+                    ("u", 2) => u16::from_le_bytes(bytes.try_into().unwrap_or([0; 2])).to_string(),
+                    ("u", 1) => u8::from_le_bytes(bytes.try_into().unwrap_or([0; 1])).to_string(),
+                    ("b", _) => (bytes.iter().any(|&b| b != 0)).to_string(),
+                    _ => format!("{bytes:?}"),
+                }
+            };
+
             let num_elements = data.len() / itemsize;
+            let mut output = String::new();
 
-            for i in 0..num_elements {
-                let start = i * itemsize;
-                let end = start + itemsize;
-                if end > data.len() {
-                    break;
+            // 2-D: rows × cols layout.
+            if shape.len() == 2 {
+                let cols = shape[1];
+                for row in 0..shape[0] {
+                    if row > 0 {
+                        output.push('\n');
+                    }
+                    for col in 0..cols {
+                        if col > 0 {
+                            output.push(',');
+                        }
+                        let i = row * cols + col;
+                        let start = i * itemsize;
+                        let end = start + itemsize;
+                        if end > data.len() {
+                            break;
+                        }
+                        output.push_str(&format_value(&data[start..end]));
+                    }
                 }
-                let bytes = &data[start..end];
-
-                let value = match (kind, itemsize) {
-                    ("f", 8) => {
-                        let v = f64::from_le_bytes(bytes.try_into().unwrap_or([0; 8]));
-                        format!("{v}")
+            } else {
+                // 1-D or fallback: one value per line, row-major.
+                for i in 0..num_elements {
+                    let start = i * itemsize;
+                    let end = start + itemsize;
+                    if end > data.len() {
+                        break;
                     }
-                    ("f", 4) => {
-                        let v = f32::from_le_bytes(bytes.try_into().unwrap_or([0; 4]));
-                        format!("{v}")
+                    if i > 0 {
+                        output.push('\n');
                     }
-                    ("i", 8) => {
-                        let v = i64::from_le_bytes(bytes.try_into().unwrap_or([0; 8]));
-                        format!("{v}")
-                    }
-                    ("i", 4) => {
-                        let v = i32::from_le_bytes(bytes.try_into().unwrap_or([0; 4]));
-                        format!("{v}")
-                    }
-                    _ => format!("{:?}", bytes),
-                };
-
-                if i > 0 {
-                    output.push('\n');
+                    output.push_str(&format_value(&data[start..end]));
                 }
-                output.push_str(&value);
             }
 
             Ok(bytes::Bytes::from(output))

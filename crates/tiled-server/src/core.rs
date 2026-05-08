@@ -11,25 +11,26 @@ use tiled_core::schemas::{
 use crate::error::ServerError;
 
 /// Walk the adapter tree to find a node at the given path.
+///
+/// Takes pre-split segments (already percent-decoded by the extractor) so
+/// keys containing literal `/` (sent as `%2F`) reach `get()` intact.
 #[tracing::instrument(skip(root))]
 pub fn walk_tree<'a>(
     root: &'a dyn ContainerAdapter,
-    path: &str,
+    segments: &[String],
 ) -> Result<&'a AnyAdapter, ServerError> {
-    let path = path.trim_matches('/');
-    if path.is_empty() {
+    if segments.is_empty() {
         return Err(ServerError::NotFound("Use root directly".into()));
     }
 
     let mut current_container: &dyn ContainerAdapter = root;
-    let mut segments = path.split('/').filter(|s| !s.is_empty()).peekable();
-
-    while let Some(segment) = segments.next() {
+    let last = segments.len() - 1;
+    for (i, segment) in segments.iter().enumerate() {
         let adapter = current_container
             .get(segment)
             .ok_or_else(|| ServerError::NotFound(format!("Key not found: {segment}")))?;
 
-        if segments.peek().is_none() {
+        if i == last {
             return Ok(adapter);
         }
 
@@ -46,23 +47,27 @@ pub fn walk_tree<'a>(
     Err(ServerError::NotFound("Path not found".into()))
 }
 
-/// Compute ancestors list from a path.
+/// Compute ancestors list from a segment list.
 ///
-/// Returns the parent segment names, matching Python tiled's wire format:
-/// `"a/b/c"` → `["a", "b"]`, `"a"` → `[]`, `""` → `[]`.
+/// Matches Python tiled's wire format: `["a", "b", "c"]` → `["a", "b"]`,
+/// `["a"]` → `[]`, `[]` → `[]`.
+pub fn ancestors_from_segments(segments: &[String]) -> Vec<String> {
+    if segments.len() <= 1 {
+        return vec![];
+    }
+    segments[..segments.len() - 1].to_vec()
+}
+
+/// Backwards-compat helper: split a slash-joined path and compute ancestors.
+/// New code should prefer [`ancestors_from_segments`].
 pub fn ancestors_from_path(path: &str) -> Vec<String> {
-    let path = path.trim_matches('/');
-    if path.is_empty() {
-        return vec![];
-    }
-    let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-    if parts.len() <= 1 {
-        return vec![];
-    }
-    parts[..parts.len() - 1]
-        .iter()
-        .map(|s| s.to_string())
-        .collect()
+    let segments: Vec<String> = path
+        .trim_matches('/')
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect();
+    ancestors_from_segments(&segments)
 }
 
 /// Default container sorting (ascending by insertion order).

@@ -580,3 +580,88 @@ async fn test_health_bypasses_auth() {
     let (status, _) = get_json(&app, "/health").await;
     assert_eq!(status, 200);
 }
+
+// ---------------------------------------------------------------------------
+// POST /api/v1/register — accept-only stub
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_register_post_accepted() {
+    let app = build_app();
+    let body = serde_json::json!({
+        "structure_family": "container",
+        "metadata": {"key": "new_node", "title": "demo"},
+        "specs": [],
+        "data_sources": [],
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/register/")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 201);
+    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(parsed["id"], "new_node");
+    assert!(parsed["links"]["self"].is_string());
+}
+
+#[tokio::test]
+async fn test_register_post_under_path() {
+    let app = build_app();
+    let body = serde_json::json!({
+        "structure_family": "array",
+        "metadata": {"key": "scan_001"},
+        "specs": [],
+        "data_sources": [],
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/register/sample_data")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 201);
+}
+
+// ---------------------------------------------------------------------------
+// Percent-encoded slash in keys is preserved (P1 fix)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_metadata_handles_percent_encoded_slash_in_key() {
+    // Build a tree with a key that contains a literal '/'.
+    let mut mapping = IndexMap::new();
+    let data: Vec<f64> = vec![1.0, 2.0, 3.0];
+    let arr = ArrayAdapter::from_f64_1d(&data, serde_json::json!({}));
+    mapping.insert("a/b".to_string(), AnyAdapter::Array(Box::new(arr)));
+    let root: Arc<dyn tiled_core::adapters::ContainerAdapter> = Arc::new(MapAdapter::new(
+        mapping,
+        serde_json::json!({}),
+        vec![],
+    ));
+    let registry = Arc::new(tiled_serialization::default_registry());
+    let state = tiled_server::AppState {
+        root_tree: root,
+        serialization_registry: registry,
+        query_names: vec![],
+        base_url: Some("http://localhost:8000".to_string()),
+        cors_policy: tiled_server::state::CorsOriginPolicy::Permissive,
+        trust_forwarded_headers: false,
+        api_key: None,
+    };
+    let app = tiled_server::build_app(state);
+
+    // %2F is the percent-encoded form of '/'. The handler must treat
+    // it as part of the key, not as a path separator.
+    let (status, body) = get_json(&app, "/api/v1/metadata/a%2Fb").await;
+    assert_eq!(status, 200);
+    let data = &body["data"];
+    assert_eq!(data["id"], "a/b");
+    assert_eq!(data["attributes"]["structure_family"], "array");
+}

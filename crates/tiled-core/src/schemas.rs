@@ -266,6 +266,10 @@ pub enum EntryFields {
 // ---------------------------------------------------------------------------
 
 /// Request body for creating a new node.
+///
+/// `key` is the requested name of the new child under the parent path
+/// (POST `/api/v1/register/<parent>` registers `<parent>/<key>`). cirrus
+/// and other write clients put `key` at top-level, matching Python tiled.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PostMetadataRequest {
     pub structure_family: StructureFamily,
@@ -275,6 +279,8 @@ pub struct PostMetadataRequest {
     pub specs: Vec<Spec>,
     #[serde(default)]
     pub data_sources: Vec<DataSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
 }
 
 /// Response for creating a new node.

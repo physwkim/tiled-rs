@@ -112,7 +112,10 @@ impl ArrayColumnAdapter {
     }
 
     /// Fetch the time coordinate column from MongoDB.
-    fn fetch_time_column(&self) -> Result<Vec<f64>> {
+    /// Fetch (seq_num, value) pairs for a projected event field. Pairs come
+    /// out **possibly with gaps** — the caller must scatter them into a
+    /// fixed-size column indexed by `seq_num - 1`.
+    fn fetch_seq_value_pairs(&self, project: &Document, push_path: &str) -> Result<Vec<(i64, f64)>> {
         let collection = self.db.collection::<Document>("event");
         let pipeline = vec![
             doc! {
@@ -121,6 +124,7 @@ impl ArrayColumnAdapter {
                     "seq_num": { "$gte": 1, "$lt": (self.num_events + 1) as i64 },
                 }
             },
+            doc! { "$project": project.clone() },
             doc! { "$sort": { "time": 1 } },
             doc! {
                 "$group": {
@@ -130,9 +134,9 @@ impl ArrayColumnAdapter {
             },
             doc! { "$sort": { "doc.seq_num": 1 } },
             doc! {
-                "$group": {
-                    "_id": null,
-                    "column": { "$push": "$doc.time" },
+                "$project": {
+                    "seq_num": "$doc.seq_num",
+                    "value": push_path,
                 }
             },
         ];
@@ -142,66 +146,50 @@ impl ArrayColumnAdapter {
             .run()
             .map_err(|e| TiledError::Internal(format!("MongoDB aggregate error: {e}")))?;
 
+        let mut out = Vec::new();
         for result in cursor {
             let doc = result.map_err(|e| TiledError::Internal(e.to_string()))?;
-            if let Ok(arr) = doc.get_array("column") {
-                return Ok(arr.iter().filter_map(|v| v.as_f64()).collect());
+            let seq = doc.get_i64("seq_num").or_else(|_| doc.get_i32("seq_num").map(i64::from)).unwrap_or(0);
+            let value = doc.get("value").and_then(|v| v.as_f64()).unwrap_or(f64::NAN);
+            if seq >= 1 {
+                out.push((seq, value));
             }
         }
+        Ok(out)
+    }
 
-        Ok(vec![0.0; self.num_events])
+    /// Scatter `(seq_num, value)` pairs into a column of length `num_events`.
+    /// Missing seq_nums become `NaN` so the column shape always matches the
+    /// declared structure shape.
+    fn scatter_pairs(&self, pairs: Vec<(i64, f64)>) -> Vec<f64> {
+        let mut col = vec![f64::NAN; self.num_events];
+        for (seq, value) in pairs {
+            let idx = (seq - 1) as usize;
+            if idx < col.len() {
+                col[idx] = value;
+            }
+        }
+        col
+    }
+
+    fn fetch_time_column(&self) -> Result<Vec<f64>> {
+        let project = doc! {"descriptor": 1, "seq_num": 1, "time": 1};
+        let pairs = self.fetch_seq_value_pairs(&project, "$doc.time")?;
+        Ok(self.scatter_pairs(pairs))
     }
 
     /// Fetch inline scalar data column from MongoDB.
     fn fetch_inline_column(&self) -> Result<Vec<f64>> {
-        let collection = self.db.collection::<Document>("event");
         let field_path = format!("data.{}", self.field_name);
         let push_path = format!("$doc.data.{}", self.field_name);
-
-        let pipeline = vec![
-            doc! {
-                "$match": {
-                    "descriptor": { "$in": &self.descriptor_uids },
-                    "seq_num": { "$gte": 1, "$lt": (self.num_events + 1) as i64 },
-                }
-            },
-            doc! {
-                "$project": {
-                    "descriptor": 1,
-                    "seq_num": 1,
-                    "time": 1,
-                    &field_path: 1,
-                }
-            },
-            doc! { "$sort": { "time": 1 } },
-            doc! {
-                "$group": {
-                    "_id": "$seq_num",
-                    "doc": { "$last": "$$ROOT" },
-                }
-            },
-            doc! { "$sort": { "doc.seq_num": 1 } },
-            doc! {
-                "$group": {
-                    "_id": null,
-                    "column": { "$push": &push_path },
-                }
-            },
-        ];
-
-        let cursor = collection
-            .aggregate(pipeline)
-            .run()
-            .map_err(|e| TiledError::Internal(format!("MongoDB aggregate error: {e}")))?;
-
-        for result in cursor {
-            let doc = result.map_err(|e| TiledError::Internal(e.to_string()))?;
-            if let Ok(arr) = doc.get_array("column") {
-                return Ok(arr.iter().map(|v| v.as_f64().unwrap_or(0.0)).collect());
-            }
-        }
-
-        Ok(vec![0.0; self.num_events])
+        let project = doc! {
+            "descriptor": 1,
+            "seq_num": 1,
+            "time": 1,
+            &field_path: 1,
+        };
+        let pairs = self.fetch_seq_value_pairs(&project, &push_path)?;
+        Ok(self.scatter_pairs(pairs))
     }
 
     /// Fetch external data column: get datum_ids from MongoDB, then fill via handlers.

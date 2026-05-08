@@ -17,6 +17,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 bytes = { workspace = true }
 arrow = { workspace = true }
+percent-encoding = "2"
 
 [dev-dependencies]
 tempfile = { workspace = true }

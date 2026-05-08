@@ -6,7 +6,7 @@ use axum::Router;
 use axum::extract::State;
 use axum::http::{HeaderValue, Method, StatusCode};
 use axum::response::IntoResponse;
-use axum::routing::get;
+use axum::routing::{get, post};
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
@@ -46,6 +46,9 @@ pub fn build_app(state: AppState) -> Router {
             "/api/v1/table/partition/{*path}",
             get(router::table_partition),
         )
+        // Write endpoints — currently accept-only (no backing store).
+        .route("/api/v1/register/", post(router::register_root))
+        .route("/api/v1/register/{*path}", post(router::register))
         // Bluesky document streaming (databroker compat)
         .route("/documents/{*path}", get(router::get_documents));
 

@@ -3,9 +3,11 @@
 use std::collections::HashMap;
 
 use axum::Json;
-use axum::extract::{Path, Query, State};
+use axum::extract::{OriginalUri, Query, State};
 use axum::http::HeaderMap;
 use axum::response::IntoResponse;
+
+use crate::extractors::PathSegments;
 
 use tiled_core::adapters::{AnyAdapter, ContainerAdapter};
 use tiled_core::links;
@@ -15,6 +17,12 @@ use crate::core;
 use crate::error::ServerError;
 use crate::extractors::BaseUrl;
 use crate::state::AppState;
+
+/// Helper that turns axum's [`OriginalUri`] into a list of percent-decoded
+/// path segments after stripping the API prefix.
+fn segments_from_uri(uri: &axum::http::Uri, prefix: &str) -> Vec<String> {
+    PathSegments::from_raw_path(uri.path(), prefix).0
+}
 
 // ---------------------------------------------------------------------------
 // Operational endpoints
@@ -69,23 +77,42 @@ pub async fn metadata_root(
     state: State<AppState>,
     base_url: BaseUrl,
 ) -> Result<impl IntoResponse, ServerError> {
-    metadata(state, Path(String::new()), base_url).await
+    metadata(
+        state,
+        OriginalUri("/api/v1/metadata/".parse().unwrap()),
+        base_url,
+    )
+    .await
 }
 
 pub async fn metadata(
     State(state): State<AppState>,
-    Path(path): Path<String>,
+    OriginalUri(uri): OriginalUri,
     BaseUrl(base_url): BaseUrl,
 ) -> Result<impl IntoResponse, ServerError> {
-    let path = path.trim_matches('/');
-
-    let resource = if path.is_empty() {
-        core::construct_root_resource(state.root_tree.as_ref(), &base_url)
-    } else {
-        let adapter = core::walk_tree(state.root_tree.as_ref(), path)?;
-        let id = path.rsplit('/').next().unwrap_or(path);
-        core::construct_resource(adapter, id, path, &base_url)
-    };
+    // Use the raw URI path so a key containing `%2F` survives as one
+    // segment rather than being split apart by axum's `Path<String>` (which
+    // percent-decodes before splitting).
+    let segments = segments_from_uri(&uri, "/api/v1/metadata/");
+    // The tree walk + Resource construction may invoke blocking adapters
+    // (e.g. `MongoCatalog::get` triggers a sync MongoDB query the first
+    // time). Run them on the blocking thread pool so async workers stay
+    // responsive.
+    let resource = tokio::task::spawn_blocking(move || -> Result<_, ServerError> {
+        if segments.is_empty() {
+            Ok(core::construct_root_resource(
+                state.root_tree.as_ref(),
+                &base_url,
+            ))
+        } else {
+            let adapter = core::walk_tree(state.root_tree.as_ref(), &segments)?;
+            let id = segments.last().cloned().unwrap_or_default();
+            let path = segments.join("/");
+            Ok(core::construct_resource(adapter, &id, &path, &base_url))
+        }
+    })
+    .await
+    .map_err(|e| ServerError::Internal(format!("blocking task failed: {e}")))??;
 
     Ok(Json(Response {
         data: Some(resource),
@@ -93,6 +120,16 @@ pub async fn metadata(
         links: None,
         meta: None,
     }))
+}
+
+/// Helper: split an axum `Path<String>` payload into key segments. The
+/// extractor has already percent-decoded each segment for us; we only need
+/// to drop empty pieces produced by leading/trailing slashes.
+fn split_path_segments(path: &str) -> Vec<String> {
+    path.split('/')
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -104,16 +141,22 @@ pub async fn search_root(
     params: Query<HashMap<String, String>>,
     base_url: BaseUrl,
 ) -> Result<impl IntoResponse, ServerError> {
-    search(state, Path(String::new()), params, base_url).await
+    search(
+        state,
+        OriginalUri("/api/v1/search/".parse().unwrap()),
+        params,
+        base_url,
+    )
+    .await
 }
 
 pub async fn search(
     State(state): State<AppState>,
-    Path(path): Path<String>,
+    OriginalUri(uri): OriginalUri,
     Query(params): Query<HashMap<String, String>>,
     BaseUrl(base_url): BaseUrl,
 ) -> Result<impl IntoResponse, ServerError> {
-    let path = path.trim_matches('/');
+    let segments = segments_from_uri(&uri, "/api/v1/search/");
 
     let offset: usize = params
         .get("page[offset]")
@@ -125,7 +168,6 @@ pub async fn search(
         .unwrap_or(links::DEFAULT_PAGE_SIZE)
         .min(links::MAX_PAGE_SIZE);
 
-    // Parse query filters from URL params
     let filter_params: Vec<(String, String)> = params
         .iter()
         .filter(|(k, _)| k.starts_with("filter["))
@@ -133,22 +175,35 @@ pub async fn search(
         .collect();
     let queries = tiled_core::queries::decode_query_filters(&filter_params);
 
-    let container: &dyn ContainerAdapter = if path.is_empty() {
-        state.root_tree.as_ref()
-    } else {
-        let adapter = core::walk_tree(state.root_tree.as_ref(), path)?;
-        match adapter {
-            AnyAdapter::Container(c) => c.as_ref(),
-            _ => {
-                return Err(ServerError::Validation(format!(
-                    "'{path}' is not a container"
-                )));
+    // Walk + paginate on the blocking pool: container.search() / .get() may
+    // call into MongoDB.
+    let resp = tokio::task::spawn_blocking(move || -> Result<_, ServerError> {
+        let container: &dyn ContainerAdapter = if segments.is_empty() {
+            state.root_tree.as_ref()
+        } else {
+            let adapter = core::walk_tree(state.root_tree.as_ref(), &segments)?;
+            match adapter {
+                AnyAdapter::Container(c) => c.as_ref(),
+                _ => {
+                    return Err(ServerError::Validation(format!(
+                        "'{}' is not a container",
+                        segments.join("/")
+                    )));
+                }
             }
-        }
-    };
-
-    let resp =
-        core::construct_entries_response(container, path, &base_url, offset, limit, &queries);
+        };
+        let logical_path = segments.join("/");
+        Ok(core::construct_entries_response(
+            container,
+            &logical_path,
+            &base_url,
+            offset,
+            limit,
+            &queries,
+        ))
+    })
+    .await
+    .map_err(|e| ServerError::Internal(format!("blocking task failed: {e}")))??;
     Ok(Json(resp))
 }
 
@@ -158,17 +213,20 @@ pub async fn search(
 
 pub async fn array_block(
     State(state): State<AppState>,
-    Path(path): Path<String>,
+    OriginalUri(uri): OriginalUri,
     Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, ServerError> {
-    let path = path.trim_matches('/');
+    let segments = segments_from_uri(&uri, "/api/v1/array/block/");
 
-    let adapter = core::walk_tree(state.root_tree.as_ref(), path)?;
+    let adapter = core::walk_tree(state.root_tree.as_ref(), &segments)?;
     let array_adapter = match adapter {
         AnyAdapter::Array(a) => a.as_ref(),
         _ => {
-            return Err(ServerError::Validation(format!("'{path}' is not an array")));
+            return Err(ServerError::Validation(format!(
+                "'{}' is not an array",
+                segments.join("/")
+            )));
         }
     };
 
@@ -217,6 +275,7 @@ pub async fn array_block(
         let ser_meta = serde_json::json!({
             "itemsize": data.dtype.element_size(),
             "kind": String::from(data.dtype.kind.to_numpy_char()),
+            "shape": data.shape,
         });
         serializer(&data.data, &ser_meta).map_err(|e| ServerError::Internal(e.to_string()))?
     } else {
@@ -232,16 +291,19 @@ pub async fn array_block(
 
 pub async fn table_partition(
     State(state): State<AppState>,
-    Path(path): Path<String>,
+    OriginalUri(uri): OriginalUri,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<impl IntoResponse, ServerError> {
-    let path = path.trim_matches('/');
+    let segments = segments_from_uri(&uri, "/api/v1/table/partition/");
 
-    let adapter = core::walk_tree(state.root_tree.as_ref(), path)?;
+    let adapter = core::walk_tree(state.root_tree.as_ref(), &segments)?;
     let table_adapter = match adapter {
         AnyAdapter::Table(t) => t.as_ref(),
         _ => {
-            return Err(ServerError::Validation(format!("'{path}' is not a table")));
+            return Err(ServerError::Validation(format!(
+                "'{}' is not a table",
+                segments.join("/")
+            )));
         }
     };
 
@@ -289,18 +351,16 @@ pub async fn table_partition(
 
 pub async fn get_documents(
     State(state): State<AppState>,
-    Path(path): Path<String>,
+    OriginalUri(uri): OriginalUri,
 ) -> Result<impl IntoResponse, ServerError> {
-    let path = path.trim_matches('/');
-
-    // Walk to the run node.
-    let adapter = if path.is_empty() {
+    let segments = segments_from_uri(&uri, "/documents/");
+    if segments.is_empty() {
         return Err(ServerError::Validation(
             "Path to a BlueskyRun is required".into(),
         ));
-    } else {
-        core::walk_tree(state.root_tree.as_ref(), path)?
-    };
+    }
+
+    let adapter = core::walk_tree(state.root_tree.as_ref(), &segments)?;
 
     // The run must be a container (BlueskyRun).
     let run = adapter
@@ -351,4 +411,80 @@ pub async fn get_documents(
         body,
     )
         .into_response())
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/v1/register/{*path} — Accept registration payloads
+// ---------------------------------------------------------------------------
+//
+// The server currently has no mutable backing store, so this handler is
+// accept-only: it parses the body to validate shape and returns a synthetic
+// PostMetadataResponse. Production deployments wiring up a real catalog
+// (sqlite, postgres) will replace this with an implementation that actually
+// persists the node.
+
+pub async fn register_root(
+    state: State<AppState>,
+    base_url: BaseUrl,
+    body: Json<tiled_core::schemas::PostMetadataRequest>,
+) -> Result<impl IntoResponse, ServerError> {
+    register(
+        state,
+        OriginalUri("/api/v1/register/".parse().unwrap()),
+        base_url,
+        body,
+    )
+    .await
+}
+
+pub async fn register(
+    State(_state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+    BaseUrl(base_url): BaseUrl,
+    Json(req): Json<tiled_core::schemas::PostMetadataRequest>,
+) -> Result<impl IntoResponse, ServerError> {
+    let segments = segments_from_uri(&uri, "/api/v1/register/");
+    let path = segments.join("/");
+    let path = path.trim_matches('/');
+    // Generate a synthetic ID from the request payload's structure_family +
+    // a hash of the metadata. Real implementations would allocate via the
+    // catalog database.
+    // Prefer the top-level `key` (Python tiled wire format, used by cirrus),
+    // fall back to `metadata.key` for older clients, then synthesise.
+    let id = req
+        .key
+        .clone()
+        .or_else(|| {
+            req.metadata
+                .get("key")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        })
+        .unwrap_or_else(|| format!("{:?}-{:x}", req.structure_family, fastrand_seed()));
+
+    let child_path = if path.is_empty() {
+        id.clone()
+    } else {
+        format!("{path}/{id}")
+    };
+
+    let links = tiled_core::links::links_for_node(req.structure_family, &base_url, &child_path);
+    let resp = tiled_core::schemas::PostMetadataResponse {
+        id,
+        links: Some(serde_json::to_value(&links).unwrap_or_default()),
+        metadata: Some(req.metadata),
+        data_sources: Some(req.data_sources),
+        access_blob: None,
+    };
+    Ok((axum::http::StatusCode::CREATED, Json(resp)))
+}
+
+/// Tiny seed for synthetic IDs — uses the wall clock so collisions across
+/// requests are vanishingly unlikely without dragging in a full RNG dep.
+fn fastrand_seed() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
 }
