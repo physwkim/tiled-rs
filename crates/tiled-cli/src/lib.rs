@@ -220,6 +220,16 @@ pub async fn run(command: Command) -> Result<()> {
 
             // Resolve API key: CLI flag > config file > env var.
             let api_key = api_key.or_else(|| file_config.as_ref().and_then(|c| c.api_key()));
+            // Empty string means "auth enabled but expected key is empty" — a
+            // request with `?api_key=` or `Authorization: Apikey ` would then
+            // pass the constant-time compare and silently grant access while
+            // the startup log still claims auth is on. Refuse to start.
+            if api_key.as_deref() == Some("") {
+                anyhow::bail!(
+                    "--api-key (or config single_user_api_key) is empty; \
+                     either omit it for anonymous access or supply a non-empty key"
+                );
+            }
 
             let root_tree: Arc<dyn tiled_core::adapters::ContainerAdapter> =
                 if let Some(ref uri) = resolved_mongo_uri {

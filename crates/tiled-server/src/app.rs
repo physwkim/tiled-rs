@@ -79,7 +79,14 @@ async fn api_key_middleware(
 ) -> axum::response::Response {
     use subtle::ConstantTimeEq;
     let expected = match &state.api_key {
-        Some(key) => key,
+        Some(key) if !key.is_empty() => key,
+        // Empty `Some("")` would otherwise let `?api_key=` or
+        // `Authorization: Apikey ` pass the ct_eq below, so refuse all
+        // requests defensively. The CLI rejects this at startup; this
+        // covers library users that construct `AppState` directly.
+        Some(_) => {
+            return (StatusCode::UNAUTHORIZED, "Server misconfigured: empty api_key").into_response();
+        }
         None => return next.run(request).await,
     };
 
