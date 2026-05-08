@@ -18,6 +18,7 @@ tracing = { workspace = true }
 bytes = { workspace = true }
 arrow = { workspace = true }
 percent-encoding = "2"
+subtle = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

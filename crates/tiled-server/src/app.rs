@@ -77,16 +77,23 @@ async fn api_key_middleware(
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
+    use subtle::ConstantTimeEq;
     let expected = match &state.api_key {
         Some(key) => key,
         None => return next.run(request).await,
+    };
+
+    // Constant-time compare: a plain `==` on strings short-circuits on the
+    // first differing byte and leaks the prefix length to a timing attacker.
+    let ct_eq = |candidate: &[u8]| -> bool {
+        candidate.ct_eq(expected.as_bytes()).into()
     };
 
     // Check query parameter: ?api_key=<key>
     if let Some(query) = request.uri().query() {
         for pair in query.split('&') {
             if let Some(value) = pair.strip_prefix("api_key=")
-                && value == expected
+                && ct_eq(value.as_bytes())
             {
                 return next.run(request).await;
             }
@@ -97,7 +104,7 @@ async fn api_key_middleware(
     if let Some(auth) = request.headers().get("authorization")
         && let Ok(auth_str) = auth.to_str()
         && let Some(key) = auth_str.strip_prefix("Apikey ")
-        && key == expected
+        && ct_eq(key.as_bytes())
     {
         return next.run(request).await;
     }
