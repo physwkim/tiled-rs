@@ -98,11 +98,57 @@ pub fn build_app(state: AppState) -> Router {
         ));
     app = app.merge(public_auth).merge(guarded);
 
-    app.layer(axum::middleware::from_fn(timeout_middleware))
+    let body_limit = state.max_request_body_bytes;
+    app.layer(axum::extract::DefaultBodyLimit::max(body_limit))
+        .layer(axum::middleware::from_fn(correlation_id_middleware))
+        .layer(axum::middleware::from_fn(timeout_middleware))
         .layer(CompressionLayer::new())
         .layer(TraceLayer::new_for_http())
         .layer(cors)
         .with_state(state)
+}
+
+/// Generates a per-request `x-tiled-request-id` if the client didn't set
+/// one and emits it on the response. Mirrors tiled#673 so logs and client
+/// errors share a correlation key.
+async fn correlation_id_middleware(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::http::HeaderValue;
+
+    let header_name = "x-tiled-request-id";
+    let request_id = match request
+        .headers()
+        .get(header_name)
+        .and_then(|v| v.to_str().ok())
+    {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => short_request_id(),
+    };
+
+    let mut request = request;
+    request.extensions_mut().insert(RequestId(request_id.clone()));
+    let mut response = next.run(request).await;
+    if let Ok(value) = HeaderValue::from_str(&request_id) {
+        response.headers_mut().insert(header_name, value);
+    }
+    response
+}
+
+#[derive(Debug, Clone)]
+pub struct RequestId(pub String);
+
+fn short_request_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{nanos:x}-{counter:x}")
 }
 
 /// Universal auth middleware.

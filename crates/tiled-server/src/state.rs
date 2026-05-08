@@ -43,15 +43,41 @@ pub struct AppState {
     /// Optional proxy-header authenticator. Honoured only when
     /// `trust_forwarded_headers` is also true.
     pub proxied_header_auth: Option<Arc<tiled_auth::ProxiedHeaderAuthenticator>>,
+    /// CIDR/IP list permitted to set X-Forwarded-* headers when
+    /// `trust_forwarded_headers` is on. `None` = trust the headers from
+    /// any peer (only safe when the listener is bound to a private
+    /// network); empty Vec = trust nobody (effectively disables proxy
+    /// header parsing); non-empty Vec = match the connecting peer's IP
+    /// against the list. Mirrors uvicorn's `forwarded_allow_ips` and the
+    /// fix in bluesky/tiled#148.
+    pub forwarded_allow_ips: Option<Vec<std::net::IpAddr>>,
+    /// Per-endpoint request body size cap (bytes). Pre-multipart payloads
+    /// (POST register, PATCH metadata, PUT data_source) larger than this
+    /// are rejected with 413. Default 10 MiB matches the metadata size
+    /// limit in tiled-catalog so a too-large catalog payload fails fast.
+    pub max_request_body_bytes: usize,
 }
 
 impl AppState {
     pub fn resolve_base_url(&self, headers: &axum::http::HeaderMap) -> String {
+        self.resolve_base_url_with_peer(headers, None)
+    }
+
+    /// Like [`resolve_base_url`] but lets the caller pass the connecting
+    /// peer's IP — used so X-Forwarded-Host is honoured only when the
+    /// peer is listed in `forwarded_allow_ips`.
+    pub fn resolve_base_url_with_peer(
+        &self,
+        headers: &axum::http::HeaderMap,
+        peer_ip: Option<std::net::IpAddr>,
+    ) -> String {
         if let Some(ref url) = self.base_url {
             return url.clone();
         }
 
-        let (host, scheme) = if self.trust_forwarded_headers {
+        let trust = self.trust_forwarded_headers
+            && self.peer_is_trusted(peer_ip);
+        let (host, scheme) = if trust {
             let h = headers
                 .get("x-forwarded-host")
                 .or_else(|| headers.get("host"))
@@ -71,5 +97,17 @@ impl AppState {
         };
 
         format!("{scheme}://{host}")
+    }
+
+    pub fn peer_is_trusted(&self, peer_ip: Option<std::net::IpAddr>) -> bool {
+        match (&self.forwarded_allow_ips, peer_ip) {
+            // None = "trust any peer" (legacy default).
+            (None, _) => true,
+            // Empty list = "trust nobody".
+            (Some(list), _) if list.is_empty() => false,
+            (Some(list), Some(ip)) => list.iter().any(|allowed| *allowed == ip),
+            // Allow-list configured but we don't know the peer → don't trust.
+            (Some(_), None) => false,
+        }
     }
 }
