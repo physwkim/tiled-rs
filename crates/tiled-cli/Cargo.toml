@@ -20,3 +20,4 @@ indexmap = { workspace = true }
 bytes = { workspace = true }
 axum = { workspace = true }
 tiled-mongo = { workspace = true }
+tiled-catalog = { workspace = true }

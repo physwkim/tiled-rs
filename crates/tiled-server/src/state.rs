@@ -23,6 +23,11 @@ pub struct AppState {
     pub trust_forwarded_headers: bool,
     /// Single-user API key. `None` = anonymous access allowed.
     pub api_key: Option<String>,
+    /// Optional persistent catalog. When present, write endpoints
+    /// (`POST /register`, `PATCH /metadata`, `PUT /data_source`,
+    /// `DELETE /metadata`) operate against it; without it those
+    /// endpoints return 501 Not Implemented.
+    pub catalog: Option<tiled_catalog::Catalog>,
 }
 
 impl AppState {

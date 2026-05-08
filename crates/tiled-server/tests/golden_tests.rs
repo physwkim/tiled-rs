@@ -59,6 +59,7 @@ fn build_app() -> axum::Router {
         cors_policy: tiled_server::state::CorsOriginPolicy::Permissive,
         trust_forwarded_headers: false,
         api_key: None,
+        catalog: None,
     };
 
     tiled_server::build_app(state)
@@ -80,6 +81,7 @@ fn build_app_dynamic(trust_forwarded: bool) -> axum::Router {
         cors_policy: tiled_server::state::CorsOriginPolicy::AllowList(Vec::new()),
         trust_forwarded_headers: trust_forwarded,
         api_key: None,
+        catalog: None,
     };
 
     tiled_server::build_app(state)
@@ -456,6 +458,7 @@ async fn test_empty_container() {
         cors_policy: tiled_server::state::CorsOriginPolicy::Permissive,
         trust_forwarded_headers: false,
         api_key: None,
+        catalog: None,
     };
     let app = tiled_server::build_app(state);
 
@@ -536,6 +539,7 @@ fn build_app_with_api_key(key: &str) -> axum::Router {
         cors_policy: tiled_server::state::CorsOriginPolicy::Permissive,
         trust_forwarded_headers: false,
         api_key: Some(key.to_string()),
+        catalog: None,
     };
 
     tiled_server::build_app(state)
@@ -654,6 +658,7 @@ async fn test_metadata_handles_percent_encoded_slash_in_key() {
         cors_policy: tiled_server::state::CorsOriginPolicy::Permissive,
         trust_forwarded_headers: false,
         api_key: None,
+        catalog: None,
     };
     let app = tiled_server::build_app(state);
 

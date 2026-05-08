@@ -53,6 +53,7 @@ async fn spawn_server(api_key: Option<String>) -> String {
         cors_policy: tiled_server::state::CorsOriginPolicy::Permissive,
         trust_forwarded_headers: false,
         api_key,
+        catalog: None,
     };
 
     let app = tiled_server::build_app(state);

@@ -116,25 +116,34 @@ pub async fn metadata(
     // segment rather than being split apart by axum's `Path<String>` (which
     // percent-decodes before splitting).
     let segments = segments_from_uri(&uri, "/api/v1/metadata/");
-    // The tree walk + Resource construction may invoke blocking adapters
-    // (e.g. `MongoCatalog::get` triggers a sync MongoDB query the first
-    // time). Run them on the blocking thread pool so async workers stay
-    // responsive.
-    let resource = tokio::task::spawn_blocking(move || -> Result<_, ServerError> {
-        if segments.is_empty() {
-            Ok(core::construct_root_resource(
-                state.root_tree.as_ref(),
-                &base_url,
-            ))
-        } else {
-            let adapter = core::walk_tree(state.root_tree.as_ref(), &segments)?;
-            let id = segments.last().cloned().unwrap_or_default();
-            let path = segments.join("/");
-            Ok(core::construct_resource(adapter, &id, &path, &base_url))
-        }
-    })
-    .await
-    .map_err(|e| ServerError::Internal(format!("blocking task failed: {e}")))??;
+    // When a SQL catalog is wired, read directly through it: the
+    // CatalogAdapter caches children eagerly to satisfy the sync trait,
+    // and PATCH/DELETE write past that cache, so a same-request read after
+    // a write would otherwise see stale data. Direct DB lookup keeps
+    // metadata responses consistent with the latest committed write.
+    let resource = if let Some(ref catalog) = state.catalog {
+        catalog_metadata_resource(catalog, &segments, &base_url).await?
+    } else {
+        // The tree walk + Resource construction may invoke blocking
+        // adapters (e.g. `MongoCatalog::get` triggers a sync MongoDB
+        // query the first time). Run them on the blocking thread pool so
+        // async workers stay responsive.
+        tokio::task::spawn_blocking(move || -> Result<_, ServerError> {
+            if segments.is_empty() {
+                Ok(core::construct_root_resource(
+                    state.root_tree.as_ref(),
+                    &base_url,
+                ))
+            } else {
+                let adapter = core::walk_tree(state.root_tree.as_ref(), &segments)?;
+                let id = segments.last().cloned().unwrap_or_default();
+                let path = segments.join("/");
+                Ok(core::construct_resource(adapter, &id, &path, &base_url))
+            }
+        })
+        .await
+        .map_err(|e| ServerError::Internal(format!("blocking task failed: {e}")))??
+    };
 
     Ok(Json(Response {
         data: Some(resource),
@@ -453,16 +462,13 @@ pub async fn register_root(
 }
 
 pub async fn register(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     OriginalUri(uri): OriginalUri,
     BaseUrl(base_url): BaseUrl,
     Json(req): Json<tiled_core::schemas::PostMetadataRequest>,
 ) -> Result<impl IntoResponse, ServerError> {
     let segments = segments_from_uri(&uri, "/api/v1/register/");
     let path = segments.join("/");
-    // Generate a synthetic ID from the request payload's structure_family +
-    // a hash of the metadata. Real implementations would allocate via the
-    // catalog database.
     // Prefer the top-level `key` (Python tiled wire format, used by cirrus),
     // fall back to `metadata.key` for older clients, then synthesise.
     let id = req
@@ -479,12 +485,99 @@ pub async fn register(
             format!("{:?}-{nanos:x}-{counter:x}", req.structure_family)
         });
 
+    let structure_family = match req.structure_family {
+        tiled_core::structures::StructureFamily::Container => "container",
+        tiled_core::structures::StructureFamily::Array => "array",
+        tiled_core::structures::StructureFamily::Table => "table",
+        tiled_core::structures::StructureFamily::Sparse => "sparse",
+        tiled_core::structures::StructureFamily::Awkward => "awkward",
+    }
+    .to_string();
+
+    if let Some(ref catalog) = state.catalog {
+        // Resolve parent_id by walking the segments. Empty segments → root.
+        let parent_id = if segments.is_empty() {
+            None
+        } else {
+            let parent = catalog
+                .lookup(&segments)
+                .await
+                .map_err(map_catalog_err)?
+                .ok_or_else(|| {
+                    ServerError::NotFound(format!("parent path '{path}' does not exist"))
+                })?;
+            Some(parent.id)
+        };
+
+        let node = catalog
+            .create_node(
+                parent_id,
+                segments.clone(),
+                tiled_catalog::node::RegisterRequest {
+                    key: id.clone(),
+                    structure_family: structure_family.clone(),
+                    metadata: req.metadata.clone(),
+                    specs: serde_json::to_value(&req.specs).unwrap_or_default(),
+                    access_blob: serde_json::Value::Object(Default::default()),
+                },
+            )
+            .await
+            .map_err(map_catalog_err)?;
+
+        // Persist any data sources sent with the create request.
+        for ds in &req.data_sources {
+            let assets: Vec<tiled_catalog::data_source::AssetSpec> = ds
+                .assets
+                .iter()
+                .map(|a| tiled_catalog::data_source::AssetSpec {
+                    data_uri: a.data_uri.clone(),
+                    is_directory: a.is_directory,
+                    parameter: a.parameter.clone().unwrap_or_else(|| "data_uri".into()),
+                    num: a.num.map(|n| n as i32),
+                })
+                .collect();
+            let structure_json = ds
+                .structure
+                .as_ref()
+                .and_then(|s| serde_json::to_value(s).ok())
+                .unwrap_or_default();
+            let spec = tiled_catalog::data_source::DataSourceSpec {
+                structure_family: ds_family_str(ds.structure_family).to_string(),
+                structure: structure_json,
+                mimetype: ds.mimetype.clone().unwrap_or_default(),
+                parameters: ds.parameters.clone(),
+                management: format!("{:?}", ds.management).to_lowercase(),
+                assets,
+            };
+            catalog
+                .create_data_source(node.id, spec)
+                .await
+                .map_err(map_catalog_err)?;
+        }
+
+        let child_path = if path.is_empty() {
+            node.key.clone()
+        } else {
+            format!("{path}/{}", node.key)
+        };
+        let links = tiled_core::links::links_for_node(req.structure_family, &base_url, &child_path);
+        let resp = tiled_core::schemas::PostMetadataResponse {
+            id: node.key,
+            links: Some(serde_json::to_value(&links).unwrap_or_default()),
+            metadata: Some(node.metadata),
+            data_sources: Some(req.data_sources),
+            access_blob: Some(node.access_blob),
+        };
+        return Ok((axum::http::StatusCode::CREATED, Json(resp)));
+    }
+
+    // No catalog wired — accept-only fallback (synthetic id, no persistence).
+    // Useful for development against a Mongo-backed read tree.
     let child_path = if path.is_empty() {
         id.clone()
     } else {
         format!("{path}/{id}")
     };
-
     let links = tiled_core::links::links_for_node(req.structure_family, &base_url, &child_path);
     let resp = tiled_core::schemas::PostMetadataResponse {
         id,
@@ -494,6 +587,287 @@ pub async fn register(
         access_blob: None,
     };
     Ok((axum::http::StatusCode::CREATED, Json(resp)))
+}
+
+fn ds_family_str(f: tiled_core::structures::StructureFamily) -> &'static str {
+    use tiled_core::structures::StructureFamily as SF;
+    match f {
+        SF::Container => "container",
+        SF::Array => "array",
+        SF::Table => "table",
+        SF::Sparse => "sparse",
+        SF::Awkward => "awkward",
+    }
+}
+
+fn map_catalog_err(e: tiled_catalog::CatalogError) -> ServerError {
+    use tiled_catalog::CatalogError as CE;
+    match e {
+        CE::NotFound(m) => ServerError::NotFound(m),
+        CE::Validation(m) => ServerError::Validation(m),
+        CE::Conflict(m) => ServerError::Validation(m),
+        // Database/Migration/Json/Io are all 500-class; the IntoResponse
+        // impl logs the detail and returns a generic 500 body so we don't
+        // leak DB internals to the client (R7).
+        other => ServerError::Internal(other.to_string()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PATCH /api/v1/metadata/{*path} — update metadata + specs
+// ---------------------------------------------------------------------------
+//
+// JSON body: `{ "metadata": {...}, "specs": [...] }`. Everything else
+// (links, data_sources) is read-only here — use PUT /data_source for
+// structural changes.
+
+pub async fn patch_metadata(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+    BaseUrl(base_url): BaseUrl,
+    Json(req): Json<serde_json::Value>,
+) -> Result<impl IntoResponse, ServerError> {
+    let segments = segments_from_uri(&uri, "/api/v1/metadata/");
+    let catalog = state
+        .catalog
+        .as_ref()
+        .ok_or_else(|| ServerError::Validation("server has no catalog DB; PATCH not supported".into()))?;
+    if segments.is_empty() {
+        return Err(ServerError::Validation("cannot PATCH the catalog root".into()));
+    }
+    let node = catalog
+        .lookup(&segments)
+        .await
+        .map_err(map_catalog_err)?
+        .ok_or_else(|| ServerError::NotFound(format!("'{}' not found", segments.join("/"))))?;
+    let metadata = req
+        .get("metadata")
+        .cloned()
+        .unwrap_or_else(|| node.metadata.clone());
+    let specs = req
+        .get("specs")
+        .cloned()
+        .unwrap_or_else(|| node.specs.clone());
+    let updated = catalog
+        .update_metadata(node.id, metadata, specs)
+        .await
+        .map_err(map_catalog_err)?;
+    let path = segments.join("/");
+    let family = parse_structure_family(&updated.structure_family)?;
+    let links = tiled_core::links::links_for_node(family, &base_url, &path);
+    Ok(Json(tiled_core::schemas::PostMetadataResponse {
+        id: updated.key,
+        links: Some(serde_json::to_value(&links).unwrap_or_default()),
+        metadata: Some(updated.metadata),
+        data_sources: None,
+        access_blob: Some(updated.access_blob),
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// PUT /api/v1/data_source/{*path} — replace structure / parameters
+// ---------------------------------------------------------------------------
+//
+// JSON body: `{ "data_source": { id, structure, parameters } }`. Asset
+// rewrite is intentionally out of scope here — adding/removing assets goes
+// through register so the FK + transaction guarantees stay simple.
+
+pub async fn put_data_source(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+    Json(req): Json<serde_json::Value>,
+) -> Result<impl IntoResponse, ServerError> {
+    let segments = segments_from_uri(&uri, "/api/v1/data_source/");
+    let catalog = state
+        .catalog
+        .as_ref()
+        .ok_or_else(|| ServerError::Validation("server has no catalog DB; PUT not supported".into()))?;
+    if segments.is_empty() {
+        return Err(ServerError::Validation("PUT /data_source requires a node path".into()));
+    }
+    let node = catalog
+        .lookup(&segments)
+        .await
+        .map_err(map_catalog_err)?
+        .ok_or_else(|| ServerError::NotFound(format!("'{}' not found", segments.join("/"))))?;
+    let body = req
+        .get("data_source")
+        .ok_or_else(|| ServerError::Validation("body missing 'data_source'".into()))?;
+    let id = body
+        .get("id")
+        .and_then(|v| v.as_i64())
+        .ok_or_else(|| ServerError::Validation("'data_source.id' missing".into()))?;
+    // Sanity: the targeted data_source must belong to the resolved node.
+    let owned = catalog
+        .list_data_sources(node.id)
+        .await
+        .map_err(map_catalog_err)?;
+    if !owned.iter().any(|d| d.id == id) {
+        return Err(ServerError::NotFound(format!(
+            "data_source {id} does not belong to '{}'",
+            segments.join("/")
+        )));
+    }
+    let structure = body.get("structure").cloned().unwrap_or_default();
+    let parameters = body.get("parameters").cloned().unwrap_or_default();
+    let updated = catalog
+        .update_data_source(id, structure, parameters)
+        .await
+        .map_err(map_catalog_err)?;
+    Ok(Json(serde_json::json!({"data_source": {
+        "id": updated.id,
+        "structure_family": updated.structure_family,
+        "structure": updated.structure,
+        "mimetype": updated.mimetype,
+        "parameters": updated.parameters,
+        "management": updated.management,
+    }})))
+}
+
+// ---------------------------------------------------------------------------
+// DELETE /api/v1/metadata/{*path} — remove a node (cascade)
+// ---------------------------------------------------------------------------
+
+pub async fn delete_metadata(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+) -> Result<impl IntoResponse, ServerError> {
+    let segments = segments_from_uri(&uri, "/api/v1/metadata/");
+    let catalog = state
+        .catalog
+        .as_ref()
+        .ok_or_else(|| ServerError::Validation("server has no catalog DB; DELETE not supported".into()))?;
+    if segments.is_empty() {
+        return Err(ServerError::Validation("cannot DELETE the catalog root".into()));
+    }
+    let node = catalog
+        .lookup(&segments)
+        .await
+        .map_err(map_catalog_err)?
+        .ok_or_else(|| ServerError::NotFound(format!("'{}' not found", segments.join("/"))))?;
+    catalog.delete_node(node.id).await.map_err(map_catalog_err)?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+/// Build a `Resource` for the catalog by reading the DB directly. Skips
+/// the `CatalogAdapter`'s in-memory cache so a same-request read after a
+/// write sees the latest state.
+async fn catalog_metadata_resource(
+    catalog: &tiled_catalog::Catalog,
+    segments: &[String],
+    base_url: &str,
+) -> Result<tiled_core::schemas::Resource, ServerError> {
+    use tiled_core::schemas::{NodeAttributes, NodeStructure, Resource, SortingItem, SortDirection};
+    if segments.is_empty() {
+        let count = catalog
+            .count_children(None)
+            .await
+            .map_err(map_catalog_err)?;
+        let links = tiled_core::links::links_for_node(
+            tiled_core::structures::StructureFamily::Container,
+            base_url,
+            "",
+        );
+        return Ok(Resource {
+            id: String::new(),
+            attributes: NodeAttributes {
+                ancestors: vec![],
+                structure_family: Some(tiled_core::structures::StructureFamily::Container),
+                specs: Some(vec![]),
+                metadata: Some(serde_json::Value::Object(Default::default())),
+                structure: Some(
+                    serde_json::to_value(&NodeStructure {
+                        contents: None,
+                        count: count as usize,
+                    })
+                    .unwrap_or_default(),
+                ),
+                access_blob: None,
+                sorting: Some(vec![SortingItem {
+                    key: "_".into(),
+                    direction: SortDirection::Ascending,
+                }]),
+                data_sources: None,
+            },
+            links,
+        });
+    }
+
+    let node = catalog
+        .lookup(segments)
+        .await
+        .map_err(map_catalog_err)?
+        .ok_or_else(|| ServerError::NotFound(format!("'{}' not found", segments.join("/"))))?;
+    let path = segments.join("/");
+    let id = segments.last().cloned().unwrap_or_default();
+    let family = parse_structure_family(&node.structure_family)?;
+    let links = tiled_core::links::links_for_node(family, base_url, &path);
+    let ancestors = if segments.len() > 1 {
+        segments[..segments.len() - 1].to_vec()
+    } else {
+        vec![]
+    };
+    // For container nodes, surface the child count so the client doesn't
+    // need an extra `/search/` round-trip. Leaves carry their data-source
+    // structure when present.
+    let structure_value = if matches!(family, tiled_core::structures::StructureFamily::Container) {
+        let count = catalog
+            .count_children(Some(node.id))
+            .await
+            .map_err(map_catalog_err)?;
+        Some(
+            serde_json::to_value(&NodeStructure {
+                contents: None,
+                count: count as usize,
+            })
+            .unwrap_or_default(),
+        )
+    } else {
+        catalog
+            .list_data_sources(node.id)
+            .await
+            .map_err(map_catalog_err)?
+            .first()
+            .map(|ds| ds.structure.clone())
+    };
+    let sorting = if matches!(family, tiled_core::structures::StructureFamily::Container) {
+        Some(vec![SortingItem {
+            key: "_".into(),
+            direction: SortDirection::Ascending,
+        }])
+    } else {
+        None
+    };
+    Ok(Resource {
+        id,
+        attributes: NodeAttributes {
+            ancestors,
+            structure_family: Some(family),
+            specs: serde_json::from_value(node.specs).unwrap_or_default(),
+            metadata: Some(node.metadata),
+            structure: structure_value,
+            access_blob: Some(node.access_blob),
+            sorting,
+            data_sources: None,
+        },
+        links,
+    })
+}
+
+fn parse_structure_family(
+    s: &str,
+) -> Result<tiled_core::structures::StructureFamily, ServerError> {
+    use tiled_core::structures::StructureFamily as SF;
+    match s {
+        "container" => Ok(SF::Container),
+        "array" => Ok(SF::Array),
+        "table" => Ok(SF::Table),
+        "sparse" => Ok(SF::Sparse),
+        "awkward" => Ok(SF::Awkward),
+        other => Err(ServerError::Validation(format!(
+            "unknown structure_family in DB: {other}"
+        ))),
+    }
 }
 
 /// Distinct (wall-clock, counter) seed used to synthesise IDs when the

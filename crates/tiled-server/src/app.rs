@@ -6,7 +6,7 @@ use axum::Router;
 use axum::extract::State;
 use axum::http::{HeaderValue, Method, StatusCode};
 use axum::response::IntoResponse;
-use axum::routing::{get, post};
+use axum::routing::{delete, get, patch, post, put};
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
@@ -46,9 +46,13 @@ pub fn build_app(state: AppState) -> Router {
             "/api/v1/table/partition/{*path}",
             get(router::table_partition),
         )
-        // Write endpoints — currently accept-only (no backing store).
+        // Write endpoints — backed by tiled-catalog when one is configured;
+        // otherwise the register handlers fall through to accept-only mode.
         .route("/api/v1/register/", post(router::register_root))
         .route("/api/v1/register/{*path}", post(router::register))
+        .route("/api/v1/metadata/{*path}", patch(router::patch_metadata))
+        .route("/api/v1/metadata/{*path}", delete(router::delete_metadata))
+        .route("/api/v1/data_source/{*path}", put(router::put_data_source))
         // Bluesky document streaming (databroker compat)
         .route("/documents/{*path}", get(router::get_documents));
 

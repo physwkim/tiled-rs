@@ -52,6 +52,13 @@ pub enum Command {
         /// MongoDB URI for Bluesky data (e.g. mongodb://localhost:27017/my_database)
         #[arg(long)]
         mongo_uri: Option<String>,
+
+        /// SQLite or Postgres URI for the persistent catalog (e.g.
+        /// `sqlite:///var/lib/tiled.db` or `postgres://user@host/tiled`).
+        /// When set, write endpoints (`POST /register`, `PATCH /metadata`,
+        /// `PUT /data_source`, `DELETE /metadata`) operate against this DB.
+        #[arg(long)]
+        catalog_uri: Option<String>,
     },
 
     /// Database management commands (not yet implemented)
@@ -225,6 +232,7 @@ pub async fn run(command: Command) -> Result<()> {
             trust_proxy,
             api_key,
             mongo_uri,
+            catalog_uri,
         } => {
             // Load config file if provided.
             let file_config = config
@@ -252,6 +260,23 @@ pub async fn run(command: Command) -> Result<()> {
                 );
             }
 
+            // Open the persistent catalog up-front (before the read tree) so
+            // a misconfigured DB fails the start-up rather than the first
+            // write request.
+            let catalog_handle: Option<tiled_catalog::Catalog> = match catalog_uri.as_deref() {
+                None => None,
+                Some(uri) => {
+                    tracing::info!("Opening catalog: {}", redact_mongo_uri(uri));
+                    let cat = tiled_catalog::Catalog::connect(uri)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("catalog connect: {e}"))?;
+                    cat.migrate()
+                        .await
+                        .map_err(|e| anyhow::anyhow!("catalog migrate: {e}"))?;
+                    Some(cat)
+                }
+            };
+
             let root_tree: Arc<dyn tiled_core::adapters::ContainerAdapter> =
                 if let Some(ref uri) = resolved_mongo_uri {
                     tracing::info!("Connecting to MongoDB: {}", redact_mongo_uri(uri));
@@ -259,11 +284,17 @@ pub async fn run(command: Command) -> Result<()> {
                         .map_err(|e| anyhow::anyhow!("MongoDB connection failed: {e}"))?;
                     tracing::info!("MongoDB catalog loaded ({} runs)", catalog.len());
                     Arc::new(catalog)
+                } else if let Some(ref cat) = catalog_handle {
+                    let resolver: Arc<dyn tiled_catalog::adapter::LeafResolver> =
+                        Arc::new(tiled_catalog::adapter::UnresolvedLeaf);
+                    Arc::new(tiled_catalog::CatalogAdapter::root(cat.clone(), resolver))
                 } else if demo {
                     tracing::info!("Starting with demo dataset");
                     Arc::new(build_demo_tree())
                 } else {
-                    anyhow::bail!("Specify --demo, --mongo-uri, or --config to start the server");
+                    anyhow::bail!(
+                        "Specify --demo, --mongo-uri, --catalog-uri, or --config to start the server"
+                    );
                 };
 
             let registry = Arc::new(tiled_serialization::default_registry());
@@ -295,6 +326,7 @@ pub async fn run(command: Command) -> Result<()> {
                 cors_policy,
                 trust_forwarded_headers: trust_proxy,
                 api_key,
+                catalog: catalog_handle,
             };
 
             let app = tiled_server::build_app(state);
