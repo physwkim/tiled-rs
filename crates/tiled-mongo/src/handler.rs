@@ -245,10 +245,17 @@ impl Hdf5Handler {
 #[cfg(feature = "hdf5")]
 impl FileHandler for Hdf5Handler {
     fn read(&self, datum_kwargs: &serde_json::Value) -> Result<(Vec<u8>, Vec<usize>)> {
-        let point_number = datum_kwargs
+        let point_signed = datum_kwargs
             .get("point_number")
             .and_then(|v| v.as_i64())
-            .unwrap_or(0) as usize;
+            .unwrap_or(0);
+        // Reject negatives explicitly; `as usize` would wrap to usize::MAX
+        // and then the `start = point_number * frame_per_point` multiply
+        // would overflow back into a small value that silently passes the
+        // bounds check below.
+        let point_number = usize::try_from(point_signed).map_err(|_| {
+            TiledError::Validation(format!("HDF5 point_number must be non-negative, got {point_signed}"))
+        })?;
 
         let file = rust_hdf5::H5File::open(&self.file_path)
             .map_err(|e| TiledError::Internal(format!("HDF5 open failed: {e}")))?;
@@ -266,14 +273,20 @@ impl FileHandler for Hdf5Handler {
             ));
         }
 
-        let start = point_number * self.frame_per_point;
+        // Use checked_mul so a giant kwargs value can't silently wrap.
+        let start = point_number.checked_mul(self.frame_per_point).ok_or_else(|| {
+            TiledError::Validation(format!(
+                "HDF5 point_number {point_number} * frame_per_point {} overflows",
+                self.frame_per_point
+            ))
+        })?;
         if start >= full_shape[0] {
             return Err(TiledError::Validation(format!(
                 "Point {point_number} out of range for dataset with {} frames",
                 full_shape[0]
             )));
         }
-        let end = (start + self.frame_per_point).min(full_shape[0]);
+        let end = start.saturating_add(self.frame_per_point).min(full_shape[0]);
 
         // Build a hyperslab covering [start..end] on axis 0 and the full
         // extent on every other axis.
