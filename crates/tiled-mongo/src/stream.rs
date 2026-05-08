@@ -18,7 +18,6 @@ use crate::filler::Filler;
 /// An event stream (e.g. "primary") containing data columns.
 pub struct EventStreamAdapter {
     db: Database,
-    stream_name: String,
     descriptors: Vec<Document>,
     cutoff_seq_num: usize,
     metadata: serde_json::Value,
@@ -42,13 +41,12 @@ impl EventStreamAdapter {
             .collect();
 
         let metadata = serde_json::json!({
-            "stream_name": &stream_name,
+            "stream_name": stream_name,
             "descriptors": descriptor_meta,
         });
 
         Self {
             db,
-            stream_name,
             descriptors,
             cutoff_seq_num,
             metadata,

@@ -17,6 +17,10 @@ pub struct TiledConfig {
 #[derive(Debug, Deserialize)]
 pub struct TreeConfig {
     /// URL path where this tree is mounted (e.g. "/raw").
+    /// Stored for forward compatibility with Python tiled's
+    /// multi-tree configs; the Rust server currently mounts a single
+    /// tree at the API root.
+    #[allow(dead_code)]
     #[serde(default = "default_path")]
     pub path: String,
     /// Adapter type (e.g. "mongo_normalized").
@@ -32,7 +36,10 @@ pub struct TreeConfig {
 pub struct TreeArgs {
     /// MongoDB URI.
     pub uri: Option<String>,
-    /// Handler registry (not used in Rust, kept for compatibility).
+    /// Handler registry — kept for Python tiled config compatibility.
+    /// The Rust server uses the built-in handler registry; user-supplied
+    /// handler factories aren't wired up yet.
+    #[allow(dead_code)]
     #[serde(default)]
     pub handler_registry: std::collections::HashMap<String, String>,
 }
@@ -40,6 +47,10 @@ pub struct TreeArgs {
 /// Authentication configuration.
 #[derive(Debug, Deserialize)]
 pub struct AuthConfig {
+    /// Accepted from Python tiled configs but not yet wired into the
+    /// Rust server's auth middleware (single-user API key is the only
+    /// auth path today).
+    #[allow(dead_code)]
     #[serde(default)]
     pub allow_anonymous_access: bool,
     pub single_user_api_key: Option<String>,

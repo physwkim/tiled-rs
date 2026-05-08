@@ -83,21 +83,27 @@ impl BlueskyRunAdapter {
                     descriptors_by_stream.entry(name).or_default().push(desc);
                 }
 
-                // Determine cutoff seq_num from the stop document.
-                let cutoff_seq_num = self
+                // `stop.num_events` is a `{stream_name: count}` dict — use the
+                // per-stream count so each EventStream declares the right
+                // number of rows. Streams not listed there default to 1 (no
+                // events), matching Bluesky's "stop emitted before any events
+                // arrived" case.
+                let num_events_doc = self
                     .stop_doc
                     .as_ref()
                     .and_then(|d| d.get_document("num_events").ok())
-                    .map(|num_events| {
-                        num_events
-                            .iter()
-                            .map(|(_, v)| v.as_i64().unwrap_or(0) as usize + 1)
-                            .max()
-                            .unwrap_or(1)
-                    })
-                    .unwrap_or(1);
+                    .cloned();
 
                 for (stream_name, descriptors) in descriptors_by_stream {
+                    let cutoff_seq_num = num_events_doc
+                        .as_ref()
+                        .and_then(|ne| {
+                            ne.get_i64(&stream_name)
+                                .ok()
+                                .map(|n| n as usize + 1)
+                                .or_else(|| ne.get_i32(&stream_name).ok().map(|n| n as usize + 1))
+                        })
+                        .unwrap_or(1);
                     let stream = EventStreamAdapter::new(
                         self.db.clone(),
                         stream_name.clone(),
