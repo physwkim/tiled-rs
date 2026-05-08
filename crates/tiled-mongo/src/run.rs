@@ -98,10 +98,13 @@ impl BlueskyRunAdapter {
                     let cutoff_seq_num = num_events_doc
                         .as_ref()
                         .and_then(|ne| {
-                            ne.get_i64(&stream_name)
+                            // Accept i64 or i32; reject negative event counts
+                            // (would wrap when cast to usize).
+                            let n = ne
+                                .get_i64(&stream_name)
                                 .ok()
-                                .map(|n| n as usize + 1)
-                                .or_else(|| ne.get_i32(&stream_name).ok().map(|n| n as usize + 1))
+                                .or_else(|| ne.get_i32(&stream_name).ok().map(i64::from))?;
+                            usize::try_from(n).ok().map(|n| n + 1)
                         })
                         .unwrap_or(1);
                     let stream = EventStreamAdapter::new(
