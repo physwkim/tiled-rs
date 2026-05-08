@@ -51,7 +51,11 @@ pub async fn health() -> impl IntoResponse {
 }
 
 pub async fn ready(State(state): State<AppState>) -> impl IntoResponse {
-    let count = state.root_tree.len();
+    // Use the blocking pool — for adapters like tiled_mongo's MongoCatalog,
+    // the first `.len()` may trigger a sync DB load.
+    let count = tokio::task::spawn_blocking(move || state.root_tree.len())
+        .await
+        .unwrap_or(0);
     Json(serde_json::json!({"status": "ok", "nodes": count}))
 }
 
@@ -97,7 +101,7 @@ pub async fn metadata_root(
 ) -> Result<impl IntoResponse, ServerError> {
     metadata(
         state,
-        OriginalUri("/api/v1/metadata/".parse().unwrap()),
+        OriginalUri("/api/v1/metadata/".parse().expect("static URI")),
         base_url,
     )
     .await
@@ -140,16 +144,6 @@ pub async fn metadata(
     }))
 }
 
-/// Helper: split an axum `Path<String>` payload into key segments. The
-/// extractor has already percent-decoded each segment for us; we only need
-/// to drop empty pieces produced by leading/trailing slashes.
-fn split_path_segments(path: &str) -> Vec<String> {
-    path.split('/')
-        .filter(|s| !s.is_empty())
-        .map(String::from)
-        .collect()
-}
-
 // ---------------------------------------------------------------------------
 // GET /api/v1/search/{*path}
 // ---------------------------------------------------------------------------
@@ -161,7 +155,7 @@ pub async fn search_root(
 ) -> Result<impl IntoResponse, ServerError> {
     search(
         state,
-        OriginalUri("/api/v1/search/".parse().unwrap()),
+        OriginalUri("/api/v1/search/".parse().expect("static URI")),
         params,
         base_url,
     )
@@ -451,7 +445,7 @@ pub async fn register_root(
 ) -> Result<impl IntoResponse, ServerError> {
     register(
         state,
-        OriginalUri("/api/v1/register/".parse().unwrap()),
+        OriginalUri("/api/v1/register/".parse().expect("static URI")),
         base_url,
         body,
     )
@@ -480,7 +474,10 @@ pub async fn register(
                 .and_then(|v| v.as_str())
                 .map(String::from)
         })
-        .unwrap_or_else(|| format!("{:?}-{:x}", req.structure_family, fastrand_seed()));
+        .unwrap_or_else(|| {
+            let (nanos, counter) = synthetic_seed();
+            format!("{:?}-{nanos:x}-{counter:x}", req.structure_family)
+        });
 
     let child_path = if path.is_empty() {
         id.clone()
@@ -499,10 +496,11 @@ pub async fn register(
     Ok((axum::http::StatusCode::CREATED, Json(resp)))
 }
 
-/// Tiny seed for synthetic IDs — wall clock plus a process-wide atomic
-/// counter so concurrent POSTs that fire within the same nanosecond still
-/// produce distinct ids.
-fn fastrand_seed() -> u64 {
+/// Distinct (wall-clock, counter) seed used to synthesise IDs when the
+/// caller didn't supply a `key`. The two values are kept separate (not
+/// XORed) so concurrent POSTs in the same nanosecond can't collide via
+/// any combination of (nanos, counter) values.
+fn synthetic_seed() -> (u64, u64) {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -510,5 +508,5 @@ fn fastrand_seed() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
-    nanos ^ COUNTER.fetch_add(1, Ordering::Relaxed)
+    (nanos, COUNTER.fetch_add(1, Ordering::Relaxed))
 }

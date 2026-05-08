@@ -59,14 +59,27 @@ impl Filler {
     }
 
     /// Fill a column of datum_ids into raw byte arrays.
-    pub fn fill_column(&self, datum_ids: &[String], expected_shape: &[usize]) -> Result<Vec<u8>> {
+    ///
+    /// `expected_shape` is the per-datum shape (i.e. the column's
+    /// `inner_shape` excluding the leading row axis). Each handler's
+    /// returned shape must equal this; otherwise the result would be a
+    /// jagged/misaligned column. We error out early instead of silently
+    /// concatenating bytes of differing per-row sizes.
+    pub fn fill_column(
+        &self,
+        datum_ids: &[String],
+        expected_shape: &[usize],
+    ) -> Result<Vec<u8>> {
         let mut all_bytes = Vec::new();
-
         for datum_id in datum_ids {
-            let (data, _shape) = self.fill(datum_id)?;
+            let (data, shape) = self.fill(datum_id)?;
+            if !expected_shape.is_empty() && shape != expected_shape {
+                return Err(TiledError::Validation(format!(
+                    "datum {datum_id}: shape {shape:?} does not match expected {expected_shape:?}"
+                )));
+            }
             all_bytes.extend_from_slice(&data);
         }
-
         Ok(all_bytes)
     }
 
