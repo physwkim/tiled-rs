@@ -24,12 +24,29 @@ use crate::error::{ClientError, Result};
 use crate::utils::handle_error;
 
 /// Three tokens returned by every OIDC grant flow.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+///
+/// `Debug` deliberately redacts the token values — formatting one with `{:?}`
+/// (e.g. inside a `tracing` event) prints `<set>` rather than the raw bearer
+/// token, so casual debug logging can't leak the credential.
+#[derive(Clone, Deserialize, Serialize)]
 pub struct Tokens {
     pub access_token: String,
     pub refresh_token: String,
     #[serde(default)]
     pub id_token: Option<String>,
+}
+
+impl std::fmt::Debug for Tokens {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Tokens")
+            .field("access_token", &"<set>")
+            .field("refresh_token", &"<set>")
+            .field(
+                "id_token",
+                &self.id_token.as_ref().map(|_| "<set>"),
+            )
+            .finish()
+    }
 }
 
 /// On-disk + in-memory token store, keyed by token name (`access_token`,
@@ -38,12 +55,21 @@ pub struct Tokens {
 ///
 /// Disk layout: one file per token under
 /// `<token_directory>/<token_name>`. File mode is 0o600.
-#[derive(Debug)]
 pub struct TokenStore {
     /// Directory under which tokens are persisted, or `None` for in-memory.
     dir: Option<PathBuf>,
     /// In-memory cache. Updated on `set_token` and on disk reload.
     cache: Mutex<HashMap<String, String>>,
+}
+
+impl std::fmt::Debug for TokenStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Don't print the cache contents — they are token values.
+        f.debug_struct("TokenStore")
+            .field("dir", &self.dir)
+            .field("cache", &"<redacted>")
+            .finish()
+    }
 }
 
 impl TokenStore {
@@ -181,12 +207,22 @@ impl TokenStore {
 ///
 /// `Arc`-wrapped so it can be cheaply shared between the context and any
 /// request retry loop.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct TiledAuth {
     pub(crate) inner: Arc<TiledAuthInner>,
 }
 
-#[derive(Debug)]
+impl std::fmt::Debug for TiledAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TiledAuth")
+            .field("refresh_url", &self.inner.refresh_url)
+            .field("client_id", &self.inner.client_id)
+            .field("csrf_token", &"<redacted>")
+            .field("tokens", &"<redacted>")
+            .finish()
+    }
+}
+
 pub struct TiledAuthInner {
     pub(crate) refresh_url: Url,
     pub(crate) csrf_token: String,

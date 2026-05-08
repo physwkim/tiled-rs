@@ -31,7 +31,6 @@ pub struct Context {
     pub(crate) inner: Arc<ContextInner>,
 }
 
-#[derive(Debug)]
 pub(crate) struct ContextInner {
     /// Reqwest HTTP client (rustls + cookie store).
     pub(crate) http: Client,
@@ -51,6 +50,23 @@ pub(crate) struct ContextInner {
     pub(crate) cache: Option<Arc<HttpCache>>,
     /// Optional client resolver for spec-based dispatch.
     pub(crate) resolver: Option<Arc<dyn ClientResolver>>,
+}
+
+impl std::fmt::Debug for ContextInner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Avoid leaking the api_key / csrf_token / auth state when a
+        // user formats a `Context` for debugging — they'd otherwise hit
+        // raw bearer credentials in a log line.
+        f.debug_struct("ContextInner")
+            .field("base_url", &self.base_url)
+            .field("api_uri", &self.api_uri)
+            .field("api_key", &"<redacted>")
+            .field("auth", &"<redacted>")
+            .field("csrf_token", &"<redacted>")
+            .field("cache", &self.cache.as_ref().map(|_| "<set>"))
+            .field("resolver", &self.resolver.as_ref().map(|_| "<set>"))
+            .finish()
+    }
 }
 
 impl Context {
