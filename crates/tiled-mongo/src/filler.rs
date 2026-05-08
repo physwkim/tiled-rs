@@ -63,8 +63,10 @@ impl Filler {
     /// `expected_shape` is the per-datum shape (i.e. the column's
     /// `inner_shape` excluding the leading row axis). Each handler's
     /// returned shape must equal this; otherwise the result would be a
-    /// jagged/misaligned column. We error out early instead of silently
-    /// concatenating bytes of differing per-row sizes.
+    /// jagged/misaligned column. Errors out early instead of silently
+    /// concatenating bytes of differing per-row sizes — including the
+    /// scalar case where `expected_shape` is empty but the handler
+    /// returned a non-empty shape.
     pub fn fill_column(
         &self,
         datum_ids: &[String],
@@ -73,7 +75,7 @@ impl Filler {
         let mut all_bytes = Vec::new();
         for datum_id in datum_ids {
             let (data, shape) = self.fill(datum_id)?;
-            if !expected_shape.is_empty() && shape != expected_shape {
+            if shape.as_slice() != expected_shape {
                 return Err(TiledError::Validation(format!(
                     "datum {datum_id}: shape {shape:?} does not match expected {expected_shape:?}"
                 )));

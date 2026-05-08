@@ -166,24 +166,40 @@ fn read_npy_file(path: &str) -> Result<(Vec<u8>, Vec<usize>)> {
     let data = std::fs::read(path)
         .map_err(|e| TiledError::Internal(format!("Failed to read {path}: {e}")))?;
 
-    // NPY format: 6-byte magic + 2-byte version + 2-byte header_len + header + data
-    // Minimal parsing: skip the header, return raw data bytes.
+    // NPY format:
+    //   bytes 0..6  : magic `\x93NUMPY`
+    //   bytes 6..8  : version (major, minor)
+    //   v1.0        : 2-byte header_len at bytes 8..10
+    //   v2.0 / v3.0 : 4-byte header_len at bytes 8..12
+    //   followed by `header_len` bytes of Python literal, then raw data.
     if data.len() < 10 || &data[..6] != b"\x93NUMPY" {
         return Err(TiledError::Validation(format!(
             "Not a valid .npy file: {path}"
         )));
     }
 
-    let header_len = u16::from_le_bytes([data[8], data[9]]) as usize;
-    let header_end = 10 + header_len;
+    let major = data[6];
+    let (header_len, data_start) = if major >= 2 {
+        if data.len() < 12 {
+            return Err(TiledError::Validation(format!(
+                "Truncated v{major}.x .npy header: {path}"
+            )));
+        }
+        let len = u32::from_le_bytes([data[8], data[9], data[10], data[11]]) as usize;
+        (len, 12)
+    } else {
+        let len = u16::from_le_bytes([data[8], data[9]]) as usize;
+        (len, 10)
+    };
+
+    let header_end = data_start + header_len;
     if data.len() < header_end {
         return Err(TiledError::Validation(format!(
             "Truncated .npy header: {path}"
         )));
     }
 
-    // Parse shape from header string like "{'descr': '<f8', 'fortran_order': False, 'shape': (480, 640), }"
-    let header_str = std::str::from_utf8(&data[10..header_end]).unwrap_or("");
+    let header_str = std::str::from_utf8(&data[data_start..header_end]).unwrap_or("");
     let shape = parse_npy_shape(header_str);
 
     let raw_data = data[header_end..].to_vec();
