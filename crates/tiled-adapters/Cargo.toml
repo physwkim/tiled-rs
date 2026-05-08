@@ -8,7 +8,7 @@ default = ["csv-adapter", "parquet", "arrow-ipc"]
 csv-adapter = ["dep:csv"]
 parquet = ["dep:parquet"]
 arrow-ipc = []
-hdf5 = ["dep:hdf5"]
+hdf5 = ["dep:rust-hdf5"]
 tiff = ["dep:tiff", "dep:image"]
 zarr = ["dep:zarrs", "dep:object_store"]
 
@@ -26,7 +26,7 @@ indexmap = { workspace = true }
 # Feature-gated
 csv = { workspace = true, optional = true }
 parquet = { workspace = true, optional = true }
-hdf5 = { workspace = true, optional = true }
+rust-hdf5 = { workspace = true, optional = true }
 tiff = { workspace = true, optional = true }
 image = { workspace = true, optional = true }
 zarrs = { workspace = true, optional = true }

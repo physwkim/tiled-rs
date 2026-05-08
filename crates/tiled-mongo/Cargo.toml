@@ -6,7 +6,7 @@ edition.workspace = true
 [features]
 default = ["npy", "hdf5"]
 npy = ["dep:ndarray"]
-hdf5 = ["dep:hdf5"]
+hdf5 = ["dep:rust-hdf5"]
 tiff = ["dep:tiff", "dep:image"]
 
 [dependencies]
@@ -22,6 +22,6 @@ thiserror = { workspace = true }
 
 # File handlers (feature-gated)
 ndarray = { workspace = true, optional = true }
-hdf5 = { workspace = true, optional = true }
+rust-hdf5 = { workspace = true, optional = true }
 tiff = { workspace = true, optional = true }
 image = { workspace = true, optional = true }

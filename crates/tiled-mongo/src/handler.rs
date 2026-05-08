@@ -234,7 +234,7 @@ impl FileHandler for Hdf5Handler {
             .and_then(|v| v.as_i64())
             .unwrap_or(0) as usize;
 
-        let file = hdf5::File::open(&self.file_path)
+        let file = rust_hdf5::H5File::open(&self.file_path)
             .map_err(|e| TiledError::Internal(format!("HDF5 open failed: {e}")))?;
 
         // Area Detector convention: dataset at /entry/data/data
@@ -243,11 +243,10 @@ impl FileHandler for Hdf5Handler {
             .or_else(|_| file.dataset("data"))
             .map_err(|e| TiledError::Internal(format!("HDF5 dataset not found: {e}")))?;
 
-        let full_shape: Vec<usize> = dataset.shape().iter().map(|&s| s as usize).collect();
+        let full_shape: Vec<usize> = dataset.shape();
 
-        // Extract frames for this point.
         let start = point_number * self.frame_per_point;
-        let end = start + self.frame_per_point;
+        let end = (start + self.frame_per_point).min(full_shape[0]);
 
         if full_shape.is_empty() || start >= full_shape[0] {
             return Err(TiledError::Validation(format!(
@@ -256,13 +255,18 @@ impl FileHandler for Hdf5Handler {
             )));
         }
 
-        // Read as f64 and convert to bytes.
-        let data: Vec<f64> = dataset
-            .read_slice_1d(start..end.min(full_shape[0]))
-            .map_err(|e| TiledError::Internal(format!("HDF5 read error: {e}")))?
-            .to_vec();
+        // Build a hyperslab covering [start..end] on axis 0 and the full
+        // extent on every other axis.
+        let mut offsets = vec![0usize; full_shape.len()];
+        offsets[0] = start;
+        let mut counts = full_shape.clone();
+        counts[0] = end - start;
 
-        let mut shape = vec![end.min(full_shape[0]) - start];
+        let data: Vec<f64> = dataset
+            .read_slice::<f64>(&offsets, &counts)
+            .map_err(|e| TiledError::Internal(format!("HDF5 read error: {e}")))?;
+
+        let mut shape = vec![end - start];
         shape.extend_from_slice(&full_shape[1..]);
 
         let raw: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();

@@ -98,8 +98,8 @@ tempfile = "3"
 tiff = "0.9"
 image = "0.25"
 
-# HDF5 (feature-gated) — hdf5-metno with static build (no system libhdf5 needed)
-hdf5 = { package = "hdf5-metno", version = "0.12", features = ["static"] }
+# HDF5 (feature-gated) — pure-Rust HDF5 reader/writer, no system libhdf5
+rust-hdf5 = { version = "0.2", features = ["deflate"] }
 
 # Zarr
 zarrs = "0.20"
