@@ -1,0 +1,124 @@
+//! End-to-end auth DB exercises (SQLite).
+
+use chrono::{Duration, Utc};
+
+use tiled_auth::{
+    AuthDb, ApiKeyCreate, DummyAuthenticator, Issuer, Scope, ScopeSet,
+    Authenticator,
+};
+
+async fn fresh_db() -> (AuthDb, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("sqlite://{}", dir.path().join("auth.db").display());
+    let db = AuthDb::connect(&uri).await.unwrap();
+    db.migrate().await.unwrap();
+    (db, dir)
+}
+
+#[tokio::test]
+async fn migrate_and_principal_lifecycle() {
+    let (db, _dir) = fresh_db().await;
+    assert_eq!(db.applied_migrations().await.unwrap(), vec!["0001_initial".to_string()]);
+
+    let (p, ident) = db.ensure_principal("dummy", "alice").await.unwrap();
+    assert!(p.id > 0);
+    assert_eq!(ident.provider, "dummy");
+    assert_eq!(ident.sub, "alice");
+
+    // Calling again returns the same principal.
+    let (p2, _) = db.ensure_principal("dummy", "alice").await.unwrap();
+    assert_eq!(p.id, p2.id);
+}
+
+#[tokio::test]
+async fn api_key_create_verify_revoke() {
+    let (db, _dir) = fresh_db().await;
+    let (p, _) = db.ensure_principal("dummy", "alice").await.unwrap();
+
+    let scopes = ScopeSet::from_iter([Scope::ReadMetadata, Scope::ReadData]);
+    let material = db
+        .create_api_key(ApiKeyCreate {
+            principal_id: p.id,
+            note: Some("test".into()),
+            scopes: scopes.clone(),
+            expiration_time: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(material.record.first_eight.len(), 8);
+    assert_eq!(material.record.scopes, scopes);
+    assert_eq!(material.secret.len(), 64); // 32 bytes hex
+
+    // Verify the plaintext.
+    let verified = db.verify_api_key(&material.secret).await.unwrap();
+    assert_eq!(verified.id, material.record.id);
+
+    // Wrong key is rejected.
+    let err = db.verify_api_key("000000000").await.unwrap_err();
+    assert!(matches!(err, tiled_auth::AuthError::Unauthorized(_)));
+
+    // Revoke + verify again should fail.
+    db.revoke_api_key(&material.record.first_eight).await.unwrap();
+    let err = db.verify_api_key(&material.secret).await.unwrap_err();
+    assert!(matches!(err, tiled_auth::AuthError::Unauthorized(_)));
+}
+
+#[tokio::test]
+async fn session_revocation_blocks_jwt() {
+    let (db, _dir) = fresh_db().await;
+    let (p, _) = db.ensure_principal("dummy", "alice").await.unwrap();
+    let scopes = ScopeSet::from_iter([Scope::ReadMetadata]);
+    let session = db
+        .create_session(p.id, scopes.clone(), Utc::now() + Duration::hours(1))
+        .await
+        .unwrap();
+
+    let issuer = Issuer::new(b"this-is-a-test-secret-32-bytes-long!!").unwrap();
+    let token = issuer.issue_access(&p.uuid, &session.uuid, scopes).unwrap();
+    let claims = issuer.verify_access(&token).unwrap();
+    assert_eq!(claims.sub, p.uuid);
+
+    // Server-side check: lookup_session() should report revoked = true
+    // after revocation, and that's what the middleware will read.
+    db.revoke_session(&session.uuid).await.unwrap();
+    let s = db.lookup_session(&session.uuid).await.unwrap();
+    assert!(s.revoked);
+}
+
+#[tokio::test]
+async fn dummy_authenticator_password_check() {
+    let mut auth = DummyAuthenticator::new("dummy");
+    auth.add_user("alice", "open-sesame").unwrap();
+    let s = auth.authenticate("alice", "open-sesame").await.unwrap();
+    assert_eq!(s.sub, "alice");
+    auth.authenticate("alice", "wrong").await.unwrap_err();
+}
+
+#[tokio::test]
+async fn device_code_flow() {
+    let (db, _dir) = fresh_db().await;
+    let (p, _) = db.ensure_principal("dummy", "alice").await.unwrap();
+
+    let dc = db
+        .initiate_device_code(Duration::minutes(10), Duration::seconds(0))
+        .await
+        .unwrap();
+    assert_eq!(dc.user_code.len(), 17); // XXXXXXXX-XXXXXXXX (USER_CODE_LEN=8)
+    assert!(dc.principal_id.is_none());
+
+    // First poll: pending.
+    let st = db.poll_device_code(&dc.device_code).await.unwrap();
+    assert!(matches!(st, tiled_auth::device_code::DeviceStatus::Pending));
+
+    // Approve, then poll again: granted.
+    db.approve_device_code(&dc.user_code, p.id).await.unwrap();
+    let st = db.poll_device_code(&dc.device_code).await.unwrap();
+    match st {
+        tiled_auth::device_code::DeviceStatus::Granted(pid) => assert_eq!(pid, p.id),
+        _ => panic!("expected Granted"),
+    }
+
+    // After grant, the row is consumed; next poll fails to find it.
+    let err = db.poll_device_code(&dc.device_code).await.unwrap_err();
+    assert!(matches!(err, tiled_auth::AuthError::NotFound(_)));
+}
