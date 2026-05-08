@@ -92,17 +92,35 @@ pub enum CatalogCommand {
 
 #[derive(Subcommand)]
 pub enum ApiKeyCommand {
-    /// Create a new API key
+    /// Create a new API key. Prints the plaintext secret exactly once;
+    /// the server only stores its Argon2id hash.
     Create {
-        /// Optional note for the key
+        /// Auth DB URI (e.g. sqlite:///var/lib/tiled-auth.db).
+        #[arg(long, env = "TILED_AUTH_DB_URI")]
+        auth_db_uri: String,
+        /// Principal UUID this key belongs to. If absent, a fresh
+        /// service principal is created so the key can stand alone.
+        #[arg(long)]
+        principal: Option<String>,
+        /// Optional note describing the key (visible in `api-key list`).
         #[arg(long)]
         note: Option<String>,
+        /// Repeat to grant a scope. Default: full scope set.
+        #[arg(long = "scope")]
+        scopes: Vec<String>,
+        /// Expiration in seconds from now. None = never expires.
+        #[arg(long)]
+        expires_in: Option<i64>,
     },
-    /// List API keys
-    List,
-    /// Revoke an API key
+    /// List API keys.
+    List {
+        #[arg(long, env = "TILED_AUTH_DB_URI")]
+        auth_db_uri: String,
+    },
+    /// Revoke an API key by its first-eight prefix.
     Revoke {
-        /// First eight characters of the key
+        #[arg(long, env = "TILED_AUTH_DB_URI")]
+        auth_db_uri: String,
         first_eight: String,
     },
 }
@@ -346,22 +364,188 @@ pub async fn run(command: Command) -> Result<()> {
         }
         Command::Catalog { command } => match command {
             CatalogCommand::Init { uri } => {
-                anyhow::bail!("'catalog init' is not yet implemented (uri: {uri})")
+                tracing::info!("Initialising catalog at {}", redact_mongo_uri(&uri));
+                let cat = tiled_catalog::Catalog::connect(&uri)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+                cat.migrate()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("migrate: {e}"))?;
+                let applied = cat
+                    .applied_migrations()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("query migrations: {e}"))?;
+                println!("catalog initialised; applied migrations: {applied:?}");
+                Ok(())
             }
             CatalogCommand::UpgradeDatabase { uri } => {
-                anyhow::bail!("'catalog upgrade-database' is not yet implemented (uri: {uri})")
+                let cat = tiled_catalog::Catalog::connect(&uri)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("connect: {e}"))?;
+                cat.migrate()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("migrate: {e}"))?;
+                let applied = cat
+                    .applied_migrations()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("query migrations: {e}"))?;
+                println!("up-to-date; applied migrations: {applied:?}");
+                Ok(())
             }
         },
         Command::ApiKey { command } => match command {
-            ApiKeyCommand::Create { note: _ } => {
-                anyhow::bail!("'api-key create' is not yet implemented")
+            ApiKeyCommand::Create {
+                auth_db_uri,
+                principal,
+                note,
+                scopes,
+                expires_in,
+            } => {
+                let db = tiled_auth::AuthDb::connect(&auth_db_uri)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("auth db: {e}"))?;
+                db.migrate()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("auth migrate: {e}"))?;
+                let principal_id = match principal {
+                    Some(uuid) => {
+                        // Look up the existing principal by uuid; refuse
+                        // to mint a key for a stranger.
+                        find_principal_by_uuid(&db, &uuid)
+                            .await?
+                            .ok_or_else(|| anyhow::anyhow!("principal {uuid} not found"))?
+                    }
+                    None => {
+                        let p = db
+                            .create_principal("service")
+                            .await
+                            .map_err(|e| anyhow::anyhow!("principal: {e}"))?;
+                        eprintln!("created service principal {} for new key", p.uuid);
+                        p.id
+                    }
+                };
+                let scope_set = if scopes.is_empty() {
+                    tiled_auth::ScopeSet::full()
+                } else {
+                    let mut set = tiled_auth::ScopeSet::default();
+                    for s in &scopes {
+                        let scope = tiled_auth::Scope::parse(s)
+                            .ok_or_else(|| anyhow::anyhow!("unknown scope: {s}"))?;
+                        set.insert(scope);
+                    }
+                    set
+                };
+                let exp = expires_in.map(|s| {
+                    chrono::Utc::now() + chrono::Duration::seconds(s)
+                });
+                let material = db
+                    .create_api_key(tiled_auth::ApiKeyCreate {
+                        principal_id,
+                        note,
+                        scopes: scope_set,
+                        expiration_time: exp,
+                    })
+                    .await
+                    .map_err(|e| anyhow::anyhow!("create api key: {e}"))?;
+                println!("secret: {}", material.secret);
+                println!("first_eight: {}", material.record.first_eight);
+                println!(
+                    "scopes: {}",
+                    material
+                        .record
+                        .scopes
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                if let Some(t) = material.record.expiration_time {
+                    println!("expires_at: {t}");
+                }
+                eprintln!(
+                    "\n\
+                    NOTE: Save the secret above — the server only kept its hash, so this is \n\
+                    the only chance to copy it.",
+                );
+                Ok(())
             }
-            ApiKeyCommand::List => {
-                anyhow::bail!("'api-key list' is not yet implemented")
+            ApiKeyCommand::List { auth_db_uri } => {
+                let db = tiled_auth::AuthDb::connect(&auth_db_uri)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("auth db: {e}"))?;
+                db.migrate()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("auth migrate: {e}"))?;
+                let keys = db
+                    .list_api_keys(None)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("list: {e}"))?;
+                if keys.is_empty() {
+                    println!("(no keys)");
+                } else {
+                    println!(
+                        "{:<8} {:<6} {:<40} {:<24} expires",
+                        "PREFIX", "ID", "SCOPES", "NOTE"
+                    );
+                    for k in keys {
+                        let scopes: String = k
+                            .scopes
+                            .iter()
+                            .map(|s| s.as_str())
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        let note = k.note.unwrap_or_default();
+                        let exp = k
+                            .expiration_time
+                            .map(|t| t.to_rfc3339())
+                            .unwrap_or_else(|| "never".into());
+                        println!(
+                            "{:<8} {:<6} {:<40} {:<24} {}",
+                            k.first_eight, k.id, scopes, note, exp
+                        );
+                    }
+                }
+                Ok(())
             }
-            ApiKeyCommand::Revoke { first_eight: _ } => {
-                anyhow::bail!("'api-key revoke' is not yet implemented")
+            ApiKeyCommand::Revoke {
+                auth_db_uri,
+                first_eight,
+            } => {
+                let db = tiled_auth::AuthDb::connect(&auth_db_uri)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("auth db: {e}"))?;
+                db.migrate()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("auth migrate: {e}"))?;
+                let removed = db
+                    .revoke_api_key(&first_eight)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("revoke: {e}"))?;
+                println!("revoked api key {} (id={})", removed.first_eight, removed.id);
+                Ok(())
             }
         },
+    }
+}
+
+async fn find_principal_by_uuid(
+    db: &tiled_auth::AuthDb,
+    uuid: &str,
+) -> anyhow::Result<Option<i64>> {
+    use sqlx::Row;
+    use tiled_auth::db::AuthPool;
+    match db.pool() {
+        AuthPool::Sqlite(pool) => Ok(sqlx::query("SELECT id FROM principals WHERE uuid = ?")
+            .bind(uuid)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| anyhow::anyhow!("lookup: {e}"))?
+            .map(|r| r.get::<i64, _>("id"))),
+        AuthPool::Postgres(pool) => Ok(sqlx::query("SELECT id FROM principals WHERE uuid = $1")
+            .bind(uuid)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| anyhow::anyhow!("lookup: {e}"))?
+            .map(|r| r.get::<i64, _>("id"))),
     }
 }

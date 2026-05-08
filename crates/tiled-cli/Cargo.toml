@@ -21,3 +21,6 @@ bytes = { workspace = true }
 axum = { workspace = true }
 tiled-mongo = { workspace = true }
 tiled-catalog = { workspace = true }
+tiled-auth = { workspace = true }
+chrono = { workspace = true }
+sqlx = { workspace = true }
