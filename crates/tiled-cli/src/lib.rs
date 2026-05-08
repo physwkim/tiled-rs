@@ -100,6 +100,27 @@ pub enum ApiKeyCommand {
     },
 }
 
+/// Replace the password segment of a MongoDB URI with `***` so it's safe to
+/// log. Format: `scheme://[user[:password]@]host[/db][?opts]`. Leaves the
+/// rest of the URI intact so operators can still match logs against the
+/// configured host. If parsing fails (no `://`, no userinfo), returns the
+/// input unchanged — there's no password to leak.
+fn redact_mongo_uri(uri: &str) -> String {
+    let Some((scheme, rest)) = uri.split_once("://") else {
+        return uri.to_string();
+    };
+    let Some(at_idx) = rest.find('@') else {
+        return uri.to_string();
+    };
+    let userinfo = &rest[..at_idx];
+    let host_and_rest = &rest[at_idx + 1..];
+    let user = userinfo.split_once(':').map(|(u, _)| u).unwrap_or(userinfo);
+    if user.is_empty() && !userinfo.contains(':') {
+        return uri.to_string();
+    }
+    format!("{scheme}://{user}:***@{host_and_rest}")
+}
+
 /// Build a demo MapAdapter with sample arrays for testing.
 fn build_demo_tree() -> MapAdapter {
     let mut mapping = IndexMap::new();
@@ -233,7 +254,7 @@ pub async fn run(command: Command) -> Result<()> {
 
             let root_tree: Arc<dyn tiled_core::adapters::ContainerAdapter> =
                 if let Some(ref uri) = resolved_mongo_uri {
-                    tracing::info!("Connecting to MongoDB: {uri}");
+                    tracing::info!("Connecting to MongoDB: {}", redact_mongo_uri(uri));
                     let catalog = tiled_mongo::MongoCatalog::from_uri(uri)
                         .map_err(|e| anyhow::anyhow!("MongoDB connection failed: {e}"))?;
                     tracing::info!("MongoDB catalog loaded ({} runs)", catalog.len());
