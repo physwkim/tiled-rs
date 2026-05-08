@@ -37,13 +37,12 @@ pub fn build_app(state: AppState) -> Router {
         .route("/health", get(router::health))
         .route("/ready", get(router::ready));
 
-    // Auth endpoints — exempt from the auth middleware (you can't login
-    // through a wall that demands a login token).
-    let auth_routes = Router::new()
+    // Public auth endpoints — login/refresh/device/initiate must work
+    // without prior auth (otherwise login is unreachable). Each handler
+    // does its own credential check where required.
+    let public_auth = Router::new()
         .route("/api/v1/auth/{provider}/login", post(auth_router::login))
         .route("/api/v1/auth/refresh", post(auth_router::refresh))
-        .route("/api/v1/auth/logout", post(auth_router::logout))
-        .route("/api/v1/auth/whoami", get(auth_router::whoami))
         .route(
             "/api/v1/auth/device/initiate",
             post(auth_router::device_initiate),
@@ -51,7 +50,13 @@ pub fn build_app(state: AppState) -> Router {
         .route(
             "/api/v1/auth/device/token",
             post(auth_router::device_token),
-        )
+        );
+
+    // Authenticated auth endpoints — must run inside the auth middleware
+    // so AuthContext is populated.
+    let private_auth = Router::new()
+        .route("/api/v1/auth/logout", post(auth_router::logout))
+        .route("/api/v1/auth/whoami", get(auth_router::whoami))
         .route(
             "/api/v1/auth/device/approve",
             post(auth_router::device_approve),
@@ -85,13 +90,13 @@ pub fn build_app(state: AppState) -> Router {
         .route("/api/v1/data_source/{*path}", put(router::put_data_source))
         .route("/documents/{*path}", get(router::get_documents));
 
-    let api = api
-        .merge(auth_routes)
+    let guarded = api
+        .merge(private_auth)
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
         ));
-    app = app.merge(api);
+    app = app.merge(public_auth).merge(guarded);
 
     app.layer(axum::middleware::from_fn(timeout_middleware))
         .layer(CompressionLayer::new())

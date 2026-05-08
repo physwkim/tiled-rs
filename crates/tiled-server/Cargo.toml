@@ -31,6 +31,7 @@ tiled-core = { workspace = true }
 tiled-adapters = { workspace = true }
 tiled-serialization = { workspace = true }
 tiled-catalog = { workspace = true }
+tiled-auth = { workspace = true }
 serde_json = { workspace = true }
 axum = { workspace = true }
 tower = { workspace = true }
