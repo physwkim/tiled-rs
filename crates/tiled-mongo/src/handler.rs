@@ -260,16 +260,20 @@ impl FileHandler for Hdf5Handler {
             .map_err(|e| TiledError::Internal(format!("HDF5 dataset not found: {e}")))?;
 
         let full_shape: Vec<usize> = dataset.shape();
+        if full_shape.is_empty() {
+            return Err(TiledError::Validation(
+                "HDF5 dataset has zero rank — cannot index by point".into(),
+            ));
+        }
 
         let start = point_number * self.frame_per_point;
-        let end = (start + self.frame_per_point).min(full_shape[0]);
-
-        if full_shape.is_empty() || start >= full_shape[0] {
+        if start >= full_shape[0] {
             return Err(TiledError::Validation(format!(
                 "Point {point_number} out of range for dataset with {} frames",
-                full_shape.first().unwrap_or(&0)
+                full_shape[0]
             )));
         }
+        let end = (start + self.frame_per_point).min(full_shape[0]);
 
         // Build a hyperslab covering [start..end] on axis 0 and the full
         // extent on every other axis.
