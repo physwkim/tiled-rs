@@ -175,6 +175,58 @@ async fn duplicate_key_at_same_level_returns_422() {
 }
 
 #[tokio::test]
+async fn search_pushes_filters_to_sql() {
+    let (app, _dir) = build_test_app().await;
+
+    // Seed three nodes with different metadata.
+    for (key, plan, count) in [
+        ("a", "count", 3),
+        ("b", "scan", 7),
+        ("c", "count", 12),
+    ] {
+        let body = serde_json::json!({
+            "key": key,
+            "structure_family": "container",
+            "metadata": {"plan_name": plan, "num_points": count},
+            "specs": [],
+            "data_sources": [],
+        });
+        let (status, _) = json_request(&app, Method::POST, "/api/v1/register/", body).await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+
+    // filter[eq][condition][key]=plan_name & filter[eq][condition][value]="count"
+    let url = "/api/v1/search/?\
+        filter[eq][condition][key]=plan_name&\
+        filter[eq][condition][value]=%22count%22";
+    let (status, body) = json_request(&app, Method::GET, url, serde_json::Value::Null).await;
+    assert_eq!(status, StatusCode::OK, "search: {body}");
+    let ids: Vec<&str> = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["a", "c"]);
+    assert_eq!(body["meta"]["count"], 2);
+
+    // Comparison: num_points > 5 → b and c.
+    let url = "/api/v1/search/?\
+        filter[comparison][condition][operator]=gt&\
+        filter[comparison][condition][key]=num_points&\
+        filter[comparison][condition][value]=5";
+    let (status, body) = json_request(&app, Method::GET, url, serde_json::Value::Null).await;
+    assert_eq!(status, StatusCode::OK, "comparison: {body}");
+    let ids: Vec<&str> = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["b", "c"]);
+}
+
+#[tokio::test]
 async fn delete_root_rejected() {
     let (app, _dir) = build_test_app().await;
     let (status, _) = empty_request(&app, Method::DELETE, "/api/v1/metadata/").await;

@@ -196,6 +196,84 @@ pub async fn search(
         .collect();
     let queries = tiled_core::queries::decode_query_filters(&filter_params);
 
+    if let Some(ref catalog) = state.catalog {
+        // Push filters down to SQL — avoids materialising every child in
+        // memory, and (more importantly) avoids the CatalogAdapter cache
+        // which would otherwise return stale rows after a write.
+        let parent_id = if segments.is_empty() {
+            None
+        } else {
+            let parent = catalog
+                .lookup(&segments)
+                .await
+                .map_err(map_catalog_err)?
+                .ok_or_else(|| {
+                    ServerError::NotFound(format!("'{}' not found", segments.join("/")))
+                })?;
+            if parent.structure_family != "container" {
+                return Err(ServerError::Validation(format!(
+                    "'{}' is not a container",
+                    segments.join("/")
+                )));
+            }
+            Some(parent.id)
+        };
+
+        let (rows, total) = catalog
+            .search_children(parent_id, &queries, offset as i64, limit as i64)
+            .await
+            .map_err(map_catalog_err)?;
+        let logical_path = segments.join("/");
+        let path_trimmed = logical_path.trim_matches('/');
+        let entries: Vec<tiled_core::schemas::Resource> = rows
+            .into_iter()
+            .map(|node| {
+                let family = parse_structure_family(&node.structure_family).unwrap_or(
+                    tiled_core::structures::StructureFamily::Container,
+                );
+                let child_path = if path_trimmed.is_empty() {
+                    node.key.clone()
+                } else {
+                    format!("{path_trimmed}/{}", node.key)
+                };
+                let links = tiled_core::links::links_for_node(family, &base_url, &child_path);
+                tiled_core::schemas::Resource {
+                    id: node.key,
+                    attributes: tiled_core::schemas::NodeAttributes {
+                        ancestors: node.ancestors,
+                        structure_family: Some(family),
+                        specs: serde_json::from_value(node.specs).unwrap_or_default(),
+                        metadata: Some(node.metadata),
+                        structure: None,
+                        access_blob: Some(node.access_blob),
+                        sorting: None,
+                        data_sources: None,
+                    },
+                    links,
+                }
+            })
+            .collect();
+        let pagination = tiled_core::links::pagination_links(
+            &base_url,
+            "search",
+            &logical_path,
+            offset,
+            limit,
+            total as usize,
+        );
+        return Ok(Json(tiled_core::schemas::Response {
+            data: Some(entries),
+            error: None,
+            links: Some(serde_json::to_value(&pagination).unwrap_or_default()),
+            meta: Some(
+                serde_json::to_value(tiled_core::schemas::ContainerMeta {
+                    count: total as usize,
+                })
+                .unwrap_or_default(),
+            ),
+        }));
+    }
+
     // Walk + paginate on the blocking pool: container.search() / .get() may
     // call into MongoDB.
     let resp = tokio::task::spawn_blocking(move || -> Result<_, ServerError> {

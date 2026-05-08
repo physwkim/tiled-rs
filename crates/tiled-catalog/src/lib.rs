@@ -21,6 +21,7 @@ pub mod error;
 pub mod migrate;
 pub mod node;
 pub mod orm;
+pub mod search;
 
 pub use adapter::CatalogAdapter;
 pub use data_source::{AssetRecord, DataSourceRecord};
