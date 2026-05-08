@@ -173,9 +173,9 @@ impl BuiltinDType {
             (rest, None)
         };
 
-        let size: usize = size_str.parse().map_err(|_| {
-            TiledError::InvalidDType(format!("Cannot parse itemsize from '{s}'"))
-        })?;
+        let size: usize = size_str
+            .parse()
+            .map_err(|_| TiledError::InvalidDType(format!("Cannot parse itemsize from '{s}'")))?;
 
         // Unicode stores UCS4 (4 bytes per char), but numpy string format uses char count
         let itemsize = if kind == Kind::Unicode {
@@ -403,7 +403,10 @@ pub struct ArrowTable {
 }
 
 impl ArrowTable {
-    pub fn new(batches: Vec<arrow::array::RecordBatch>, schema: arrow::datatypes::SchemaRef) -> Self {
+    pub fn new(
+        batches: Vec<arrow::array::RecordBatch>,
+        schema: arrow::datatypes::SchemaRef,
+    ) -> Self {
         Self { batches, schema }
     }
 
@@ -419,7 +422,11 @@ impl ArrowTable {
 
     /// Column names.
     pub fn column_names(&self) -> Vec<&str> {
-        self.schema.fields().iter().map(|f| f.name().as_str()).collect()
+        self.schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect()
     }
 }
 

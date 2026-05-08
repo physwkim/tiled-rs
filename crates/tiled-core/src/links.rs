@@ -105,8 +105,14 @@ mod tests {
     #[test]
     fn test_links_for_container_root() {
         let links = links_for_node(StructureFamily::Container, "http://localhost:8000", "");
-        assert_eq!(links.self_link.as_deref(), Some("http://localhost:8000/api/v1/metadata/"));
-        assert_eq!(links.search.as_deref(), Some("http://localhost:8000/api/v1/search/"));
+        assert_eq!(
+            links.self_link.as_deref(),
+            Some("http://localhost:8000/api/v1/metadata/")
+        );
+        assert_eq!(
+            links.search.as_deref(),
+            Some("http://localhost:8000/api/v1/search/")
+        );
     }
 
     #[test]

@@ -5,7 +5,7 @@
 use std::sync::{Arc, OnceLock};
 
 use indexmap::IndexMap;
-use mongodb::bson::{doc, Document};
+use mongodb::bson::{Document, doc};
 use mongodb::sync::Database;
 
 use tiled_core::adapters::{AnyAdapter, BaseAdapter, ContainerAdapter};
@@ -27,11 +27,7 @@ pub struct BlueskyRunAdapter {
 }
 
 impl BlueskyRunAdapter {
-    pub fn new(
-        db: Database,
-        start_doc: Document,
-        stop_doc: Option<Document>,
-    ) -> Self {
+    pub fn new(db: Database, start_doc: Document, stop_doc: Option<Document>) -> Self {
         Self::with_handlers(db, start_doc, stop_doc, Arc::new(HandlerRegistry::new()))
     }
 
@@ -75,24 +71,14 @@ impl BlueskyRunAdapter {
             let uid = self.uid().to_string();
 
             // Create filler for external data resolution.
-            let filler = Arc::new(Filler::new(
-                self.db.clone(),
-                self.handler_registry.clone(),
-            ));
+            let filler = Arc::new(Filler::new(self.db.clone(), self.handler_registry.clone()));
 
             let collection = self.db.collection::<Document>("event_descriptor");
             if let Ok(cursor) = collection.find(doc! { "run_start": &uid }).run() {
-                let mut descriptors_by_stream: IndexMap<String, Vec<Document>> =
-                    IndexMap::new();
+                let mut descriptors_by_stream: IndexMap<String, Vec<Document>> = IndexMap::new();
                 for desc in cursor.flatten() {
-                    let name = desc
-                        .get_str("name")
-                        .unwrap_or("primary")
-                        .to_string();
-                    descriptors_by_stream
-                        .entry(name)
-                        .or_default()
-                        .push(desc);
+                    let name = desc.get_str("name").unwrap_or("primary").to_string();
+                    descriptors_by_stream.entry(name).or_default().push(desc);
                 }
 
                 // Determine cutoff seq_num from the stop document.

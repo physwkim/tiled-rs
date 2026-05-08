@@ -9,8 +9,8 @@
 
 use std::sync::Arc;
 
-use reqwest::{Client, Method, RequestBuilder, Response};
 use reqwest::header::{HeaderMap, HeaderValue};
+use reqwest::{Client, Method, RequestBuilder, Response};
 use tokio::sync::RwLock;
 use url::Url;
 
@@ -234,10 +234,9 @@ impl Context {
         }
         if let Some(auth) = self.auth().await {
             if let Some(h) = auth.auth_header().await {
-                return Ok(Some(
-                    HeaderValue::from_str(&h)
-                        .map_err(|e| ClientError::Invalid(format!("invalid bearer: {e}")))?,
-                ));
+                return Ok(Some(HeaderValue::from_str(&h).map_err(|e| {
+                    ClientError::Invalid(format!("invalid bearer: {e}"))
+                })?));
             }
         }
         Ok(None)
@@ -265,7 +264,9 @@ impl Context {
             return Ok(resp);
         }
         let auth = self.auth().await;
-        let Some(a) = auth else { return Ok(resp); };
+        let Some(a) = auth else {
+            return Ok(resp);
+        };
         a.refresh(&self.inner.http).await?;
 
         // Build the original request, override Authorization in-place.
@@ -276,7 +277,9 @@ impl Context {
             .map_err(ClientError::from)?;
         request.headers_mut().remove(reqwest::header::AUTHORIZATION);
         if let Some(v) = self.auth_header_value().await? {
-            request.headers_mut().insert(reqwest::header::AUTHORIZATION, v);
+            request
+                .headers_mut()
+                .insert(reqwest::header::AUTHORIZATION, v);
         }
         Ok(self.inner.http.execute(request).await?)
     }
@@ -294,7 +297,8 @@ impl Context {
 
     /// Send a GET, applying default headers + auth and the msgpack Accept.
     pub async fn get(&self, url: &Url) -> Result<Response> {
-        self.get_with_accept(url, crate::utils::MSGPACK_MIME_TYPE).await
+        self.get_with_accept(url, crate::utils::MSGPACK_MIME_TYPE)
+            .await
     }
 
     /// Send a GET with a caller-chosen Accept. Cache lookup keys by
@@ -379,11 +383,7 @@ impl Context {
         Ok(resp.bytes().await?)
     }
 
-    pub async fn post_json(
-        &self,
-        url: &Url,
-        body: &serde_json::Value,
-    ) -> Result<Response> {
+    pub async fn post_json(&self, url: &Url, body: &serde_json::Value) -> Result<Response> {
         let req = self.request(Method::POST, url).await?.json(body);
         let req = self.add_csrf(req).await;
         let resp = self.send_with_auth(req).await?;
@@ -396,11 +396,7 @@ impl Context {
         Ok(resp)
     }
 
-    pub async fn patch_json(
-        &self,
-        url: &Url,
-        body: &serde_json::Value,
-    ) -> Result<Response> {
+    pub async fn patch_json(&self, url: &Url, body: &serde_json::Value) -> Result<Response> {
         let req = self.request(Method::PATCH, url).await?.json(body);
         let req = self.add_csrf(req).await;
         let resp = self.send_with_auth(req).await?;
@@ -479,17 +475,14 @@ impl Context {
             .authentication
             .providers
             .iter()
-            .filter_map(|v| {
-                crate::auth::AuthProvider::from_json(v, Some(&self.inner.api_uri)).ok()
-            })
+            .filter_map(|v| crate::auth::AuthProvider::from_json(v, Some(&self.inner.api_uri)).ok())
             .collect();
         if providers.is_empty() {
             return Err(ClientError::AuthRequired(
                 "server has no authentication providers".into(),
             ));
         }
-        let tokens =
-            crate::auth::prompt_for_credentials(&self.inner.http, &providers).await?;
+        let tokens = crate::auth::prompt_for_credentials(&self.inner.http, &providers).await?;
         self.configure_auth(tokens, remember_me).await
     }
 
@@ -591,9 +584,7 @@ impl Context {
             .as_ref()
             .and_then(|l| l.get("whoami").and_then(|v| v.as_str()))
             .ok_or_else(|| {
-                ClientError::Invalid(
-                    "server does not advertise authentication.links.whoami".into(),
-                )
+                ClientError::Invalid("server does not advertise authentication.links.whoami".into())
             })?;
         let url = self.resolve_link(url)?;
         let resp = self.get(&url).await?;
@@ -731,8 +722,7 @@ mod tests {
 
     #[test]
     fn from_uri_strips_node_path() {
-        let (ctx, parts) =
-            Context::from_uri("http://localhost:8000/api/v1/foo/bar").unwrap();
+        let (ctx, parts) = Context::from_uri("http://localhost:8000/api/v1/foo/bar").unwrap();
         assert_eq!(parts, vec!["foo".to_string(), "bar".to_string()]);
         assert_eq!(ctx.api_uri().as_str(), "http://localhost:8000/api/v1/");
     }
@@ -746,8 +736,7 @@ mod tests {
 
     #[test]
     fn from_uri_sub_path_host() {
-        let (ctx, parts) =
-            Context::from_uri("https://example.com/tiled/api/v1/foo/bar").unwrap();
+        let (ctx, parts) = Context::from_uri("https://example.com/tiled/api/v1/foo/bar").unwrap();
         assert_eq!(parts, vec!["foo".to_string(), "bar".to_string()]);
         assert_eq!(ctx.api_uri().as_str(), "https://example.com/tiled/api/v1/");
     }
@@ -761,8 +750,7 @@ mod tests {
 
     #[tokio::test]
     async fn from_uri_promotes_api_key_to_state() {
-        let (ctx, _) =
-            Context::from_uri("http://localhost:8000/?api_key=secret").unwrap();
+        let (ctx, _) = Context::from_uri("http://localhost:8000/?api_key=secret").unwrap();
         assert_eq!(ctx.api_key().await.as_deref(), Some("secret"));
     }
 }

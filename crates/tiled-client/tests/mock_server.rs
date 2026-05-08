@@ -9,13 +9,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use axum::Json;
 use axum::Router;
 use axum::extract::{Path, State};
 use axum::http::header::{AUTHORIZATION, CACHE_CONTROL, SET_COOKIE};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
-use axum::Json;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 
@@ -83,8 +83,7 @@ async fn post_json_round_trip() {
     let base = spawn(app).await;
 
     let (ctx, _) = Context::from_uri(&base).unwrap();
-    let url =
-        url::Url::parse(&format!("{base}/api/v1/register/bluesky")).unwrap();
+    let url = url::Url::parse(&format!("{base}/api/v1/register/bluesky")).unwrap();
     let body = serde_json::json!({
         "structure_family": "container",
         "metadata": {"start": {"uid": "abc"}},
@@ -108,10 +107,7 @@ async fn cache_serves_second_get_without_calling_server() {
     async fn handle_about(State(c): State<Arc<AtomicU32>>) -> impl IntoResponse {
         c.fetch_add(1, Ordering::SeqCst);
         let body = about_payload();
-        (
-            [(CACHE_CONTROL, "public, max-age=3600")],
-            Json(body),
-        )
+        ([(CACHE_CONTROL, "public, max-age=3600")], Json(body))
     }
     let app = Router::new()
         .route("/api/v1/", get(handle_about))
@@ -119,11 +115,8 @@ async fn cache_serves_second_get_without_calling_server() {
     let base = spawn(app).await;
 
     let cache = HttpCache::in_memory(1024 * 1024);
-    let (ctx, _) = Context::from_uri_with_options(
-        &base,
-        ContextOptions::default().cache(cache),
-    )
-    .unwrap();
+    let (ctx, _) =
+        Context::from_uri_with_options(&base, ContextOptions::default().cache(cache)).unwrap();
     let _ = ctx.server_info().await.unwrap();
     // Second call should be served from cache.
     let url = url::Url::parse(&format!("{base}/api/v1/")).unwrap();
@@ -158,11 +151,8 @@ async fn cache_keys_by_accept() {
     let base = spawn(app).await;
 
     let cache = HttpCache::in_memory(1024 * 1024);
-    let (ctx, _) = Context::from_uri_with_options(
-        &base,
-        ContextOptions::default().cache(cache),
-    )
-    .unwrap();
+    let (ctx, _) =
+        Context::from_uri_with_options(&base, ContextOptions::default().cache(cache)).unwrap();
     let url = url::Url::parse(&format!("{base}/api/v1/data")).unwrap();
     let b1 = ctx.get_bytes(&url, "application/json").await.unwrap();
     let b2 = ctx.get_bytes(&url, "application/x-msgpack").await.unwrap();
@@ -191,8 +181,7 @@ async fn auth_refresh_on_401_replaces_authorization() {
 
     async fn handle_about() -> impl IntoResponse {
         let mut about = about_payload();
-        about["authentication"]["links"]["refresh_session"] =
-            "auth/session/refresh".into();
+        about["authentication"]["links"]["refresh_session"] = "auth/session/refresh".into();
         ([(SET_COOKIE, "tiled_csrf=csrf-token; Path=/")], Json(about))
     }
 
@@ -209,7 +198,9 @@ async fn auth_refresh_on_401_replaces_authorization() {
         if all.len() > 1 {
             return (StatusCode::BAD_REQUEST, "duplicate Authorization header").into_response();
         }
-        let val = all.first().map(|b| std::str::from_utf8(b).unwrap_or(""))
+        let val = all
+            .first()
+            .map(|b| std::str::from_utf8(b).unwrap_or(""))
             .unwrap_or("");
         if val == "Bearer old-token" {
             state.seen_old.fetch_add(1, Ordering::SeqCst);
@@ -317,7 +308,14 @@ async fn client_resolver_emits_custom_variant() {
             item: &Item,
             _include_data_sources: bool,
         ) -> Option<tiled_client::Result<std::sync::Arc<dyn Any + Send + Sync>>> {
-            if item.attributes.specs.as_deref().unwrap_or(&[]).iter().any(|s| s.name == "xarray_dataset") {
+            if item
+                .attributes
+                .specs
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .any(|s| s.name == "xarray_dataset")
+            {
                 Some(Ok(std::sync::Arc::new(DatasetFlavored(item.id.clone()))))
             } else {
                 None
@@ -354,8 +352,7 @@ async fn client_resolver_emits_custom_variant() {
     .unwrap();
     let url = url::Url::parse(&format!("{base}/api/v1/metadata/")).unwrap();
     let resp = ctx.get(&url).await.unwrap();
-    let envelope: serde_json::Value =
-        tiled_client::utils::decode_response(resp).await.unwrap();
+    let envelope: serde_json::Value = tiled_client::utils::decode_response(resp).await.unwrap();
     let item: Item = serde_json::from_value(envelope["data"].clone()).unwrap();
     let any = AnyClient::from_item(ctx, item, false).unwrap();
     let custom: &DatasetFlavored = any.as_custom().expect("custom variant");
@@ -373,10 +370,7 @@ async fn revalidation_with_304_serves_cached_body() {
 
     let counter: Arc<AtomicU32> = Arc::new(AtomicU32::new(0));
 
-    async fn handle(
-        State(c): State<Arc<AtomicU32>>,
-        headers: HeaderMap,
-    ) -> impl IntoResponse {
+    async fn handle(State(c): State<Arc<AtomicU32>>, headers: HeaderMap) -> impl IntoResponse {
         let n = c.fetch_add(1, Ordering::SeqCst);
         // First request: full 200 with ETag + max-age=0 (forces revalidate next time).
         if n == 0 {
@@ -412,23 +406,29 @@ async fn revalidation_with_304_serves_cached_body() {
     let base = spawn(app).await;
 
     let cache = HttpCache::in_memory(1024 * 1024);
-    let (ctx, _) = Context::from_uri_with_options(
-        &base,
-        ContextOptions::default().cache(cache),
-    )
-    .unwrap();
+    let (ctx, _) =
+        Context::from_uri_with_options(&base, ContextOptions::default().cache(cache)).unwrap();
     let url = url::Url::parse(&format!("{base}/api/v1/data")).unwrap();
     // First fetch: 200 from origin.
-    let b1 = ctx.get_bytes(&url, "application/octet-stream").await.unwrap();
+    let b1 = ctx
+        .get_bytes(&url, "application/octet-stream")
+        .await
+        .unwrap();
     assert_eq!(&b1[..], b"hello-body");
     // Second fetch: cache stale (max-age=0) → If-None-Match → 304 → cached body.
-    let b2 = ctx.get_bytes(&url, "application/octet-stream").await.unwrap();
+    let b2 = ctx
+        .get_bytes(&url, "application/octet-stream")
+        .await
+        .unwrap();
     assert_eq!(&b2[..], b"hello-body");
     // Both went to origin, but body content remained the cached one.
     assert_eq!(counter.load(Ordering::SeqCst), 2);
     // Third fetch: now the 304 response had max-age=60, so we serve from cache
     // without hitting origin.
-    let b3 = ctx.get_bytes(&url, "application/octet-stream").await.unwrap();
+    let b3 = ctx
+        .get_bytes(&url, "application/octet-stream")
+        .await
+        .unwrap();
     assert_eq!(&b3[..], b"hello-body");
     assert_eq!(counter.load(Ordering::SeqCst), 2);
 }
@@ -441,9 +441,7 @@ async fn revalidation_with_304_serves_cached_body() {
 async fn post_invalidates_cached_get_for_same_url() {
     let counter: Arc<AtomicU32> = Arc::new(AtomicU32::new(0));
 
-    async fn handle_get(
-        State(c): State<Arc<AtomicU32>>,
-    ) -> impl IntoResponse {
+    async fn handle_get(State(c): State<Arc<AtomicU32>>) -> impl IntoResponse {
         let n = c.fetch_add(1, Ordering::SeqCst);
         let body = format!("v{n}");
         (
@@ -456,30 +454,35 @@ async fn post_invalidates_cached_get_for_same_url() {
     }
 
     let app = Router::new()
-        .route(
-            "/api/v1/thing",
-            get(handle_get).post(handle_post),
-        )
+        .route("/api/v1/thing", get(handle_get).post(handle_post))
         .with_state(counter.clone());
     let base = spawn(app).await;
 
     let cache = HttpCache::in_memory(1024 * 1024);
-    let (ctx, _) = Context::from_uri_with_options(
-        &base,
-        ContextOptions::default().cache(cache),
-    )
-    .unwrap();
+    let (ctx, _) =
+        Context::from_uri_with_options(&base, ContextOptions::default().cache(cache)).unwrap();
     let url = url::Url::parse(&format!("{base}/api/v1/thing")).unwrap();
-    let b1 = ctx.get_bytes(&url, "application/octet-stream").await.unwrap();
+    let b1 = ctx
+        .get_bytes(&url, "application/octet-stream")
+        .await
+        .unwrap();
     assert_eq!(&b1[..], b"v0");
     // Second GET: served from cache.
-    let b2 = ctx.get_bytes(&url, "application/octet-stream").await.unwrap();
+    let b2 = ctx
+        .get_bytes(&url, "application/octet-stream")
+        .await
+        .unwrap();
     assert_eq!(&b2[..], b"v0");
     assert_eq!(counter.load(Ordering::SeqCst), 1);
     // POST invalidates the cached GET.
-    ctx.post_json(&url, &serde_json::json!({"x": 1})).await.unwrap();
+    ctx.post_json(&url, &serde_json::json!({"x": 1}))
+        .await
+        .unwrap();
     // Next GET goes back to origin.
-    let b3 = ctx.get_bytes(&url, "application/octet-stream").await.unwrap();
+    let b3 = ctx
+        .get_bytes(&url, "application/octet-stream")
+        .await
+        .unwrap();
     assert_eq!(&b3[..], b"v1");
     assert_eq!(counter.load(Ordering::SeqCst), 2);
 }

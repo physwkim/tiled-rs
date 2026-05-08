@@ -2,7 +2,7 @@
 //!
 //! Mirrors `tiled/client/constructors.py`.
 
-use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
+use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use serde::Deserialize;
 use url::Url;
 
@@ -13,8 +13,17 @@ use crate::error::{ClientError, Result};
 use crate::utils::{decode_response, retry};
 
 const PATH_SEGMENT: &AsciiSet = &CONTROLS
-    .add(b' ').add(b'"').add(b'<').add(b'>').add(b'#').add(b'?')
-    .add(b'`').add(b'{').add(b'}').add(b'/').add(b'%');
+    .add(b' ')
+    .add(b'"')
+    .add(b'<')
+    .add(b'>')
+    .add(b'#')
+    .add(b'?')
+    .add(b'`')
+    .add(b'{')
+    .add(b'}')
+    .add(b'/')
+    .add(b'%');
 
 /// Connect to a Tiled server and return the client at the requested path.
 ///

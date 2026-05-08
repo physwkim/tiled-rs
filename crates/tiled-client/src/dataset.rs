@@ -22,11 +22,7 @@ pub struct Variable {
 }
 
 impl Variable {
-    fn ensure_dtype(
-        &self,
-        kind: tiled_core::dtype::Kind,
-        itemsize: usize,
-    ) -> Option<&[u8]> {
+    fn ensure_dtype(&self, kind: tiled_core::dtype::Kind, itemsize: usize) -> Option<&[u8]> {
         // Tiled servers consistently emit little-endian array buffers.
         match &self.dtype {
             DType::Builtin(b)

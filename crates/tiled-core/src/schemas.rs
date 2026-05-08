@@ -369,9 +369,7 @@ mod tests {
         let about = About {
             api_version: 0,
             library_version: "0.1.0".into(),
-            formats: HashMap::from([
-                ("array".into(), vec!["application/octet-stream".into()]),
-            ]),
+            formats: HashMap::from([("array".into(), vec!["application/octet-stream".into()])]),
             aliases: HashMap::new(),
             queries: vec!["fulltext".into(), "lookup".into()],
             authentication: AboutAuthentication {
@@ -379,9 +377,7 @@ mod tests {
                 providers: vec![],
                 links: None,
             },
-            links: HashMap::from([
-                ("self".into(), "http://localhost:8000/api/v1/".into()),
-            ]),
+            links: HashMap::from([("self".into(), "http://localhost:8000/api/v1/".into())]),
             meta: HashMap::new(),
         };
         let json = serde_json::to_value(&about).unwrap();
@@ -395,9 +391,15 @@ mod tests {
     fn test_pagination_links() {
         let links = PaginationLinks {
             self_link: "http://localhost:8000/api/v1/search/?page[offset]=0&page[limit]=10".into(),
-            first: Some("http://localhost:8000/api/v1/search/?page[offset]=0&page[limit]=10".into()),
-            last: Some("http://localhost:8000/api/v1/search/?page[offset]=90&page[limit]=10".into()),
-            next: Some("http://localhost:8000/api/v1/search/?page[offset]=10&page[limit]=10".into()),
+            first: Some(
+                "http://localhost:8000/api/v1/search/?page[offset]=0&page[limit]=10".into(),
+            ),
+            last: Some(
+                "http://localhost:8000/api/v1/search/?page[offset]=90&page[limit]=10".into(),
+            ),
+            next: Some(
+                "http://localhost:8000/api/v1/search/?page[offset]=10&page[limit]=10".into(),
+            ),
             prev: None,
         };
         let json = serde_json::to_value(&links).unwrap();

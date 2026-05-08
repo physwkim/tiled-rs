@@ -87,14 +87,10 @@ pub async fn handle_error(resp: Response) -> Result<Response> {
     let body = resp.text().await.unwrap_or_default();
 
     if status == 410 {
-        return Err(ClientError::KeyNotFound(format!(
-            "broken link: {body}"
-        )));
+        return Err(ClientError::KeyNotFound(format!("broken link: {body}")));
     }
     if status == 401 || status == 403 {
-        return Err(ClientError::AuthRequired(format!(
-            "{status}: {body}"
-        )));
+        return Err(ClientError::AuthRequired(format!("{status}: {body}")));
     }
 
     let detail = if ctype.starts_with(JSON_MIME_TYPE) {
@@ -142,9 +138,7 @@ where
             Err(e) if !is_transient(&e) => return Err(e),
             Err(e) => {
                 attempt += 1;
-                if attempt >= DEFAULT_RETRY_ATTEMPTS
-                    || tokio::time::Instant::now() >= deadline
-                {
+                if attempt >= DEFAULT_RETRY_ATTEMPTS || tokio::time::Instant::now() >= deadline {
                     return Err(e);
                 }
                 tracing::warn!(target: "tiled.client", attempt, %e, "retrying");

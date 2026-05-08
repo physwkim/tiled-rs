@@ -292,10 +292,7 @@ impl HttpCache {
     }
 
     /// In-place variant: caller already holds both locks.
-    async fn ensure_loaded_locked(
-        backend: &mut Backend,
-        used: &mut usize,
-    ) -> Result<()> {
+    async fn ensure_loaded_locked(backend: &mut Backend, used: &mut usize) -> Result<()> {
         if let Backend::Sqlite(b) = backend {
             if b.pool.is_none() {
                 let pool = open_pool(&b.path).await?;
@@ -363,7 +360,11 @@ impl HttpCache {
         let expires_at = Utc::now() + chrono::Duration::seconds(max_age as i64);
 
         let bytes = resp.bytes().await?;
-        let size = bytes.len() + headers.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>();
+        let size = bytes.len()
+            + headers
+                .iter()
+                .map(|(k, v)| k.len() + v.len())
+                .sum::<usize>();
         let entry = CacheEntry {
             url: url.as_str().to_string(),
             accept: accept.to_string(),
@@ -639,11 +640,7 @@ impl HttpCache {
     }
 }
 
-fn rebuild_response(
-    status: u16,
-    headers: &[(String, String)],
-    body: Bytes,
-) -> Result<Response> {
+fn rebuild_response(status: u16, headers: &[(String, String)], body: Bytes) -> Result<Response> {
     let mut builder = http::Response::builder().status(status);
     for (k, v) in headers {
         if let Ok(val) = HeaderValue::from_str(v) {
@@ -748,9 +745,7 @@ async fn delete_entry(pool: &SqlitePool, url: &str, accept: &str) -> Result<()> 
     Ok(())
 }
 
-async fn load_all_entries(
-    pool: &SqlitePool,
-) -> Result<(HashMap<String, CacheEntry>, usize)> {
+async fn load_all_entries(pool: &SqlitePool) -> Result<(HashMap<String, CacheEntry>, usize)> {
     use sqlx::Row;
     let rows = sqlx::query(
         "SELECT url, accept, status, headers, body, expires_at, must_revalidate, no_cache,
@@ -773,8 +768,7 @@ async fn load_all_entries(
         let must_revalidate: i64 = row.try_get("must_revalidate").map_err(map_sqlx_err)?;
         let no_cache: i64 = row.try_get("no_cache").map_err(map_sqlx_err)?;
         let etag: Option<String> = row.try_get("etag").map_err(map_sqlx_err)?;
-        let last_modified: Option<String> =
-            row.try_get("last_modified").map_err(map_sqlx_err)?;
+        let last_modified: Option<String> = row.try_get("last_modified").map_err(map_sqlx_err)?;
         let vary_json: String = row.try_get("vary").map_err(map_sqlx_err)?;
         let stored_str: String = row.try_get("stored_at").map_err(map_sqlx_err)?;
         let size_bytes: i64 = row.try_get("size_bytes").map_err(map_sqlx_err)?;
@@ -881,7 +875,9 @@ mod tests {
         drop(pool);
 
         // sqlite_with_load (eager): reload + assert.
-        let cache = HttpCache::sqlite_with_load(&path, 1024 * 1024).await.unwrap();
+        let cache = HttpCache::sqlite_with_load(&path, 1024 * 1024)
+            .await
+            .unwrap();
         assert_eq!(cache.used_bytes().await, entry.size_bytes);
         let url = Url::parse("http://test/a").unwrap();
         let resp = cache.try_get(&url, "application/x-msgpack").await.unwrap();
@@ -891,8 +887,16 @@ mod tests {
 
         // Invalidating removes from disk too — across all accept variants.
         cache.invalidate(&url).await.unwrap();
-        let cache2 = HttpCache::sqlite_with_load(&path, 1024 * 1024).await.unwrap();
-        assert!(cache2.try_get(&url, "application/x-msgpack").await.unwrap().is_none());
+        let cache2 = HttpCache::sqlite_with_load(&path, 1024 * 1024)
+            .await
+            .unwrap();
+        assert!(
+            cache2
+                .try_get(&url, "application/x-msgpack")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -902,7 +906,9 @@ mod tests {
         // Pre-populate the file out-of-band.
         let pool = open_pool(&path).await.unwrap();
         ensure_schema(&pool).await.unwrap();
-        upsert_entry(&pool, &dummy_entry("http://test/a", b"x")).await.unwrap();
+        upsert_entry(&pool, &dummy_entry("http://test/a", b"x"))
+            .await
+            .unwrap();
         drop(pool);
 
         // sync ctor: should auto-load on first try_get and not silently overwrite.
@@ -926,12 +932,22 @@ mod tests {
         upsert_entry(&pool, &b).await.unwrap();
         drop(pool);
 
-        let cache = HttpCache::sqlite_with_load(&path, 1024 * 1024).await.unwrap();
+        let cache = HttpCache::sqlite_with_load(&path, 1024 * 1024)
+            .await
+            .unwrap();
         let url = Url::parse("http://test/x").unwrap();
-        let r1 = cache.try_get(&url, "application/x-msgpack").await.unwrap().unwrap();
+        let r1 = cache
+            .try_get(&url, "application/x-msgpack")
+            .await
+            .unwrap()
+            .unwrap();
         let body1 = r1.bytes().await.unwrap();
         assert_eq!(&body1[..], b"msgpack-body");
-        let r2 = cache.try_get(&url, "application/json").await.unwrap().unwrap();
+        let r2 = cache
+            .try_get(&url, "application/json")
+            .await
+            .unwrap()
+            .unwrap();
         let body2 = r2.bytes().await.unwrap();
         assert_eq!(&body2[..], b"json-body");
     }
@@ -948,12 +964,16 @@ mod tests {
         }
         drop(pool);
 
-        let cache = HttpCache::sqlite_with_load(&path, 1024 * 1024).await.unwrap();
+        let cache = HttpCache::sqlite_with_load(&path, 1024 * 1024)
+            .await
+            .unwrap();
         assert!(cache.used_bytes().await > 0);
         cache.clear().await.unwrap();
         assert_eq!(cache.used_bytes().await, 0);
 
-        let cache2 = HttpCache::sqlite_with_load(&path, 1024 * 1024).await.unwrap();
+        let cache2 = HttpCache::sqlite_with_load(&path, 1024 * 1024)
+            .await
+            .unwrap();
         assert_eq!(cache2.used_bytes().await, 0);
     }
 }

@@ -132,9 +132,15 @@ impl ArrayStructure {
             .filter_map(|v| v.as_u64().map(|n| n as usize))
             .collect();
 
-        let dims = value.get("dims").filter(|v| !v.is_null())
+        let dims = value
+            .get("dims")
+            .filter(|v| !v.is_null())
             .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|x| x.as_str().map(String::from)).collect());
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            });
 
         let resizable = value
             .get("resizable")
@@ -303,9 +309,15 @@ impl SparseStructure {
                 ))
             });
 
-        let dims = value.get("dims").filter(|v| !v.is_null())
+        let dims = value
+            .get("dims")
+            .filter(|v| !v.is_null())
             .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|x| x.as_str().map(String::from)).collect());
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            });
 
         let resizable = value
             .get("resizable")

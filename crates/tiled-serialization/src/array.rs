@@ -32,10 +32,7 @@ pub fn register_array_serializers(registry: &SerializationRegistry) {
             if itemsize == 0 {
                 return Err("itemsize must be > 0".into());
             }
-            let kind = metadata
-                .get("kind")
-                .and_then(|v| v.as_str())
-                .unwrap_or("f");
+            let kind = metadata.get("kind").and_then(|v| v.as_str()).unwrap_or("f");
 
             let mut output = String::new();
             let num_elements = data.len() / itemsize;

@@ -20,15 +20,15 @@ use tiled_core::error::{Result, TiledError};
 pub trait FileHandler: Send + Sync {
     /// Read a single datum from the file.
     /// Returns raw bytes in C-contiguous order + shape.
-    fn read(
-        &self,
-        datum_kwargs: &serde_json::Value,
-    ) -> Result<(Vec<u8>, Vec<usize>)>;
+    fn read(&self, datum_kwargs: &serde_json::Value) -> Result<(Vec<u8>, Vec<usize>)>;
 }
 
 /// Registry of spec → handler factory.
 pub struct HandlerRegistry {
-    factories: HashMap<String, Arc<dyn Fn(&str, &str, &serde_json::Value) -> Result<Box<dyn FileHandler>> + Send + Sync>>,
+    factories: HashMap<
+        String,
+        Arc<dyn Fn(&str, &str, &serde_json::Value) -> Result<Box<dyn FileHandler>> + Send + Sync>,
+    >,
     root_map: HashMap<String, String>,
 }
 
@@ -96,11 +96,7 @@ impl HandlerRegistry {
         resource_kwargs: &serde_json::Value,
     ) -> Result<Box<dyn FileHandler>> {
         // Apply root_map if applicable.
-        let resolved_root = self
-            .root_map
-            .get(root)
-            .map(|s| s.as_str())
-            .unwrap_or(root);
+        let resolved_root = self.root_map.get(root).map(|s| s.as_str()).unwrap_or(root);
 
         let factory = self.factories.get(spec).ok_or_else(|| {
             TiledError::Validation(format!("No handler registered for spec: {spec}"))
@@ -173,13 +169,17 @@ fn read_npy_file(path: &str) -> Result<(Vec<u8>, Vec<usize>)> {
     // NPY format: 6-byte magic + 2-byte version + 2-byte header_len + header + data
     // Minimal parsing: skip the header, return raw data bytes.
     if data.len() < 10 || &data[..6] != b"\x93NUMPY" {
-        return Err(TiledError::Validation(format!("Not a valid .npy file: {path}")));
+        return Err(TiledError::Validation(format!(
+            "Not a valid .npy file: {path}"
+        )));
     }
 
     let header_len = u16::from_le_bytes([data[8], data[9]]) as usize;
     let header_end = 10 + header_len;
     if data.len() < header_end {
-        return Err(TiledError::Validation(format!("Truncated .npy header: {path}")));
+        return Err(TiledError::Validation(format!(
+            "Truncated .npy header: {path}"
+        )));
     }
 
     // Parse shape from header string like "{'descr': '<f8', 'fortran_order': False, 'shape': (480, 640), }"

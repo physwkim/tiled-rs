@@ -9,8 +9,8 @@
 
 use tiled_core::schemas::{NodeAttributes, Resource};
 use tiled_core::structures::{
-    ArrayStructure, AwkwardStructure, ContainerStructure, SparseStructure, Spec,
-    StructureFamily, TableStructure,
+    ArrayStructure, AwkwardStructure, ContainerStructure, SparseStructure, Spec, StructureFamily,
+    TableStructure,
 };
 
 use crate::context::Context;
@@ -47,18 +47,18 @@ impl ParsedStructure {
                     .structure
                     .as_ref()
                     .ok_or_else(|| ClientError::Invalid("array missing structure".into()))?;
-                Ok(Self::Array(ArrayStructure::from_json(s).map_err(
-                    |e| ClientError::Invalid(format!("invalid array structure: {e}")),
-                )?))
+                Ok(Self::Array(ArrayStructure::from_json(s).map_err(|e| {
+                    ClientError::Invalid(format!("invalid array structure: {e}"))
+                })?))
             }
             StructureFamily::Table => {
                 let s = attrs
                     .structure
                     .as_ref()
                     .ok_or_else(|| ClientError::Invalid("table missing structure".into()))?;
-                Ok(Self::Table(TableStructure::from_json(s).map_err(
-                    |e| ClientError::Invalid(format!("invalid table structure: {e}")),
-                )?))
+                Ok(Self::Table(TableStructure::from_json(s).map_err(|e| {
+                    ClientError::Invalid(format!("invalid table structure: {e}"))
+                })?))
             }
             StructureFamily::Sparse => {
                 let s = attrs
@@ -125,11 +125,7 @@ impl BaseClient {
 
     /// Specs the node conforms to.
     pub fn specs(&self) -> &[Spec] {
-        self.item
-            .attributes
-            .specs
-            .as_deref()
-            .unwrap_or(&[])
+        self.item.attributes.specs.as_deref().unwrap_or(&[])
     }
 
     /// Path ancestors (e.g. `["root", "subgroup"]`).

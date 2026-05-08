@@ -7,7 +7,7 @@ use indexmap::IndexMap;
 use tokio::net::TcpListener;
 
 use tiled_adapters::{ArrayAdapter, MapAdapter};
-use tiled_client::{from_uri, AnyClient};
+use tiled_client::{AnyClient, from_uri};
 use tiled_core::adapters::AnyAdapter;
 use tiled_core::queries::Query;
 
@@ -159,9 +159,7 @@ async fn auth_failure_when_api_key_required_but_missing() {
     let err = result.unwrap_err();
     let msg = format!("{err}");
     assert!(
-        msg.contains("authentication")
-            || msg.contains("401")
-            || msg.contains("403"),
+        msg.contains("authentication") || msg.contains("401") || msg.contains("403"),
         "unexpected error: {msg}"
     );
 }
@@ -221,8 +219,7 @@ async fn captures_tiled_csrf_cookie_from_about_response() {
     });
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    let (ctx, _) =
-        tiled_client::Context::from_uri(&format!("http://{addr}")).unwrap();
+    let (ctx, _) = tiled_client::Context::from_uri(&format!("http://{addr}")).unwrap();
     // Trigger the about fetch.
     ctx.server_info().await.unwrap();
     assert_eq!(ctx.csrf_token().await.as_deref(), Some("abc123"));

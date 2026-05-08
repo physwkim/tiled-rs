@@ -255,7 +255,11 @@ mod tests {
         // 1D array but 2 block indices → error
         let err = adapter.read_block(&[0, 0], &slice).await;
         assert!(err.is_err());
-        assert!(err.unwrap_err().to_string().contains("Expected 1 block indices"));
+        assert!(
+            err.unwrap_err()
+                .to_string()
+                .contains("Expected 1 block indices")
+        );
     }
 
     #[tokio::test]

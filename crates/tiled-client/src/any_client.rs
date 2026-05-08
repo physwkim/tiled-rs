@@ -59,11 +59,7 @@ pub enum AnyClient {
 impl AnyClient {
     /// Dispatch on `structure_family` to build the right client. If the
     /// context has a [`ClientResolver`] configured, it is consulted first.
-    pub fn from_item(
-        context: Context,
-        item: Item,
-        include_data_sources: bool,
-    ) -> Result<Self> {
+    pub fn from_item(context: Context, item: Item, include_data_sources: bool) -> Result<Self> {
         if let Some(resolver) = context.resolver() {
             if let Some(custom) = resolver.resolve(&context, &item, include_data_sources) {
                 return Ok(Self::Custom(custom?));

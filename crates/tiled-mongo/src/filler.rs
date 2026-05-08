@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use mongodb::bson::{doc, Document};
+use mongodb::bson::{Document, doc};
 use mongodb::sync::Database;
 
 use tiled_core::error::{Result, TiledError};
@@ -39,9 +39,7 @@ impl Filler {
             .find_one(doc! { "datum_id": datum_id })
             .run()
             .map_err(|e| TiledError::Internal(format!("Datum lookup failed: {e}")))?
-            .ok_or_else(|| {
-                TiledError::NotFound(format!("Datum not found: {datum_id}"))
-            })?;
+            .ok_or_else(|| TiledError::NotFound(format!("Datum not found: {datum_id}")))?;
 
         let resource_uid = datum_doc
             .get_str("resource")
@@ -61,11 +59,7 @@ impl Filler {
     }
 
     /// Fill a column of datum_ids into raw byte arrays.
-    pub fn fill_column(
-        &self,
-        datum_ids: &[String],
-        expected_shape: &[usize],
-    ) -> Result<Vec<u8>> {
+    pub fn fill_column(&self, datum_ids: &[String], expected_shape: &[usize]) -> Result<Vec<u8>> {
         let mut all_bytes = Vec::new();
 
         for datum_id in datum_ids {
@@ -92,9 +86,7 @@ impl Filler {
             .find_one(doc! { "uid": resource_uid })
             .run()
             .map_err(|e| TiledError::Internal(format!("Resource lookup failed: {e}")))?
-            .ok_or_else(|| {
-                TiledError::NotFound(format!("Resource not found: {resource_uid}"))
-            })?;
+            .ok_or_else(|| TiledError::NotFound(format!("Resource not found: {resource_uid}")))?;
 
         let spec = resource_doc
             .get_str("spec")

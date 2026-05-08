@@ -2,7 +2,11 @@ use anyhow::Result;
 use clap::Parser;
 
 #[derive(Parser)]
-#[command(name = "tiled", version, about = "Tiled: structured scientific data access service")]
+#[command(
+    name = "tiled",
+    version,
+    about = "Tiled: structured scientific data access service"
+)]
 struct Cli {
     #[command(subcommand)]
     command: tiled_cli::Command,

@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use mongodb::bson::{doc, Bson, Document};
+use mongodb::bson::{Bson, Document, doc};
 use mongodb::sync::Database;
 
 use tiled_core::adapters::{ArrayAdapterRead, BaseAdapter, BoxFuture};
@@ -206,9 +206,10 @@ impl ArrayColumnAdapter {
 
     /// Fetch external data column: get datum_ids from MongoDB, then fill via handlers.
     fn fetch_external_column(&self) -> Result<Vec<u8>> {
-        let filler = self.filler.as_ref().ok_or_else(|| {
-            TiledError::Internal("External data but no filler configured".into())
-        })?;
+        let filler = self
+            .filler
+            .as_ref()
+            .ok_or_else(|| TiledError::Internal("External data but no filler configured".into()))?;
 
         let collection = self.db.collection::<Document>("event");
         let field_path = format!("data.{}", self.field_name);

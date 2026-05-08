@@ -2,10 +2,10 @@
 
 use std::collections::HashMap;
 
+use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
 use axum::response::IntoResponse;
-use axum::Json;
 
 use tiled_core::adapters::{AnyAdapter, ContainerAdapter};
 use tiled_core::links;
@@ -55,10 +55,7 @@ pub async fn about(State(state): State<AppState>, BaseUrl(base_url): BaseUrl) ->
                 "https://blueskyproject.io/tiled".into(),
             ),
         ]),
-        meta: HashMap::from([(
-            "root_path".into(),
-            serde_json::Value::String(String::new()),
-        )]),
+        meta: HashMap::from([("root_path".into(), serde_json::Value::String(String::new()))]),
     };
 
     Json(about)
@@ -150,9 +147,8 @@ pub async fn search(
         }
     };
 
-    let resp = core::construct_entries_response(
-        container, path, &base_url, offset, limit, &queries,
-    );
+    let resp =
+        core::construct_entries_response(container, path, &base_url, offset, limit, &queries);
     Ok(Json(resp))
 }
 
@@ -172,9 +168,7 @@ pub async fn array_block(
     let array_adapter = match adapter {
         AnyAdapter::Array(a) => a.as_ref(),
         _ => {
-            return Err(ServerError::Validation(format!(
-                "'{path}' is not an array"
-            )));
+            return Err(ServerError::Validation(format!("'{path}' is not an array")));
         }
     };
 
@@ -192,7 +186,13 @@ pub async fn array_block(
             .collect::<Result<Vec<_>, _>>()?
     };
 
-    let slice = tiled_core::ndslice::NDSlice::empty();
+    // Honor the `slice` query parameter (numpy-style). Empty / missing →
+    // full block.
+    let slice = match params.get("slice").map(|s| s.as_str()) {
+        None | Some("") => tiled_core::ndslice::NDSlice::empty(),
+        Some(s) => tiled_core::ndslice::NDSlice::from_numpy_str(s)
+            .map_err(|e| ServerError::Validation(format!("Invalid slice '{s}': {e}")))?,
+    };
     let data = array_adapter
         .read_block(&block, &slice)
         .await
@@ -210,26 +210,20 @@ pub async fn array_block(
     )
     .unwrap_or_else(|| "application/octet-stream".to_string());
 
-    let body = if let Some(serializer) =
-        state
-            .serialization_registry
-            .dispatch(tiled_core::structures::StructureFamily::Array, &media_type)
+    let body = if let Some(serializer) = state
+        .serialization_registry
+        .dispatch(tiled_core::structures::StructureFamily::Array, &media_type)
     {
         let ser_meta = serde_json::json!({
             "itemsize": data.dtype.element_size(),
             "kind": String::from(data.dtype.kind.to_numpy_char()),
         });
-        serializer(&data.data, &ser_meta)
-            .map_err(|e| ServerError::Internal(e.to_string()))?
+        serializer(&data.data, &ser_meta).map_err(|e| ServerError::Internal(e.to_string()))?
     } else {
         data.data
     };
 
-    Ok((
-        [(axum::http::header::CONTENT_TYPE, media_type)],
-        body,
-    )
-        .into_response())
+    Ok(([(axum::http::header::CONTENT_TYPE, media_type)], body).into_response())
 }
 
 // ---------------------------------------------------------------------------
@@ -247,9 +241,7 @@ pub async fn table_partition(
     let table_adapter = match adapter {
         AnyAdapter::Table(t) => t.as_ref(),
         _ => {
-            return Err(ServerError::Validation(format!(
-                "'{path}' is not a table"
-            )));
+            return Err(ServerError::Validation(format!("'{path}' is not a table")));
         }
     };
 
@@ -258,9 +250,9 @@ pub async fn table_partition(
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
 
-    let fields: Option<Vec<String>> = params.get("field").map(|f| {
-        f.split(',').map(|s| s.trim().to_string()).collect()
-    });
+    let fields: Option<Vec<String>> = params
+        .get("field")
+        .map(|f| f.split(',').map(|s| s.trim().to_string()).collect());
 
     let table = table_adapter
         .read_partition(partition, fields.as_deref())
@@ -269,9 +261,8 @@ pub async fn table_partition(
 
     let mut buf = Vec::new();
     {
-        let mut writer =
-            arrow::ipc::writer::FileWriter::try_new(&mut buf, &table.schema)
-                .map_err(|e| ServerError::Internal(format!("Arrow IPC write error: {e}")))?;
+        let mut writer = arrow::ipc::writer::FileWriter::try_new(&mut buf, &table.schema)
+            .map_err(|e| ServerError::Internal(format!("Arrow IPC write error: {e}")))?;
         for batch in &table.batches {
             writer
                 .write(batch)
@@ -312,9 +303,9 @@ pub async fn get_documents(
     };
 
     // The run must be a container (BlueskyRun).
-    let run = adapter.as_container().ok_or_else(|| {
-        ServerError::Validation("This is not a BlueskyRun".into())
-    })?;
+    let run = adapter
+        .as_container()
+        .ok_or_else(|| ServerError::Validation("This is not a BlueskyRun".into()))?;
 
     // Build a JSON-seq response with the run's metadata as documents.
     // Format: {"name": "start", "doc": {...}}\n{"name": "stop", "doc": {...}}\n

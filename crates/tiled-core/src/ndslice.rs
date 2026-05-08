@@ -53,13 +53,17 @@ impl SliceDim {
 
 /// Serialize SliceDim to JSON (matching Python tiled wire format).
 impl Serialize for SliceDim {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap;
         match self {
             Self::Index(i) => serializer.serialize_i64(*i as i64),
             Self::Slice { start, stop, step } => {
                 // Count non-None fields
-                let count = start.is_some() as usize + stop.is_some() as usize + step.is_some() as usize;
+                let count =
+                    start.is_some() as usize + stop.is_some() as usize + step.is_some() as usize;
                 let mut map = serializer.serialize_map(Some(count))?;
                 if let Some(s) = start {
                     map.serialize_entry("start", &(*s as i64))?;
@@ -83,7 +87,9 @@ impl Serialize for SliceDim {
 }
 
 impl<'de> Deserialize<'de> for SliceDim {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
         let value = serde_json::Value::deserialize(deserializer)?;
         match &value {
             serde_json::Value::Number(n) => {
@@ -94,13 +100,14 @@ impl<'de> Deserialize<'de> for SliceDim {
             }
             serde_json::Value::Object(map) => {
                 // Check for ellipsis encoding: {"step": 0}
-                if map.len() == 1
-                    && map.get("step").and_then(|v| v.as_i64()) == Some(0)
-                {
+                if map.len() == 1 && map.get("step").and_then(|v| v.as_i64()) == Some(0) {
                     return Ok(Self::Ellipsis);
                 }
 
-                let start = map.get("start").and_then(|v| v.as_i64()).map(|v| v as isize);
+                let start = map
+                    .get("start")
+                    .and_then(|v| v.as_i64())
+                    .map(|v| v as isize);
                 let stop = map.get("stop").and_then(|v| v.as_i64()).map(|v| v as isize);
                 let step = map.get("step").and_then(|v| v.as_i64()).map(|v| v as isize);
                 Ok(Self::Slice { start, stop, step })
@@ -156,15 +163,18 @@ impl NDSlice {
             } else if part.contains(':') {
                 dims.push(parse_slice_part(part)?);
             } else {
-                let idx: isize = part.parse().map_err(|_| {
-                    TiledError::InvalidSlice(format!("Invalid index: '{part}'"))
-                })?;
+                let idx: isize = part
+                    .parse()
+                    .map_err(|_| TiledError::InvalidSlice(format!("Invalid index: '{part}'")))?;
                 dims.push(SliceDim::Index(idx));
             }
         }
 
         // Validate: at most one ellipsis
-        let ellipsis_count = dims.iter().filter(|d| matches!(d, SliceDim::Ellipsis)).count();
+        let ellipsis_count = dims
+            .iter()
+            .filter(|d| matches!(d, SliceDim::Ellipsis))
+            .count();
         if ellipsis_count > 1 {
             return Err(TiledError::InvalidSlice(
                 "NDSlice can only contain one Ellipsis".into(),
@@ -211,7 +221,11 @@ impl NDSlice {
         }
 
         let total_ndim = ndim.unwrap_or(self.0.len());
-        let non_ellipsis_count = self.0.iter().filter(|d| !matches!(d, SliceDim::Ellipsis)).count();
+        let non_ellipsis_count = self
+            .0
+            .iter()
+            .filter(|d| !matches!(d, SliceDim::Ellipsis))
+            .count();
 
         if total_ndim < non_ellipsis_count {
             return Err(TiledError::InvalidSlice(
@@ -277,7 +291,8 @@ fn parse_slice_part(s: &str) -> Result<SliceDim> {
 }
 
 /// Regex pattern for validating slice query parameters.
-pub const SLICE_REGEX: &str = r"^(?:(?:-?\d+)?:){0,2}(?:-?\d+)?(?:,(?:(?:-?\d+)?:){0,2}(?:-?\d+)?)*$";
+pub const SLICE_REGEX: &str =
+    r"^(?:(?:-?\d+)?:){0,2}(?:-?\d+)?(?:,(?:(?:-?\d+)?:){0,2}(?:-?\d+)?)*$";
 
 #[cfg(test)]
 mod tests {
@@ -394,18 +409,22 @@ mod tests {
     fn test_slice_dim_is_full() {
         assert!(SliceDim::full().is_full());
         assert!(SliceDim::Ellipsis.is_full());
-        assert!(SliceDim::Slice {
-            start: Some(0),
-            stop: None,
-            step: Some(1),
-        }
-        .is_full());
+        assert!(
+            SliceDim::Slice {
+                start: Some(0),
+                stop: None,
+                step: Some(1),
+            }
+            .is_full()
+        );
         assert!(!SliceDim::Index(0).is_full());
-        assert!(!SliceDim::Slice {
-            start: Some(1),
-            stop: Some(3),
-            step: None,
-        }
-        .is_full());
+        assert!(
+            !SliceDim::Slice {
+                start: Some(1),
+                stop: Some(3),
+                step: None,
+            }
+            .is_full()
+        );
     }
 }

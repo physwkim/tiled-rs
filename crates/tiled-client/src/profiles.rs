@@ -173,9 +173,7 @@ fn gather_profiles(
     Ok(levels)
 }
 
-fn resolve_precedence(
-    levels: &[HashMap<PathBuf, serde_yaml::Value>],
-) -> ProfileSet {
+fn resolve_precedence(levels: &[HashMap<PathBuf, serde_yaml::Value>]) -> ProfileSet {
     let mut combined: HashMap<String, (PathBuf, serde_yaml::Value)> = HashMap::new();
     let mut collisions: HashMap<String, Vec<PathBuf>> = HashMap::new();
     for level in levels {
@@ -240,8 +238,7 @@ fn compose_profile(name: &str, uri: &str, verify: bool) -> Result<String> {
         ])),
     )]);
     let value = serde_yaml::Value::Mapping(content);
-    serde_yaml::to_string(&value)
-        .map_err(|e| ClientError::Invalid(format!("yaml dump: {e}")))
+    serde_yaml::to_string(&value).map_err(|e| ClientError::Invalid(format!("yaml dump: {e}")))
 }
 
 /// Create a new profile in the user-config directory (highest precedence).
@@ -271,9 +268,8 @@ pub fn delete_profile(name: &str) -> Result<Option<PathBuf>> {
         for ext in &["yml", "yaml"] {
             let filepath = path.join(format!("{name}.{ext}"));
             if filepath.exists() {
-                std::fs::remove_file(&filepath).map_err(|e| {
-                    ClientError::Invalid(format!("rm {}: {e}", filepath.display()))
-                })?;
+                std::fs::remove_file(&filepath)
+                    .map_err(|e| ClientError::Invalid(format!("rm {}: {e}", filepath.display())))?;
                 return Ok(Some(filepath));
             }
         }
@@ -283,13 +279,20 @@ pub fn delete_profile(name: &str) -> Result<Option<PathBuf>> {
 
 fn default_profile_marker_path() -> Option<PathBuf> {
     let last = paths().into_iter().next_back()?;
-    Some(last.parent().map(|p| p.to_path_buf()).unwrap_or(last).join("default_profile"))
+    Some(
+        last.parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or(last)
+            .join("default_profile"),
+    )
 }
 
 /// Read the saved default profile name.
 pub fn get_default_profile_name() -> Option<String> {
     let p = default_profile_marker_path()?;
-    std::fs::read_to_string(&p).ok().map(|s| s.trim().to_string())
+    std::fs::read_to_string(&p)
+        .ok()
+        .map(|s| s.trim().to_string())
 }
 
 /// Persist `name` as the default profile (or clear when `None`).
@@ -358,9 +361,9 @@ impl Profile {
 /// they require an in-process server).
 pub async fn from_profile(name: &str) -> Result<crate::any_client::AnyClient> {
     let (_path, profile) = Profile::lookup(name)?;
-    let uri = profile.uri.ok_or_else(|| {
-        ClientError::Invalid(format!("profile '{name}' has no 'uri' field"))
-    })?;
+    let uri = profile
+        .uri
+        .ok_or_else(|| ClientError::Invalid(format!("profile '{name}' has no 'uri' field")))?;
     let mut opts = crate::context::ContextOptions::default();
     if let Some(k) = profile.api_key {
         opts = opts.api_key(k);
@@ -408,16 +411,8 @@ mod tests {
     #[test]
     fn collision_in_same_dir_drops_profile() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("a.yml"),
-            "shared:\n  uri: http://a\n",
-        )
-        .unwrap();
-        std::fs::write(
-            dir.path().join("b.yml"),
-            "shared:\n  uri: http://b\n",
-        )
-        .unwrap();
+        std::fs::write(dir.path().join("a.yml"), "shared:\n  uri: http://a\n").unwrap();
+        std::fs::write(dir.path().join("b.yml"), "shared:\n  uri: http://b\n").unwrap();
         let levels = gather_profiles(&[dir.path().to_path_buf()], false).unwrap();
         let resolved = resolve_precedence(&levels);
         // Both files at same level define 'shared' → omitted.
@@ -430,11 +425,8 @@ mod tests {
         let hi = tempfile::tempdir().unwrap();
         std::fs::write(lo.path().join("p.yml"), "x:\n  uri: http://low\n").unwrap();
         std::fs::write(hi.path().join("p.yml"), "x:\n  uri: http://high\n").unwrap();
-        let levels = gather_profiles(
-            &[lo.path().to_path_buf(), hi.path().to_path_buf()],
-            true,
-        )
-        .unwrap();
+        let levels =
+            gather_profiles(&[lo.path().to_path_buf(), hi.path().to_path_buf()], true).unwrap();
         let resolved = resolve_precedence(&levels);
         let (_, content) = resolved.profiles.get("x").unwrap();
         let uri = content

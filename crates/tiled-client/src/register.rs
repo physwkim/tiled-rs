@@ -82,10 +82,7 @@ pub fn default_mimetypes() -> &'static HashMap<&'static str, &'static str> {
 }
 
 /// Resolve a path's mimetype from extension (and an optional override map).
-pub fn resolve_mimetype(
-    path: &Path,
-    overrides: &HashMap<String, String>,
-) -> Option<String> {
+pub fn resolve_mimetype(path: &Path, overrides: &HashMap<String, String>) -> Option<String> {
     let suffixes: Vec<String> = path
         .file_name()?
         .to_string_lossy()
@@ -376,7 +373,10 @@ pub async fn register(
         .await
         .map_err(|e| ClientError::Invalid(format!("stat {}: {e}", path.display())))?;
     if meta.is_dir() {
-        if try_register_single(&target, path, true, settings).await?.is_some() {
+        if try_register_single(&target, path, true, settings)
+            .await?
+            .is_some()
+        {
             return Ok(());
         }
         if overwrite {
@@ -401,8 +401,7 @@ async fn navigate_or_create(
             // Only treat genuine "not found" (or HTTP 404) as "needs create".
             // Network/auth/parse errors are propagated so we don't spuriously
             // create children on transient failures.
-            Err(ClientError::KeyNotFound(_))
-            | Err(ClientError::Server { status: 404, .. }) => {
+            Err(ClientError::KeyNotFound(_)) | Err(ClientError::Server { status: 404, .. }) => {
                 let key = (settings.key_from_filename)(segment);
                 create_container(&current, &key).await?;
                 let child = current.get(&key).await?;
@@ -451,11 +450,7 @@ fn build_register_url(parent: &ContainerClient) -> Result<Url> {
     Ok(url)
 }
 
-async fn walk_and_register(
-    node: &ContainerClient,
-    path: &Path,
-    settings: &Settings,
-) -> Result<()> {
+async fn walk_and_register(node: &ContainerClient, path: &Path, settings: &Settings) -> Result<()> {
     let mut files: Vec<PathBuf> = Vec::new();
     let mut directories: Vec<PathBuf> = Vec::new();
     let mut rd = tokio::fs::read_dir(path)
@@ -525,8 +520,8 @@ async fn try_register_single(
         return Ok(None);
     };
 
-    let uri = Url::from_file_path(path)
-        .map_err(|_| ClientError::Invalid("path to file URI".into()))?;
+    let uri =
+        Url::from_file_path(path).map_err(|_| ClientError::Invalid("path to file URI".into()))?;
     let spec = adapter.inspect(&uri, is_directory).await?;
 
     let key = (settings.key_from_filename)(
@@ -563,12 +558,12 @@ fn img_sequence_regex(ext: &str) -> Option<&'static Regex> {
     static NPY: OnceLock<Regex> = OnceLock::new();
     static PNG: OnceLock<Regex> = OnceLock::new();
     match ext {
-        ".tif" | ".tiff" => Some(TIF.get_or_init(|| {
-            Regex::new(r"^(.*?)(\d+)\.(?:tif|tiff)$").unwrap()
-        })),
-        ".jpg" | ".jpeg" => Some(JPG.get_or_init(|| {
-            Regex::new(r"^(.*?)(\d+)\.(?:jpg|jpeg)$").unwrap()
-        })),
+        ".tif" | ".tiff" => {
+            Some(TIF.get_or_init(|| Regex::new(r"^(.*?)(\d+)\.(?:tif|tiff)$").unwrap()))
+        }
+        ".jpg" | ".jpeg" => {
+            Some(JPG.get_or_init(|| Regex::new(r"^(.*?)(\d+)\.(?:jpg|jpeg)$").unwrap()))
+        }
         ".npy" => Some(NPY.get_or_init(|| Regex::new(r"^(.*?)(\d+)\.npy$").unwrap())),
         ".png" => Some(PNG.get_or_init(|| Regex::new(r"^(.*?)(\d+)\.png$").unwrap())),
         _ => None,
@@ -585,9 +580,7 @@ fn img_sequence_mimetype(ext: &str) -> Option<&'static str> {
     }
 }
 
-fn group_image_sequences(
-    files: Vec<PathBuf>,
-) -> (HashMap<String, Vec<PathBuf>>, Vec<PathBuf>) {
+fn group_image_sequences(files: Vec<PathBuf>) -> (HashMap<String, Vec<PathBuf>>, Vec<PathBuf>) {
     let mut sequences: HashMap<String, Vec<PathBuf>> = HashMap::new();
     let mut unhandled = Vec::new();
     for file in files {
@@ -632,9 +625,9 @@ async fn register_image_sequence(
     sequence: &[PathBuf],
     settings: &Settings,
 ) -> Result<()> {
-    let first = sequence.first().ok_or_else(|| {
-        ClientError::Invalid("empty image sequence".into())
-    })?;
+    let first = sequence
+        .first()
+        .ok_or_else(|| ClientError::Invalid("empty image sequence".into()))?;
     let ext = first
         .extension()
         .and_then(|e| e.to_str())

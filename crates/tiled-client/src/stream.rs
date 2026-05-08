@@ -46,17 +46,11 @@ use crate::error::{ClientError, Result};
 #[serde(tag = "type")]
 pub enum Schema {
     #[serde(rename = "array-schema")]
-    Array {
-        version: u32,
-        data_type: DType,
-    },
+    Array { version: u32, data_type: DType },
     #[serde(rename = "container-schema")]
     Container { version: u32 },
     #[serde(rename = "table-schema")]
-    Table {
-        version: u32,
-        arrow_schema: String,
-    },
+    Table { version: u32, arrow_schema: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -276,7 +270,9 @@ impl Subscription {
 
     async fn connect_once(&self, start: Option<i64>) -> Result<SubscriptionStream> {
         let mut url = self.ws_uri()?;
-        let last = self.last_sequence.load(std::sync::atomic::Ordering::Relaxed);
+        let last = self
+            .last_sequence
+            .load(std::sync::atomic::Ordering::Relaxed);
         let effective_start: Option<i64> = if last != NO_SEQ {
             Some((last as i64).saturating_add(1))
         } else {
@@ -286,9 +282,10 @@ impl Subscription {
             url.query_pairs_mut().append_pair("start", &s.to_string());
         }
 
-        let mut req = url.as_str().into_client_request().map_err(|e| {
-            ClientError::Invalid(format!("ws request build: {e}"))
-        })?;
+        let mut req = url
+            .as_str()
+            .into_client_request()
+            .map_err(|e| ClientError::Invalid(format!("ws request build: {e}")))?;
 
         if let Some(key) = self.context.api_key().await {
             let value = HeaderValue::from_str(&format!("Apikey {key}"))
@@ -305,16 +302,11 @@ impl Subscription {
         }
 
         let cfg = WebSocketConfig::default();
-        let result =
-            tokio_tungstenite::connect_async_with_config(req, Some(cfg), false).await;
+        let result = tokio_tungstenite::connect_async_with_config(req, Some(cfg), false).await;
         let (ws, _resp) = match result {
             Ok(pair) => pair,
-            Err(tokio_tungstenite::tungstenite::Error::Http(resp))
-                if resp.status() == 401 =>
-            {
-                return Err(ClientError::AuthRequired(
-                    "ws handshake 401".into(),
-                ));
+            Err(tokio_tungstenite::tungstenite::Error::Http(resp)) if resp.status() == 401 => {
+                return Err(ClientError::AuthRequired("ws handshake 401".into()));
             }
             Err(e) => {
                 return Err(ClientError::Invalid(format!("ws connect: {e}")));
@@ -370,19 +362,14 @@ impl SubscriptionStream {
 impl Stream for SubscriptionStream {
     type Item = Result<Update>;
 
-    fn poll_next(
-        mut self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-    ) -> Poll<Option<Self::Item>> {
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
         loop {
             let item = match self.ws.as_mut().poll_next(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(None) => return Poll::Ready(None),
                 Poll::Ready(Some(Ok(msg))) => msg,
                 Poll::Ready(Some(Err(e))) => {
-                    return Poll::Ready(Some(Err(ClientError::Invalid(format!(
-                        "ws read: {e}"
-                    )))));
+                    return Poll::Ready(Some(Err(ClientError::Invalid(format!("ws read: {e}")))));
                 }
             };
             let bytes = match item {

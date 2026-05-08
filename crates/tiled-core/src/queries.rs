@@ -416,22 +416,17 @@ fn decode_single_query(name: &str, fields: &HashMap<String, String>) -> Option<Q
         }
         "in" => {
             let key = fields.get("key")?.clone();
-            let value: Vec<serde_json::Value> =
-                serde_json::from_str(fields.get("value")?).ok()?;
+            let value: Vec<serde_json::Value> = serde_json::from_str(fields.get("value")?).ok()?;
             Some(Query::In(In { key, value }))
         }
         "notin" => {
             let key = fields.get("key")?.clone();
-            let value: Vec<serde_json::Value> =
-                serde_json::from_str(fields.get("value")?).ok()?;
+            let value: Vec<serde_json::Value> = serde_json::from_str(fields.get("value")?).ok()?;
             Some(Query::NotIn(NotIn { key, value }))
         }
         "keypresent" => {
             let key = fields.get("key")?.clone();
-            let exists = fields
-                .get("exists")
-                .map(|v| v != "false")
-                .unwrap_or(true);
+            let exists = fields.get("exists").map(|v| v != "false").unwrap_or(true);
             Some(Query::KeyPresent(KeyPresent { key, exists }))
         }
         "like" => {
@@ -440,8 +435,7 @@ fn decode_single_query(name: &str, fields: &HashMap<String, String>) -> Option<Q
             Some(Query::Like(Like { key, pattern }))
         }
         "specs" => {
-            let include: Vec<String> =
-                serde_json::from_str(fields.get("include")?).ok()?;
+            let include: Vec<String> = serde_json::from_str(fields.get("include")?).ok()?;
             let exclude: Vec<String> = fields
                 .get("exclude")
                 .and_then(|s| serde_json::from_str(s).ok())

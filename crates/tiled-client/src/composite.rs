@@ -53,10 +53,9 @@ impl CompositeClient {
                     if let Some(cols) = structure.get("columns").and_then(|v| v.as_array()) {
                         for col in cols {
                             if let Some(name) = col.as_str() {
-                                if let Some(prev) = out.insert(
-                                    name.to_string(),
-                                    format!("{key}/{name}"),
-                                ) {
+                                if let Some(prev) =
+                                    out.insert(name.to_string(), format!("{key}/{name}"))
+                                {
                                     return Err(ClientError::Invalid(format!(
                                         "composite key collision on '{name}': existing='{prev}', new='{key}/{name}'"
                                     )));
@@ -104,15 +103,13 @@ impl CompositeClient {
             // even if it has zero rows, the schema field carries the type.
             // This avoids a silent float64 fallback when all partitions are
             // empty.
-            let dtype: Option<tiled_core::dtype::DType> = parts
-                .iter()
-                .find_map(|p| {
-                    if p.schema.fields().is_empty() {
-                        None
-                    } else {
-                        arrow_to_tiled_dtype(p.schema.field(0).data_type()).ok()
-                    }
-                });
+            let dtype: Option<tiled_core::dtype::DType> = parts.iter().find_map(|p| {
+                if p.schema.fields().is_empty() {
+                    None
+                } else {
+                    arrow_to_tiled_dtype(p.schema.field(0).data_type()).ok()
+                }
+            });
             let dtype = dtype.ok_or_else(|| {
                 ClientError::Invalid(format!(
                     "composite column '{col}': no partitions in table '{table_id}', cannot infer dtype"
@@ -148,11 +145,7 @@ impl CompositeClient {
     /// Errors out on name collision (a top-level array and a table column
     /// sharing a name), matching the contract of `flat_keys_mapping`.
     pub async fn read(&self, variables: Option<&[&str]>) -> Result<Dataset> {
-        fn insert_unique(
-            ds: &mut Dataset,
-            name: impl Into<String>,
-            var: Variable,
-        ) -> Result<()> {
+        fn insert_unique(ds: &mut Dataset, name: impl Into<String>, var: Variable) -> Result<()> {
             let name = name.into();
             if ds.data_vars.contains_key(&name) || ds.coords.contains_key(&name) {
                 return Err(ClientError::Invalid(format!(
@@ -245,17 +238,14 @@ impl CompositeClient {
                     let n = parts.first().map(|p| p.schema.fields().len()).unwrap_or(0);
                     for col_i in 0..n {
                         let name = parts[0].schema.field(col_i).name().clone();
-                        let dt =
-                            arrow_to_tiled_dtype(parts[0].schema.field(col_i).data_type())?;
+                        let dt = arrow_to_tiled_dtype(parts[0].schema.field(col_i).data_type())?;
                         let mut data = Vec::new();
                         let mut total = 0usize;
                         for p in &parts {
                             for batch in &p.batches {
                                 let array = batch.column(col_i);
-                                let bytes = array_to_le_bytes(
-                                    array,
-                                    p.schema.field(col_i).data_type(),
-                                )?;
+                                let bytes =
+                                    array_to_le_bytes(array, p.schema.field(col_i).data_type())?;
                                 data.extend_from_slice(&bytes);
                                 total += array.len();
                             }
@@ -308,14 +298,12 @@ fn arrow_to_tiled_dtype(dt: &ArrowDataType) -> Result<DType> {
         ArrowDataType::Float32 => BuiltinDType::new(Endianness::Little, Kind::Float, 4),
         ArrowDataType::Int64 => BuiltinDType::new(Endianness::Little, Kind::Integer, 8),
         ArrowDataType::Int32 => BuiltinDType::new(Endianness::Little, Kind::Integer, 4),
-        ArrowDataType::UInt64 => {
-            BuiltinDType::new(Endianness::Little, Kind::UnsignedInteger, 8)
-        }
-        ArrowDataType::UInt32 => {
-            BuiltinDType::new(Endianness::Little, Kind::UnsignedInteger, 4)
-        }
+        ArrowDataType::UInt64 => BuiltinDType::new(Endianness::Little, Kind::UnsignedInteger, 8),
+        ArrowDataType::UInt32 => BuiltinDType::new(Endianness::Little, Kind::UnsignedInteger, 4),
         other => {
-            return Err(ClientError::Invalid(format!("unsupported arrow dtype: {other:?}")));
+            return Err(ClientError::Invalid(format!(
+                "unsupported arrow dtype: {other:?}"
+            )));
         }
     };
     Ok(DType::Builtin(b))
@@ -372,7 +360,9 @@ fn array_to_le_bytes(array: &dyn Array, dt: &ArrowDataType) -> Result<Vec<u8>> {
             .flat_map(|v| v.to_le_bytes())
             .collect(),
         other => {
-            return Err(ClientError::Invalid(format!("unsupported arrow dtype: {other:?}")));
+            return Err(ClientError::Invalid(format!(
+                "unsupported arrow dtype: {other:?}"
+            )));
         }
     };
     Ok(out)

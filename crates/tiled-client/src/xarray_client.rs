@@ -65,8 +65,7 @@ impl DatasetClient {
         let entries = self.inner.list_entries(None).await?;
         let mut wide_candidates: Vec<(String, AnyClient, Vec<Spec>)> = Vec::new();
         let mut narrow_candidates: Vec<(String, AnyClient, Vec<Spec>)> = Vec::new();
-        let mut first_dims: std::collections::BTreeSet<usize> =
-            std::collections::BTreeSet::new();
+        let mut first_dims: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
 
         for item in entries {
             let id = item.id.clone();
@@ -76,8 +75,7 @@ impl DatasetClient {
                 }
             }
             let specs = item.attributes.specs.clone().unwrap_or_default();
-            let any =
-                AnyClient::from_item(self.inner.base().context().clone(), item, false)?;
+            let any = AnyClient::from_item(self.inner.base().context().clone(), item, false)?;
             let array = match &any {
                 AnyClient::Array(a) => Some(a),
                 _ => None,
@@ -154,20 +152,21 @@ impl DatasetClient {
             for b in &blocks {
                 data.extend_from_slice(&b.data);
             }
-            let var = Variable {
-                dims: arr.structure().dims.clone().unwrap_or_else(|| {
-                    (0..arr.ndim()).map(|i| format!("{name}_dim{i}")).collect()
-                }),
-                shape: arr.shape().to_vec(),
-                dtype: arr.structure().data_type.clone(),
-                data: Bytes::from(data),
-                attrs: arr
-                    .base()
-                    .metadata()
-                    .get("attrs")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null),
-            };
+            let var =
+                Variable {
+                    dims: arr.structure().dims.clone().unwrap_or_else(|| {
+                        (0..arr.ndim()).map(|i| format!("{name}_dim{i}")).collect()
+                    }),
+                    shape: arr.shape().to_vec(),
+                    dtype: arr.structure().data_type.clone(),
+                    data: Bytes::from(data),
+                    attrs: arr
+                        .base()
+                        .metadata()
+                        .get("attrs")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                };
             let role = classify_role(&specs)?;
             place_variable(&mut ds, role, name, var);
         }
@@ -175,13 +174,11 @@ impl DatasetClient {
         Ok(ds)
     }
 
-    async fn fetch_wide_arrow(
-        &self,
-        variables: &[String],
-    ) -> Result<HashMap<String, Variable>> {
+    async fn fetch_wide_arrow(&self, variables: &[String]) -> Result<HashMap<String, Variable>> {
         let link = self.inner.base().require_link("full")?;
         let mut url = Url::parse(link)?;
-        url.query_pairs_mut().append_pair("format", ARROW_FILE_MIME_TYPE);
+        url.query_pairs_mut()
+            .append_pair("format", ARROW_FILE_MIME_TYPE);
         for v in variables {
             url.query_pairs_mut().append_pair("field", v);
         }
@@ -273,7 +270,9 @@ fn place_variable(ds: &mut Dataset, role: Role, name: String, var: Variable) {
 // Arrow → tiled DType / bytes conversions (minimal coverage)
 // ---------------------------------------------------------------------------
 
-use arrow::array::{Array, Float32Array, Float64Array, Int32Array, Int64Array, UInt32Array, UInt64Array};
+use arrow::array::{
+    Array, Float32Array, Float64Array, Int32Array, Int64Array, UInt32Array, UInt64Array,
+};
 use arrow::datatypes::DataType as ArrowDataType;
 use tiled_core::dtype::{BuiltinDType, DType, Endianness, Kind};
 
@@ -283,12 +282,8 @@ fn arrow_dtype_to_tiled_dtype(dt: &ArrowDataType) -> Result<DType> {
         ArrowDataType::Float32 => BuiltinDType::new(Endianness::Little, Kind::Float, 4),
         ArrowDataType::Int64 => BuiltinDType::new(Endianness::Little, Kind::Integer, 8),
         ArrowDataType::Int32 => BuiltinDType::new(Endianness::Little, Kind::Integer, 4),
-        ArrowDataType::UInt64 => {
-            BuiltinDType::new(Endianness::Little, Kind::UnsignedInteger, 8)
-        }
-        ArrowDataType::UInt32 => {
-            BuiltinDType::new(Endianness::Little, Kind::UnsignedInteger, 4)
-        }
+        ArrowDataType::UInt64 => BuiltinDType::new(Endianness::Little, Kind::UnsignedInteger, 8),
+        ArrowDataType::UInt32 => BuiltinDType::new(Endianness::Little, Kind::UnsignedInteger, 4),
         other => {
             return Err(ClientError::Invalid(format!(
                 "unsupported arrow dtype in wide-table fetch: {other:?}"

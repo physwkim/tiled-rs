@@ -62,7 +62,11 @@ impl MapAdapter {
     }
 
     /// Iterate over a paginated range of (key, adapter) pairs.
-    pub fn items_range(&self, offset: usize, limit: usize) -> impl Iterator<Item = (&str, &AnyAdapter)> {
+    pub fn items_range(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> impl Iterator<Item = (&str, &AnyAdapter)> {
         self.mapping
             .iter()
             .skip(offset)
@@ -125,10 +129,7 @@ impl ContainerAdapter for MapAdapter {
 fn matches_query(adapter: &AnyAdapter, query: &Query) -> bool {
     let meta = adapter.metadata();
     match query {
-        Query::FullText(ft) => {
-            let text = meta.to_string();
-            text.contains(&ft.text)
-        }
+        Query::FullText(ft) => meta.to_string().contains(&ft.text),
         Query::Eq(eq) => meta.get(&eq.key).is_some_and(|v| v == &eq.value),
         Query::NotEq(neq) => meta.get(&neq.key).is_none_or(|v| v != &neq.value),
         Query::KeyPresent(kp) => meta.get(&kp.key).is_some() == kp.exists,
@@ -137,9 +138,85 @@ fn matches_query(adapter: &AnyAdapter, query: &Query) -> bool {
             .and_then(|v| v.as_array())
             .is_some_and(|arr| arr.contains(&c.value)),
         Query::StructureFamily(sf) => adapter.structure_family() == sf.value,
-        // Other query types pass through (no filtering) for in-memory adapter
-        _ => true,
+        Query::Comparison(c) => meta
+            .get(&c.key)
+            .is_some_and(|v| compare_json(v, &c.value, c.operator)),
+        Query::In(q) => meta
+            .get(&q.key)
+            .is_some_and(|v| q.value.iter().any(|x| x == v)),
+        Query::NotIn(q) => meta
+            .get(&q.key)
+            .is_some_and(|v| !q.value.iter().any(|x| x == v)),
+        Query::Like(l) => {
+            let regex_pat = sql_like_to_regex(&l.pattern);
+            regex::Regex::new(&regex_pat)
+                .ok()
+                .and_then(|re| {
+                    meta.get(&l.key)
+                        .and_then(|v| v.as_str())
+                        .map(|s| re.is_match(s))
+                })
+                .unwrap_or(false)
+        }
+        Query::Regex(r) => regex::RegexBuilder::new(&r.pattern)
+            .case_insensitive(!r.case_sensitive)
+            .build()
+            .ok()
+            .and_then(|re| {
+                meta.get(&r.key)
+                    .and_then(|v| v.as_str())
+                    .map(|s| re.is_match(s))
+            })
+            .unwrap_or(false),
+        Query::Specs(s) => {
+            let names: std::collections::HashSet<_> =
+                adapter.specs().iter().map(|sp| sp.name.as_str()).collect();
+            s.include.iter().all(|n| names.contains(n.as_str()))
+                && !s.exclude.iter().any(|n| names.contains(n.as_str()))
+        }
+        // Lookup is resolved at the search endpoint via direct key lookup;
+        // KeysFilter / AccessBlobFilter are filters the in-memory adapter
+        // does not implement (always-true keeps results unchanged rather
+        // than dropping everything silently).
+        Query::Lookup(_) | Query::KeysFilter(_) | Query::AccessBlobFilter(_) => true,
     }
+}
+
+fn compare_json(
+    left: &serde_json::Value,
+    right: &serde_json::Value,
+    op: tiled_core::queries::Operator,
+) -> bool {
+    use std::cmp::Ordering;
+    use tiled_core::queries::Operator;
+    let cmp = match (left.as_f64(), right.as_f64()) {
+        (Some(a), Some(b)) => a.partial_cmp(&b),
+        _ => match (left.as_str(), right.as_str()) {
+            (Some(a), Some(b)) => Some(a.cmp(b)),
+            _ => None,
+        },
+    };
+    let Some(cmp) = cmp else { return false };
+    matches!(
+        (op, cmp),
+        (Operator::Lt, Ordering::Less)
+            | (Operator::Gt, Ordering::Greater)
+            | (Operator::Le, Ordering::Less | Ordering::Equal)
+            | (Operator::Ge, Ordering::Greater | Ordering::Equal)
+    )
+}
+
+fn sql_like_to_regex(pat: &str) -> String {
+    let mut out = String::from("^");
+    for ch in pat.chars() {
+        match ch {
+            '%' => out.push_str(".*"),
+            '_' => out.push('.'),
+            c => out.push_str(&regex::escape(&c.to_string())),
+        }
+    }
+    out.push('$');
+    out
 }
 
 #[cfg(test)]
@@ -167,10 +244,7 @@ mod tests {
         let mut mapping = IndexMap::new();
         for i in 0..10 {
             let child = MapAdapter::new(IndexMap::new(), serde_json::json!({}), vec![]);
-            mapping.insert(
-                format!("item_{i}"),
-                AnyAdapter::Container(Box::new(child)),
-            );
+            mapping.insert(format!("item_{i}"), AnyAdapter::Container(Box::new(child)));
         }
         let adapter = MapAdapter::new(mapping, serde_json::json!({}), vec![]);
         assert_eq!(adapter.len(), 10);

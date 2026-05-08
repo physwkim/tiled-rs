@@ -25,13 +25,13 @@ pub mod auth;
 pub mod awkward;
 pub mod base;
 pub mod cache;
+pub mod composite;
 pub mod constructors;
 pub mod container;
 pub mod context;
 pub mod dataframe;
-pub mod error;
-pub mod composite;
 pub mod dataset;
+pub mod error;
 pub mod profiles;
 pub mod register;
 pub mod sparse;
@@ -46,28 +46,27 @@ pub use auth::{
     device_code_grant, password_grant, prompt_for_credentials, token_directory_for_server,
 };
 pub use awkward::{AwkwardBuffers, AwkwardClient};
-pub use composite::{CompositeClient, CompositePart};
-pub use dataset::{Dataset, Variable};
-pub use profiles::{
-    Profile, ProfileSet, create_profile, delete_profile, from_profile, get_default_profile_name,
-    list_profiles, load_profiles, paths as profile_paths, set_default_profile_name,
-};
-pub use xarray_client::DatasetClient;
 pub use base::{BaseClient, Item, ParsedStructure};
 pub use cache::{CacheControl, CacheEntry, HttpCache};
+pub use composite::{CompositeClient, CompositePart};
 pub use constructors::{from_context, from_uri, from_uri_with_options};
 pub use container::{ContainerClient, SortDirection};
 pub use context::{Context, ContextOptions};
 pub use dataframe::{TableClient, TablePartition};
+pub use dataset::{Dataset, Variable};
 pub use error::{ClientError, Result};
+pub use profiles::{
+    Profile, ProfileSet, create_profile, delete_profile, from_profile, get_default_profile_name,
+    list_profiles, load_profiles, paths as profile_paths, set_default_profile_name,
+};
 pub use register::{
-    AssetSpec, CsvAdapter, DataSourceSpec, JsonAdapter, ParquetAdapter,
-    PassthroughAdapter, RegistrationAdapter, Settings as RegisterSettings, WatchHandle,
-    default_filter, default_mimetypes, list_files, register, resolve_mimetype,
-    strip_suffixes, watch,
+    AssetSpec, CsvAdapter, DataSourceSpec, JsonAdapter, ParquetAdapter, PassthroughAdapter,
+    RegistrationAdapter, Settings as RegisterSettings, WatchHandle, default_filter,
+    default_mimetypes, list_files, register, resolve_mimetype, strip_suffixes, watch,
 };
 pub use sparse::SparseClient;
 pub use stream::{
     ArrayData, ArrayPatch, ArrayRef, ChildCreated, ChildMetadataUpdated, Schema, Subscription,
     SubscriptionStream, TableData, Update,
 };
+pub use xarray_client::DatasetClient;

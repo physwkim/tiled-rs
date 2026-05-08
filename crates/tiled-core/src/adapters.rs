@@ -34,10 +34,7 @@ pub trait BaseAdapter: Send + Sync {
 pub trait ArrayAdapterRead: BaseAdapter {
     fn structure(&self) -> &ArrayStructure;
 
-    fn read<'a>(
-        &'a self,
-        slice: &'a NDSlice,
-    ) -> BoxFuture<'a, Result<DynNDArray>>;
+    fn read<'a>(&'a self, slice: &'a NDSlice) -> BoxFuture<'a, Result<DynNDArray>>;
 
     fn read_block<'a>(
         &'a self,
@@ -47,11 +44,8 @@ pub trait ArrayAdapterRead: BaseAdapter {
 }
 
 pub trait ArrayAdapterWrite: ArrayAdapterRead {
-    fn write_block<'a>(
-        &'a self,
-        data: DynNDArray,
-        block: &'a [usize],
-    ) -> BoxFuture<'a, Result<()>>;
+    fn write_block<'a>(&'a self, data: DynNDArray, block: &'a [usize])
+    -> BoxFuture<'a, Result<()>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -61,10 +55,7 @@ pub trait ArrayAdapterWrite: ArrayAdapterRead {
 pub trait TableAdapterRead: BaseAdapter {
     fn structure(&self) -> &TableStructure;
 
-    fn read<'a>(
-        &'a self,
-        fields: Option<&'a [String]>,
-    ) -> BoxFuture<'a, Result<ArrowTable>>;
+    fn read<'a>(&'a self, fields: Option<&'a [String]>) -> BoxFuture<'a, Result<ArrowTable>>;
 
     fn read_partition<'a>(
         &'a self,
@@ -94,15 +85,9 @@ pub struct SparseData {
 pub trait SparseAdapterRead: BaseAdapter {
     fn structure(&self) -> &SparseStructure;
 
-    fn read<'a>(
-        &'a self,
-        slice: &'a NDSlice,
-    ) -> BoxFuture<'a, Result<SparseData>>;
+    fn read<'a>(&'a self, slice: &'a NDSlice) -> BoxFuture<'a, Result<SparseData>>;
 
-    fn read_block<'a>(
-        &'a self,
-        block: &'a [usize],
-    ) -> BoxFuture<'a, Result<SparseData>>;
+    fn read_block<'a>(&'a self, block: &'a [usize]) -> BoxFuture<'a, Result<SparseData>>;
 }
 
 // ---------------------------------------------------------------------------

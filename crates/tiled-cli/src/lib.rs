@@ -120,10 +120,7 @@ fn build_demo_tree() -> MapAdapter {
         20,
         serde_json::json!({"description": "A 10x20 array of floats"}),
     );
-    mapping.insert(
-        "medium_2d".to_string(),
-        AnyAdapter::Array(Box::new(arr_2d)),
-    );
+    mapping.insert("medium_2d".to_string(), AnyAdapter::Array(Box::new(arr_2d)));
 
     // Nested container
     let mut inner_mapping = IndexMap::new();
@@ -215,8 +212,11 @@ pub async fn run(command: Command) -> Result<()> {
                 .transpose()?;
 
             // Resolve MongoDB URI: CLI flag > config file.
-            let resolved_mongo_uri = mongo_uri
-                .or_else(|| file_config.as_ref().and_then(|c| c.mongo_uri().map(String::from)));
+            let resolved_mongo_uri = mongo_uri.or_else(|| {
+                file_config
+                    .as_ref()
+                    .and_then(|c| c.mongo_uri().map(String::from))
+            });
 
             // Resolve API key: CLI flag > config file > env var.
             let api_key = api_key.or_else(|| file_config.as_ref().and_then(|c| c.api_key()));
@@ -232,9 +232,7 @@ pub async fn run(command: Command) -> Result<()> {
                     tracing::info!("Starting with demo dataset");
                     Arc::new(build_demo_tree())
                 } else {
-                    anyhow::bail!(
-                        "Specify --demo, --mongo-uri, or --config to start the server"
-                    );
+                    anyhow::bail!("Specify --demo, --mongo-uri, or --config to start the server");
                 };
 
             let registry = Arc::new(tiled_serialization::default_registry());

@@ -75,11 +75,8 @@ impl EventStreamAdapter {
             let num_events = self.cutoff_seq_num - 1;
 
             // Add "time" coordinate column (always inline).
-            let time_col = ArrayColumnAdapter::new_time(
-                self.db.clone(),
-                descriptor_uids.clone(),
-                num_events,
-            );
+            let time_col =
+                ArrayColumnAdapter::new_time(self.db.clone(), descriptor_uids.clone(), num_events);
             mapping.insert("time".to_string(), AnyAdapter::Array(Box::new(time_col)));
 
             // Add data columns from data_keys.
@@ -100,9 +97,7 @@ impl EventStreamAdapter {
                         })
                         .unwrap_or_default();
 
-                    let dtype_str = field_meta
-                        .get_str("dtype")
-                        .unwrap_or("number");
+                    let dtype_str = field_meta.get_str("dtype").unwrap_or("number");
 
                     // Check if this field has external data.
                     let is_external = field_meta.get_str("external").is_ok()
@@ -116,7 +111,11 @@ impl EventStreamAdapter {
                         shape,
                         dtype_str.to_string(),
                         is_external,
-                        if is_external { self.filler.clone() } else { None },
+                        if is_external {
+                            self.filler.clone()
+                        } else {
+                            None
+                        },
                     );
                     mapping.insert(key.clone(), AnyAdapter::Array(Box::new(col)));
                 }

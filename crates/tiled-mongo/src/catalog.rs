@@ -6,7 +6,7 @@
 use std::sync::OnceLock;
 
 use indexmap::IndexMap;
-use mongodb::bson::{doc, Document};
+use mongodb::bson::{Document, doc};
 use mongodb::sync::Database;
 
 use tiled_core::adapters::{AnyAdapter, BaseAdapter, ContainerAdapter};
@@ -61,10 +61,7 @@ impl MongoCatalog {
             if let Ok(cursor) = collection.find(doc! {}).with_options(opts).run() {
                 for result in cursor {
                     if let Ok(start_doc) = result {
-                        let uid = start_doc
-                            .get_str("uid")
-                            .unwrap_or_default()
-                            .to_string();
+                        let uid = start_doc.get_str("uid").unwrap_or_default().to_string();
                         if uid.is_empty() {
                             continue;
                         }
@@ -78,11 +75,7 @@ impl MongoCatalog {
                             .ok()
                             .flatten();
 
-                        let run = BlueskyRunAdapter::new(
-                            self.db.clone(),
-                            start_doc,
-                            stop_doc,
-                        );
+                        let run = BlueskyRunAdapter::new(self.db.clone(), start_doc, stop_doc);
                         mapping.insert(uid, AnyAdapter::Container(Box::new(run)));
                     }
                 }

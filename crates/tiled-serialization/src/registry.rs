@@ -30,12 +30,7 @@ impl SerializationRegistry {
         }
     }
 
-    pub fn register(
-        &self,
-        family: StructureFamily,
-        media_type: &str,
-        serializer: SerializerFn,
-    ) {
+    pub fn register(&self, family: StructureFamily, media_type: &str, serializer: SerializerFn) {
         self.lookup
             .insert((family, Arc::from(media_type)), Arc::new(serializer));
     }
@@ -46,11 +41,7 @@ impl SerializationRegistry {
     }
 
     /// Dispatch: get the serializer for a given (family, media_type).
-    pub fn dispatch(
-        &self,
-        family: StructureFamily,
-        media_type: &str,
-    ) -> Option<Arc<SerializerFn>> {
+    pub fn dispatch(&self, family: StructureFamily, media_type: &str) -> Option<Arc<SerializerFn>> {
         // Avoid allocating a key by scanning — the lookup table is small.
         self.lookup
             .iter()

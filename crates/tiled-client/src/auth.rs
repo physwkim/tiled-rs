@@ -53,9 +53,8 @@ impl TokenStore {
                 ClientError::Invalid(format!("token directory {}: {e}", d.display()))
             })?;
             // Mirror `_check_writable_token_directory`.
-            let meta = std::fs::metadata(d).map_err(|e| {
-                ClientError::Invalid(format!("token directory metadata: {e}"))
-            })?;
+            let meta = std::fs::metadata(d)
+                .map_err(|e| ClientError::Invalid(format!("token directory metadata: {e}")))?;
             if meta.permissions().readonly() {
                 return Err(ClientError::Invalid(format!(
                     "token directory {} is not writable",
@@ -131,14 +130,16 @@ impl TokenStore {
                 std::fs::set_permissions(&tmp_path, perms)
                     .map_err(|e| ClientError::Invalid(format!("chmod token tmp: {e}")))?;
             }
-            tokio::fs::rename(&tmp_path, &final_path).await.map_err(|e| {
-                let _ = std::fs::remove_file(&tmp_path);
-                ClientError::Invalid(format!(
-                    "rename {} → {}: {e}",
-                    tmp_path.display(),
-                    final_path.display()
-                ))
-            })?;
+            tokio::fs::rename(&tmp_path, &final_path)
+                .await
+                .map_err(|e| {
+                    let _ = std::fs::remove_file(&tmp_path);
+                    ClientError::Invalid(format!(
+                        "rename {} → {}: {e}",
+                        tmp_path.display(),
+                        final_path.display()
+                    ))
+                })?;
         }
         self.cache.lock().await.insert(key.into(), value.into());
         Ok(())
@@ -255,9 +256,7 @@ impl TiledAuth {
             .get("refresh_token", true)
             .await?
             .ok_or_else(|| {
-                ClientError::AuthRequired(
-                    "no refresh_token in cache; please log in again".into(),
-                )
+                ClientError::AuthRequired("no refresh_token in cache; please log in again".into())
             })?;
 
         let resp = build_refresh_request(
@@ -359,9 +358,7 @@ pub async fn device_code_grant(
     let authorization_uri = verification
         .get(uri_field)
         .and_then(|v| v.as_str())
-        .ok_or_else(|| {
-            ClientError::Invalid(format!("device-code response missing '{uri_field}'"))
-        })?
+        .ok_or_else(|| ClientError::Invalid(format!("device-code response missing '{uri_field}'")))?
         .to_string();
     let user_code = verification
         .get("user_code")
@@ -381,10 +378,7 @@ pub async fn device_code_grant(
         .ok_or_else(|| ClientError::Invalid("device-code response missing 'device_code'".into()))?
         .to_string();
     let polling_uri = if oauth2_spec {
-        token_endpoint
-            .expect("guarded")
-            .as_str()
-            .to_string()
+        token_endpoint.expect("guarded").as_str().to_string()
     } else {
         verification
             .get("verification_uri")
@@ -403,8 +397,7 @@ pub async fn device_code_grant(
     );
     let _ = webbrowser::open(&authorization_uri);
 
-    let deadline = std::time::Instant::now()
-        + std::time::Duration::from_secs(expires_in);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(expires_in);
     print!("Waiting...");
     use std::io::Write;
     let _ = std::io::stdout().flush();
@@ -435,8 +428,7 @@ pub async fn device_code_grant(
         let status = resp.status();
         if status == 400 {
             // Could be authorization_pending — keep polling.
-            let body: serde_json::Value =
-                resp.json().await.unwrap_or(serde_json::Value::Null);
+            let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
             let error_field = if oauth2_spec {
                 body.get("error").and_then(|v| v.as_str())
             } else {
@@ -566,9 +558,7 @@ impl AuthProvider {
         let auth_endpoint = links
             .get("auth_endpoint")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                ClientError::Invalid("provider missing 'links.auth_endpoint'".into())
-            })?;
+            .ok_or_else(|| ClientError::Invalid("provider missing 'links.auth_endpoint'".into()))?;
         let auth_endpoint = parse_link(auth_endpoint)?;
         let client_id = links
             .get("client_id")
@@ -595,10 +585,7 @@ impl AuthProvider {
 
 /// Interactive: walk the user through choosing a provider and entering creds.
 /// Mirrors `prompt_for_credentials`.
-pub async fn prompt_for_credentials(
-    http: &Client,
-    providers: &[AuthProvider],
-) -> Result<Tokens> {
+pub async fn prompt_for_credentials(http: &Client, providers: &[AuthProvider]) -> Result<Tokens> {
     if providers.is_empty() {
         return Err(ClientError::AuthRequired(
             "server has no authentication providers configured".into(),

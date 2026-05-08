@@ -2,11 +2,11 @@
 
 use std::time::Duration;
 
+use axum::Router;
 use axum::extract::State;
 use axum::http::{HeaderValue, Method, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::get;
-use axum::Router;
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
@@ -19,10 +19,7 @@ pub fn build_app(state: AppState) -> Router {
     let cors = match &state.cors_policy {
         CorsOriginPolicy::Permissive => CorsLayer::permissive(),
         CorsOriginPolicy::AllowList(origins) => {
-            let parsed: Vec<HeaderValue> = origins
-                .iter()
-                .filter_map(|o| o.parse().ok())
-                .collect();
+            let parsed: Vec<HeaderValue> = origins.iter().filter_map(|o| o.parse().ok()).collect();
             CorsLayer::new()
                 .allow_origin(parsed)
                 .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])

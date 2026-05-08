@@ -5,18 +5,25 @@
 //! equivalent async getters: `get`, `keys`, `len`, `iter`, plus `search` for
 //! filtered listings.
 
-use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
+use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use serde::Deserialize;
-use tiled_core::schemas::{
-    ContainerLinks, NodeAttributes, NodeLinks, PaginationLinks, Resource,
-};
+use tiled_core::schemas::{ContainerLinks, NodeAttributes, NodeLinks, PaginationLinks, Resource};
 use url::Url;
 
 /// Characters to percent-encode inside a path segment (per RFC 3986
 /// `pchar` minus `unreserved` and `sub-delims`).
 const PATH_SEGMENT: &AsciiSet = &CONTROLS
-    .add(b' ').add(b'"').add(b'<').add(b'>').add(b'#').add(b'?')
-    .add(b'`').add(b'{').add(b'}').add(b'/').add(b'%');
+    .add(b' ')
+    .add(b'"')
+    .add(b'<')
+    .add(b'>')
+    .add(b'#')
+    .add(b'?')
+    .add(b'`')
+    .add(b'{')
+    .add(b'}')
+    .add(b'/')
+    .add(b'%');
 
 use crate::any_client::AnyClient;
 use crate::base::{BaseClient, Item};
@@ -100,7 +107,8 @@ impl ContainerClient {
         };
         url.set_path(&new_path);
         if self.base.include_data_sources {
-            url.query_pairs_mut().append_pair("include_data_sources", "true");
+            url.query_pairs_mut()
+                .append_pair("include_data_sources", "true");
         }
 
         let resp: ResourceEnvelope = retry(|| async {
@@ -111,7 +119,11 @@ impl ContainerClient {
         let item = resp
             .data
             .ok_or_else(|| ClientError::KeyNotFound(format!("no child '{key}'")))?;
-        AnyClient::from_item(self.base.context.clone(), item, self.base.include_data_sources)
+        AnyClient::from_item(
+            self.base.context.clone(),
+            item,
+            self.base.include_data_sources,
+        )
     }
 
     /// List the children of this container, optionally limited to `limit`

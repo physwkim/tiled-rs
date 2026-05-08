@@ -87,10 +87,7 @@ fn build_app_dynamic(trust_forwarded: bool) -> axum::Router {
 
 /// Send a GET request through the app in-process and return (status, body bytes).
 async fn get(app: &axum::Router, uri: &str) -> (StatusCode, Bytes) {
-    let req = Request::builder()
-        .uri(uri)
-        .body(Body::empty())
-        .unwrap();
+    let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
     let status = resp.status();
     let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
@@ -187,10 +184,9 @@ async fn test_array_metadata() {
     assert_eq!(data["id"], "some_array");
     assert_eq!(data["attributes"]["structure_family"], "array");
 
-    // ancestors for a top-level child should be [""]
+    // ancestors for a top-level child = [] (Python `path_parts[:-1]`)
     let ancestors = data["attributes"]["ancestors"].as_array().unwrap();
-    assert_eq!(ancestors.len(), 1);
-    assert_eq!(ancestors[0], "");
+    assert!(ancestors.is_empty());
 
     // structure must be the ArrayStructure
     let structure = &data["attributes"]["structure"];
@@ -205,8 +201,7 @@ async fn test_array_metadata() {
 #[tokio::test]
 async fn test_search_root() {
     let app = build_app();
-    let (status, body) =
-        get_json(&app, "/api/v1/search/?page[offset]=0&page[limit]=10").await;
+    let (status, body) = get_json(&app, "/api/v1/search/?page[offset]=0&page[limit]=10").await;
     assert_eq!(status, 200);
 
     // data should be an array of resources
@@ -272,11 +267,9 @@ async fn test_nested_array_metadata() {
         serde_json::json!([3])
     );
 
-    // ancestors for "subgroup/nested_arr" should be ["", "subgroup"]
+    // ancestors for "subgroup/nested_arr" = ["subgroup"] (parent segments)
     let ancestors = data["attributes"]["ancestors"].as_array().unwrap();
-    assert_eq!(ancestors.len(), 2);
-    assert_eq!(ancestors[0], "");
-    assert_eq!(ancestors[1], "subgroup");
+    assert_eq!(ancestors, &[serde_json::json!("subgroup")]);
 }
 
 #[tokio::test]
@@ -292,8 +285,7 @@ async fn test_not_found() {
 #[tokio::test]
 async fn test_search_pagination() {
     let app = build_app();
-    let (status, body) =
-        get_json(&app, "/api/v1/search/?page[offset]=0&page[limit]=1").await;
+    let (status, body) = get_json(&app, "/api/v1/search/?page[offset]=0&page[limit]=1").await;
     assert_eq!(status, 200);
 
     let entries = body["data"].as_array().unwrap();
@@ -314,27 +306,18 @@ async fn test_ancestors_correctness() {
 
     // Root: no ancestors
     let (_, body) = get_json(&app, "/api/v1/metadata/").await;
-    let ancestors = body["data"]["attributes"]["ancestors"]
-        .as_array()
-        .unwrap();
+    let ancestors = body["data"]["attributes"]["ancestors"].as_array().unwrap();
     assert!(ancestors.is_empty(), "root should have no ancestors");
 
-    // Top-level child: ancestors = [""]
+    // Top-level child: ancestors = [] (Python tiled `path_parts[:-1]`)
     let (_, body) = get_json(&app, "/api/v1/metadata/some_array").await;
-    let ancestors = body["data"]["attributes"]["ancestors"]
-        .as_array()
-        .unwrap();
-    assert_eq!(ancestors, &[serde_json::json!("")]);
+    let ancestors = body["data"]["attributes"]["ancestors"].as_array().unwrap();
+    assert!(ancestors.is_empty(), "top-level child has no ancestors");
 
-    // Two-level child: ancestors = ["", "subgroup"]
+    // Two-level child: ancestors = ["subgroup"] (parent segments only)
     let (_, body) = get_json(&app, "/api/v1/metadata/subgroup/nested_arr").await;
-    let ancestors = body["data"]["attributes"]["ancestors"]
-        .as_array()
-        .unwrap();
-    assert_eq!(
-        ancestors,
-        &[serde_json::json!(""), serde_json::json!("subgroup")]
-    );
+    let ancestors = body["data"]["attributes"]["ancestors"].as_array().unwrap();
+    assert_eq!(ancestors, &[serde_json::json!("subgroup")]);
 }
 
 // ---------------------------------------------------------------------------
@@ -494,7 +477,12 @@ async fn test_search_on_non_container() {
     // some_array is an array, not a container — search should fail
     let (status, body) = get_json(&app, "/api/v1/search/some_array").await;
     assert_eq!(status, 422);
-    assert!(body["error"]["message"].as_str().unwrap().contains("not a container"));
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("not a container")
+    );
 }
 
 #[tokio::test]
@@ -503,7 +491,12 @@ async fn test_block_wrong_dimension_count() {
     // some_array is 1D but we pass 2 block indices
     let (status, body) = get_json(&app, "/api/v1/array/block/some_array?block=0,0").await;
     assert_eq!(status, 422);
-    assert!(body["error"]["message"].as_str().unwrap().contains("block indices"));
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("block indices")
+    );
 }
 
 #[tokio::test]
@@ -519,7 +512,12 @@ async fn test_traverse_through_non_container() {
     // some_array is a leaf — can't traverse further
     let (status, body) = get_json(&app, "/api/v1/metadata/some_array/child").await;
     assert_eq!(status, 404);
-    assert!(body["error"]["message"].as_str().unwrap().contains("not a container"));
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("not a container")
+    );
 }
 
 // ---------------------------------------------------------------------------

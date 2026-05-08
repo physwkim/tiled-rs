@@ -4738,6 +4738,7 @@ dependencies = [
  "indexmap",
  "object_store",
  "parquet",
+ "regex",
  "rust-hdf5",
  "serde",
  "serde_json",

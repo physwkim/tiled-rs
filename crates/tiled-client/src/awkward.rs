@@ -67,13 +67,7 @@ impl AwkwardClient {
     pub async fn read_buffers(&self) -> Result<bytes::Bytes> {
         let link = self.base.require_link("buffers")?;
         let url = Url::parse(link)?;
-        retry(|| async {
-            self.base
-                .context
-                .get_bytes(&url, "application/zip")
-                .await
-        })
-        .await
+        retry(|| async { self.base.context.get_bytes(&url, "application/zip").await }).await
     }
 
     /// Fetch buffers + form/length and unpack the zip into a named map ready
