@@ -56,9 +56,15 @@ impl Default for BusInner {
 struct ChannelEntry {
     sender: broadcast::Sender<UpdateEnvelope>,
     sequence: AtomicU64,
+    /// Bounded ring of recent updates so a reconnecting client can
+    /// resume from `?start=<seq>` (tiled#1218). The broadcast channel
+    /// itself doesn't keep history; we mirror the last `HISTORY_CAPACITY`
+    /// envelopes here under a Mutex.
+    history: std::sync::Mutex<std::collections::VecDeque<UpdateEnvelope>>,
 }
 
 const CHANNEL_CAPACITY: usize = 256;
+const HISTORY_CAPACITY: usize = 256;
 
 impl StreamingBus {
     pub fn new() -> Self {
@@ -79,8 +85,32 @@ impl StreamingBus {
             .or_insert_with(|| ChannelEntry {
                 sender: broadcast::channel(CHANNEL_CAPACITY).0,
                 sequence: AtomicU64::new(0),
+                history: std::sync::Mutex::new(std::collections::VecDeque::with_capacity(
+                    HISTORY_CAPACITY,
+                )),
             });
         entry.sender.subscribe()
+    }
+
+    /// Return every envelope in this path's history with sequence > `start`,
+    /// oldest first. Used to replay missed updates when a client reconnects
+    /// with `?start=<n>` (tiled#1218). If the requested sequence is older
+    /// than the buffer's oldest entry the caller must accept some loss —
+    /// they receive only what's still in the ring.
+    pub fn history_since(&self, path: &str, start: u64) -> Vec<UpdateEnvelope> {
+        match self.inner.channels.get(path) {
+            Some(entry) => entry
+                .history
+                .lock()
+                .map(|hist| {
+                    hist.iter()
+                        .filter(|e| e.sequence > start)
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default(),
+            None => Vec::new(),
+        }
     }
 
     /// Publish an update for `path`. Delivers to the channel for `path`
@@ -96,6 +126,9 @@ impl StreamingBus {
                 .or_insert_with(|| ChannelEntry {
                     sender: broadcast::channel(CHANNEL_CAPACITY).0,
                     sequence: AtomicU64::new(0),
+                    history: std::sync::Mutex::new(
+                        std::collections::VecDeque::with_capacity(HISTORY_CAPACITY),
+                    ),
                 });
             let seq = entry.sequence.fetch_add(1, Ordering::Relaxed) + 1;
             let env = UpdateEnvelope {
@@ -104,10 +137,15 @@ impl StreamingBus {
                 path: path.to_string(),
                 kind,
             };
-            // `send` returns Err if no live receivers; we'll prune that
-            // entry below. Don't try to read the entry's receiver_count
-            // here while the entry guard is held — DashMap will deadlock
-            // against a concurrent subscribe inserting at the same key.
+            // Append to the bounded replay buffer before broadcasting so
+            // a fast reconnect after a network blip sees the just-sent
+            // event in `history_since`.
+            if let Ok(mut hist) = entry.history.lock() {
+                if hist.len() == HISTORY_CAPACITY {
+                    hist.pop_front();
+                }
+                hist.push_back(env.clone());
+            }
             let _ = entry.sender.send(env.clone());
             env
         };
@@ -195,8 +233,11 @@ pub enum UpdateKind {
 
 #[derive(Debug, Deserialize)]
 pub struct SubscribeQuery {
-    /// Optional sequence number from which to resume. Not yet honoured —
-    /// we always start from "now".
+    /// Sequence number from which to resume. Replays anything still in
+    /// the bus's bounded history with `sequence > start`. Older entries
+    /// have been evicted; clients that supply a `start` older than the
+    /// ring's oldest entry must be prepared to detect the gap (their
+    /// next live `sequence` will be > `start + history.len()`).
     #[serde(default)]
     pub start: Option<u64>,
 }
@@ -204,7 +245,7 @@ pub struct SubscribeQuery {
 pub async fn ws_subscribe(
     State(state): State<AppState>,
     OriginalUri(uri): OriginalUri,
-    Query(_q): Query<SubscribeQuery>,
+    Query(q): Query<SubscribeQuery>,
     auth: AuthContext,
     ws: WebSocketUpgrade,
 ) -> Result<axum::response::Response, ServerError> {
@@ -237,7 +278,13 @@ pub async fn ws_subscribe(
     let schema = build_schema_payload(&state, &segments).await;
 
     let bus = state.streaming_bus.clone();
-    Ok(ws.on_upgrade(move |socket| run_subscription(socket, bus, path_str, schema)))
+    let replay = match q.start {
+        Some(seq) => bus.history_since(&path_str, seq),
+        None => Vec::new(),
+    };
+    Ok(ws.on_upgrade(move |socket| {
+        run_subscription(socket, bus, path_str, schema, replay)
+    }))
 }
 
 async fn build_schema_payload(
@@ -293,6 +340,7 @@ async fn run_subscription(
     bus: StreamingBus,
     path: String,
     schema: serde_json::Value,
+    replay: Vec<UpdateEnvelope>,
 ) {
     let (mut tx, mut rx) = futures::StreamExt::split(socket);
     use futures::SinkExt;
@@ -306,6 +354,7 @@ async fn run_subscription(
         "path": path,
         "timestamp": Utc::now().to_rfc3339(),
         "schema": schema,
+        "resumed": !replay.is_empty(),
     });
     let bytes = match rmp_serde::to_vec_named(&initial) {
         Ok(v) => v,
@@ -316,6 +365,23 @@ async fn run_subscription(
     };
     if tx.send(Message::Binary(bytes.into())).await.is_err() {
         return;
+    }
+
+    // Replay any history snapshotted before subscribe so the client
+    // resuming from `?start=N` sees the missed updates in order. The
+    // live channel may also still hold a buffered copy of these events;
+    // sequence numbers are monotonic so the client dedupes by `sequence`.
+    for env in replay {
+        let payload = match rmp_serde::to_vec_named(&env) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(target: "tiled.streaming", "encode replay: {e}");
+                continue;
+            }
+        };
+        if tx.send(Message::Binary(payload.into())).await.is_err() {
+            return;
+        }
     }
 
     let mut receiver = bus.subscribe(&path);

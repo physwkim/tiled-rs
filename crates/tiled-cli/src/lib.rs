@@ -415,6 +415,7 @@ pub async fn run(command: Command) -> Result<()> {
         forwarded_allow_ips: None,
         max_request_body_bytes: 10 * 1024 * 1024,
         streaming_bus: tiled_server::streaming::StreamingBus::new(),
+        access_policy: None,
         default_login_scopes: tiled_auth::ScopeSet::full(),
             };
 

@@ -27,12 +27,16 @@ pub struct RegisterRequest {
 pub type NodeRecord = Node;
 
 const MAX_METADATA_BYTES: usize = 10 * 1024 * 1024;
+const MAX_STRUCTURE_BYTES: usize = 10 * 1024 * 1024;
 const MAX_SPECS: usize = 20;
 const MAX_SPEC_CHARS: usize = 255;
+const MAX_REFERENCES: usize = 20;
+const MAX_REFERENCE_LABEL_CHARS: usize = 255;
+const MAX_REFERENCE_URL_CHARS: usize = 2047;
 
 /// Validate metadata + specs against the size limits Python tiled enforces
-/// (bluesky/tiled#342). Caught early so a misbehaving client can't push a
-/// 100 MB blob through to disk.
+/// (bluesky/tiled#342, #262). Caught early so a misbehaving client can't
+/// push a 100 MB blob through to disk.
 pub fn validate_payload(metadata: &Value, specs: &Value) -> Result<()> {
     let metadata_bytes = serde_json::to_vec(metadata)?.len();
     if metadata_bytes > MAX_METADATA_BYTES {
@@ -61,6 +65,48 @@ pub fn validate_payload(metadata: &Value, specs: &Value) -> Result<()> {
                 )));
             }
         }
+    }
+    // tiled#342: reference list cap (when callers nest references inside
+    // metadata). The Python schema uses a top-level `references` array;
+    // we don't have that field but apply the same caps when present.
+    if let Some(refs) = metadata.get("references").and_then(|v| v.as_array()) {
+        if refs.len() > MAX_REFERENCES {
+            return Err(CatalogError::Validation(format!(
+                "{} references supplied; limit is {MAX_REFERENCES}",
+                refs.len()
+            )));
+        }
+        for r in refs {
+            let label = r.get("label").and_then(|v| v.as_str()).unwrap_or("");
+            if label.len() > MAX_REFERENCE_LABEL_CHARS {
+                return Err(CatalogError::Validation(format!(
+                    "reference label length {} > {MAX_REFERENCE_LABEL_CHARS}",
+                    label.len()
+                )));
+            }
+            let url = r.get("url").and_then(|v| v.as_str()).unwrap_or("");
+            if url.len() > MAX_REFERENCE_URL_CHARS {
+                return Err(CatalogError::Validation(format!(
+                    "reference url length {} > {MAX_REFERENCE_URL_CHARS}",
+                    url.len()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Cap structure JSON payload — tiled#262. A 100MB structure is almost
+/// always a sign of accidental misuse (e.g. embedding pixel data into
+/// the structure object instead of a data source). Treated separately
+/// from metadata so the limit can be tuned independently if a real
+/// workload needs it.
+pub fn validate_structure(structure: &Value) -> Result<()> {
+    let bytes = serde_json::to_vec(structure)?.len();
+    if bytes > MAX_STRUCTURE_BYTES {
+        return Err(CatalogError::Validation(format!(
+            "data_source.structure is {bytes} bytes; limit is {MAX_STRUCTURE_BYTES}",
+        )));
     }
     Ok(())
 }

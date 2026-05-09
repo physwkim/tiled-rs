@@ -92,6 +92,7 @@ impl Catalog {
         node_id: i64,
         spec: DataSourceSpec,
     ) -> Result<DataSource> {
+        crate::node::validate_structure(&spec.structure)?;
         match self.pool() {
             DbPool::Sqlite(pool) => {
                 let mut tx = pool.begin().await?;
@@ -175,6 +176,7 @@ impl Catalog {
         structure: Value,
         parameters: Value,
     ) -> Result<DataSource> {
+        crate::node::validate_structure(&structure)?;
         match self.pool() {
             DbPool::Sqlite(pool) => {
                 let row = sqlx::query(

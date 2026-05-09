@@ -835,6 +835,14 @@ pub async fn put_data_source(
         .update_data_source(id, structure, parameters)
         .await
         .map_err(map_catalog_err)?;
+    // Notify subscribers — a new partition / chunk likely became
+    // available. tiled#1339 made the Python server emit DataAppended on
+    // the same path for the same reason.
+    let path = segments.join("/");
+    state.streaming_bus.publish(
+        &path,
+        crate::streaming::UpdateKind::DataAppended { partition: None },
+    );
     Ok(Json(serde_json::json!({"data_source": {
         "id": updated.id,
         "structure_family": updated.structure_family,

@@ -67,6 +67,7 @@ fn build_app() -> axum::Router {
         forwarded_allow_ips: None,
         max_request_body_bytes: 10 * 1024 * 1024,
         streaming_bus: tiled_server::streaming::StreamingBus::new(),
+        access_policy: None,
         default_login_scopes: tiled_auth::ScopeSet::full(),
     };
 
@@ -97,6 +98,7 @@ fn build_app_dynamic(trust_forwarded: bool) -> axum::Router {
         forwarded_allow_ips: None,
         max_request_body_bytes: 10 * 1024 * 1024,
         streaming_bus: tiled_server::streaming::StreamingBus::new(),
+        access_policy: None,
         default_login_scopes: tiled_auth::ScopeSet::full(),
     };
 
@@ -482,6 +484,7 @@ async fn test_empty_container() {
         forwarded_allow_ips: None,
         max_request_body_bytes: 10 * 1024 * 1024,
         streaming_bus: tiled_server::streaming::StreamingBus::new(),
+        access_policy: None,
         default_login_scopes: tiled_auth::ScopeSet::full(),
     };
     let app = tiled_server::build_app(state);
@@ -571,6 +574,7 @@ fn build_app_with_api_key(key: &str) -> axum::Router {
         forwarded_allow_ips: None,
         max_request_body_bytes: 10 * 1024 * 1024,
         streaming_bus: tiled_server::streaming::StreamingBus::new(),
+        access_policy: None,
         default_login_scopes: tiled_auth::ScopeSet::full(),
     };
 
@@ -698,6 +702,7 @@ async fn test_metadata_handles_percent_encoded_slash_in_key() {
         forwarded_allow_ips: None,
         max_request_body_bytes: 10 * 1024 * 1024,
         streaming_bus: tiled_server::streaming::StreamingBus::new(),
+        access_policy: None,
         default_login_scopes: tiled_auth::ScopeSet::full(),
     };
     let app = tiled_server::build_app(state);

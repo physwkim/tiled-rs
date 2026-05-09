@@ -5,7 +5,9 @@ edition.workspace = true
 
 [dependencies]
 tiled-core = { workspace = true }
+tiled-auth = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
+async-trait = "0.1"

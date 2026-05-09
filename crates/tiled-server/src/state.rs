@@ -62,6 +62,11 @@ pub struct AppState {
     /// connected to /api/v1/{family}/subscribe/{*path} receive matching
     /// updates.
     pub streaming_bus: crate::streaming::StreamingBus,
+    /// Optional AccessPolicy. When set, search/read handlers consult it
+    /// for per-node scope decisions (tiled#287). `None` keeps the
+    /// scope check entirely on the auth middleware (current default —
+    /// session JWT scopes apply uniformly across the tree).
+    pub access_policy: Option<Arc<dyn tiled_access::AccessPolicy>>,
     /// Scope set issued to a session created via `/auth/{provider}/login`
     /// or device-code grant. Defaults to the full set (matches single-
     /// user behaviour); operators can narrow it to the safe defaults
