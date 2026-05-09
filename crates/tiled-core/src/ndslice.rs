@@ -207,6 +207,99 @@ impl NDSlice {
             .join(",")
     }
 
+    /// Whether the slice's resulting shape can be determined from the
+    /// slice alone — no Ellipsis, no relative (negative or open-ended)
+    /// indexing. Necessary precondition for [`Self::compose`]: the
+    /// composer can't reason about a slice whose shape depends on the
+    /// underlying array.
+    ///
+    /// Mirrors `NDSlice.is_expanded` from upstream tiled (PR #1337).
+    pub fn is_expanded(&self) -> bool {
+        self.0.iter().all(|d| match d {
+            SliceDim::Ellipsis => false,
+            SliceDim::Slice { start, stop, .. } => {
+                start.unwrap_or(0) >= 0 && matches!(stop, Some(s) if *s >= 0)
+            }
+            SliceDim::Index(_) => true,
+        })
+    }
+
+    /// Compose two slices: `arr[self][other]` is equivalent to
+    /// `arr[self.compose(&other)]`. Mirrors upstream tiled
+    /// `compose_slices` (PR #1337).
+    ///
+    /// Constraints:
+    /// * `self` (the left slice) must be `is_expanded()` — no Ellipsis,
+    ///   no relative indexing — because we cannot otherwise determine
+    ///   the result shape.
+    /// * Ellipsis is honoured in `other` only when it sits at the
+    ///   **last** position; in that case the trailing dims of `self`
+    ///   pass through unchanged. Other Ellipsis placements would
+    ///   require shape-aware expansion and are rejected (caller can
+    ///   pre-expand via [`Self::to_json`] + reconstruction if needed).
+    pub fn compose(&self, other: &NDSlice) -> Result<NDSlice> {
+        // Empty slice ↔ identity.
+        if self.0.is_empty() {
+            return Ok(other.clone());
+        }
+        if other.0.is_empty() {
+            return Ok(self.clone());
+        }
+        if !self.is_expanded() {
+            return Err(TiledError::InvalidSlice(
+                "Composition with the left slice requires fully-expanded dims (no '...' or '/-1')".into(),
+            ));
+        }
+        // Reject Ellipsis in `other` except as the trailing element.
+        let trailing_ellipsis = matches!(other.0.last(), Some(SliceDim::Ellipsis));
+        let interior_ellipsis = other
+            .0
+            .iter()
+            .take(other.0.len().saturating_sub(1))
+            .any(|d| matches!(d, SliceDim::Ellipsis));
+        if interior_ellipsis {
+            return Err(TiledError::InvalidSlice(
+                "Composition with Ellipsis in non-last position is not supported".into(),
+            ));
+        }
+
+        let mut out: Vec<SliceDim> = Vec::with_capacity(self.0.len());
+        let mut i_other = 0usize;
+        for s1 in &self.0 {
+            // Integer dims of `self` reduce dimensionality — they pass
+            // through and `other` indexes into the remaining dims only.
+            if let SliceDim::Index(_) = s1 {
+                out.push(s1.clone());
+                continue;
+            }
+            // No more right-slice items? Trailing dim passes through.
+            if i_other >= other.0.len() {
+                out.push(s1.clone());
+                continue;
+            }
+            let s2 = &other.0[i_other];
+            i_other += 1;
+            match s2 {
+                SliceDim::Ellipsis => {
+                    // "..." at the end → all remaining dims pass through.
+                    out.push(s1.clone());
+                    let _ = trailing_ellipsis; // silence unused
+                    // Once we hit the ellipsis, drain the rest of self.
+                    // (s2 itself isn't consumed against any further dim.)
+                    out.extend(self.0[out.len()..].iter().cloned());
+                    return Ok(NDSlice(out));
+                }
+                SliceDim::Index(idx) => {
+                    out.push(SliceDim::Index(compose_slc_with_idx(s1, *idx)?));
+                }
+                SliceDim::Slice { .. } => {
+                    out.push(compose_slc_with_slc(s1, s2)?);
+                }
+            }
+        }
+        Ok(NDSlice(out))
+    }
+
     /// Convert to JSON representation, expanding Ellipsis to fill `ndim` dimensions.
     pub fn to_json(&self, ndim: Option<usize>) -> Result<Vec<serde_json::Value>> {
         let has_ellipsis = self.0.iter().any(|d| matches!(d, SliceDim::Ellipsis));
@@ -253,6 +346,108 @@ impl NDSlice {
 
         Ok(result)
     }
+}
+
+/// Apply `slc` then index by `idx`. Both must be normalised
+/// (`is_expanded`) — required by upstream `_slc_with_int`.
+fn compose_slc_with_idx(slc: &SliceDim, idx: isize) -> Result<isize> {
+    let (start, stop, step) = match slc {
+        SliceDim::Slice { start, stop, step } => (
+            start.unwrap_or(0),
+            stop.ok_or_else(|| {
+                TiledError::InvalidSlice(
+                    "Composition with relative indexing is not supported.".into(),
+                )
+            })?,
+            step.unwrap_or(1),
+        ),
+        SliceDim::Index(_) => {
+            return Err(TiledError::InvalidSlice(
+                "Cannot index into a single-element dim".into(),
+            ));
+        }
+        SliceDim::Ellipsis => {
+            return Err(TiledError::InvalidSlice(
+                "Composition with Ellipsis in left slice is not supported.".into(),
+            ));
+        }
+    };
+    if step == 0 {
+        return Err(TiledError::InvalidSlice("slice step cannot be zero".into()));
+    }
+    let length: isize = if step > 0 {
+        (stop - start + step - 1).max(0) / step
+    } else {
+        (start - stop - step - 1).max(0) / (-step)
+    };
+    let idx = if idx < 0 { idx + length } else { idx };
+    if idx < 0 || idx >= length {
+        return Err(TiledError::InvalidSlice(
+            "Composition with out-of-bounds index".into(),
+        ));
+    }
+    Ok(start + step * idx)
+}
+
+/// Compose two SliceDim::Slice items. Mirrors upstream `_slc_with_slc`.
+fn compose_slc_with_slc(slc1: &SliceDim, slc2: &SliceDim) -> Result<SliceDim> {
+    let (start1, stop1, step1) = match slc1 {
+        SliceDim::Slice { start, stop, step } => (
+            start.unwrap_or(0),
+            stop.ok_or_else(|| {
+                TiledError::InvalidSlice(
+                    "Composition with relative indexing is not supported.".into(),
+                )
+            })?,
+            step.unwrap_or(1),
+        ),
+        _ => {
+            return Err(TiledError::InvalidSlice(
+                "compose_slc_with_slc requires both args to be Slice variants".into(),
+            ));
+        }
+    };
+    if step1 == 0 {
+        return Err(TiledError::InvalidSlice("slice step cannot be zero".into()));
+    }
+    let length: isize = if step1 > 0 {
+        (stop1 - start1 + step1 - 1).max(0) / step1
+    } else {
+        (start1 - stop1 - step1 - 1).max(0) / (-step1)
+    };
+    // Apply slice2 to a 0..length range — this is Python's slice.indices().
+    let (start2, stop2, step2) = match slc2 {
+        SliceDim::Slice { start, stop, step } => {
+            let step2 = step.unwrap_or(1);
+            if step2 == 0 {
+                return Err(TiledError::InvalidSlice(
+                    "slice step cannot be zero".into(),
+                ));
+            }
+            let (default_start, default_stop) = if step2 > 0 { (0, length) } else { (length - 1, -1) };
+            // Normalise relative starts/stops against the post-slc1 length.
+            let normalise = |v: Option<isize>, default_v: isize| -> isize {
+                let mut x = v.unwrap_or(default_v);
+                if x < 0 {
+                    x += length;
+                }
+                x.clamp(if step2 > 0 { 0 } else { -1 }, length)
+            };
+            let s = normalise(*start, default_start);
+            let t = normalise(*stop, default_stop);
+            (s, t, step2)
+        }
+        _ => {
+            return Err(TiledError::InvalidSlice(
+                "compose_slc_with_slc requires both args to be Slice variants".into(),
+            ));
+        }
+    };
+    Ok(SliceDim::Slice {
+        start: Some(start1 + step1 * start2),
+        stop: Some(start1 + step1 * stop2),
+        step: Some(step1 * step2),
+    })
 }
 
 /// Parse a colon-delimited slice part like `"1:3"`, `"::2"`, `"1:5:2"`.
@@ -403,6 +598,93 @@ mod tests {
         // Ellipsis fills two remaining dims with {}
         assert_eq!(json[1], serde_json::json!({}));
         assert_eq!(json[2], serde_json::json!({}));
+    }
+
+    #[test]
+    fn test_is_expanded() {
+        // No ellipsis, absolute starts/stops → expanded.
+        assert!(NDSlice::from_numpy_str("1:5,2:4").unwrap().is_expanded());
+        assert!(NDSlice::from_numpy_str("3,1:5").unwrap().is_expanded());
+        // Ellipsis → not expanded.
+        assert!(!NDSlice::from_numpy_str("1:5,...").unwrap().is_expanded());
+        // Open-ended (None stop) → not expanded.
+        assert!(!NDSlice::from_numpy_str("1:").unwrap().is_expanded());
+        // Negative start → not expanded.
+        let s = NDSlice(vec![SliceDim::Slice {
+            start: Some(-1),
+            stop: Some(5),
+            step: None,
+        }]);
+        assert!(!s.is_expanded());
+    }
+
+    #[test]
+    fn test_compose_simple() {
+        // arr[0:10][2:8] = arr[2:8]
+        let a = NDSlice::from_numpy_str("0:10").unwrap();
+        let b = NDSlice::from_numpy_str("2:8").unwrap();
+        let c = a.compose(&b).unwrap();
+        assert_eq!(c.0[0], SliceDim::Slice { start: Some(2), stop: Some(8), step: Some(1) });
+    }
+
+    #[test]
+    fn test_compose_strided() {
+        // arr[1:9:2][0:3] → start=1, length=4 (1,3,5,7), [0:3]→1,3,5
+        // expected: start=1, stop=7, step=2
+        let a = NDSlice::from_numpy_str("1:9:2").unwrap();
+        let b = NDSlice::from_numpy_str("0:3").unwrap();
+        let c = a.compose(&b).unwrap();
+        assert_eq!(
+            c.0[0],
+            SliceDim::Slice { start: Some(1), stop: Some(7), step: Some(2) }
+        );
+    }
+
+    #[test]
+    fn test_compose_with_index() {
+        // arr[2:10][3] → arr[2 + 1*3] = arr[5]
+        let a = NDSlice::from_numpy_str("2:10").unwrap();
+        let b = NDSlice::from_numpy_str("3").unwrap();
+        let c = a.compose(&b).unwrap();
+        assert_eq!(c.0[0], SliceDim::Index(5));
+    }
+
+    #[test]
+    fn test_compose_passthrough_integer_dim() {
+        // arr[5,1:10][0:3]: integer dim (5) is consumed; right slice
+        // applies to the second dim only.
+        // Result: [5, 1:4]
+        let a = NDSlice::from_numpy_str("5,1:10").unwrap();
+        let b = NDSlice::from_numpy_str("0:3").unwrap();
+        let c = a.compose(&b).unwrap();
+        assert_eq!(c.0[0], SliceDim::Index(5));
+        assert_eq!(
+            c.0[1],
+            SliceDim::Slice { start: Some(1), stop: Some(4), step: Some(1) }
+        );
+    }
+
+    #[test]
+    fn test_compose_empty_is_identity() {
+        let a = NDSlice::from_numpy_str("1:5").unwrap();
+        let empty = NDSlice::empty();
+        assert_eq!(a.compose(&empty).unwrap(), a);
+        assert_eq!(empty.compose(&a).unwrap(), a);
+    }
+
+    #[test]
+    fn test_compose_left_unexpanded_rejected() {
+        // Left slice with ellipsis cannot be composed.
+        let a = NDSlice::from_numpy_str("...,2:4").unwrap();
+        let b = NDSlice::from_numpy_str("0:1").unwrap();
+        assert!(a.compose(&b).is_err());
+    }
+
+    #[test]
+    fn test_compose_right_interior_ellipsis_rejected() {
+        let a = NDSlice::from_numpy_str("0:5,0:5,0:5").unwrap();
+        let b = NDSlice::from_numpy_str("0,...,0").unwrap();
+        assert!(a.compose(&b).is_err());
     }
 
     #[test]

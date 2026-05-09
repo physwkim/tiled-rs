@@ -5,6 +5,13 @@
 //! `"entry/data/data"`). The adapter exposes the dataset as a chunked
 //! array — chunk layout falls back to one chunk per axis if HDF5 reports
 //! a contiguous dataset.
+//!
+//! Slice-aware reads (upstream tiled PR #1330): `read` and `read_block`
+//! translate the requested `NDSlice` to an HDF5 hyperslab `(offsets,
+//! counts)` pair so the storage layer only materialises the requested
+//! window. Strided slices (`step > 1`) read the full window and stride
+//! down in Rust, since `rust-hdf5` doesn't expose hyperslab `stride` —
+//! correctness over a one-PR scope win.
 
 #![cfg(feature = "hdf5")]
 
@@ -15,15 +22,13 @@ use bytes::Bytes;
 use tiled_core::adapters::{ArrayAdapterRead, BaseAdapter, BoxFuture};
 use tiled_core::dtype::{BuiltinDType, DType, DynNDArray, Endianness, Kind};
 use tiled_core::error::{Result, TiledError};
-use tiled_core::ndslice::NDSlice;
+use tiled_core::ndslice::{NDSlice, SliceDim};
 use tiled_core::structures::{ArrayStructure, Spec, StructureFamily};
 
 pub struct Hdf5Adapter {
-    /// Cached array (read once into memory). HDF5 chunked reads on demand
-    /// require keeping a file handle live across awaits, which conflicts
-    /// with the trait's `Send + 'static` future requirement; the typical
-    /// AD frame fits in memory.
-    array: DynNDArray,
+    path: PathBuf,
+    dataset: String,
+    dtype: BuiltinDType,
     structure: ArrayStructure,
     metadata: serde_json::Value,
     specs: Vec<Spec>,
@@ -47,15 +52,10 @@ impl Hdf5Adapter {
             ));
         }
         let element_size = ds.element_size();
-        let counts = shape.clone();
-        let offsets = vec![0usize; shape.len()];
-
-        // rust-hdf5 doesn't expose a public datatype-class accessor, so
-        // we probe by reading with progressively narrower H5Type
-        // candidates: float first, then signed integer, then unsigned.
-        // The library's runtime type-check rejects the wrong T quickly
-        // so the fall-through cost is bounded by tries (≤ 3 per size).
-        let (raw_bytes, dtype) = read_native(&ds, element_size, &offsets, &counts)?;
+        // Probe dtype with a 1-element read; cache for subsequent slice reads.
+        let probe_offsets = vec![0usize; shape.len()];
+        let probe_counts = vec![1usize; shape.len()];
+        let (_probe_bytes, dtype) = read_native(&ds, element_size, &probe_offsets, &probe_counts)?;
 
         let chunks: Vec<Vec<usize>> = shape.iter().map(|d| vec![*d]).collect();
         let structure = ArrayStructure {
@@ -65,14 +65,222 @@ impl Hdf5Adapter {
             dims: None,
             resizable: Default::default(),
         };
-        let array = DynNDArray::new(Bytes::from(raw_bytes), dtype, shape);
         Ok(Self {
-            array,
+            path,
+            dataset: dataset.to_string(),
+            dtype,
             structure,
             metadata,
             specs: vec![Spec::new("hdf5")],
         })
     }
+
+    fn read_with_slice(&self, slice: &NDSlice) -> Result<DynNDArray> {
+        let shape = &self.structure.shape;
+        let plan = SlicePlan::from_ndslice(slice, shape)?;
+        let file = rust_hdf5::H5File::open(&self.path)
+            .map_err(|e| TiledError::Internal(format!("hdf5 reopen: {e}")))?;
+        let ds = file
+            .dataset(&self.dataset)
+            .map_err(|e| TiledError::Internal(format!("hdf5 dataset {}: {e}", self.dataset)))?;
+        let (raw, _dtype) = read_native(
+            &ds,
+            self.dtype.element_size(),
+            &plan.offsets,
+            &plan.counts,
+        )?;
+        // Apply striding + integer-index dim reduction in Rust where the
+        // HDF5 layer can't (stride>1, Index() collapse).
+        let (final_bytes, final_shape) =
+            postprocess(raw, &plan, self.dtype.element_size());
+        Ok(DynNDArray::new(
+            Bytes::from(final_bytes),
+            self.dtype.clone(),
+            final_shape,
+        ))
+    }
+}
+
+/// Computed hyperslab + post-processing instructions for a slice read.
+#[derive(Debug)]
+struct SlicePlan {
+    /// HDF5 starts (one per ndim of source dataset).
+    offsets: Vec<usize>,
+    /// HDF5 counts (one per ndim of source dataset).
+    counts: Vec<usize>,
+    /// Strides applied in Rust after the hyperslab read. `1` means no
+    /// stride. Same length as `counts`.
+    strides: Vec<usize>,
+    /// `true` for axes that should be removed (Index dim) after read.
+    /// Same length as `counts`.
+    drop_axis: Vec<bool>,
+}
+
+impl SlicePlan {
+    fn from_ndslice(slice: &NDSlice, shape: &[usize]) -> Result<Self> {
+        let ndim = shape.len();
+        let mut dims = expand_ellipsis(slice, ndim)?;
+        // Pad missing trailing dims with full slices.
+        while dims.len() < ndim {
+            dims.push(SliceDim::full());
+        }
+        if dims.len() > ndim {
+            return Err(TiledError::InvalidSlice(format!(
+                "slice has {} dims but dataset has {} dims",
+                dims.len(),
+                ndim
+            )));
+        }
+
+        let mut offsets = Vec::with_capacity(ndim);
+        let mut counts = Vec::with_capacity(ndim);
+        let mut strides = Vec::with_capacity(ndim);
+        let mut drop_axis = Vec::with_capacity(ndim);
+
+        for (axis, dim) in dims.iter().enumerate() {
+            let axis_len = shape[axis];
+            match dim {
+                SliceDim::Index(i) => {
+                    let normalised = if *i < 0 {
+                        i + axis_len as isize
+                    } else {
+                        *i
+                    };
+                    if normalised < 0 || (normalised as usize) >= axis_len {
+                        return Err(TiledError::InvalidSlice(format!(
+                            "index {i} out of bounds for axis {axis} (len {axis_len})"
+                        )));
+                    }
+                    offsets.push(normalised as usize);
+                    counts.push(1);
+                    strides.push(1);
+                    drop_axis.push(true);
+                }
+                SliceDim::Slice { start, stop, step } => {
+                    let step = step.unwrap_or(1);
+                    if step <= 0 {
+                        // Negative-step slices need a separate code
+                        // path — punt for now (rare in API usage).
+                        return Err(TiledError::InvalidSlice(
+                            "negative-step slices not supported in HDF5 slice plan"
+                                .into(),
+                        ));
+                    }
+                    let start_n = match start {
+                        Some(s) if *s < 0 => (s + axis_len as isize).max(0) as usize,
+                        Some(s) => (*s as usize).min(axis_len),
+                        None => 0,
+                    };
+                    let stop_n = match stop {
+                        Some(s) if *s < 0 => (s + axis_len as isize).max(0) as usize,
+                        Some(s) => (*s as usize).min(axis_len),
+                        None => axis_len,
+                    };
+                    let count = stop_n.saturating_sub(start_n);
+                    offsets.push(start_n);
+                    counts.push(count);
+                    strides.push(step as usize);
+                    drop_axis.push(false);
+                }
+                SliceDim::Ellipsis => unreachable!("expanded above"),
+            }
+        }
+
+        Ok(SlicePlan {
+            offsets,
+            counts,
+            strides,
+            drop_axis,
+        })
+    }
+}
+
+fn expand_ellipsis(slice: &NDSlice, ndim: usize) -> Result<Vec<SliceDim>> {
+    let mut out = Vec::with_capacity(ndim);
+    let n_ellipsis = slice
+        .0
+        .iter()
+        .filter(|d| matches!(d, SliceDim::Ellipsis))
+        .count();
+    if n_ellipsis > 1 {
+        return Err(TiledError::InvalidSlice(
+            "more than one ellipsis in slice".into(),
+        ));
+    }
+    let non_ellipsis_count = slice.0.len() - n_ellipsis;
+    if non_ellipsis_count > ndim {
+        return Err(TiledError::InvalidSlice(format!(
+            "slice has more non-ellipsis dims ({non_ellipsis_count}) than dataset ndim ({ndim})"
+        )));
+    }
+    let fill = ndim - non_ellipsis_count;
+    for d in &slice.0 {
+        if matches!(d, SliceDim::Ellipsis) {
+            for _ in 0..fill {
+                out.push(SliceDim::full());
+            }
+        } else {
+            out.push(d.clone());
+        }
+    }
+    Ok(out)
+}
+
+/// Stride down + collapse Index dims after the HDF5 read.
+fn postprocess(
+    raw: Vec<u8>,
+    plan: &SlicePlan,
+    element_size: usize,
+) -> (Vec<u8>, Vec<usize>) {
+    // If every stride is 1, just drop integer-indexed dims — no copy needed.
+    if plan.strides.iter().all(|&s| s == 1) {
+        let final_shape: Vec<usize> = plan
+            .counts
+            .iter()
+            .zip(&plan.drop_axis)
+            .filter_map(|(c, drop)| if *drop { None } else { Some(*c) })
+            .collect();
+        return (raw, final_shape);
+    }
+
+    // Strided: walk the raw buffer in row-major order, picking elements
+    // whose per-axis index is a multiple of stride.
+    let strided_counts: Vec<usize> = plan
+        .counts
+        .iter()
+        .zip(&plan.strides)
+        .map(|(c, s)| c.div_ceil(*s))
+        .collect();
+    let mut out = Vec::with_capacity(strided_counts.iter().product::<usize>() * element_size);
+    let mut idx = vec![0usize; plan.counts.len()];
+    let total: usize = plan.counts.iter().product();
+    let mut linear = 0usize;
+    while linear < total {
+        // Are all axes on a stride boundary?
+        let take = idx
+            .iter()
+            .zip(&plan.strides)
+            .all(|(i, s)| i % s == 0);
+        if take {
+            let start = linear * element_size;
+            out.extend_from_slice(&raw[start..start + element_size]);
+        }
+        // Advance index in row-major order.
+        for axis in (0..idx.len()).rev() {
+            idx[axis] += 1;
+            if idx[axis] < plan.counts[axis] {
+                break;
+            }
+            idx[axis] = 0;
+        }
+        linear += 1;
+    }
+    let final_shape: Vec<usize> = strided_counts
+        .iter()
+        .zip(&plan.drop_axis)
+        .filter_map(|(c, drop)| if *drop { None } else { Some(*c) })
+        .collect();
+    (out, final_shape)
 }
 
 fn read_native(
@@ -140,13 +348,13 @@ impl ArrayAdapterRead for Hdf5Adapter {
     fn structure(&self) -> &ArrayStructure {
         &self.structure
     }
-    fn read<'a>(&'a self, _slice: &'a NDSlice) -> BoxFuture<'a, Result<DynNDArray>> {
-        Box::pin(async move { Ok(self.array.clone()) })
+    fn read<'a>(&'a self, slice: &'a NDSlice) -> BoxFuture<'a, Result<DynNDArray>> {
+        Box::pin(async move { self.read_with_slice(slice) })
     }
     fn read_block<'a>(
         &'a self,
         block: &'a [usize],
-        _slice: &'a NDSlice,
+        slice: &'a NDSlice,
     ) -> BoxFuture<'a, Result<DynNDArray>> {
         Box::pin(async move {
             for (axis, &b) in block.iter().enumerate() {
@@ -156,7 +364,7 @@ impl ArrayAdapterRead for Hdf5Adapter {
                     )));
                 }
             }
-            Ok(self.array.clone())
+            self.read_with_slice(slice)
         })
     }
 }
