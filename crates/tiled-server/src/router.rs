@@ -1753,6 +1753,23 @@ pub async fn delete_metadata(
         )
         .await;
     auth.require(tiled_auth::Scope::DeleteNode)?;
+    // Reject deletion of a non-empty container (upstream tiled #503).
+    // Cascading FK delete *would* succeed, but silently dropping a
+    // subtree is the kind of thing that needs explicit `rm -rf`
+    // semantics; require the caller to empty the container first.
+    if node.structure_family == "container" {
+        let kid_count = catalog
+            .count_children(Some(node.id))
+            .await
+            .map_err(map_catalog_err)?;
+        if kid_count > 0 {
+            return Err(ServerError::Validation(format!(
+                "container '{}' is not empty ({kid_count} children); \
+                 delete its contents first or use a future recursive endpoint",
+                segments.join("/"),
+            )));
+        }
+    }
     catalog.delete_node(node.id).await.map_err(map_catalog_err)?;
     let path = segments.join("/");
     state

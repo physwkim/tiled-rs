@@ -162,7 +162,15 @@ async fn register_then_read_then_patch_then_delete() {
         "updated"
     );
 
-    // DELETE expt cascades to scan_1.
+    // Upstream tiled #503: DELETE on a non-empty container is now
+    // rejected — explicit rmdir-style emptying is required.
+    let (status, _) = empty_request(&app, Method::DELETE, "/api/v1/metadata/expt").await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    // Empty the child first, THEN the container.
+    let (status, _) =
+        empty_request(&app, Method::DELETE, "/api/v1/metadata/expt/scan_1").await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
     let (status, _) = empty_request(&app, Method::DELETE, "/api/v1/metadata/expt").await;
     assert_eq!(status, StatusCode::NO_CONTENT);
 
