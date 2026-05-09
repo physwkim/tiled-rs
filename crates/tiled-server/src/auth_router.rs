@@ -353,6 +353,23 @@ pub async fn api_key_revoke(
 ) -> Result<impl IntoResponse, ServerError> {
     auth.require(tiled_auth::Scope::ApiKeyRevoke)?;
     let (db, _) = require_auth_db(&state)?;
+    let principal = auth.principal.clone().ok_or_else(|| {
+        ServerError::Unauthorized("login required to revoke an api key".into())
+    })?;
+    // Look up the key owner before revoking so a non-admin can't drop a
+    // key that belongs to someone else (just having ApiKeyRevoke scope on
+    // your own session would otherwise be enough).
+    let candidates = db
+        .list_api_keys(Some(principal.id))
+        .await
+        .map_err(map_auth_err)?;
+    let allowed = candidates.iter().any(|k| k.first_eight == first_eight)
+        || auth.scopes.contains(tiled_auth::Scope::Admin);
+    if !allowed {
+        return Err(ServerError::Forbidden(
+            "api key does not belong to this principal".into(),
+        ));
+    }
     let _ = db
         .revoke_api_key(&first_eight)
         .await
