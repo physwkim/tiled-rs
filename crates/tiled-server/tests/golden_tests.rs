@@ -70,6 +70,8 @@ fn build_app() -> axum::Router {
         streaming_bus: tiled_server::streaming::StreamingBus::new(),
         access_policy: None,
         default_login_scopes: tiled_auth::ScopeSet::full(),
+        enable_web: true,
+        web_assets_dir: None,
     };
 
     tiled_server::build_app(state)
@@ -102,6 +104,8 @@ fn build_app_dynamic(trust_forwarded: bool) -> axum::Router {
         streaming_bus: tiled_server::streaming::StreamingBus::new(),
         access_policy: None,
         default_login_scopes: tiled_auth::ScopeSet::full(),
+        enable_web: true,
+        web_assets_dir: None,
     };
 
     tiled_server::build_app(state)
@@ -489,6 +493,8 @@ async fn test_empty_container() {
         streaming_bus: tiled_server::streaming::StreamingBus::new(),
         access_policy: None,
         default_login_scopes: tiled_auth::ScopeSet::full(),
+        enable_web: true,
+        web_assets_dir: None,
     };
     let app = tiled_server::build_app(state);
 
@@ -580,6 +586,8 @@ fn build_app_with_api_key(key: &str) -> axum::Router {
         streaming_bus: tiled_server::streaming::StreamingBus::new(),
         access_policy: None,
         default_login_scopes: tiled_auth::ScopeSet::full(),
+        enable_web: true,
+        web_assets_dir: None,
     };
 
     tiled_server::build_app(state)
@@ -709,6 +717,8 @@ async fn test_metadata_handles_percent_encoded_slash_in_key() {
         streaming_bus: tiled_server::streaming::StreamingBus::new(),
         access_policy: None,
         default_login_scopes: tiled_auth::ScopeSet::full(),
+        enable_web: true,
+        web_assets_dir: None,
     };
     let app = tiled_server::build_app(state);
 

@@ -1,0 +1,54 @@
+{% extends "admin_layout.html" %}
+{% block content %}
+<p class="muted">Logged in as: <code>{{ principal_uuid }}</code> · scopes: <code>{{ scopes }}</code></p>
+
+<h3>Active keys</h3>
+{% if keys.is_empty() %}
+<p class="muted">No keys yet.</p>
+{% else %}
+<table>
+  <thead>
+    <tr><th>Prefix</th><th>Scopes</th><th>Note</th><th>Expires</th><th></th></tr>
+  </thead>
+  <tbody>
+    {% for k in keys %}
+    <tr>
+      <td><code>{{ k.first_eight }}</code></td>
+      <td><code>{{ k.scopes }}</code></td>
+      <td>{{ k.note }}</td>
+      <td>{{ k.expires }}</td>
+      <td>
+        <form method="post" action="/admin/api-keys/{{ k.first_eight }}/revoke" onsubmit="return confirm('Revoke {{ k.first_eight }}?');">
+          <button class="danger" type="submit">revoke</button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+
+<h3 style="margin-top:32px">Issue a new key</h3>
+<form method="post" action="/admin/api-keys/create">
+  <p>
+    <label>Note: <input type="text" name="note" placeholder="e.g. lab-laptop"></label>
+  </p>
+  <p>
+    <label>Scopes (comma-separated; default: full set):</label><br>
+    <input type="text" name="scopes" placeholder="read:metadata, read:data">
+  </p>
+  <p>
+    <label>Expires in (seconds; blank = never):</label><br>
+    <input type="text" name="expires_in">
+  </p>
+  <p>
+    <button type="submit">create</button>
+  </p>
+</form>
+{% if let Some(secret) = new_secret %}
+<section class="card" style="border-color:#27ae60">
+  <p><strong>Save this secret now — it won't be shown again.</strong></p>
+  <pre>{{ secret }}</pre>
+</section>
+{% endif %}
+{% endblock %}

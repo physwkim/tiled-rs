@@ -1,0 +1,19 @@
+[package]
+name = "tiled-web"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tiled-core = { workspace = true }
+tiled-auth = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+sqlx = { workspace = true }
+rust-embed = "8"
+mime_guess = "2"
+askama = "0.12"

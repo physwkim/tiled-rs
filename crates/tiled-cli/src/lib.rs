@@ -96,6 +96,18 @@ pub enum Command {
         /// once authenticated writers exist.
         #[arg(long = "allowed-data-dir")]
         allowed_data_dirs: Vec<std::path::PathBuf>,
+
+        /// Disable the bundled WebUI shell. The API still works; only
+        /// the `/`, `/static/*`, and `/admin/*` browser surface goes
+        /// away. Useful for headless deployments.
+        #[arg(long)]
+        no_web: bool,
+
+        /// Override the embedded SPA bundle with a directory on disk —
+        /// the typical way to swap in the prebuilt bluesky/tiled WebUI
+        /// without recompiling tiled-rs.
+        #[arg(long)]
+        web_assets_dir: Option<std::path::PathBuf>,
     },
 
     /// Database management commands (not yet implemented)
@@ -294,6 +306,8 @@ pub async fn run(command: Command) -> Result<()> {
             auth_provider_name,
             proxied_auth_header,
             allowed_data_dirs,
+            no_web,
+            web_assets_dir,
         } => {
             // Load config file if provided.
             let file_config = config
@@ -418,6 +432,8 @@ pub async fn run(command: Command) -> Result<()> {
         streaming_bus: tiled_server::streaming::StreamingBus::new(),
         access_policy: None,
         default_login_scopes: tiled_auth::ScopeSet::full(),
+        enable_web: !no_web,
+        web_assets_dir,
             };
 
             let app = tiled_server::build_app(state);

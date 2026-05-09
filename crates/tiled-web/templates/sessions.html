@@ -1,0 +1,28 @@
+{% extends "admin_layout.html" %}
+{% block content %}
+<p class="muted">Showing sessions for <code>{{ principal_uuid }}</code>.</p>
+{% if sessions.is_empty() %}
+<p>No active sessions.</p>
+{% else %}
+<table>
+  <thead>
+    <tr><th>UUID</th><th>Created</th><th>Last used</th><th>Expires</th><th>Revoked</th></tr>
+  </thead>
+  <tbody>
+    {% for s in sessions %}
+    <tr>
+      <td><code>{{ s.uuid }}</code></td>
+      <td>{{ s.created }}</td>
+      <td>{{ s.last_used }}</td>
+      <td>{{ s.expires }}</td>
+      <td>{% if s.revoked %}yes{% else %}no{% endif %}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+<form method="post" action="/admin/sessions/revoke-all" style="margin-top:24px"
+      onsubmit="return confirm('Revoke every session for this principal?');">
+  <button type="submit" class="danger">revoke all</button>
+</form>
+{% endblock %}

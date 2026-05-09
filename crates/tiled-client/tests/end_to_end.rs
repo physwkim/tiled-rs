@@ -64,6 +64,8 @@ async fn spawn_server(api_key: Option<String>) -> String {
         streaming_bus: tiled_server::streaming::StreamingBus::new(),
         access_policy: None,
         default_login_scopes: tiled_auth::ScopeSet::full(),
+        enable_web: true,
+        web_assets_dir: None,
     };
 
     let app = tiled_server::build_app(state);

@@ -7,6 +7,7 @@ members = [
     "crates/tiled-auth",
     "crates/tiled-access",
     "crates/tiled-server",
+    "crates/tiled-web",
     "crates/tiled-client",
     "crates/tiled-cli",
     "crates/tiled-mongo",
@@ -125,6 +126,7 @@ tiled-serialization = { path = "crates/tiled-serialization" }
 tiled-auth = { path = "crates/tiled-auth" }
 tiled-access = { path = "crates/tiled-access" }
 tiled-server = { path = "crates/tiled-server" }
+tiled-web = { path = "crates/tiled-web" }
 tiled-client = { path = "crates/tiled-client" }
 tiled-cli = { path = "crates/tiled-cli" }
 tiled-mongo = { path = "crates/tiled-mongo" }

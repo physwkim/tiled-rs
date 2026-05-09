@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tiled-rs admin · {{ title }}</title>
+<link rel="stylesheet" href="/static/spa.css">
+</head>
+<body>
+<header class="topbar">
+  <h1><a href="/">tiled-rs</a> · admin</h1>
+  <nav>
+    <a href="/admin/api-keys">API keys</a>
+    <a href="/admin/sessions">sessions</a>
+    <a href="/admin/streaming">streaming</a>
+    <a href="/api/v1/auth/logout">logout</a>
+  </nav>
+</header>
+<main>
+  <section class="card">
+    <h2>{{ title }}</h2>
+    {% block content %}{% endblock %}
+  </section>
+  {% if let Some(msg) = message %}
+  <section class="card">
+    <p class="muted">{{ msg }}</p>
+  </section>
+  {% endif %}
+</main>
+</body>
+</html>

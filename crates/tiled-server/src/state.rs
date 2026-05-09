@@ -79,6 +79,14 @@ pub struct AppState {
     /// SimpleAccessPolicy. Per-key fine-grained scopes still flow
     /// through `POST /auth/apikeys`.
     pub default_login_scopes: tiled_auth::ScopeSet,
+    /// Skip the bundled WebUI shell mount when false. Compile-time the
+    /// `web` feature still has to be on; this is a runtime toggle for
+    /// `--no-web` deployments.
+    pub enable_web: bool,
+    /// Optional directory the SPA assets are served from. `None` uses
+    /// the compiled-in placeholder bundle. Honoured only when the
+    /// `web` feature is compiled in.
+    pub web_assets_dir: Option<std::path::PathBuf>,
 }
 
 impl AppState {

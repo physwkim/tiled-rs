@@ -1,0 +1,9 @@
+{% extends "admin_layout.html" %}
+{% block content %}
+<p>Total open channels: <strong>{{ total_channels }}</strong></p>
+<p class="muted">
+  Each channel covers a node path; subscribers attached at any ancestor
+  of a published path receive the update too. Channels with zero
+  subscribers are GC'd on the next publish.
+</p>
+{% endblock %}

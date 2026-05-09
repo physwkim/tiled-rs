@@ -4,13 +4,14 @@ version.workspace = true
 edition.workspace = true
 
 [features]
-default = ["csv-adapter", "image-serializer", "parquet-serializer"]
+default = ["csv-adapter", "image-serializer", "parquet-serializer", "web"]
 csv-adapter = ["tiled-adapters/csv-adapter"]
 parquet-adapter = ["tiled-adapters/parquet"]
 tiff-adapter = ["tiled-adapters/tiff"]
 hdf5-adapter = ["tiled-adapters/hdf5"]
 image-serializer = ["tiled-serialization/image"]
 parquet-serializer = ["tiled-serialization/parquet"]
+web = ["dep:tiled-web"]
 
 [dependencies]
 tiled-core = { workspace = true }
@@ -19,6 +20,7 @@ tiled-serialization = { workspace = true }
 tiled-catalog = { workspace = true }
 tiled-auth = { workspace = true }
 tiled-access = { workspace = true }
+tiled-web = { workspace = true, optional = true }
 axum = { workspace = true }
 tower = { workspace = true }
 tower-http = { workspace = true }

@@ -119,13 +119,37 @@ pub fn build_app(state: AppState) -> Router {
     app = app.merge(public_auth).merge(ws).merge(guarded);
 
     let body_limit = state.max_request_body_bytes;
-    app.layer(axum::extract::DefaultBodyLimit::max(body_limit))
+    let api_app = app
+        .layer(axum::extract::DefaultBodyLimit::max(body_limit))
         .layer(axum::middleware::from_fn(correlation_id_middleware))
         .layer(axum::middleware::from_fn(timeout_middleware))
         .layer(CompressionLayer::new())
         .layer(TraceLayer::new_for_http())
         .layer(cors)
-        .with_state(state)
+        .with_state(state.clone());
+
+    // Browser surface (SPA shell + admin pages). Mounted alongside the
+    // API after with_state — tiled-web's router carries its own
+    // WebState internally, so it merges cleanly into a stateless
+    // Router<()>. Behind the `web` feature so headless deployments can
+    // strip the static bundle from the binary.
+    #[cfg(feature = "web")]
+    {
+        if state.enable_web {
+            let bus = state.streaming_bus.clone();
+            let web_state = tiled_web::WebState {
+                auth_db: state.auth_db.clone(),
+                issuer: state.issuer.clone(),
+                default_login_scopes: state.default_login_scopes.clone(),
+                login_provider: "dummy".into(),
+                channel_count_fn: std::sync::Arc::new(move || bus.channel_count()),
+                secure_cookies: state.trust_forwarded_headers,
+                assets_dir: state.web_assets_dir.clone(),
+            };
+            return api_app.merge(tiled_web::build_router(web_state));
+        }
+    }
+    api_app
 }
 
 /// Generates a per-request `x-tiled-request-id` if the client didn't set

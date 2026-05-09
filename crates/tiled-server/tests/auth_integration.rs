@@ -56,6 +56,8 @@ async fn build_test_app() -> (axum::Router, tempfile::TempDir, Catalog) {
         streaming_bus: tiled_server::streaming::StreamingBus::new(),
         access_policy: None,
         default_login_scopes: tiled_auth::ScopeSet::full(),
+        enable_web: true,
+        web_assets_dir: None,
     };
     (tiled_server::build_app(state), dir, catalog)
 }

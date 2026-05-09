@@ -47,6 +47,8 @@ async fn spawn_server() -> (String, tempfile::TempDir) {
         streaming_bus: tiled_server::streaming::StreamingBus::new(),
         access_policy: None,
         default_login_scopes: tiled_auth::ScopeSet::full(),
+        enable_web: true,
+        web_assets_dir: None,
     };
     let app = tiled_server::build_app(state);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

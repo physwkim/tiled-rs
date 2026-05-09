@@ -1,0 +1,13 @@
+{% extends "admin_layout.html" %}
+{% block content %}
+<p>Sign in to manage your API keys + sessions.</p>
+<form method="post" action="/admin/login">
+  <p><label>Provider: <input type="text" name="provider" value="dummy"></label></p>
+  <p><label>Username: <input type="text" name="username"></label></p>
+  <p><label>Password: <input type="password" name="password"></label></p>
+  <p><button type="submit">sign in</button></p>
+</form>
+{% if let Some(err) = login_error %}
+<p class="muted" style="color:#c0392b">{{ err }}</p>
+{% endif %}
+{% endblock %}
