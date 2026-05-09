@@ -12,6 +12,10 @@ members = [
     "crates/tiled-cli",
     "crates/tiled-mongo",
 ]
+# tiled-web-spa is a WASM-target crate built independently by trunk with
+# its own release profile (opt-level=z, lto=fat). Excluded so a host
+# `cargo build` doesn't pull it onto the wrong target.
+exclude = ["crates/tiled-web-spa"]
 resolver = "3"
 
 [workspace.package]

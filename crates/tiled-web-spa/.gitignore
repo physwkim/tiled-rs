@@ -1,0 +1,3 @@
+target/
+dist/
+style/app.tailwind.css

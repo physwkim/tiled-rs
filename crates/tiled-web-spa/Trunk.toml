@@ -1,0 +1,29 @@
+[build]
+target = "index.html"
+dist = "dist"
+release = true
+# tiled-web mounts the bundle under /static/ (the build copies dist/* to
+# crates/tiled-web/assets/spa/, served via that prefix). Setting
+# public_url means the trunk-generated <script> tag and asset URLs are
+# emitted as /static/<file> instead of /<file>.
+public_url = "/static/"
+
+[serve]
+port = 5173
+# Forward API + admin to the running tiled-rs server during dev.
+proxy_backend = "http://127.0.0.1:8000/api/"
+
+# A second proxy entry for /admin/* — Trunk lets us register multiple.
+[[proxy]]
+backend = "http://127.0.0.1:8000/admin/"
+
+[[hooks]]
+stage = "pre_build"
+command = "../../tools/tailwindcss"
+command_arguments = [
+  "-i",
+  "style/app.css",
+  "-o",
+  "style/app.tailwind.css",
+  "--minify",
+]

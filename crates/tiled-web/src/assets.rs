@@ -1,13 +1,14 @@
 //! Embedded SPA bundle.
 //!
-//! Compile-time embed of `assets/spa/`. Routes:
+//! Compile-time embed of `assets/spa/`. The directory is populated by
+//! `build.rs`: `trunk build` output if trunk is on PATH, otherwise the
+//! committed `assets/spa-placeholder/` is copied in. Routes:
 //!   - `GET /` → `index.html`
 //!   - `GET /static/<file>` → matching asset
 //!   - `GET /<spa-route>` → `index.html` (SPA fallback)
 //!
-//! When the operator wants to swap in the real bundle, drop the build
-//! artefact at `crates/tiled-web/assets/spa/` before compiling, or pass
-//! `--web-assets-dir <path>` to load from disk instead.
+//! Operators can override at runtime with `--web-assets-dir <path>` to
+//! load from disk instead of the embedded bundle.
 
 use std::path::PathBuf;
 use std::sync::Arc;
