@@ -365,16 +365,12 @@ pub async fn array_block(
     };
 
     let block_str = params.get("block").map(|s| s.as_str()).unwrap_or("");
-    let block: Vec<usize> = if block_str.is_empty() {
-        vec![0; array_adapter.structure().ndim()]
+    let block_specs: Vec<BlockSpec> = if block_str.is_empty() {
+        vec![BlockSpec::Single(0); array_adapter.structure().ndim()]
     } else {
         block_str
             .split(',')
-            .map(|s| {
-                s.trim()
-                    .parse::<usize>()
-                    .map_err(|_| ServerError::Validation(format!("Invalid block index: {s}")))
-            })
+            .map(|s| BlockSpec::parse(s.trim()))
             .collect::<Result<Vec<_>, _>>()?
     };
 
@@ -385,10 +381,34 @@ pub async fn array_block(
         Some(s) => tiled_core::ndslice::NDSlice::from_numpy_str(s)
             .map_err(|e| ServerError::Validation(format!("Invalid slice '{s}': {e}")))?,
     };
-    let data = array_adapter
-        .read_block(&block, &slice)
-        .await
-        .map_err(ServerError::from)?;
+    // Single-chunk fast path = every axis is BlockSpec::Single. Mirrors
+    // pre-#1302 behaviour exactly so existing callers see no change.
+    let single_chunk: Option<Vec<usize>> = block_specs
+        .iter()
+        .map(|s| match s {
+            BlockSpec::Single(i) => Some(*i),
+            BlockSpec::Range(_, _) => None,
+        })
+        .collect();
+    let data = if let Some(block) = single_chunk {
+        array_adapter
+            .read_block(&block, &slice)
+            .await
+            .map_err(ServerError::from)?
+    } else {
+        // Multi-chunk read — upstream tiled PR #1302. Slicing within a
+        // multi-chunk block requires applying the slice to the
+        // assembled buffer; restrict to "no slice" for the first port
+        // and surface a clear 422 if both are combined. Slice across a
+        // chunk range is a follow-up (needs a contiguous-buffer
+        // apply_slice helper).
+        if !slice.is_empty() {
+            return Err(ServerError::Validation(
+                "?slice= combined with a multi-chunk ?block= range is not yet supported".into(),
+            ));
+        }
+        read_block_range(array_adapter, &block_specs).await?
+    };
 
     let accept = headers
         .get("accept")
@@ -417,6 +437,218 @@ pub async fn array_block(
     };
 
     Ok(([(axum::http::header::CONTENT_TYPE, media_type)], body).into_response())
+}
+
+// ---------------------------------------------------------------------------
+// `?block=` parser + multi-chunk read (upstream tiled PR #1302)
+// ---------------------------------------------------------------------------
+
+/// One axis of a block selection. `Single` is the historical
+/// integer-index form; `Range` (start..stop) spans a chunk range.
+#[derive(Debug, Clone, Copy)]
+enum BlockSpec {
+    Single(usize),
+    Range(usize, usize),
+}
+
+impl BlockSpec {
+    fn parse(piece: &str) -> Result<Self, ServerError> {
+        if let Some((s, t)) = piece.split_once(':') {
+            let start: usize = s
+                .parse()
+                .map_err(|_| ServerError::Validation(format!("Invalid block range '{piece}'")))?;
+            let stop: usize = t
+                .parse()
+                .map_err(|_| ServerError::Validation(format!("Invalid block range '{piece}'")))?;
+            if stop <= start {
+                return Err(ServerError::Validation(format!(
+                    "Block range '{piece}': stop ({stop}) must be > start ({start})"
+                )));
+            }
+            Ok(BlockSpec::Range(start, stop))
+        } else {
+            piece
+                .parse::<usize>()
+                .map(BlockSpec::Single)
+                .map_err(|_| ServerError::Validation(format!("Invalid block index '{piece}'")))
+        }
+    }
+
+    fn range(self) -> (usize, usize) {
+        match self {
+            BlockSpec::Single(i) => (i, i + 1),
+            BlockSpec::Range(s, t) => (s, t),
+        }
+    }
+}
+
+/// Walk the cartesian product of chunks the request spans, read each
+/// one with an empty slice, and concat them in row-major order into a
+/// single result buffer.
+async fn read_block_range(
+    adapter: &dyn tiled_core::adapters::ArrayAdapterRead,
+    block_specs: &[BlockSpec],
+) -> Result<tiled_core::dtype::DynNDArray, ServerError> {
+    let structure = adapter.structure();
+    let chunks = &structure.chunks;
+    if block_specs.len() != chunks.len() {
+        return Err(ServerError::Validation(format!(
+            "Block parameter must have {} comma-separated parameters (got {})",
+            chunks.len(),
+            block_specs.len()
+        )));
+    }
+    // Per-axis chunk range + bounds check.
+    let mut axis_ranges: Vec<(usize, usize)> = Vec::with_capacity(block_specs.len());
+    for (axis, spec) in block_specs.iter().enumerate() {
+        let (start, stop) = spec.range();
+        if stop > chunks[axis].len() {
+            return Err(ServerError::Validation(format!(
+                "Block range axis {axis}: stop {stop} exceeds chunk count {}",
+                chunks[axis].len()
+            )));
+        }
+        axis_ranges.push((start, stop));
+    }
+    // Result shape per axis = sum of chunk sizes spanned on that axis.
+    let result_shape: Vec<usize> = axis_ranges
+        .iter()
+        .zip(chunks.iter())
+        .map(|((start, stop), axis_chunks)| axis_chunks[*start..*stop].iter().sum())
+        .collect();
+
+    // Probe element size by reading the first chunk (cheap — same chunk
+    // we'd read anyway). We'll reuse it as the result block 0.
+    let first_idx: Vec<usize> = axis_ranges.iter().map(|(s, _)| *s).collect();
+    let first = adapter
+        .read_block(&first_idx, &tiled_core::ndslice::NDSlice::empty())
+        .await
+        .map_err(ServerError::from)?;
+    let elem_size = first.dtype.element_size();
+    let total: usize = result_shape.iter().product();
+    let mut buf = vec![0u8; total * elem_size];
+
+    // Pre-compute byte offsets in result for axis index `i_axis`:
+    // result_axis_offsets[axis][i] = sum of chunk sizes [start..i] in elements.
+    let result_axis_offsets: Vec<Vec<usize>> = axis_ranges
+        .iter()
+        .zip(chunks.iter())
+        .map(|((start, stop), axis_chunks)| {
+            let mut acc = 0usize;
+            (*start..*stop)
+                .map(|c| {
+                    let here = acc;
+                    acc += axis_chunks[c];
+                    here
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    // Iterate chunks in row-major order and copy into result.
+    let chunk_count: Vec<usize> = axis_ranges.iter().map(|(s, t)| t - s).collect();
+    let total_chunks: usize = chunk_count.iter().product();
+    let mut idx_in_range = vec![0usize; chunk_count.len()];
+    let mut copied_first = false;
+
+    for _step in 0..total_chunks {
+        let chunk_global_idx: Vec<usize> = idx_in_range
+            .iter()
+            .zip(axis_ranges.iter())
+            .map(|(i, (s, _))| s + i)
+            .collect();
+        let chunk_data = if !copied_first && chunk_global_idx == first_idx {
+            copied_first = true;
+            first.clone()
+        } else {
+            adapter
+                .read_block(&chunk_global_idx, &tiled_core::ndslice::NDSlice::empty())
+                .await
+                .map_err(ServerError::from)?
+        };
+        let chunk_offsets: Vec<usize> = idx_in_range
+            .iter()
+            .zip(result_axis_offsets.iter())
+            .map(|(i, off)| off[*i])
+            .collect();
+        copy_chunk_into_result(
+            &mut buf,
+            &result_shape,
+            &chunk_offsets,
+            &chunk_data.data,
+            &chunk_data.shape,
+            elem_size,
+        );
+        // Advance the per-axis index in row-major order.
+        for axis in (0..idx_in_range.len()).rev() {
+            idx_in_range[axis] += 1;
+            if idx_in_range[axis] < chunk_count[axis] {
+                break;
+            }
+            idx_in_range[axis] = 0;
+        }
+    }
+
+    Ok(tiled_core::dtype::DynNDArray::new(
+        bytes::Bytes::from(buf),
+        first.dtype,
+        result_shape,
+    ))
+}
+
+/// Copy a single chunk's row-major bytes into the right offset of the
+/// (also row-major) result buffer. Walks each "row" — the innermost
+/// axis is contiguous — and computes the destination offset per row
+/// from the per-axis chunk offsets and the result's strides.
+fn copy_chunk_into_result(
+    result: &mut [u8],
+    result_shape: &[usize],
+    chunk_offsets: &[usize],
+    chunk: &[u8],
+    chunk_shape: &[usize],
+    elem_size: usize,
+) {
+    let ndim = result_shape.len();
+    if ndim == 0 || chunk_shape.iter().any(|d| *d == 0) {
+        return;
+    }
+    if ndim == 1 {
+        let dst = chunk_offsets[0] * elem_size;
+        let len = chunk_shape[0] * elem_size;
+        result[dst..dst + len].copy_from_slice(&chunk[..len]);
+        return;
+    }
+    // Strides in bytes (row-major, innermost stride = elem_size).
+    let mut result_strides = vec![elem_size; ndim];
+    for i in (0..ndim - 1).rev() {
+        result_strides[i] = result_strides[i + 1] * result_shape[i + 1];
+    }
+    let mut chunk_strides = vec![elem_size; ndim];
+    for i in (0..ndim - 1).rev() {
+        chunk_strides[i] = chunk_strides[i + 1] * chunk_shape[i + 1];
+    }
+    let inner = ndim - 1;
+    let row_bytes = chunk_shape[inner] * elem_size;
+    let outer_total: usize = chunk_shape[..inner].iter().product();
+
+    let mut outer = vec![0usize; inner];
+    for _row in 0..outer_total {
+        let mut src = 0usize;
+        let mut dst = chunk_offsets[inner] * elem_size;
+        for axis in 0..inner {
+            src += outer[axis] * chunk_strides[axis];
+            dst += (chunk_offsets[axis] + outer[axis]) * result_strides[axis];
+        }
+        result[dst..dst + row_bytes].copy_from_slice(&chunk[src..src + row_bytes]);
+        // Increment outer in row-major order.
+        for axis in (0..inner).rev() {
+            outer[axis] += 1;
+            if outer[axis] < chunk_shape[axis] {
+                break;
+            }
+            outer[axis] = 0;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1098,4 +1330,75 @@ fn synthetic_seed() -> (u64, u64) {
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
     (nanos, COUNTER.fetch_add(1, Ordering::Relaxed))
+}
+
+#[cfg(test)]
+mod block_parser_tests {
+    use super::*;
+
+    #[test]
+    fn parse_single_int() {
+        let s = BlockSpec::parse("3").unwrap();
+        assert!(matches!(s, BlockSpec::Single(3)));
+        assert_eq!(s.range(), (3, 4));
+    }
+
+    #[test]
+    fn parse_range() {
+        let s = BlockSpec::parse("2:5").unwrap();
+        assert!(matches!(s, BlockSpec::Range(2, 5)));
+        assert_eq!(s.range(), (2, 5));
+    }
+
+    #[test]
+    fn parse_invalid_int_rejected() {
+        assert!(BlockSpec::parse("abc").is_err());
+    }
+
+    #[test]
+    fn parse_range_stop_le_start_rejected() {
+        assert!(BlockSpec::parse("3:3").is_err());
+        assert!(BlockSpec::parse("4:2").is_err());
+    }
+
+    #[test]
+    fn copy_chunk_1d() {
+        let mut result = vec![0u8; 10];
+        let chunk = vec![1u8, 2, 3, 4];
+        copy_chunk_into_result(&mut result, &[10], &[3], &chunk, &[4], 1);
+        assert_eq!(result, vec![0, 0, 0, 1, 2, 3, 4, 0, 0, 0]);
+    }
+
+    #[test]
+    fn copy_chunk_2d() {
+        // result is 4x4, chunk is 2x2, place at offset (1, 1):
+        //  . . . .       . . . .
+        //  . a b .   →   . a b .
+        //  . c d .       . c d .
+        //  . . . .       . . . .
+        let mut result = vec![0u8; 16];
+        let chunk = vec![b'a', b'b', b'c', b'd'];
+        copy_chunk_into_result(&mut result, &[4, 4], &[1, 1], &chunk, &[2, 2], 1);
+        let expected = vec![
+            0, 0, 0, 0,
+            0, b'a', b'b', 0,
+            0, b'c', b'd', 0,
+            0, 0, 0, 0,
+        ];
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn copy_chunk_2d_multi_byte() {
+        // 2x2 result, chunk is 1x2 placed at (1, 0). element_size=2
+        // Each 2-byte element is little-endian u16; values 100, 200
+        let mut result = vec![0u8; 8];
+        let chunk = (100u16).to_le_bytes().iter()
+            .chain((200u16).to_le_bytes().iter())
+            .copied().collect::<Vec<_>>();
+        copy_chunk_into_result(&mut result, &[2, 2], &[1, 0], &chunk, &[1, 2], 2);
+        // Bytes 4..6 = 100, bytes 6..8 = 200.
+        assert_eq!(&result[4..6], &(100u16).to_le_bytes());
+        assert_eq!(&result[6..8], &(200u16).to_le_bytes());
+    }
 }
