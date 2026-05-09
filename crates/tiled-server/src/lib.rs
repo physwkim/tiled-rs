@@ -7,6 +7,7 @@ pub mod extractors;
 pub mod file_resolver;
 pub mod router;
 pub mod state;
+pub mod streaming;
 
 pub use app::build_app;
 pub use auth_context::{AuthContext, AuthKind};

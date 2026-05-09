@@ -657,6 +657,19 @@ pub async fn register(
         } else {
             format!("{path}/{}", node.key)
         };
+        // Notify subscribers — both the parent (so a watcher of the
+        // container hears about the new child) and the new node itself
+        // (so any "watch this path" subscriber that connected first sees
+        // the create event).
+        state
+            .streaming_bus
+            .publish(
+                &path,
+                crate::streaming::UpdateKind::ChildCreated {
+                    key: node.key.clone(),
+                    structure_family: structure_family.clone(),
+                },
+            );
         let links = tiled_core::links::links_for_node(req.structure_family, &base_url, &child_path);
         let resp = tiled_core::schemas::PostMetadataResponse {
             id: node.key,
@@ -752,6 +765,12 @@ pub async fn patch_metadata(
         .await
         .map_err(map_catalog_err)?;
     let path = segments.join("/");
+    state.streaming_bus.publish(
+        &path,
+        crate::streaming::UpdateKind::MetadataUpdated {
+            metadata: updated.metadata.clone(),
+        },
+    );
     let family = parse_structure_family(&updated.structure_family)?;
     let links = tiled_core::links::links_for_node(family, &base_url, &path);
     Ok(Json(tiled_core::schemas::PostMetadataResponse {
@@ -850,6 +869,10 @@ pub async fn delete_metadata(
         .map_err(map_catalog_err)?
         .ok_or_else(|| ServerError::NotFound(format!("'{}' not found", segments.join("/"))))?;
     catalog.delete_node(node.id).await.map_err(map_catalog_err)?;
+    let path = segments.join("/");
+    state
+        .streaming_bus
+        .publish(&path, crate::streaming::UpdateKind::NodeDeleted);
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 

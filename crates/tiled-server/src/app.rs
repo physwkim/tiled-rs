@@ -73,6 +73,18 @@ pub fn build_app(state: AppState) -> Router {
     // Data API endpoints — auth middleware always runs and either
     // populates AuthContext or returns 401.
     let api = Router::new()
+        .route(
+            "/api/v1/array/subscribe/{*path}",
+            get(crate::streaming::ws_subscribe),
+        )
+        .route(
+            "/api/v1/container/subscribe/{*path}",
+            get(crate::streaming::ws_subscribe),
+        )
+        .route(
+            "/api/v1/table/subscribe/{*path}",
+            get(crate::streaming::ws_subscribe),
+        )
         .route("/api/v1/", get(router::about))
         .route("/api/v1/metadata/", get(router::metadata_root))
         .route("/api/v1/metadata/{*path}", get(router::metadata))

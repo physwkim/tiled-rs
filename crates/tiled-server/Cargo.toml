@@ -31,6 +31,9 @@ arrow = { workspace = true }
 percent-encoding = "2"
 subtle = { workspace = true }
 chrono = { workspace = true }
+dashmap = { workspace = true }
+futures = { workspace = true }
+rmp-serde = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

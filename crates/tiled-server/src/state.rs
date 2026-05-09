@@ -56,6 +56,12 @@ pub struct AppState {
     /// are rejected with 413. Default 10 MiB matches the metadata size
     /// limit in tiled-catalog so a too-large catalog payload fails fast.
     pub max_request_body_bytes: usize,
+
+    /// In-process pub/sub bus for WebSocket subscribers. Write handlers
+    /// publish to it after a successful catalog write; subscribers
+    /// connected to /api/v1/{family}/subscribe/{*path} receive matching
+    /// updates.
+    pub streaming_bus: crate::streaming::StreamingBus,
 }
 
 impl AppState {
