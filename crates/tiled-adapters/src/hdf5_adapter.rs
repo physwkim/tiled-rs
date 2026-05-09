@@ -32,6 +32,10 @@ pub struct Hdf5Adapter {
     structure: ArrayStructure,
     metadata: serde_json::Value,
     specs: Vec<Spec>,
+    /// `true` for HDF5 scalar (zero-rank) datasets. We promote them to
+    /// shape=[1] for the structure but pass empty offsets/counts to
+    /// `read_slice` so libhdf5 accepts the call.
+    scalar_promoted: bool,
 }
 
 impl Hdf5Adapter {
@@ -45,17 +49,37 @@ impl Hdf5Adapter {
         let ds = file
             .dataset(dataset)
             .map_err(|e| TiledError::Internal(format!("hdf5 dataset {dataset}: {e}")))?;
-        let shape: Vec<usize> = ds.shape();
-        if shape.is_empty() {
-            return Err(TiledError::Validation(
-                "hdf5 dataset has zero rank".into(),
-            ));
-        }
+        // Upstream tiled #944 covers scalar (`shape=()`) and
+        // shape-with-zero datasets. We surface zero-rank as a 1-element
+        // 1-D array so callers don't need to special-case it. Truly
+        // empty arrays (`shape=(...,0,...)`) are reported with their
+        // shape but read paths return an empty buffer.
+        let raw_shape: Vec<usize> = ds.shape();
+        let scalar_promoted = raw_shape.is_empty();
+        let shape = if scalar_promoted {
+            vec![1usize]
+        } else {
+            raw_shape.clone()
+        };
+        let has_zero_axis = shape.iter().any(|d| *d == 0);
         let element_size = ds.element_size();
-        // Probe dtype with a 1-element read; cache for subsequent slice reads.
-        let probe_offsets = vec![0usize; shape.len()];
-        let probe_counts = vec![1usize; shape.len()];
-        let (_probe_bytes, dtype) = read_native(&ds, element_size, &probe_offsets, &probe_counts)?;
+        // Probe dtype on the actual (raw) shape so rust-hdf5's hyperslab
+        // accepts the offsets/counts. For empty arrays we skip the read
+        // and assume f64.
+        let dtype = if has_zero_axis {
+            BuiltinDType::new(Endianness::Little, Kind::Float, 8)
+        } else if scalar_promoted {
+            let (_b, dt) = read_native(&ds, element_size, &[], &[])?;
+            dt
+        } else {
+            let (_b, dt) = read_native(
+                &ds,
+                element_size,
+                &vec![0; shape.len()],
+                &vec![1; shape.len()],
+            )?;
+            dt
+        };
 
         let chunks: Vec<Vec<usize>> = shape.iter().map(|d| vec![*d]).collect();
         let structure = ArrayStructure {
@@ -72,17 +96,40 @@ impl Hdf5Adapter {
             structure,
             metadata,
             specs: vec![Spec::new("hdf5")],
+            scalar_promoted,
         })
     }
 
     fn read_with_slice(&self, slice: &NDSlice) -> Result<DynNDArray> {
         let shape = &self.structure.shape;
-        let plan = SlicePlan::from_ndslice(slice, shape)?;
+        // Empty arrays: surface a zero-byte buffer with the structure shape.
+        if shape.iter().any(|d| *d == 0) {
+            return Ok(DynNDArray::new(
+                Bytes::new(),
+                self.dtype.clone(),
+                shape.clone(),
+            ));
+        }
         let file = rust_hdf5::H5File::open(&self.path)
             .map_err(|e| TiledError::Internal(format!("hdf5 reopen: {e}")))?;
         let ds = file
             .dataset(&self.dataset)
             .map_err(|e| TiledError::Internal(format!("hdf5 dataset {}: {e}", self.dataset)))?;
+
+        // Scalar (zero-rank) read: bypass slice planning, call read_slice
+        // with empty offsets/counts so rust-hdf5 reads the single element.
+        // The promoted shape stays [1] for the result.
+        if self.scalar_promoted {
+            let (raw, _dtype) =
+                read_native(&ds, self.dtype.element_size(), &[], &[])?;
+            return Ok(DynNDArray::new(
+                Bytes::from(raw),
+                self.dtype.clone(),
+                vec![1],
+            ));
+        }
+
+        let plan = SlicePlan::from_ndslice(slice, shape)?;
         let (raw, _dtype) = read_native(
             &ds,
             self.dtype.element_size(),

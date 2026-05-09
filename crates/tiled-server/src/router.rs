@@ -1017,11 +1017,20 @@ fn map_catalog_err(e: tiled_catalog::CatalogError) -> ServerError {
 pub async fn patch_metadata(
     State(state): State<AppState>,
     OriginalUri(uri): OriginalUri,
+    Query(params): Query<HashMap<String, String>>,
     BaseUrl(base_url): BaseUrl,
     auth: crate::AuthContext,
     Json(req): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, ServerError> {
     auth.require(tiled_auth::Scope::WriteMetadata)?;
+    // Optional `?drop_revision=true` (upstream tiled #972). When set,
+    // the previous (metadata, specs, access_blob) is discarded instead
+    // of pushed onto the revisions table — useful for high-frequency
+    // updates where the revision history would dominate storage.
+    let drop_revision = params
+        .get("drop_revision")
+        .map(|v| matches!(v.as_str(), "true" | "True" | "1" | "yes"))
+        .unwrap_or(false);
     let segments = segments_from_uri(&uri, "/api/v1/metadata/");
     let catalog = state
         .catalog
@@ -1060,7 +1069,7 @@ pub async fn patch_metadata(
         .cloned()
         .unwrap_or_else(|| node.specs.clone());
     let updated = catalog
-        .update_metadata(node.id, metadata, specs)
+        .update_metadata(node.id, metadata, specs, drop_revision)
         .await
         .map_err(map_catalog_err)?;
     let path = segments.join("/");

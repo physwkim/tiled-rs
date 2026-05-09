@@ -98,6 +98,7 @@ async fn migrate_create_lookup_delete() {
             container.id,
             json!({"description": "second"}),
             json!([{"name": "BlueskyRun", "version": "2"}]),
+            /* drop_revision */ false,
         )
         .await
         .unwrap();

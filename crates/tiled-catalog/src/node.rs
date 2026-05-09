@@ -339,40 +339,46 @@ impl Catalog {
     }
 
     /// Replace metadata + specs on a node. Pushes the previous (metadata,
-    /// specs) onto the revisions table so undo is possible. Returns the
-    /// updated node.
+    /// specs, access_blob) onto the revisions table so undo is possible —
+    /// unless `drop_revision` is set, in which case the prior version is
+    /// discarded. Mirrors upstream tiled PR #972's `?drop_revision=true`
+    /// flag. Returns the updated node.
     pub async fn update_metadata(
         &self,
         node_id: i64,
         metadata: Value,
         specs: Value,
+        drop_revision: bool,
     ) -> Result<Node> {
         validate_payload(&metadata, &specs)?;
         match self.pool() {
             DbPool::Sqlite(pool) => {
-                let prev: (String, String, String) =
-                    sqlx::query_as("SELECT metadata, specs, access_blob FROM nodes WHERE id = ?")
-                        .bind(node_id)
-                        .fetch_optional(pool)
-                        .await?
-                        .ok_or_else(|| CatalogError::NotFound(format!("node id {node_id}")))?;
-                let next_revision: i64 = sqlx::query_scalar(
-                    "SELECT COALESCE(MAX(revision), 0) + 1 FROM revisions WHERE node_id = ?",
-                )
-                .bind(node_id)
-                .fetch_one(pool)
-                .await?;
-                sqlx::query(
-                    "INSERT INTO revisions (node_id, revision, metadata, specs, access_blob)
-                     VALUES (?, ?, ?, ?, ?)",
-                )
-                .bind(node_id)
-                .bind(next_revision as i32)
-                .bind(prev.0)
-                .bind(prev.1)
-                .bind(prev.2)
-                .execute(pool)
-                .await?;
+                if !drop_revision {
+                    let prev: (String, String, String) = sqlx::query_as(
+                        "SELECT metadata, specs, access_blob FROM nodes WHERE id = ?",
+                    )
+                    .bind(node_id)
+                    .fetch_optional(pool)
+                    .await?
+                    .ok_or_else(|| CatalogError::NotFound(format!("node id {node_id}")))?;
+                    let next_revision: i64 = sqlx::query_scalar(
+                        "SELECT COALESCE(MAX(revision), 0) + 1 FROM revisions WHERE node_id = ?",
+                    )
+                    .bind(node_id)
+                    .fetch_one(pool)
+                    .await?;
+                    sqlx::query(
+                        "INSERT INTO revisions (node_id, revision, metadata, specs, access_blob)
+                         VALUES (?, ?, ?, ?, ?)",
+                    )
+                    .bind(node_id)
+                    .bind(next_revision as i32)
+                    .bind(prev.0)
+                    .bind(prev.1)
+                    .bind(prev.2)
+                    .execute(pool)
+                    .await?;
+                }
                 let row = sqlx::query(
                     "UPDATE nodes
                         SET metadata = ?, specs = ?,
@@ -389,35 +395,37 @@ impl Catalog {
                 node_from_sqlite_row(&row)
             }
             DbPool::Postgres(pool) => {
-                let row = sqlx::query(
-                    "SELECT metadata::text AS metadata, specs::text AS specs,
-                            access_blob::text AS access_blob
-                       FROM nodes WHERE id = $1",
-                )
-                .bind(node_id)
-                .fetch_optional(pool)
-                .await?
-                .ok_or_else(|| CatalogError::NotFound(format!("node id {node_id}")))?;
-                let prev_meta: String = row.get("metadata");
-                let prev_specs: String = row.get("specs");
-                let prev_access: String = row.get("access_blob");
-                let next_revision: i64 = sqlx::query_scalar(
-                    "SELECT COALESCE(MAX(revision), 0) + 1 FROM revisions WHERE node_id = $1",
-                )
-                .bind(node_id)
-                .fetch_one(pool)
-                .await?;
-                sqlx::query(
-                    "INSERT INTO revisions (node_id, revision, metadata, specs, access_blob)
-                     VALUES ($1, $2, $3::jsonb, $4::jsonb, $5::jsonb)",
-                )
-                .bind(node_id)
-                .bind(next_revision as i32)
-                .bind(prev_meta)
-                .bind(prev_specs)
-                .bind(prev_access)
-                .execute(pool)
-                .await?;
+                if !drop_revision {
+                    let row = sqlx::query(
+                        "SELECT metadata::text AS metadata, specs::text AS specs,
+                                access_blob::text AS access_blob
+                           FROM nodes WHERE id = $1",
+                    )
+                    .bind(node_id)
+                    .fetch_optional(pool)
+                    .await?
+                    .ok_or_else(|| CatalogError::NotFound(format!("node id {node_id}")))?;
+                    let prev_meta: String = row.get("metadata");
+                    let prev_specs: String = row.get("specs");
+                    let prev_access: String = row.get("access_blob");
+                    let next_revision: i64 = sqlx::query_scalar(
+                        "SELECT COALESCE(MAX(revision), 0) + 1 FROM revisions WHERE node_id = $1",
+                    )
+                    .bind(node_id)
+                    .fetch_one(pool)
+                    .await?;
+                    sqlx::query(
+                        "INSERT INTO revisions (node_id, revision, metadata, specs, access_blob)
+                         VALUES ($1, $2, $3::jsonb, $4::jsonb, $5::jsonb)",
+                    )
+                    .bind(node_id)
+                    .bind(next_revision as i32)
+                    .bind(prev_meta)
+                    .bind(prev_specs)
+                    .bind(prev_access)
+                    .execute(pool)
+                    .await?;
+                }
                 let row = sqlx::query(
                     "UPDATE nodes
                         SET metadata = $1::jsonb, specs = $2::jsonb, time_updated = now()
