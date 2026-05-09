@@ -526,6 +526,115 @@ fn parse_range(header: &str, total: usize) -> Option<(usize, usize)> {
 }
 
 // ---------------------------------------------------------------------------
+// PATCH /api/v1/array/full/{*path}?append_along=N — extend an array
+// ---------------------------------------------------------------------------
+//
+// Upstream tiled PR #802. Body is the raw bytes to append along axis
+// `append_along` (default 0). The route forwards to
+// `ArrayAdapterWrite::append`; adapters that don't override the trait
+// default get a 422 explaining "not supported by this adapter". The
+// resulting axis length is published on the streaming bus as a
+// `data-appended` event so subscribers see the new shape live.
+
+pub async fn array_append(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+    Query(params): Query<HashMap<String, String>>,
+    auth: crate::AuthContext,
+    body: bytes::Bytes,
+) -> Result<impl IntoResponse, ServerError> {
+    auth.require(tiled_auth::Scope::WriteData)?;
+    let segments = segments_from_uri(&uri, "/api/v1/array/full/");
+    pre_warm_walk(&state, &segments).await?;
+
+    let adapter = core::walk_tree(state.root_tree.as_ref(), &segments)?;
+    let array_adapter = match adapter {
+        AnyAdapter::Array(a) => a.as_ref(),
+        _ => {
+            return Err(ServerError::Validation(format!(
+                "'{}' is not an array",
+                segments.join("/")
+            )));
+        }
+    };
+    let writable = array_adapter
+        .as_writable()
+        .ok_or_else(|| ServerError::Validation(
+            "this array adapter does not support append; only adapters whose \
+             underlying store can grow (zarr, ND-streaming) implement it".into(),
+        ))?;
+
+    let append_along: usize = params
+        .get("append_along")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let structure = array_adapter.structure();
+    if append_along >= structure.shape.len() {
+        return Err(ServerError::Validation(format!(
+            "append_along={append_along} out of range (ndim={})",
+            structure.shape.len()
+        )));
+    }
+
+    // Construct a DynNDArray view over the request body. Shape is the
+    // existing structure's shape with `shape[append_along]` swapped for
+    // the inferred number of new elements (body bytes / element size /
+    // product of remaining dims).
+    let elem_size = match &structure.data_type {
+        tiled_core::dtype::DType::Builtin(b) => b.element_size(),
+        _ => {
+            return Err(ServerError::Validation(
+                "append: only Builtin dtypes are supported".into(),
+            ));
+        }
+    };
+    let mut new_shape = structure.shape.clone();
+    let other_axes: usize = structure
+        .shape
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != append_along)
+        .map(|(_, d)| *d)
+        .product();
+    if elem_size == 0 || other_axes == 0 {
+        return Err(ServerError::Validation(
+            "append: structure has zero-element-size or zero-area cross-section".into(),
+        ));
+    }
+    let row_bytes = other_axes * elem_size;
+    if body.len() % row_bytes != 0 {
+        return Err(ServerError::Validation(format!(
+            "append: body length {} is not a multiple of cross-section bytes {row_bytes}",
+            body.len()
+        )));
+    }
+    let added_along_axis = body.len() / row_bytes;
+    new_shape[append_along] = added_along_axis;
+    let dtype = match &structure.data_type {
+        tiled_core::dtype::DType::Builtin(b) => b.clone(),
+        _ => unreachable!("checked above"),
+    };
+    let payload = tiled_core::dtype::DynNDArray::new(body, dtype, new_shape);
+
+    let new_axis_len = writable
+        .append(payload, append_along)
+        .await
+        .map_err(ServerError::from)?;
+
+    let path = segments.join("/");
+    state.streaming_bus.publish(
+        &path,
+        crate::streaming::UpdateKind::DataAppended {
+            partition: Some(append_along),
+        },
+    );
+    Ok(Json(serde_json::json!({
+        "axis": append_along,
+        "new_size": new_axis_len,
+    })))
+}
+
+// ---------------------------------------------------------------------------
 // POST /api/v1/array/full — long-URL workaround for the GET counterpart
 // ---------------------------------------------------------------------------
 //
@@ -613,6 +722,23 @@ pub async fn container_full_post(
 // would require a dedicated serializer that walks recursively and pulls
 // each leaf's bytes — call it out as a deferred follow-up.
 
+pub async fn container_full_root(
+    state: State<AppState>,
+    base_url: BaseUrl,
+    headers: HeaderMap,
+    auth: crate::AuthContext,
+) -> Result<axum::response::Response, ServerError> {
+    container_full(
+        state,
+        OriginalUri("/api/v1/container/full/".parse().expect("static URI")),
+        base_url,
+        headers,
+        auth,
+    )
+    .await
+    .map(IntoResponse::into_response)
+}
+
 pub async fn container_full(
     State(state): State<AppState>,
     OriginalUri(uri): OriginalUri,
@@ -622,15 +748,21 @@ pub async fn container_full(
 ) -> Result<impl IntoResponse, ServerError> {
     auth.require(tiled_auth::Scope::ReadData)?;
     let segments = segments_from_uri(&uri, "/api/v1/container/full/");
-    pre_warm_walk(&state, &segments).await?;
-
-    let adapter = core::walk_tree(state.root_tree.as_ref(), &segments)?;
-    let container = adapter
-        .as_container()
-        .ok_or_else(|| ServerError::Validation(format!(
-            "'{}' is not a container",
-            segments.join("/")
-        )))?;
+    // walk_tree NotFound's on empty segments by design; pre_warm_walk
+    // proxies that. Skip both for the root export and use root_tree
+    // directly as the container.
+    let container: &dyn ContainerAdapter = if segments.is_empty() {
+        state.root_tree.as_ref()
+    } else {
+        pre_warm_walk(&state, &segments).await?;
+        let adapter = core::walk_tree(state.root_tree.as_ref(), &segments)?;
+        adapter
+            .as_container()
+            .ok_or_else(|| ServerError::Validation(format!(
+                "'{}' is not a container",
+                segments.join("/")
+            )))?
+    };
 
     // Build the same Vec<Resource> shape /search emits — that's what
     // the registered container serializers (html, json-seq) consume.
@@ -654,6 +786,17 @@ pub async fn container_full(
         .get("accept")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/json");
+
+    // Deep-export branch (upstream tiled #660): when the caller asks
+    // for `application/zip`, walk every leaf in the subtree and zip
+    // their per-format bytes together. Other Accept values still go
+    // through the existing container-serializer dispatch (HTML index,
+    // json-seq listing).
+    if accept.contains("application/zip") {
+        let bytes = export_container_as_zip(container, &path).await?;
+        return Ok(serve_with_range(&headers, "application/zip", bytes));
+    }
+
     let media_type = tiled_serialization::resolve_media_type(
         accept,
         tiled_core::structures::StructureFamily::Container,
@@ -674,6 +817,106 @@ pub async fn container_full(
     };
 
     Ok(serve_with_range(&headers, &media_type, body))
+}
+
+/// Walk every leaf below `container` and zip their per-family bytes
+/// together (upstream tiled #660). Path components are preserved as
+/// directory separators in the zip entry name; arrays go in as
+/// `application/octet-stream` (`.bin`), tables as Arrow-IPC
+/// (`.arrow`), sub-containers recurse. Empty containers produce a
+/// zero-entry zip (still well-formed).
+///
+/// Two-phase: collect every leaf's bytes asynchronously into a Vec,
+/// then build the zip synchronously. Avoids juggling a `&mut
+/// ZipWriter` across `.await` points (the writer borrows the output
+/// buffer mutably + reads/writes to disk in scope).
+async fn export_container_as_zip(
+    container: &dyn ContainerAdapter,
+    base_path: &str,
+) -> Result<bytes::Bytes, ServerError> {
+    let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+    collect_zip_entries(container, "", base_path, &mut entries).await?;
+
+    use std::io::{Cursor, Write};
+    use zip::write::SimpleFileOptions;
+    let mut buf = Vec::new();
+    {
+        let mut writer = zip::ZipWriter::new(Cursor::new(&mut buf));
+        let opts = SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        for (name, bytes) in entries {
+            writer
+                .start_file(&name, opts)
+                .map_err(|e| ServerError::Internal(format!("zip: {e}")))?;
+            writer
+                .write_all(&bytes)
+                .map_err(|e| ServerError::Internal(format!("zip write: {e}")))?;
+        }
+        writer
+            .finish()
+            .map_err(|e| ServerError::Internal(format!("zip finalize: {e}")))?;
+    }
+    Ok(bytes::Bytes::from(buf))
+}
+
+fn collect_zip_entries<'a>(
+    container: &'a dyn ContainerAdapter,
+    prefix: &'a str,
+    base_path: &'a str,
+    entries: &'a mut Vec<(String, Vec<u8>)>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ServerError>> + Send + 'a>> {
+    Box::pin(async move {
+        for key in container.keys() {
+            let Some(child) = container.get(&key) else { continue };
+            let entry_name = if prefix.is_empty() {
+                key.clone()
+            } else {
+                format!("{prefix}/{key}")
+            };
+            match child {
+                AnyAdapter::Array(a) => {
+                    let data = a
+                        .read(&tiled_core::ndslice::NDSlice::empty())
+                        .await
+                        .map_err(ServerError::from)?;
+                    entries.push((format!("{entry_name}.bin"), data.data.to_vec()));
+                }
+                AnyAdapter::Container(child_c) => {
+                    collect_zip_entries(child_c.as_ref(), &entry_name, base_path, entries).await?;
+                }
+                AnyAdapter::Table(t) => {
+                    let table = t.read(None).await.map_err(ServerError::from)?;
+                    let mut ipc_bytes = Vec::new();
+                    {
+                        let mut writer_ipc =
+                            arrow::ipc::writer::FileWriter::try_new(&mut ipc_bytes, &table.schema)
+                                .map_err(|e| ServerError::Internal(format!("arrow ipc: {e}")))?;
+                        for batch in &table.batches {
+                            writer_ipc
+                                .write(batch)
+                                .map_err(|e| ServerError::Internal(format!("arrow ipc: {e}")))?;
+                        }
+                        writer_ipc
+                            .finish()
+                            .map_err(|e| ServerError::Internal(format!("arrow ipc: {e}")))?;
+                    }
+                    entries.push((format!("{entry_name}.arrow"), ipc_bytes));
+                }
+                other => {
+                    let crumb = serde_json::json!({
+                        "path": format!("{base_path}/{entry_name}"),
+                        "structure_family": format!("{:?}", other.structure_family()),
+                        "note": "leaf format not yet bundled in deep export",
+                    });
+                    entries.push((
+                        format!("{entry_name}.json"),
+                        serde_json::to_vec(&crumb).unwrap(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    })
 }
 
 // ---------------------------------------------------------------------------

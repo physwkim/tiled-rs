@@ -5215,6 +5215,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "url",
+ "zip",
 ]
 
 [[package]]

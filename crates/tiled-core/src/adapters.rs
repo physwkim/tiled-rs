@@ -41,6 +41,17 @@ pub trait ArrayAdapterRead: BaseAdapter {
         block: &'a [usize],
         slice: &'a NDSlice,
     ) -> BoxFuture<'a, Result<DynNDArray>>;
+
+    /// Optional downcast to a write-capable view. Adapters whose
+    /// underlying store supports `write_block` / `append` override this
+    /// to return `Some(self)`; the rest leave it `None`. Lets the
+    /// router pick a write path at request time without giving up the
+    /// existing `Box<dyn ArrayAdapterRead>` storage in
+    /// `AnyAdapter::Array`. Mirrors the spirit of upstream tiled
+    /// PR #802 (extendable arrays) on the trait side.
+    fn as_writable(&self) -> Option<&dyn ArrayAdapterWrite> {
+        None
+    }
 }
 
 pub trait ArrayAdapterWrite: ArrayAdapterRead {
