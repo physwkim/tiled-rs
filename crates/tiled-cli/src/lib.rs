@@ -108,6 +108,18 @@ pub enum Command {
         /// without recompiling tiled-rs.
         #[arg(long)]
         web_assets_dir: Option<std::path::PathBuf>,
+
+        /// Allow `http://` URLs as webhook targets. Default off — the
+        /// server enforces HTTPS for outbound webhook posts. Useful only
+        /// for local testing; never set in production.
+        #[arg(long)]
+        webhooks_allow_http: bool,
+
+        /// Allow webhook URLs that resolve to private / loopback / link-
+        /// local / RFC1918 / metadata-IP ranges. Default off; SSRF
+        /// protection. Useful only for local testing.
+        #[arg(long)]
+        webhooks_allow_private_addresses: bool,
     },
 
     /// Database management commands (not yet implemented)
@@ -308,6 +320,8 @@ pub async fn run(command: Command) -> Result<()> {
             allowed_data_dirs,
             no_web,
             web_assets_dir,
+            webhooks_allow_http,
+            webhooks_allow_private_addresses,
         } => {
             // Load config file if provided.
             let file_config = config
@@ -410,6 +424,16 @@ pub async fn run(command: Command) -> Result<()> {
 
             let trust_forwarded_headers = trust_proxy || proxied_auth_header;
 
+            // Decide BEFORE the struct literal moves catalog_handle.
+            let webhook_config_value = if catalog_handle.is_some() {
+                let mut wc = tiled_server::webhook_dispatch::WebhookConfig::default();
+                wc.allow_http = webhooks_allow_http;
+                wc.allow_private_addresses = webhooks_allow_private_addresses;
+                Some(wc)
+            } else {
+                None
+            };
+
             let state = tiled_server::AppState {
                 root_tree,
                 serialization_registry: registry,
@@ -448,6 +472,11 @@ pub async fn run(command: Command) -> Result<()> {
                     .collect()
             })
             .unwrap_or_default(),
+        // Enable the webhook subsystem when a catalog is configured —
+        // webhooks need a DB to persist registrations and deliveries.
+        // Move catalog_handle's presence check before AppState consumes
+        // it; otherwise the borrow-after-move check fires.
+        webhook_config: webhook_config_value,
             };
 
             let app = tiled_server::build_app(state);

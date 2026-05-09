@@ -10,15 +10,27 @@ use sqlx::Row;
 use crate::db::{Catalog, DbPool};
 use crate::error::{CatalogError, Result};
 
-const SQLITE_MIGRATIONS: &[(&str, &str)] = &[(
-    "0001_initial",
-    include_str!("../migrations/sqlite/0001_initial.sql"),
-)];
+const SQLITE_MIGRATIONS: &[(&str, &str)] = &[
+    (
+        "0001_initial",
+        include_str!("../migrations/sqlite/0001_initial.sql"),
+    ),
+    (
+        "0002_webhooks",
+        include_str!("../migrations/sqlite/0002_webhooks.sql"),
+    ),
+];
 
-const POSTGRES_MIGRATIONS: &[(&str, &str)] = &[(
-    "0001_initial",
-    include_str!("../migrations/postgres/0001_initial.sql"),
-)];
+const POSTGRES_MIGRATIONS: &[(&str, &str)] = &[
+    (
+        "0001_initial",
+        include_str!("../migrations/postgres/0001_initial.sql"),
+    ),
+    (
+        "0002_webhooks",
+        include_str!("../migrations/postgres/0002_webhooks.sql"),
+    ),
+];
 
 impl Catalog {
     /// Apply any pending schema migrations.

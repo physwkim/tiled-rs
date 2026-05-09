@@ -59,6 +59,7 @@ async fn build_test_app() -> (axum::Router, tempfile::TempDir, Catalog) {
         enable_web: true,
         web_assets_dir: None,
         spec_views: Vec::new(),
+        webhook_config: None,
     };
     (tiled_server::build_app(state), dir, catalog)
 }

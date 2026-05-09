@@ -95,6 +95,11 @@ pub struct AppState {
     /// regardless of the `web` feature, which keeps construction sites
     /// uniform across crates.
     pub spec_views: Vec<SpecViewEntry>,
+    /// Configuration for the webhook subsystem (upstream tiled #1353).
+    /// `None` disables webhooks entirely (no router, no dispatcher).
+    /// `Some(_)` enables them with the per-field overrides in
+    /// `WebhookConfig`.
+    pub webhook_config: Option<crate::webhook_dispatch::WebhookConfig>,
 }
 
 /// One `spec_views` entry. Wire-compatible with tiled-web's

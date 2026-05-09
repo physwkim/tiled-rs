@@ -50,6 +50,7 @@ async fn spawn_server() -> (String, tempfile::TempDir) {
         enable_web: true,
         web_assets_dir: None,
         spec_views: Vec::new(),
+        webhook_config: None,
     };
     let app = tiled_server::build_app(state);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

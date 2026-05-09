@@ -23,6 +23,11 @@ pub enum Scope {
     Inherit,
     Metrics,
     Admin,
+    /// Read webhooks registered on a node + their delivery history.
+    /// Mirrors upstream tiled PR #1353. Granted to admin only by default.
+    ReadWebhooks,
+    /// Register / deactivate webhooks. Admin only by default.
+    WriteWebhooks,
 }
 
 impl Scope {
@@ -40,6 +45,8 @@ impl Scope {
         Self::Inherit,
         Self::Metrics,
         Self::Admin,
+        Self::ReadWebhooks,
+        Self::WriteWebhooks,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -57,6 +64,8 @@ impl Scope {
             Self::Inherit => "inherit",
             Self::Metrics => "metrics",
             Self::Admin => "admin",
+            Self::ReadWebhooks => "read:webhooks",
+            Self::WriteWebhooks => "write:webhooks",
         }
     }
 

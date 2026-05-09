@@ -21,6 +21,18 @@ use crate::state::{AppState, CorsOriginPolicy};
 
 /// Build the Axum application with all routes attached.
 pub fn build_app(state: AppState) -> Router {
+    // Spawn the webhook dispatcher (upstream tiled #1353) when enabled
+    // by config + a catalog DB is present. The dispatcher subscribes to
+    // the streaming bus's root channel so it sees every event without
+    // touching request paths.
+    if let (Some(cfg), Some(catalog)) = (state.webhook_config.as_ref(), state.catalog.as_ref()) {
+        let _ = crate::webhook_dispatch::spawn(
+            catalog.clone(),
+            state.streaming_bus.clone(),
+            cfg.clone(),
+        );
+    }
+
     let cors = match &state.cors_policy {
         CorsOriginPolicy::Permissive => CorsLayer::permissive(),
         CorsOriginPolicy::AllowList(origins) => {
@@ -113,7 +125,20 @@ pub fn build_app(state: AppState) -> Router {
         .route("/api/v1/metadata/{*path}", patch(router::patch_metadata))
         .route("/api/v1/metadata/{*path}", delete(router::delete_metadata))
         .route("/api/v1/data_source/{*path}", put(router::put_data_source))
-        .route("/documents/{*path}", get(router::get_documents));
+        .route("/documents/{*path}", get(router::get_documents))
+        // Webhooks (upstream tiled #1353).
+        .route(
+            "/api/v1/webhooks/target/{*path}",
+            post(crate::webhook_router::register).get(crate::webhook_router::list),
+        )
+        .route(
+            "/api/v1/webhooks/{id}",
+            delete(crate::webhook_router::delete),
+        )
+        .route(
+            "/api/v1/webhooks/history/{id}",
+            get(crate::webhook_router::history),
+        );
 
     let guarded = api
         .merge(private_auth)

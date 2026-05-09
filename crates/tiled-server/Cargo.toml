@@ -37,6 +37,13 @@ chrono = { workspace = true }
 dashmap = { workspace = true }
 futures = { workspace = true }
 rmp-serde = { workspace = true }
+# Webhook delivery (upstream tiled #1353).
+reqwest = { workspace = true }
+hmac = "0.12"
+sha2 = "0.10"
+base64 = "0.22"
+rand = "0.8"
+url = "2"
 
 [dev-dependencies]
 tempfile = { workspace = true }

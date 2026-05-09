@@ -73,6 +73,7 @@ fn build_app() -> axum::Router {
         enable_web: true,
         web_assets_dir: None,
         spec_views: Vec::new(),
+        webhook_config: None,
     };
 
     tiled_server::build_app(state)
@@ -108,6 +109,7 @@ fn build_app_dynamic(trust_forwarded: bool) -> axum::Router {
         enable_web: true,
         web_assets_dir: None,
         spec_views: Vec::new(),
+        webhook_config: None,
     };
 
     tiled_server::build_app(state)
@@ -498,6 +500,7 @@ async fn test_empty_container() {
         enable_web: true,
         web_assets_dir: None,
         spec_views: Vec::new(),
+        webhook_config: None,
     };
     let app = tiled_server::build_app(state);
 
@@ -592,6 +595,7 @@ fn build_app_with_api_key(key: &str) -> axum::Router {
         enable_web: true,
         web_assets_dir: None,
         spec_views: Vec::new(),
+        webhook_config: None,
     };
 
     tiled_server::build_app(state)
@@ -736,6 +740,7 @@ async fn test_metadata_handles_percent_encoded_slash_in_key() {
         enable_web: true,
         web_assets_dir: None,
         spec_views: Vec::new(),
+        webhook_config: None,
     };
     let app = tiled_server::build_app(state);
 

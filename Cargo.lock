@@ -5162,16 +5162,20 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "axum",
+ "base64",
  "bytes",
  "chrono",
  "dashmap",
  "futures",
+ "hmac",
  "indexmap",
  "percent-encoding",
+ "rand 0.8.5",
  "reqwest",
  "rmp-serde",
  "serde",
  "serde_json",
+ "sha2",
  "subtle",
  "tempfile",
  "thiserror 2.0.18",
@@ -5187,6 +5191,7 @@ dependencies = [
  "tower",
  "tower-http",
  "tracing",
+ "url",
 ]
 
 [[package]]

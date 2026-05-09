@@ -67,6 +67,7 @@ async fn spawn_server(api_key: Option<String>) -> String {
         enable_web: true,
         web_assets_dir: None,
         spec_views: Vec::new(),
+        webhook_config: None,
     };
 
     let app = tiled_server::build_app(state);
