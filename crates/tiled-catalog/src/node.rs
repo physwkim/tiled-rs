@@ -350,8 +350,8 @@ impl Catalog {
         validate_payload(&metadata, &specs)?;
         match self.pool() {
             DbPool::Sqlite(pool) => {
-                let prev: (String, String) =
-                    sqlx::query_as("SELECT metadata, specs FROM nodes WHERE id = ?")
+                let prev: (String, String, String) =
+                    sqlx::query_as("SELECT metadata, specs, access_blob FROM nodes WHERE id = ?")
                         .bind(node_id)
                         .fetch_optional(pool)
                         .await?
@@ -363,13 +363,14 @@ impl Catalog {
                 .fetch_one(pool)
                 .await?;
                 sqlx::query(
-                    "INSERT INTO revisions (node_id, revision, metadata, specs)
-                     VALUES (?, ?, ?, ?)",
+                    "INSERT INTO revisions (node_id, revision, metadata, specs, access_blob)
+                     VALUES (?, ?, ?, ?, ?)",
                 )
                 .bind(node_id)
                 .bind(next_revision as i32)
                 .bind(prev.0)
                 .bind(prev.1)
+                .bind(prev.2)
                 .execute(pool)
                 .await?;
                 let row = sqlx::query(
@@ -389,7 +390,9 @@ impl Catalog {
             }
             DbPool::Postgres(pool) => {
                 let row = sqlx::query(
-                    "SELECT metadata::text AS metadata, specs::text AS specs FROM nodes WHERE id = $1",
+                    "SELECT metadata::text AS metadata, specs::text AS specs,
+                            access_blob::text AS access_blob
+                       FROM nodes WHERE id = $1",
                 )
                 .bind(node_id)
                 .fetch_optional(pool)
@@ -397,6 +400,7 @@ impl Catalog {
                 .ok_or_else(|| CatalogError::NotFound(format!("node id {node_id}")))?;
                 let prev_meta: String = row.get("metadata");
                 let prev_specs: String = row.get("specs");
+                let prev_access: String = row.get("access_blob");
                 let next_revision: i64 = sqlx::query_scalar(
                     "SELECT COALESCE(MAX(revision), 0) + 1 FROM revisions WHERE node_id = $1",
                 )
@@ -404,13 +408,14 @@ impl Catalog {
                 .fetch_one(pool)
                 .await?;
                 sqlx::query(
-                    "INSERT INTO revisions (node_id, revision, metadata, specs)
-                     VALUES ($1, $2, $3::jsonb, $4::jsonb)",
+                    "INSERT INTO revisions (node_id, revision, metadata, specs, access_blob)
+                     VALUES ($1, $2, $3::jsonb, $4::jsonb, $5::jsonb)",
                 )
                 .bind(node_id)
                 .bind(next_revision as i32)
                 .bind(prev_meta)
                 .bind(prev_specs)
+                .bind(prev_access)
                 .execute(pool)
                 .await?;
                 let row = sqlx::query(

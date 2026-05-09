@@ -19,6 +19,10 @@ const SQLITE_MIGRATIONS: &[(&str, &str)] = &[
         "0002_webhooks",
         include_str!("../migrations/sqlite/0002_webhooks.sql"),
     ),
+    (
+        "0003_revisions_access_blob",
+        include_str!("../migrations/sqlite/0003_revisions_access_blob.sql"),
+    ),
 ];
 
 const POSTGRES_MIGRATIONS: &[(&str, &str)] = &[
@@ -29,6 +33,10 @@ const POSTGRES_MIGRATIONS: &[(&str, &str)] = &[
     (
         "0002_webhooks",
         include_str!("../migrations/postgres/0002_webhooks.sql"),
+    ),
+    (
+        "0003_revisions_access_blob",
+        include_str!("../migrations/postgres/0003_revisions_access_blob.sql"),
     ),
 ];
 

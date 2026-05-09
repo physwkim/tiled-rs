@@ -15,7 +15,11 @@ async fn migrate_create_lookup_delete() {
     cat.migrate().await.unwrap();
     assert_eq!(
         cat.applied_migrations().await.unwrap(),
-        vec!["0001_initial".to_string(), "0002_webhooks".to_string()],
+        vec![
+            "0001_initial".to_string(),
+            "0002_webhooks".to_string(),
+            "0003_revisions_access_blob".to_string(),
+        ],
     );
 
     // No nodes yet.

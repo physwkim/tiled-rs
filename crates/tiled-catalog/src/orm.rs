@@ -53,6 +53,10 @@ pub struct Revision {
     pub revision: i32,
     pub metadata: serde_json::Value,
     pub specs: serde_json::Value,
+    /// Snapshot of `nodes.access_blob` at the time this revision was
+    /// recorded. Mirrors upstream tiled PR #1084 — preserved on undo.
+    #[serde(default)]
+    pub access_blob: serde_json::Value,
     pub time_created: chrono::DateTime<chrono::Utc>,
 }
 
