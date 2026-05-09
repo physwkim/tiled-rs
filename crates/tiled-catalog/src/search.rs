@@ -163,6 +163,64 @@ impl WhereBuilder {
         }
     }
 
+    /// `In(key, [v1, v2, ...])` — match rows whose metadata.key equals
+    /// any of the listed values. Empty list → match nothing (always
+    /// false), matching upstream tiled #746's empty-list semantics.
+    fn push_in(&mut self, key: &str, values: &[Value]) {
+        if values.is_empty() {
+            // SQLite/Postgres reject `IN ()`; emit a guaranteed-false
+            // predicate instead so an empty match list yields zero rows.
+            self.pieces.push("FALSE".into());
+            return;
+        }
+        let lhs = self.dialect.json_text("metadata", key);
+        let mut placeholders = Vec::with_capacity(values.len());
+        for v in values {
+            let p = self.dialect.placeholder(self.bindings.len());
+            placeholders.push(p);
+            self.bindings.push(Bind::Text(render_value_as_text(v)));
+        }
+        self.pieces
+            .push(format!("{lhs} IN ({})", placeholders.join(", ")));
+    }
+
+    /// `NotIn(key, [v1, v2, ...])` — inverse of `push_in`. Empty list
+    /// → match everything (always true). NULLs (missing key) also pass.
+    fn push_not_in(&mut self, key: &str, values: &[Value]) {
+        if values.is_empty() {
+            self.pieces.push("TRUE".into());
+            return;
+        }
+        let lhs = self.dialect.json_text("metadata", key);
+        let mut placeholders = Vec::with_capacity(values.len());
+        for v in values {
+            let p = self.dialect.placeholder(self.bindings.len());
+            placeholders.push(p);
+            self.bindings.push(Bind::Text(render_value_as_text(v)));
+        }
+        self.pieces
+            .push(format!("({lhs} IS NULL OR {lhs} NOT IN ({}))", placeholders.join(", ")));
+    }
+
+    /// `Contains(key, value)` — substring match on the text rendering
+    /// of `metadata.key`. Stricter array-containment semantics would
+    /// need per-dialect JSON operators (`@>` on PG, `json_each` on
+    /// SQLite); LIKE is portable and covers the typical "metadata
+    /// includes this token" case.
+    fn push_contains(&mut self, key: &str, value: &Value) {
+        let lhs = self.dialect.json_text("metadata", key);
+        let p = self.dialect.placeholder(self.bindings.len());
+        let needle = match value {
+            Value::String(s) => s.clone(),
+            other => render_value_as_text(other),
+        };
+        // Escape SQL LIKE metacharacters in the user-supplied needle.
+        let escaped = needle.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+        self.pieces
+            .push(format!("{lhs} LIKE {p} ESCAPE '\\'"));
+        self.bindings.push(Bind::Text(format!("%{escaped}%")));
+    }
+
     fn push_comparison(&mut self, key: &str, op: Operator, value: &Value) {
         let lhs = self.dialect.json_text("metadata", key);
         let op_sql = match op {
@@ -242,10 +300,10 @@ impl Catalog {
                 Query::Comparison(c) => builder.push_comparison(&c.key, c.operator, &c.value),
                 // Variants we don't push down still influence ranking, but
                 // we leave them as no-ops here (see header doc).
-                Query::Contains(_)
-                | Query::In(_)
-                | Query::NotIn(_)
-                | Query::Like(_)
+                Query::In(in_q) => builder.push_in(&in_q.key, &in_q.value),
+                Query::NotIn(nin) => builder.push_not_in(&nin.key, &nin.value),
+                Query::Contains(c) => builder.push_contains(&c.key, &c.value),
+                Query::Like(_)
                 | Query::Regex(_)
                 | Query::Specs(_)
                 | Query::AccessBlobFilter(_) => {}
@@ -410,4 +468,78 @@ fn node_from_postgres_row(row: &sqlx::postgres::PgRow) -> Result<Node> {
         time_created: row.get("time_created"),
         time_updated: row.get("time_updated"),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn build(dialect: Dialect, queries: &[Query]) -> (String, usize) {
+        let mut b = WhereBuilder {
+            dialect,
+            pieces: Vec::new(),
+            bindings: Vec::new(),
+        };
+        for q in queries {
+            match q {
+                Query::In(i) => b.push_in(&i.key, &i.value),
+                Query::NotIn(n) => b.push_not_in(&n.key, &n.value),
+                Query::Contains(c) => b.push_contains(&c.key, &c.value),
+                _ => {}
+            }
+        }
+        let bcount = b.bindings.len();
+        let (sql, _) = b.finish();
+        (sql, bcount)
+    }
+
+    #[test]
+    fn in_empty_list_yields_false() {
+        let q = Query::In(tiled_core::queries::In { key: "color".into(), value: vec![] });
+        let (sql, n) = build(Dialect::Sqlite, &[q]);
+        assert!(sql.contains("FALSE"));
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn notin_empty_list_yields_true() {
+        let q = Query::NotIn(tiled_core::queries::NotIn { key: "color".into(), value: vec![] });
+        let (sql, n) = build(Dialect::Sqlite, &[q]);
+        assert!(sql.contains("TRUE"));
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn in_two_values_renders_in_clause_sqlite() {
+        let q = Query::In(tiled_core::queries::In {
+            key: "color".into(),
+            value: vec![json!("red"), json!("blue")],
+        });
+        let (sql, n) = build(Dialect::Sqlite, &[q]);
+        assert!(sql.contains("IN (?, ?)"));
+        assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn notin_two_values_keeps_null_through() {
+        let q = Query::NotIn(tiled_core::queries::NotIn {
+            key: "tag".into(),
+            value: vec![json!("a"), json!("b")],
+        });
+        let (sql, _) = build(Dialect::Sqlite, &[q]);
+        assert!(sql.contains("IS NULL OR"));
+        assert!(sql.contains("NOT IN (?, ?)"));
+    }
+
+    #[test]
+    fn contains_escapes_like_metacharacters() {
+        let q = Query::Contains(tiled_core::queries::Contains {
+            key: "note".into(),
+            value: json!("100% off_now"),
+        });
+        let (sql, _) = build(Dialect::Sqlite, &[q]);
+        // Generated SQL contains a single-backslash ESCAPE clause.
+        assert!(sql.contains("LIKE ? ESCAPE '\\'"));
+    }
 }
