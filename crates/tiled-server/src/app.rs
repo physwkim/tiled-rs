@@ -150,7 +150,15 @@ pub fn build_app(state: AppState) -> Router {
                 channel_count_fn: std::sync::Arc::new(move || bus.channel_count()),
                 secure_cookies: state.trust_forwarded_headers,
                 assets_dir: state.web_assets_dir.clone(),
-                spec_views: state.spec_views.clone(),
+                spec_views: state
+                    .spec_views
+                    .iter()
+                    .map(|s| tiled_web::SpecViewEntry {
+                        spec: s.spec.clone(),
+                        url: s.url.clone(),
+                        label: s.label.clone(),
+                    })
+                    .collect(),
             };
             return api_app.merge(tiled_web::build_router(web_state));
         }

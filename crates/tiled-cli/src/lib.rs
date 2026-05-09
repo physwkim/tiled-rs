@@ -434,14 +434,13 @@ pub async fn run(command: Command) -> Result<()> {
         default_login_scopes: tiled_auth::ScopeSet::full(),
         enable_web: !no_web,
         web_assets_dir,
-        #[cfg(feature = "web")]
         spec_views: file_config
             .as_ref()
             .and_then(|c| c.web.as_ref())
             .map(|w| {
                 w.spec_views
                     .iter()
-                    .map(|s| tiled_web::SpecViewEntry {
+                    .map(|s| tiled_server::state::SpecViewEntry {
                         spec: s.spec.clone(),
                         url: s.url.clone(),
                         label: s.label.clone(),

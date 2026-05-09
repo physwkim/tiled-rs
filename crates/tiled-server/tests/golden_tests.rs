@@ -72,7 +72,6 @@ fn build_app() -> axum::Router {
         default_login_scopes: tiled_auth::ScopeSet::full(),
         enable_web: true,
         web_assets_dir: None,
-        #[cfg(feature = "web")]
         spec_views: Vec::new(),
     };
 
@@ -108,7 +107,6 @@ fn build_app_dynamic(trust_forwarded: bool) -> axum::Router {
         default_login_scopes: tiled_auth::ScopeSet::full(),
         enable_web: true,
         web_assets_dir: None,
-        #[cfg(feature = "web")]
         spec_views: Vec::new(),
     };
 
@@ -499,7 +497,6 @@ async fn test_empty_container() {
         default_login_scopes: tiled_auth::ScopeSet::full(),
         enable_web: true,
         web_assets_dir: None,
-        #[cfg(feature = "web")]
         spec_views: Vec::new(),
     };
     let app = tiled_server::build_app(state);
@@ -594,7 +591,6 @@ fn build_app_with_api_key(key: &str) -> axum::Router {
         default_login_scopes: tiled_auth::ScopeSet::full(),
         enable_web: true,
         web_assets_dir: None,
-        #[cfg(feature = "web")]
         spec_views: Vec::new(),
     };
 
@@ -739,7 +735,6 @@ async fn test_metadata_handles_percent_encoded_slash_in_key() {
         default_login_scopes: tiled_auth::ScopeSet::full(),
         enable_web: true,
         web_assets_dir: None,
-        #[cfg(feature = "web")]
         spec_views: Vec::new(),
     };
     let app = tiled_server::build_app(state);

@@ -90,9 +90,21 @@ pub struct AppState {
     /// Operator-configured spec → external-viewer URL mappings, returned
     /// to the SPA via `GET /settings.json` (mirrors upstream tiled
     /// PR #1349's `spec_views` settings entry). Empty by default —
-    /// configure via the YAML `web.spec_views` section.
-    #[cfg(feature = "web")]
-    pub spec_views: Vec<tiled_web::SpecViewEntry>,
+    /// configure via the YAML `web.spec_views` section. Defined here
+    /// (not in tiled-web) so the field is always present on AppState
+    /// regardless of the `web` feature, which keeps construction sites
+    /// uniform across crates.
+    pub spec_views: Vec<SpecViewEntry>,
+}
+
+/// One `spec_views` entry. Wire-compatible with tiled-web's
+/// `SpecViewEntry`; lives here so `AppState` is feature-flag-free.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct SpecViewEntry {
+    pub spec: String,
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 impl AppState {

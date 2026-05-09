@@ -219,9 +219,14 @@ pub enum UpdateKind {
         key: String,
         structure_family: String,
     },
-    /// Metadata + specs were patched on this node.
+    /// Metadata + specs were patched on this node. Mirrors upstream
+    /// tiled PR #1176: `specs` is published alongside `metadata` so a
+    /// subscriber can re-render its spec view without an extra
+    /// metadata fetch round-trip.
     MetadataUpdated {
         metadata: serde_json::Value,
+        #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+        specs: serde_json::Value,
     },
     /// Node (and descendants) were deleted.
     NodeDeleted,

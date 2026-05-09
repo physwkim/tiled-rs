@@ -68,10 +68,14 @@ pub async fn about(State(state): State<AppState>, BaseUrl(base_url): BaseUrl) ->
     let aliases = state.serialization_registry.all_aliases();
 
     // Surface configured authenticators so the SPA can render the right
-    // login form. Internal authenticators expose a password endpoint;
-    // external OIDC exposes a redirect URL. Mirrors upstream tiled's
-    // `AboutAuthenticationProvider` shape (provider, mode, links).
-    let mut providers: Vec<serde_json::Value> = state
+    // login form. We only advertise internal (username/password) authenticators
+    // here — `state.external_oidc` is a *bearer validator*, not an OAuth code-
+    // flow initiator: it accepts tokens issued elsewhere but doesn't drive a
+    // browser redirect login. Emitting it as a `mode=external` provider would
+    // be a lie until upstream tiled #1178's `/authorize` endpoint is ported
+    // (tracked in workspace task; needs OidcProvider to gain client_id/secret/
+    // authorize_endpoint/token_endpoint).
+    let providers: Vec<serde_json::Value> = state
         .authenticators
         .iter()
         .map(|a| {
@@ -84,16 +88,8 @@ pub async fn about(State(state): State<AppState>, BaseUrl(base_url): BaseUrl) ->
             })
         })
         .collect();
-    if state.external_oidc.is_some() {
-        providers.push(serde_json::json!({
-            "provider": "oidc",
-            "mode": "external",
-            "links": {
-                "auth_endpoint": format!("{base_url}/api/v1/auth/oidc/authorize"),
-            },
-        }));
-    }
-    let auth_required = !providers.is_empty();
+    let auth_required =
+        !providers.is_empty() || state.external_oidc.is_some();
 
     let about = About {
         api_version: 0,
@@ -840,6 +836,7 @@ pub async fn patch_metadata(
         &path,
         crate::streaming::UpdateKind::MetadataUpdated {
             metadata: updated.metadata.clone(),
+            specs: updated.specs.clone(),
         },
     );
     let family = parse_structure_family(&updated.structure_family)?;

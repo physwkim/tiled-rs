@@ -66,6 +66,7 @@ async fn spawn_server(api_key: Option<String>) -> String {
         default_login_scopes: tiled_auth::ScopeSet::full(),
         enable_web: true,
         web_assets_dir: None,
+        spec_views: Vec::new(),
     };
 
     let app = tiled_server::build_app(state);
