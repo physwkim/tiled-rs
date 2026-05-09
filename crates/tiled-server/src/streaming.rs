@@ -67,28 +67,11 @@ impl StreamingBus {
         }
     }
 
-    /// Subscribe to updates published at exactly `path` or any of its
-    /// ancestors. Returns the broadcast receiver. Sequence numbers are
-    /// per-path so a subscriber can detect lost messages.
-    pub fn subscribe(&self, path: &str) -> Vec<broadcast::Receiver<UpdateEnvelope>> {
-        let mut receivers = Vec::new();
-        for prefix in path_prefixes(path) {
-            let entry = self
-                .inner
-                .channels
-                .entry(prefix.clone())
-                .or_insert_with(|| ChannelEntry {
-                    sender: broadcast::channel(CHANNEL_CAPACITY).0,
-                    sequence: AtomicU64::new(0),
-                });
-            receivers.push(entry.sender.subscribe());
-        }
-        receivers
-    }
-
-    /// Publish an update for `path`. The envelope's `sequence` is taken
-    /// from the per-channel counter so subscribers can detect drops.
-    pub fn publish(&self, path: &str, kind: UpdateKind) {
+    /// Subscribe to updates whose published path equals `path` or names
+    /// a descendant of `path`. The receiver is a single broadcast
+    /// channel; `publish` is responsible for fanning into ancestor
+    /// channels so a watcher at `expt` sees events at `expt/scan_1/x`.
+    pub fn subscribe(&self, path: &str) -> broadcast::Receiver<UpdateEnvelope> {
         let entry = self
             .inner
             .channels
@@ -97,14 +80,42 @@ impl StreamingBus {
                 sender: broadcast::channel(CHANNEL_CAPACITY).0,
                 sequence: AtomicU64::new(0),
             });
-        let seq = entry.sequence.fetch_add(1, Ordering::Relaxed) + 1;
-        let env = UpdateEnvelope {
-            sequence: seq,
-            timestamp: Utc::now().to_rfc3339(),
-            path: path.to_string(),
-            kind,
+        entry.sender.subscribe()
+    }
+
+    /// Publish an update for `path`. Delivers to the channel for `path`
+    /// AND every ancestor channel, so a watcher one level up still hears
+    /// about descendant changes. Sequence numbers come from the
+    /// publishing path's own counter.
+    pub fn publish(&self, path: &str, kind: UpdateKind) {
+        let env = {
+            let entry = self
+                .inner
+                .channels
+                .entry(path.to_string())
+                .or_insert_with(|| ChannelEntry {
+                    sender: broadcast::channel(CHANNEL_CAPACITY).0,
+                    sequence: AtomicU64::new(0),
+                });
+            let seq = entry.sequence.fetch_add(1, Ordering::Relaxed) + 1;
+            let env = UpdateEnvelope {
+                sequence: seq,
+                timestamp: Utc::now().to_rfc3339(),
+                path: path.to_string(),
+                kind,
+            };
+            let _ = entry.sender.send(env.clone());
+            env
         };
-        let _ = entry.sender.send(env);
+
+        for prefix in path_prefixes(path) {
+            if prefix == path {
+                continue;
+            }
+            if let Some(parent) = self.inner.channels.get(&prefix) {
+                let _ = parent.sender.send(env.clone());
+            }
+        }
     }
 }
 
@@ -191,23 +202,82 @@ pub async fn ws_subscribe(
         .unwrap_or_default();
     let path_str = segments.join("/");
 
+    // Build the schema payload now while we still have the AppState.
+    // For catalog-backed deployments we hit the DB; for in-memory trees
+    // we walk the existing tree. Either way we end up with a JSON blob
+    // describing the node's structure at subscription time.
+    let schema = build_schema_payload(&state, &segments).await;
+
     let bus = state.streaming_bus.clone();
-    Ok(ws.on_upgrade(move |socket| run_subscription(socket, bus, path_str)))
+    Ok(ws.on_upgrade(move |socket| run_subscription(socket, bus, path_str, schema)))
+}
+
+async fn build_schema_payload(
+    state: &AppState,
+    segments: &[String],
+) -> serde_json::Value {
+    if let Some(ref catalog) = state.catalog {
+        if segments.is_empty() {
+            return serde_json::json!({
+                "structure_family": "container",
+                "path": "",
+            });
+        }
+        if let Ok(Some(node)) = catalog.lookup(segments).await {
+            return serde_json::json!({
+                "structure_family": node.structure_family,
+                "specs": node.specs,
+                "path": segments.join("/"),
+            });
+        }
+    }
+    // Fall back to walking the in-memory tree on the blocking pool — the
+    // adapter trait is sync, so we can't do this on the async runtime.
+    let segments = segments.to_vec();
+    let state = state.clone();
+    tokio::task::spawn_blocking(move || -> serde_json::Value {
+        if segments.is_empty() {
+            return serde_json::json!({
+                "structure_family": "container",
+                "path": "",
+            });
+        }
+        match crate::core::walk_tree(state.root_tree.as_ref(), &segments) {
+            Ok(adapter) => serde_json::json!({
+                "structure_family": adapter.structure_family().to_string(),
+                "specs": adapter.specs(),
+                "path": segments.join("/"),
+                "structure": adapter.structure_json(),
+            }),
+            Err(_) => serde_json::json!({
+                "type": "subscription-error",
+                "message": "node not found",
+                "path": segments.join("/"),
+            }),
+        }
+    })
+    .await
+    .unwrap_or_else(|_| serde_json::json!({"type": "subscription-error", "message": "blocking task failed"}))
 }
 
 async fn run_subscription(
     socket: WebSocket,
     bus: StreamingBus,
     path: String,
+    schema: serde_json::Value,
 ) {
     let (mut tx, mut rx) = futures::StreamExt::split(socket);
     use futures::SinkExt;
 
-    // Initial schema message — minimal placeholder for now.
+    // Initial schema message — full structure of the node so the
+    // client can interpret subsequent updates without an extra GET.
+    // Mirrors tiled's "subscription-ready" wire shape: type + path +
+    // structure_family + structure (when known) + timestamp.
     let initial = serde_json::json!({
         "type": "subscription-ready",
         "path": path,
         "timestamp": Utc::now().to_rfc3339(),
+        "schema": schema,
     });
     let bytes = match rmp_serde::to_vec_named(&initial) {
         Ok(v) => v,
@@ -220,40 +290,28 @@ async fn run_subscription(
         return;
     }
 
-    let mut receivers = bus.subscribe(&path);
-    // Merge multiple ancestor receivers into one stream of envelopes by
-    // running a small fanout loop.
-    let (merged_tx, mut merged_rx) =
-        tokio::sync::mpsc::unbounded_channel::<UpdateEnvelope>();
-    for mut r in receivers.drain(..) {
-        let merged = merged_tx.clone();
-        tokio::spawn(async move {
-            while let Ok(env) = r.recv().await {
-                if merged.send(env).is_err() {
-                    break;
-                }
-            }
-        });
-    }
-    drop(merged_tx);
+    let mut receiver = bus.subscribe(&path);
 
     loop {
         tokio::select! {
-            // Forward every update to the client.
-            update = merged_rx.recv() => {
-                let Some(env) = update else { break; };
-                let payload = match rmp_serde::to_vec_named(&env) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        tracing::warn!(target: "tiled.streaming", "encode update: {e}");
-                        continue;
+            update = receiver.recv() => {
+                match update {
+                    Ok(env) => {
+                        let payload = match rmp_serde::to_vec_named(&env) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                tracing::warn!(target: "tiled.streaming", "encode update: {e}");
+                                continue;
+                            }
+                        };
+                        if tx.send(Message::Binary(payload.into())).await.is_err() {
+                            break;
+                        }
                     }
-                };
-                if tx.send(Message::Binary(payload.into())).await.is_err() {
-                    break;
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
-            // Honor client-initiated close.
             incoming = futures::StreamExt::next(&mut rx) => {
                 match incoming {
                     Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,

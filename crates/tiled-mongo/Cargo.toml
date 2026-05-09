@@ -19,6 +19,8 @@ tracing = { workspace = true }
 bytes = { workspace = true }
 indexmap = { workspace = true }
 thiserror = { workspace = true }
+arrow = { workspace = true }
+base64 = { workspace = true }
 
 # File handlers (feature-gated)
 ndarray = { workspace = true, optional = true }

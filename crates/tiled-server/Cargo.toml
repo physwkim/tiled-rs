@@ -38,6 +38,10 @@ rmp-serde = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true }
+tokio-tungstenite = "0.28"
+reqwest = { workspace = true }
+futures = { workspace = true }
+rmp-serde = { workspace = true }
 indexmap = { workspace = true }
 tiled-core = { workspace = true }
 tiled-adapters = { workspace = true }

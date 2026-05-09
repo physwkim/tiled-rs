@@ -12,6 +12,8 @@ pub mod filler;
 pub mod handler;
 pub mod run;
 pub mod stream;
+pub mod table_stream;
 
 pub use catalog::MongoCatalog;
 pub use handler::HandlerRegistry;
+pub use table_stream::EventStreamTable;

@@ -59,6 +59,35 @@ pub enum Command {
         /// `PUT /data_source`, `DELETE /metadata`) operate against this DB.
         #[arg(long)]
         catalog_uri: Option<String>,
+
+        /// Auth DB URI. When set, the server runs in multi-user mode:
+        /// `/auth/{provider}/login` and friends use this DB; API keys
+        /// are looked up here too. Required when --user is supplied.
+        #[arg(long, env = "TILED_AUTH_DB_URI")]
+        auth_db_uri: Option<String>,
+
+        /// HMAC secret used to sign JWT access/refresh tokens. Required
+        /// when --auth-db-uri is set. Must be at least 16 bytes; 32 is
+        /// recommended.
+        #[arg(long, env = "TILED_JWT_SECRET")]
+        jwt_secret: Option<String>,
+
+        /// Add a username/password pair to the dummy authenticator.
+        /// Repeatable. Format: `name:password`. Without --auth-db-uri
+        /// these are silently ignored — the dummy authenticator only
+        /// makes sense in multi-user mode.
+        #[arg(long = "user")]
+        users: Vec<String>,
+
+        /// Provider name to expose as `/auth/{provider}/login`. Defaults
+        /// to "dummy" — change it when fronting an external IdP.
+        #[arg(long, default_value = "dummy")]
+        auth_provider_name: String,
+
+        /// Trust the `X-Forwarded-User` header from a reverse proxy that
+        /// has already authenticated the user. Implies `--trust-proxy`.
+        #[arg(long)]
+        proxied_auth_header: bool,
     },
 
     /// Database management commands (not yet implemented)
@@ -251,6 +280,11 @@ pub async fn run(command: Command) -> Result<()> {
             api_key,
             mongo_uri,
             catalog_uri,
+            auth_db_uri,
+            jwt_secret,
+            users,
+            auth_provider_name,
+            proxied_auth_header,
         } => {
             // Load config file if provided.
             let file_config = config
@@ -336,6 +370,19 @@ pub async fn run(command: Command) -> Result<()> {
                 tracing::info!("Anonymous access (no API key)");
             }
 
+            // Multi-user auth wiring.
+            let (auth_db_handle, issuer_handle, authenticators_built, proxied_auth) =
+                build_auth_state(
+                    auth_db_uri.as_deref(),
+                    jwt_secret.as_deref(),
+                    &users,
+                    &auth_provider_name,
+                    proxied_auth_header,
+                )
+                .await?;
+
+            let trust_forwarded_headers = trust_proxy || proxied_auth_header;
+
             let state = tiled_server::AppState {
                 root_tree,
                 serialization_registry: registry,
@@ -345,13 +392,13 @@ pub async fn run(command: Command) -> Result<()> {
                     .collect(),
                 base_url: public_url,
                 cors_policy,
-                trust_forwarded_headers: trust_proxy,
+                trust_forwarded_headers,
                 api_key,
                 catalog: catalog_handle,
-                auth_db: None,
-                issuer: None,
-                authenticators: vec![],
-                proxied_header_auth: None,
+                auth_db: auth_db_handle,
+                issuer: issuer_handle,
+                authenticators: authenticators_built,
+                proxied_header_auth: proxied_auth,
         forwarded_allow_ips: None,
         max_request_body_bytes: 10 * 1024 * 1024,
         streaming_bus: tiled_server::streaming::StreamingBus::new(),
@@ -530,6 +577,69 @@ pub async fn run(command: Command) -> Result<()> {
             }
         },
     }
+}
+
+/// Wire up the multi-user auth pieces from the supplied flags. Returns
+/// the AppState fields the caller needs.
+async fn build_auth_state(
+    auth_db_uri: Option<&str>,
+    jwt_secret: Option<&str>,
+    users: &[String],
+    provider_name: &str,
+    proxied_auth_header: bool,
+) -> Result<(
+    Option<tiled_auth::AuthDb>,
+    Option<tiled_auth::Issuer>,
+    Vec<Arc<dyn tiled_auth::Authenticator>>,
+    Option<Arc<tiled_auth::ProxiedHeaderAuthenticator>>,
+)> {
+    if auth_db_uri.is_none() && users.is_empty() && !proxied_auth_header {
+        return Ok((None, None, vec![], None));
+    }
+    let auth_uri = auth_db_uri.ok_or_else(|| {
+        anyhow::anyhow!(
+            "--user / --proxied-auth-header require --auth-db-uri so the server can persist sessions"
+        )
+    })?;
+    let secret_str = jwt_secret.ok_or_else(|| {
+        anyhow::anyhow!("--auth-db-uri requires --jwt-secret (>= 16 bytes)")
+    })?;
+    let issuer = tiled_auth::Issuer::new(secret_str.as_bytes())
+        .map_err(|e| anyhow::anyhow!("jwt secret: {e}"))?;
+    let db = tiled_auth::AuthDb::connect(auth_uri)
+        .await
+        .map_err(|e| anyhow::anyhow!("auth db connect: {e}"))?;
+    db.migrate()
+        .await
+        .map_err(|e| anyhow::anyhow!("auth migrate: {e}"))?;
+
+    let mut dummy = tiled_auth::DummyAuthenticator::new(provider_name);
+    let mut total = 0;
+    for entry in users {
+        let (name, secret) = entry.split_once(':').ok_or_else(|| {
+            anyhow::anyhow!("--user expects 'name:password', got '{entry}'")
+        })?;
+        dummy
+            .add_user(name, secret)
+            .map_err(|e| anyhow::anyhow!("add user {name}: {e}"))?;
+        total += 1;
+    }
+    let mut authenticators: Vec<Arc<dyn tiled_auth::Authenticator>> = Vec::new();
+    if total > 0 {
+        tracing::info!(
+            "Auth: {} dummy user(s) configured under provider '{}'",
+            total,
+            provider_name
+        );
+        authenticators.push(Arc::new(dummy));
+    }
+    let proxied = if proxied_auth_header {
+        tracing::info!("Auth: trusting X-Forwarded-User from upstream proxy");
+        Some(Arc::new(tiled_auth::ProxiedHeaderAuthenticator::default()))
+    } else {
+        None
+    };
+    Ok((Some(db), Some(issuer), authenticators, proxied))
 }
 
 async fn find_principal_by_uuid(

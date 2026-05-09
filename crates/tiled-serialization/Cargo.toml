@@ -11,6 +11,7 @@ arrow-ipc = []
 msgpack = ["dep:rmp-serde"]
 parquet = ["dep:parquet"]
 image = ["dep:tiff", "dep:image"]
+hdf5 = ["dep:rust-hdf5", "dep:tempfile"]
 
 [dependencies]
 tiled-core = { workspace = true }
@@ -31,3 +32,5 @@ parquet = { workspace = true, optional = true }
 tiff = { workspace = true, optional = true }
 image = { workspace = true, optional = true }
 zip = "2"
+rust-hdf5 = { workspace = true, optional = true }
+tempfile = { workspace = true, optional = true }

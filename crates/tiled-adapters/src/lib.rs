@@ -1,6 +1,7 @@
 pub mod array_adapter;
 pub mod map_adapter;
 pub mod npy_adapter;
+pub mod sequence_adapter;
 
 #[cfg(feature = "csv-adapter")]
 pub mod csv_adapter;
@@ -10,11 +11,14 @@ pub mod tiff_adapter;
 pub mod hdf5_adapter;
 #[cfg(feature = "parquet")]
 pub mod parquet_adapter;
+#[cfg(feature = "zarr")]
+pub mod zarr_adapter;
 pub mod png_jpeg_adapter;
 
 pub use array_adapter::ArrayAdapter;
 pub use map_adapter::MapAdapter;
 pub use npy_adapter::NpyAdapter;
+pub use sequence_adapter::{FrameOpener, NpyFrameOpener, SequenceAdapter};
 
 #[cfg(feature = "csv-adapter")]
 pub use csv_adapter::CsvAdapter;
@@ -24,4 +28,6 @@ pub use tiff_adapter::TiffAdapter;
 pub use hdf5_adapter::Hdf5Adapter;
 #[cfg(feature = "parquet")]
 pub use parquet_adapter::ParquetAdapter;
+#[cfg(feature = "zarr")]
+pub use zarr_adapter::ZarrAdapter;
 pub use png_jpeg_adapter::ImageAdapter;

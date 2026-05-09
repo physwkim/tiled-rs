@@ -110,11 +110,27 @@ impl BlueskyRunAdapter {
                     let stream = EventStreamAdapter::new(
                         self.db.clone(),
                         stream_name.clone(),
-                        descriptors,
+                        descriptors.clone(),
                         cutoff_seq_num,
                         Some(filler.clone()),
                     );
-                    mapping.insert(stream_name, AnyAdapter::Container(Box::new(stream)));
+                    mapping.insert(
+                        stream_name.clone(),
+                        AnyAdapter::Container(Box::new(stream)),
+                    );
+                    // Surface a table-shaped sibling so clients that want
+                    // a flat Arrow view (pandas / polars / datafusion)
+                    // can read it without composing per-column reads.
+                    let table = crate::EventStreamTable::new(
+                        self.db.clone(),
+                        stream_name.clone(),
+                        descriptors,
+                        cutoff_seq_num,
+                    );
+                    mapping.insert(
+                        format!("{stream_name}_table"),
+                        AnyAdapter::Table(Box::new(table)),
+                    );
                 }
             }
             mapping
