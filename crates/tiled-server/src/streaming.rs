@@ -104,6 +104,10 @@ impl StreamingBus {
                 path: path.to_string(),
                 kind,
             };
+            // `send` returns Err if no live receivers; we'll prune that
+            // entry below. Don't try to read the entry's receiver_count
+            // here while the entry guard is held — DashMap will deadlock
+            // against a concurrent subscribe inserting at the same key.
             let _ = entry.sender.send(env.clone());
             env
         };
@@ -116,6 +120,30 @@ impl StreamingBus {
                 let _ = parent.sender.send(env.clone());
             }
         }
+
+        // Garbage-collect dead channels — entries whose Sender has no
+        // active receivers anymore. Without this every distinct path
+        // ever subscribed to leaks a channel for the lifetime of the
+        // process. `remove_if` is atomic so a concurrent subscribe at
+        // the same key stays consistent.
+        self.gc(path);
+        for prefix in path_prefixes(path) {
+            if prefix != path {
+                self.gc(&prefix);
+            }
+        }
+    }
+
+    fn gc(&self, path: &str) {
+        self.inner
+            .channels
+            .remove_if(path, |_, entry| entry.sender.receiver_count() == 0);
+    }
+
+    /// Number of channels currently held in the bus — useful for tests
+    /// that want to confirm the GC ran.
+    pub fn channel_count(&self) -> usize {
+        self.inner.channels.len()
     }
 }
 

@@ -72,7 +72,10 @@ pub async fn login(
         .await
         .map_err(map_auth_err)?;
     db.touch_identity_login(identity.id).await.ok();
-    let scopes = ScopeSet::full(); // password login → full scope set; api keys can narrow.
+    // Login-issued scopes default to AppState::default_login_scopes so an
+    // operator can lock down what a fresh session inherits without
+    // touching every endpoint. API keys can still narrow the set.
+    let scopes = state.default_login_scopes.clone();
     let session = db
         .create_session(principal.id, scopes.clone(), Utc::now() + issuer.refresh_ttl)
         .await
@@ -214,7 +217,7 @@ pub async fn device_token(
                 .await
                 .map_err(map_auth_err)?
                 .ok_or_else(|| ServerError::Internal("granted principal vanished".into()))?;
-            let scopes = ScopeSet::full();
+            let scopes = state.default_login_scopes.clone();
             let session = db
                 .create_session(principal_id, scopes.clone(), Utc::now() + issuer.refresh_ttl)
                 .await

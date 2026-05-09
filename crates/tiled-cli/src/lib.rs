@@ -88,6 +88,14 @@ pub enum Command {
         /// has already authenticated the user. Implies `--trust-proxy`.
         #[arg(long)]
         proxied_auth_header: bool,
+
+        /// Restrict the FileLeafResolver to data files under these
+        /// directories (repeatable). Without this flag the server will
+        /// serve any local file referenced by a registered data_uri,
+        /// which is fine for trusted single-user deployments but unsafe
+        /// once authenticated writers exist.
+        #[arg(long = "allowed-data-dir")]
+        allowed_data_dirs: Vec<std::path::PathBuf>,
     },
 
     /// Database management commands (not yet implemented)
@@ -285,6 +293,7 @@ pub async fn run(command: Command) -> Result<()> {
             users,
             auth_provider_name,
             proxied_auth_header,
+            allowed_data_dirs,
         } => {
             // Load config file if provided.
             let file_config = config
@@ -339,9 +348,13 @@ pub async fn run(command: Command) -> Result<()> {
                 } else if let Some(ref cat) = catalog_handle {
                     // Wire the file-format adapters so leaves backed by
                     // CSV / NPY / TIFF / HDF5 / PNG / JPEG / Parquet
-                    // resolve to the right adapter.
+                    // resolve to the right adapter. The allow-list is
+                    // empty by default — set --allowed-data-dir to lock
+                    // server reads down to specific directories.
                     let resolver: Arc<dyn tiled_catalog::adapter::LeafResolver> =
-                        Arc::new(tiled_server::file_resolver::FileLeafResolver);
+                        Arc::new(tiled_server::file_resolver::FileLeafResolver::new(
+                            allowed_data_dirs.clone(),
+                        ));
                     Arc::new(tiled_catalog::CatalogAdapter::root(cat.clone(), resolver))
                 } else if demo {
                     tracing::info!("Starting with demo dataset");
@@ -402,6 +415,7 @@ pub async fn run(command: Command) -> Result<()> {
         forwarded_allow_ips: None,
         max_request_body_bytes: 10 * 1024 * 1024,
         streaming_bus: tiled_server::streaming::StreamingBus::new(),
+        default_login_scopes: tiled_auth::ScopeSet::full(),
             };
 
             let app = tiled_server::build_app(state);

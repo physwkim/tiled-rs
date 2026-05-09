@@ -62,6 +62,13 @@ pub struct AppState {
     /// connected to /api/v1/{family}/subscribe/{*path} receive matching
     /// updates.
     pub streaming_bus: crate::streaming::StreamingBus,
+    /// Scope set issued to a session created via `/auth/{provider}/login`
+    /// or device-code grant. Defaults to the full set (matches single-
+    /// user behaviour); operators can narrow it to the safe defaults
+    /// (read:metadata + read:data + create + register) per Python tiled's
+    /// SimpleAccessPolicy. Per-key fine-grained scopes still flow
+    /// through `POST /auth/apikeys`.
+    pub default_login_scopes: tiled_auth::ScopeSet,
 }
 
 impl AppState {

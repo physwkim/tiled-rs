@@ -46,19 +46,17 @@ impl Hdf5Adapter {
                 "hdf5 dataset has zero rank".into(),
             ));
         }
-        // Always read as f64 for now — matches AD images and downstream
-        // serialisers. Future work: detect dtype from h5 header and
-        // preserve it.
+        let element_size = ds.element_size();
         let counts = shape.clone();
         let offsets = vec![0usize; shape.len()];
-        let data: Vec<f64> = ds
-            .read_slice::<f64>(&offsets, &counts)
-            .map_err(|e| TiledError::Internal(format!("hdf5 read: {e}")))?;
-        let dtype = BuiltinDType::new(Endianness::Little, Kind::Float, 8);
-        let mut bytes = Vec::with_capacity(data.len() * 8);
-        for v in &data {
-            bytes.extend_from_slice(&v.to_le_bytes());
-        }
+
+        // rust-hdf5 doesn't expose a public datatype-class accessor, so
+        // we probe by reading with progressively narrower H5Type
+        // candidates: float first, then signed integer, then unsigned.
+        // The library's runtime type-check rejects the wrong T quickly
+        // so the fall-through cost is bounded by tries (≤ 3 per size).
+        let (raw_bytes, dtype) = read_native(&ds, element_size, &offsets, &counts)?;
+
         let chunks: Vec<Vec<usize>> = shape.iter().map(|d| vec![*d]).collect();
         let structure = ArrayStructure {
             data_type: DType::Builtin(dtype.clone()),
@@ -67,7 +65,7 @@ impl Hdf5Adapter {
             dims: None,
             resizable: Default::default(),
         };
-        let array = DynNDArray::new(Bytes::from(bytes), dtype, shape);
+        let array = DynNDArray::new(Bytes::from(raw_bytes), dtype, shape);
         Ok(Self {
             array,
             structure,
@@ -75,6 +73,55 @@ impl Hdf5Adapter {
             specs: vec![Spec::new("hdf5")],
         })
     }
+}
+
+fn read_native(
+    ds: &rust_hdf5::H5Dataset,
+    element_size: usize,
+    offsets: &[usize],
+    counts: &[usize],
+) -> Result<(Vec<u8>, BuiltinDType)> {
+    macro_rules! try_read {
+        ($t:ty, $kind:expr) => {{
+            match ds.read_slice::<$t>(offsets, counts) {
+                Ok(values) => {
+                    let mut buf = Vec::with_capacity(values.len() * element_size);
+                    for v in &values {
+                        buf.extend_from_slice(&v.to_le_bytes());
+                    }
+                    return Ok((
+                        buf,
+                        BuiltinDType::new(Endianness::Little, $kind, element_size),
+                    ));
+                }
+                Err(_) => {} // wrong type — try the next candidate
+            }
+        }};
+    }
+    match element_size {
+        8 => {
+            try_read!(f64, Kind::Float);
+            try_read!(i64, Kind::Integer);
+            try_read!(u64, Kind::UnsignedInteger);
+        }
+        4 => {
+            try_read!(f32, Kind::Float);
+            try_read!(i32, Kind::Integer);
+            try_read!(u32, Kind::UnsignedInteger);
+        }
+        2 => {
+            try_read!(i16, Kind::Integer);
+            try_read!(u16, Kind::UnsignedInteger);
+        }
+        1 => {
+            try_read!(i8, Kind::Integer);
+            try_read!(u8, Kind::UnsignedInteger);
+        }
+        _ => {}
+    }
+    Err(TiledError::Internal(format!(
+        "hdf5 dataset element size {element_size} not supported by tiled-rs adapter"
+    )))
 }
 
 impl BaseAdapter for Hdf5Adapter {

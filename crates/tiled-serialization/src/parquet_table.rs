@@ -29,27 +29,25 @@ pub fn register_parquet_serializer(reg: &SerializationRegistry) {
 
 fn parquet_serializer() -> SerializerFn {
     Box::new(|data, _meta| -> Result<Bytes, crate::registry::SerializeError> {
-        // The table handler emits Arrow IPC bytes; round-trip through the
-        // IPC reader so we have a SchemaRef + RecordBatches to feed to
-        // ArrowWriter.
+        // Stream-style: read one batch from the IPC reader, write to
+        // parquet, drop. Avoids the intermediate `batches: Vec<_>` that
+        // forced us to keep all batches resident at once — for large
+        // partitions this halves peak memory.
         let cursor = Cursor::new(data.to_vec());
         let reader =
             FileReader::try_new(cursor, None).map_err(|e| format!("ipc reader: {e}"))?;
         let schema = reader.schema();
-        let batches: Vec<_> = reader
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("ipc batches: {e}"))?;
-
         let mut buf = Vec::new();
         let props = WriterProperties::builder()
             .set_compression(Compression::SNAPPY)
             .build();
         {
-            let mut writer = ArrowWriter::try_new(&mut buf, schema.clone(), Some(props))
+            let mut writer = ArrowWriter::try_new(&mut buf, schema, Some(props))
                 .map_err(|e| format!("parquet writer: {e}"))?;
-            for batch in &batches {
+            for batch in reader {
+                let batch = batch.map_err(|e| format!("ipc batch: {e}"))?;
                 writer
-                    .write(batch)
+                    .write(&batch)
                     .map_err(|e| format!("parquet write: {e}"))?;
             }
             writer.close().map_err(|e| format!("parquet close: {e}"))?;

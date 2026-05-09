@@ -7,7 +7,7 @@
 //! not handled here — operators with those workloads can wrap or replace
 //! this resolver.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use tiled_catalog::Catalog;
 use tiled_catalog::adapter::LeafResolver;
@@ -15,7 +15,63 @@ use tiled_catalog::error::CatalogError;
 use tiled_catalog::orm::Node;
 use tiled_core::adapters::AnyAdapter;
 
-pub struct FileLeafResolver;
+/// Resolver that decodes file:// URIs and dispatches to the right
+/// `tiled-adapters` implementation. When `allowed_data_dirs` is non-empty
+/// only paths whose canonicalised location lives under one of those
+/// directories are accepted; everything else fails with a
+/// `Validation` error so a registered `file:///etc/passwd` can't be
+/// served back as a CSV. An empty list means "no restriction" (legacy
+/// behaviour for tests / loose deployments).
+pub struct FileLeafResolver {
+    allowed_data_dirs: Vec<PathBuf>,
+}
+
+impl FileLeafResolver {
+    pub fn new(allowed_data_dirs: Vec<PathBuf>) -> Self {
+        Self { allowed_data_dirs }
+    }
+
+    /// Convenience constructor matching the legacy unrestricted shape.
+    /// New deployments should prefer [`FileLeafResolver::new`] with an
+    /// explicit allow-list.
+    pub fn unrestricted() -> Self {
+        Self {
+            allowed_data_dirs: Vec::new(),
+        }
+    }
+
+    fn check_allowed(&self, path: &Path) -> std::result::Result<(), CatalogError> {
+        if self.allowed_data_dirs.is_empty() {
+            return Ok(());
+        }
+        // Resolve symlinks before comparing so a malicious symlink inside
+        // an allowed dir can't escape.
+        let canonical = path.canonicalize().map_err(|e| {
+            CatalogError::Validation(format!(
+                "data path {} not accessible: {e}",
+                path.display()
+            ))
+        })?;
+        for allowed in &self.allowed_data_dirs {
+            let allowed_canon = allowed
+                .canonicalize()
+                .unwrap_or_else(|_| allowed.clone());
+            if canonical.starts_with(&allowed_canon) {
+                return Ok(());
+            }
+        }
+        Err(CatalogError::Validation(format!(
+            "data path {} is outside the allowed_data_dirs allow-list",
+            canonical.display()
+        )))
+    }
+}
+
+impl Default for FileLeafResolver {
+    fn default() -> Self {
+        Self::unrestricted()
+    }
+}
 
 impl LeafResolver for FileLeafResolver {
     fn resolve(
@@ -38,6 +94,7 @@ impl LeafResolver for FileLeafResolver {
             ))
         })?;
         let path = uri_to_path(&asset.data_uri)?;
+        self.check_allowed(&path)?;
         let metadata = node.metadata.clone();
 
         let mimetype = ds.mimetype.as_str();

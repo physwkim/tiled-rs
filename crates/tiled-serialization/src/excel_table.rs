@@ -28,27 +28,36 @@ pub fn register_excel_serializer(reg: &SerializationRegistry) {
 
 fn excel_serializer() -> SerializerFn {
     Box::new(|data, _meta| -> Result<Bytes, crate::registry::SerializeError> {
-        // Reuse the CSV serializer's output as the source of cell values
-        // — table row data is already stringified in that path.
-        // For now: read the input as Arrow IPC bytes.
+        // Read Arrow IPC and stream rows directly into the worksheet
+        // string buffer — no intermediate Vec<Vec<String>> for the whole
+        // table.
         use arrow::ipc::reader::FileReader;
         let cursor = Cursor::new(data.to_vec());
         let reader =
             FileReader::try_new(cursor, None).map_err(|e| format!("ipc reader: {e}"))?;
         let schema = reader.schema();
-        let mut rows: Vec<Vec<String>> = Vec::new();
+        let header: Vec<String> =
+            schema.fields().iter().map(|f| f.name().clone()).collect();
+        // Build the sheet body incrementally so we don't hold every row
+        // both as Vec<String> and as XML at the same time.
+        let mut sheet_body = String::new();
+        let mut row_number: usize = 1;
         for batch in reader {
             let batch = batch.map_err(|e| format!("ipc batch: {e}"))?;
             for r in 0..batch.num_rows() {
-                let mut row = Vec::with_capacity(batch.num_columns());
+                row_number += 1;
+                sheet_body.push_str(&format!("<row r=\"{row_number}\">"));
                 for c in 0..batch.num_columns() {
-                    row.push(arrow_cell_string(batch.column(c).as_ref(), r));
+                    let cell = arrow_cell_string(batch.column(c).as_ref(), r);
+                    sheet_body.push_str(&format!(
+                        "<c r=\"{}{row_number}\" t=\"inlineStr\"><is><t>{}</t></is></c>",
+                        col_letter(c),
+                        xml_escape(&cell)
+                    ));
                 }
-                rows.push(row);
+                sheet_body.push_str("</row>");
             }
         }
-        let header: Vec<String> =
-            schema.fields().iter().map(|f| f.name().clone()).collect();
 
         let mut buf = Cursor::new(Vec::new());
         let mut zip = ZipWriter::new(&mut buf);
@@ -76,7 +85,7 @@ fn excel_serializer() -> SerializerFn {
 
         zip.start_file("xl/worksheets/sheet1.xml", opts)
             .map_err(|e| format!("zip: {e}"))?;
-        let sheet = render_sheet(&header, &rows);
+        let sheet = render_sheet_streaming(&header, sheet_body);
         zip.write_all(sheet.as_bytes())
             .map_err(|e| format!("zip: {e}"))?;
 
@@ -85,7 +94,7 @@ fn excel_serializer() -> SerializerFn {
     })
 }
 
-fn render_sheet(header: &[String], rows: &[Vec<String>]) -> String {
+fn render_sheet_streaming(header: &[String], body: String) -> String {
     let mut out = String::new();
     out.push_str(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
@@ -100,18 +109,7 @@ fn render_sheet(header: &[String], rows: &[Vec<String>]) -> String {
         ));
     }
     out.push_str("</row>");
-    for (rn, row) in rows.iter().enumerate() {
-        out.push_str(&format!("<row r=\"{}\">", rn + 2));
-        for (cn, cell) in row.iter().enumerate() {
-            out.push_str(&format!(
-                "<c r=\"{}{}\" t=\"inlineStr\"><is><t>{}</t></is></c>",
-                col_letter(cn),
-                rn + 2,
-                xml_escape(cell)
-            ));
-        }
-        out.push_str("</row>");
-    }
+    out.push_str(&body);
     out.push_str("</sheetData></worksheet>");
     out
 }
