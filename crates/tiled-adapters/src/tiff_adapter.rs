@@ -1,14 +1,19 @@
 //! TIFF array adapter.
 //!
-//! Decodes TIFF (single-page) into a u16 grayscale buffer using the
-//! `tiff` crate. Multi-page TIFFs aren't supported here — register such
+//! Decodes TIFF (single-page) into a typed buffer using the `tiff`
+//! crate. Multi-page TIFFs aren't supported here — register such
 //! files as a sequence and let the file-sequence adapter stack them.
+//!
+//! Grayscale TIFFs surface as `[h, w]`; RGB/RGBA/CMYK as
+//! `[h, w, channels]` (mirrors upstream tiled #143 — RGB TIFFs were
+//! previously coerced to grayscale, dropping channel data).
 
 #![cfg(feature = "tiff")]
 
 use std::path::PathBuf;
 
 use bytes::Bytes;
+use tiff::ColorType;
 
 use tiled_core::adapters::{ArrayAdapterRead, BaseAdapter, BoxFuture};
 use tiled_core::dtype::{BuiltinDType, DType, DynNDArray, Endianness, Kind};
@@ -33,29 +38,62 @@ impl TiffAdapter {
         let (w, h) = decoder
             .dimensions()
             .map_err(|e| TiledError::Internal(format!("tiff dims: {e}")))?;
+        let color = decoder
+            .colortype()
+            .map_err(|e| TiledError::Internal(format!("tiff colortype: {e}")))?;
+        let channels = match color {
+            ColorType::Gray(_) => 1usize,
+            ColorType::RGB(_) => 3,
+            ColorType::RGBA(_) => 4,
+            ColorType::CMYK(_) => 4,
+            other => {
+                return Err(TiledError::Validation(format!(
+                    "tiff color type {other:?} is not supported"
+                )));
+            }
+        };
 
-        // Pull the first IFD's pixel data. We coerce to u16 (matches what
-        // the AreaDetector tooling produces) so downstream serialisers can
-        // assume a fixed dtype.
         let result = decoder
             .read_image()
             .map_err(|e| TiledError::Internal(format!("tiff decode: {e}")))?;
-        let raw_u16: Vec<u16> = match result {
-            tiff::decoder::DecodingResult::U8(v) => v.into_iter().map(u16::from).collect(),
-            tiff::decoder::DecodingResult::U16(v) => v,
-            tiff::decoder::DecodingResult::U32(v) => v.into_iter().map(|x| x as u16).collect(),
+        // Encode native sample width per pixel — preserve dtype rather
+        // than uniformly coercing to u16 (which loses precision for f32
+        // micrographs and overflows for u32 thermal sensors).
+        let (bytes, dtype): (Vec<u8>, BuiltinDType) = match result {
+            tiff::decoder::DecodingResult::U8(v) => {
+                (v, BuiltinDType::new(Endianness::Little, Kind::UnsignedInteger, 1))
+            }
+            tiff::decoder::DecodingResult::U16(v) => {
+                let mut buf = Vec::with_capacity(v.len() * 2);
+                for s in &v { buf.extend_from_slice(&s.to_le_bytes()); }
+                (buf, BuiltinDType::new(Endianness::Little, Kind::UnsignedInteger, 2))
+            }
+            tiff::decoder::DecodingResult::U32(v) => {
+                let mut buf = Vec::with_capacity(v.len() * 4);
+                for s in &v { buf.extend_from_slice(&s.to_le_bytes()); }
+                (buf, BuiltinDType::new(Endianness::Little, Kind::UnsignedInteger, 4))
+            }
+            tiff::decoder::DecodingResult::F32(v) => {
+                let mut buf = Vec::with_capacity(v.len() * 4);
+                for s in &v { buf.extend_from_slice(&s.to_le_bytes()); }
+                (buf, BuiltinDType::new(Endianness::Little, Kind::Float, 4))
+            }
+            tiff::decoder::DecodingResult::F64(v) => {
+                let mut buf = Vec::with_capacity(v.len() * 8);
+                for s in &v { buf.extend_from_slice(&s.to_le_bytes()); }
+                (buf, BuiltinDType::new(Endianness::Little, Kind::Float, 8))
+            }
             other => {
                 return Err(TiledError::Validation(format!(
                     "unsupported tiff sample format: {other:?}"
                 )));
             }
         };
-        let mut bytes = Vec::with_capacity(raw_u16.len() * 2);
-        for v in &raw_u16 {
-            bytes.extend_from_slice(&v.to_le_bytes());
-        }
-        let dtype = BuiltinDType::new(Endianness::Little, Kind::UnsignedInteger, 2);
-        let shape = vec![h as usize, w as usize];
+        let shape: Vec<usize> = if channels > 1 {
+            vec![h as usize, w as usize, channels]
+        } else {
+            vec![h as usize, w as usize]
+        };
         let chunks: Vec<Vec<usize>> = shape.iter().map(|d| vec![*d]).collect();
         let structure = ArrayStructure {
             data_type: DType::Builtin(dtype.clone()),
