@@ -46,6 +46,24 @@ pub trait ArrayAdapterRead: BaseAdapter {
 pub trait ArrayAdapterWrite: ArrayAdapterRead {
     fn write_block<'a>(&'a self, data: DynNDArray, block: &'a [usize])
     -> BoxFuture<'a, Result<()>>;
+
+    /// Extend the array along `axis` by appending `data`. Returns the
+    /// new size of `axis` after the append. Mirrors upstream tiled
+    /// PR #802's appendable-zarr work — only adapters whose underlying
+    /// store supports growth (zarr, ND-streaming) implement it; default
+    /// errors out with a clear "not supported" so the route stays the
+    /// same shape regardless of backend support.
+    fn append<'a>(
+        &'a self,
+        _data: DynNDArray,
+        _axis: usize,
+    ) -> BoxFuture<'a, Result<usize>> {
+        Box::pin(async move {
+            Err(crate::error::TiledError::Validation(
+                "append is not supported by this adapter".into(),
+            ))
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------

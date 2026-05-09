@@ -132,13 +132,29 @@ impl WhereBuilder {
     }
 
     fn push_full_text(&mut self, text: &str) {
-        let col = self.dialect.metadata_full_text();
-        let p = self.dialect.placeholder(self.bindings.len());
-        // Use LIKE for portability — `metadata::text LIKE %term%`. Case-
-        // insensitive matching would need lower(...) on both sides; left
-        // case-sensitive for now (matches MongoCatalog).
-        self.pieces.push(format!("{col} LIKE {p}"));
-        self.bindings.push(Bind::Text(format!("%{text}%")));
+        match self.dialect {
+            Dialect::Postgres => {
+                // Postgres GIN-indexed full-text search (upstream tiled
+                // PR #640). `to_tsquery` would force the caller to write
+                // tsquery syntax themselves; `plainto_tsquery` accepts a
+                // plain phrase and ANDs the lexemes together — close to
+                // the user's intent without surprises.
+                let p = self.dialect.placeholder(self.bindings.len());
+                self.pieces.push(format!(
+                    "to_tsvector('simple', metadata::text) @@ plainto_tsquery('simple', {p})"
+                ));
+                self.bindings.push(Bind::Text(text.to_string()));
+            }
+            Dialect::Sqlite => {
+                // SQLite: portable `LIKE %term%` substring match. FTS5
+                // would be faster but requires a virtual-table mirror —
+                // separate port (upstream #723).
+                let col = self.dialect.metadata_full_text();
+                let p = self.dialect.placeholder(self.bindings.len());
+                self.pieces.push(format!("{col} LIKE {p}"));
+                self.bindings.push(Bind::Text(format!("%{text}%")));
+            }
+        }
     }
 
     fn push_structure_family(&mut self, family: &str) {

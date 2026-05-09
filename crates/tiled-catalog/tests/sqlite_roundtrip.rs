@@ -19,6 +19,7 @@ async fn migrate_create_lookup_delete() {
             "0001_initial".to_string(),
             "0002_webhooks".to_string(),
             "0003_revisions_access_blob".to_string(),
+            "0004_metadata_fts".to_string(),
         ],
     );
 

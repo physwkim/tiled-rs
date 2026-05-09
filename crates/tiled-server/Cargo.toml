@@ -44,6 +44,8 @@ sha2 = "0.10"
 base64 = "0.22"
 rand = "0.8"
 url = "2"
+# RFC 6902 json-patch (upstream tiled #688).
+json-patch = "3"
 
 [dev-dependencies]
 tempfile = { workspace = true }

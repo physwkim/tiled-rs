@@ -116,6 +116,9 @@ pub fn build_app(state: AppState) -> Router {
         .route("/api/v1/search/{*path}", get(router::search))
         .route("/api/v1/array/block/{*path}", get(router::array_block))
         .route("/api/v1/array/full/{*path}", get(router::array_full))
+        .route("/api/v1/container/full/{*path}", get(router::container_full))
+        .route("/api/v1/array/full", post(router::array_full_post))
+        .route("/api/v1/container/full", post(router::container_full_post))
         .route(
             "/api/v1/table/partition/{*path}",
             get(router::table_partition),

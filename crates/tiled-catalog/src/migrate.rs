@@ -23,6 +23,10 @@ const SQLITE_MIGRATIONS: &[(&str, &str)] = &[
         "0003_revisions_access_blob",
         include_str!("../migrations/sqlite/0003_revisions_access_blob.sql"),
     ),
+    (
+        "0004_metadata_fts",
+        include_str!("../migrations/sqlite/0004_metadata_fts.sql"),
+    ),
 ];
 
 const POSTGRES_MIGRATIONS: &[(&str, &str)] = &[
@@ -37,6 +41,10 @@ const POSTGRES_MIGRATIONS: &[(&str, &str)] = &[
     (
         "0003_revisions_access_blob",
         include_str!("../migrations/postgres/0003_revisions_access_blob.sql"),
+    ),
+    (
+        "0004_metadata_fts",
+        include_str!("../migrations/postgres/0004_metadata_fts.sql"),
     ),
 ];
 

@@ -6,6 +6,7 @@ use axum::Json;
 use axum::extract::{OriginalUri, Query, State};
 use axum::http::HeaderMap;
 use axum::response::IntoResponse;
+use serde::Deserialize;
 
 use crate::extractors::PathSegments;
 
@@ -436,7 +437,243 @@ pub async fn array_block(
         data.data
     };
 
-    Ok(([(axum::http::header::CONTENT_TYPE, media_type)], body).into_response())
+    Ok(serve_with_range(&headers, &media_type, body))
+}
+
+/// Build a Response that honors `Range: bytes=...` when present
+/// (upstream tiled PR #762). Used by data routes that produce a full
+/// byte buffer in memory — DuckDB httpfs and similar tools rely on
+/// partial GETs to scan only the file slices they need.
+fn serve_with_range(
+    headers: &HeaderMap,
+    content_type: &str,
+    body: bytes::Bytes,
+) -> axum::response::Response {
+    use axum::http::{HeaderName, HeaderValue, StatusCode, header};
+    let total = body.len();
+    let range = headers
+        .get(header::RANGE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| parse_range(s, total));
+    let accept_ranges = (
+        HeaderName::from_static("accept-ranges"),
+        HeaderValue::from_static("bytes"),
+    );
+    match range {
+        Some((start, end)) if end >= start && end < total => {
+            let slice = body.slice(start..=end);
+            let mut resp = (
+                StatusCode::PARTIAL_CONTENT,
+                [
+                    (header::CONTENT_TYPE, HeaderValue::from_str(content_type)
+                        .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"))),
+                    accept_ranges,
+                    (
+                        header::CONTENT_RANGE,
+                        HeaderValue::from_str(&format!("bytes {start}-{end}/{total}"))
+                            .unwrap_or_else(|_| HeaderValue::from_static("bytes 0-0/0")),
+                    ),
+                ],
+                slice,
+            )
+                .into_response();
+            // axum's tuple response set CONTENT_LENGTH from the body, so
+            // the slice length flows naturally; no manual override.
+            resp.extensions_mut().insert(());
+            resp
+        }
+        _ => (
+            [
+                (header::CONTENT_TYPE, HeaderValue::from_str(content_type)
+                    .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"))),
+                accept_ranges,
+            ],
+            body,
+        )
+            .into_response(),
+    }
+}
+
+/// Parse a single-range `Range: bytes=START-END` header. Multi-range
+/// (`bytes=0-5,10-`) is not supported — multi-part responses are a
+/// non-trivial slice of HTTP that very few tools (and not DuckDB
+/// httpfs) actually use. Returns `None` on parse error or out-of-bounds.
+fn parse_range(header: &str, total: usize) -> Option<(usize, usize)> {
+    let raw = header.strip_prefix("bytes=")?;
+    if raw.contains(',') {
+        return None; // multi-range not supported
+    }
+    let (start_s, end_s) = raw.split_once('-')?;
+    if start_s.is_empty() {
+        // Suffix range: `bytes=-N` → last N bytes.
+        let n: usize = end_s.parse().ok()?;
+        if n == 0 || n > total {
+            return None;
+        }
+        return Some((total - n, total - 1));
+    }
+    let start: usize = start_s.parse().ok()?;
+    let end = if end_s.is_empty() {
+        if total == 0 { return None; }
+        total - 1
+    } else {
+        end_s.parse().ok()?
+    };
+    if start > end || end >= total {
+        return None;
+    }
+    Some((start, end))
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/v1/array/full — long-URL workaround for the GET counterpart
+// ---------------------------------------------------------------------------
+//
+// Mirrors upstream tiled PR #657. Mostly applies when slice / block /
+// filter parameters get long enough to bump into the practical URL
+// length cap (some intermediaries clip ~8 KB; the JSON body version
+// has no such limit). Body shape: `{path, slice?, block?, format?}`.
+
+#[derive(Debug, Deserialize)]
+pub struct LongRequest {
+    /// Forward-slash-separated tree path. Empty string = root.
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub slice: Option<String>,
+    #[serde(default)]
+    pub block: Option<String>,
+    #[serde(default)]
+    pub format: Option<String>,
+}
+
+impl LongRequest {
+    fn to_query_params(&self) -> HashMap<String, String> {
+        let mut p = HashMap::new();
+        if let Some(s) = &self.slice {
+            p.insert("slice".to_string(), s.clone());
+        }
+        if let Some(b) = &self.block {
+            p.insert("block".to_string(), b.clone());
+        }
+        if let Some(f) = &self.format {
+            p.insert("format".to_string(), f.clone());
+        }
+        p
+    }
+}
+
+pub async fn array_full_post(
+    state: State<AppState>,
+    BaseUrl(base_url): BaseUrl,
+    headers: HeaderMap,
+    auth: crate::AuthContext,
+    Json(req): Json<LongRequest>,
+) -> Result<axum::response::Response, ServerError> {
+    let _ = base_url;
+    let path = req.path.trim_start_matches('/');
+    let uri: axum::http::Uri = format!("/api/v1/array/full/{path}")
+        .parse()
+        .map_err(|e| ServerError::Internal(format!("rebuild URI: {e}")))?;
+    array_full(
+        state,
+        OriginalUri(uri),
+        Query(req.to_query_params()),
+        headers,
+        auth,
+    )
+    .await
+    .map(IntoResponse::into_response)
+}
+
+pub async fn container_full_post(
+    state: State<AppState>,
+    BaseUrl(base_url): BaseUrl,
+    headers: HeaderMap,
+    auth: crate::AuthContext,
+    Json(req): Json<LongRequest>,
+) -> Result<axum::response::Response, ServerError> {
+    let path = req.path.trim_start_matches('/');
+    let uri: axum::http::Uri = format!("/api/v1/container/full/{path}")
+        .parse()
+        .map_err(|e| ServerError::Internal(format!("rebuild URI: {e}")))?;
+    container_full(state, OriginalUri(uri), BaseUrl(base_url), headers, auth)
+        .await
+        .map(IntoResponse::into_response)
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/container/full/{*path} — export entire container
+// ---------------------------------------------------------------------------
+//
+// Upstream tiled PR #660. Walks the container's immediate children and
+// dispatches to whichever container serializer the Accept header asks
+// for (HTML index, json-seq listing). Container-format outputs that
+// concatenate child *data* into one file (HDF5, Zarr, zip-of-arrays)
+// would require a dedicated serializer that walks recursively and pulls
+// each leaf's bytes — call it out as a deferred follow-up.
+
+pub async fn container_full(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+    BaseUrl(base_url): BaseUrl,
+    headers: HeaderMap,
+    auth: crate::AuthContext,
+) -> Result<impl IntoResponse, ServerError> {
+    auth.require(tiled_auth::Scope::ReadData)?;
+    let segments = segments_from_uri(&uri, "/api/v1/container/full/");
+    pre_warm_walk(&state, &segments).await?;
+
+    let adapter = core::walk_tree(state.root_tree.as_ref(), &segments)?;
+    let container = adapter
+        .as_container()
+        .ok_or_else(|| ServerError::Validation(format!(
+            "'{}' is not a container",
+            segments.join("/")
+        )))?;
+
+    // Build the same Vec<Resource> shape /search emits — that's what
+    // the registered container serializers (html, json-seq) consume.
+    let path = segments.join("/");
+    let children: Vec<tiled_core::schemas::Resource> = container
+        .keys()
+        .iter()
+        .filter_map(|k| container.get(k).map(|child| {
+            let child_path = if path.is_empty() {
+                k.clone()
+            } else {
+                format!("{path}/{k}")
+            };
+            core::construct_resource(child, k, &child_path, &base_url)
+        }))
+        .collect();
+    let body_json =
+        serde_json::to_vec(&children).map_err(|e| ServerError::Internal(format!("encode: {e}")))?;
+
+    let accept = headers
+        .get("accept")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/json");
+    let media_type = tiled_serialization::resolve_media_type(
+        accept,
+        tiled_core::structures::StructureFamily::Container,
+        &state.serialization_registry,
+    )
+    .unwrap_or_else(|| "text/html".to_string());
+
+    let body = if let Some(serializer) = state
+        .serialization_registry
+        .dispatch(tiled_core::structures::StructureFamily::Container, &media_type)
+    {
+        let meta = serde_json::json!({"path": path});
+        serializer(&body_json, &meta).map_err(|e| ServerError::Internal(e.to_string()))?
+    } else {
+        return Err(ServerError::Validation(format!(
+            "no container serializer for {media_type}"
+        )));
+    };
+
+    Ok(serve_with_range(&headers, &media_type, body))
 }
 
 // ---------------------------------------------------------------------------
@@ -1019,6 +1256,7 @@ pub async fn patch_metadata(
     OriginalUri(uri): OriginalUri,
     Query(params): Query<HashMap<String, String>>,
     BaseUrl(base_url): BaseUrl,
+    headers: HeaderMap,
     auth: crate::AuthContext,
     Json(req): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, ServerError> {
@@ -1060,14 +1298,89 @@ pub async fn patch_metadata(
         )
         .await;
     auth.require(tiled_auth::Scope::WriteMetadata)?;
-    let metadata = req
-        .get("metadata")
-        .cloned()
-        .unwrap_or_else(|| node.metadata.clone());
-    let specs = req
-        .get("specs")
-        .cloned()
-        .unwrap_or_else(|| node.specs.clone());
+
+    // Content-Type-driven dispatch (upstream tiled #688):
+    //
+    //   * application/json-patch+json   — body is an array of RFC 6902 ops
+    //     applied to the existing metadata + specs in place;
+    //   * application/merge-patch+json  — body is a partial document merged
+    //     into existing metadata + specs per RFC 7396 (null fields delete);
+    //   * default (any other / missing) — historical "partial replace": top-
+    //     level `metadata` and/or `specs` keys overwrite the old values.
+    let content_type = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let mode = if content_type.contains("application/json-patch+json") {
+        PatchMode::JsonPatch
+    } else if content_type.contains("application/merge-patch+json") {
+        PatchMode::MergePatch
+    } else {
+        PatchMode::PartialReplace
+    };
+    let (metadata, specs) = match mode {
+        PatchMode::PartialReplace => {
+            let metadata = req
+                .get("metadata")
+                .cloned()
+                .unwrap_or_else(|| node.metadata.clone());
+            let specs = req
+                .get("specs")
+                .cloned()
+                .unwrap_or_else(|| node.specs.clone());
+            (metadata, specs)
+        }
+        PatchMode::JsonPatch => {
+            let ops_array = req.as_array().ok_or_else(|| {
+                ServerError::Validation(
+                    "application/json-patch+json body must be a JSON array of ops".into(),
+                )
+            })?;
+            // Build a single working doc {metadata, specs}, run the ops,
+            // then split it back. RFC 6902 paths starting with /metadata
+            // or /specs work without further translation.
+            let mut working = serde_json::json!({
+                "metadata": node.metadata,
+                "specs": node.specs,
+            });
+            let patch: json_patch::Patch = serde_json::from_value(
+                serde_json::Value::Array(ops_array.clone()),
+            )
+            .map_err(|e| {
+                ServerError::Validation(format!("invalid json-patch: {e}"))
+            })?;
+            json_patch::patch(&mut working, &patch).map_err(|e| {
+                ServerError::Validation(format!("json-patch failed: {e}"))
+            })?;
+            let metadata = working
+                .get("metadata")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            let specs = working
+                .get("specs")
+                .cloned()
+                .unwrap_or_else(|| serde_json::Value::Array(Vec::new()));
+            (metadata, specs)
+        }
+        PatchMode::MergePatch => {
+            // RFC 7396: recursively merge into the working doc; null
+            // values in the patch delete the corresponding key. We only
+            // merge the top-level `metadata` and `specs` fields (everything
+            // else on the body is ignored — this matches upstream's
+            // behaviour where merge-patch doesn't touch structure).
+            let mut metadata = node.metadata.clone();
+            let mut specs = node.specs.clone();
+            if let Some(m) = req.get("metadata") {
+                merge_patch_apply(&mut metadata, m);
+            }
+            if let Some(s) = req.get("specs") {
+                // specs is conventionally an array; replace wholesale on
+                // merge-patch (RFC 7396 says non-objects are replaced).
+                specs = s.clone();
+            }
+            (metadata, specs)
+        }
+    };
     let updated = catalog
         .update_metadata(node.id, metadata, specs, drop_revision)
         .await
@@ -1409,5 +1722,109 @@ mod block_parser_tests {
         // Bytes 4..6 = 100, bytes 6..8 = 200.
         assert_eq!(&result[4..6], &(100u16).to_le_bytes());
         assert_eq!(&result[6..8], &(200u16).to_le_bytes());
+    }
+}
+
+/// Which dispatch arm `patch_metadata` takes, derived from
+/// `Content-Type`. Mirrors upstream tiled PR #688's three modes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PatchMode {
+    /// Default. Top-level `metadata`/`specs` keys overwrite the old values.
+    PartialReplace,
+    /// RFC 6902 ops array (`application/json-patch+json`).
+    JsonPatch,
+    /// RFC 7396 partial doc (`application/merge-patch+json`).
+    MergePatch,
+}
+
+/// RFC 7396 merge-patch: recursively merge `patch` into `target`. A
+/// `null` value in `patch` deletes the corresponding key on an object.
+fn merge_patch_apply(target: &mut serde_json::Value, patch: &serde_json::Value) {
+    match (target, patch) {
+        (serde_json::Value::Object(target_map), serde_json::Value::Object(patch_map)) => {
+            for (key, value) in patch_map {
+                if value.is_null() {
+                    target_map.remove(key);
+                } else if let Some(existing) = target_map.get_mut(key) {
+                    merge_patch_apply(existing, value);
+                } else {
+                    target_map.insert(key.clone(), value.clone());
+                }
+            }
+        }
+        (target, patch) => {
+            *target = patch.clone();
+        }
+    }
+}
+
+#[cfg(test)]
+mod patch_dispatch_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn merge_patch_overwrites_scalar() {
+        let mut a = json!({"x": 1, "y": 2});
+        merge_patch_apply(&mut a, &json!({"y": 99}));
+        assert_eq!(a, json!({"x": 1, "y": 99}));
+    }
+
+    #[test]
+    fn merge_patch_recurses_into_objects() {
+        let mut a = json!({"nested": {"a": 1, "b": 2}});
+        merge_patch_apply(&mut a, &json!({"nested": {"b": 99}}));
+        assert_eq!(a, json!({"nested": {"a": 1, "b": 99}}));
+    }
+
+    #[test]
+    fn merge_patch_null_deletes_key() {
+        let mut a = json!({"x": 1, "y": 2});
+        merge_patch_apply(&mut a, &json!({"y": null}));
+        assert_eq!(a, json!({"x": 1}));
+    }
+
+    #[test]
+    fn merge_patch_replaces_arrays_wholesale() {
+        let mut a = json!({"arr": [1, 2, 3]});
+        merge_patch_apply(&mut a, &json!({"arr": [9]}));
+        assert_eq!(a, json!({"arr": [9]}));
+    }
+}
+
+#[cfg(test)]
+mod range_tests {
+    use super::parse_range;
+
+    #[test]
+    fn full_range() {
+        assert_eq!(parse_range("bytes=0-9", 10), Some((0, 9)));
+    }
+
+    #[test]
+    fn open_ended() {
+        assert_eq!(parse_range("bytes=5-", 10), Some((5, 9)));
+    }
+
+    #[test]
+    fn suffix_last_n() {
+        assert_eq!(parse_range("bytes=-3", 10), Some((7, 9)));
+    }
+
+    #[test]
+    fn out_of_bounds_rejected() {
+        assert_eq!(parse_range("bytes=0-99", 10), None);
+        assert_eq!(parse_range("bytes=20-30", 10), None);
+    }
+
+    #[test]
+    fn malformed_rejected() {
+        assert_eq!(parse_range("bytes=abc-9", 10), None);
+        assert_eq!(parse_range("0-9", 10), None); // missing prefix
+    }
+
+    #[test]
+    fn multi_range_not_supported() {
+        assert_eq!(parse_range("bytes=0-1,3-4", 10), None);
     }
 }
