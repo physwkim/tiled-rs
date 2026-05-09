@@ -303,8 +303,11 @@ pub async fn run(command: Command) -> Result<()> {
                     tracing::info!("MongoDB catalog loaded ({} runs)", catalog.len());
                     Arc::new(catalog)
                 } else if let Some(ref cat) = catalog_handle {
+                    // Wire the file-format adapters so leaves backed by
+                    // CSV / NPY / TIFF / HDF5 / PNG / JPEG / Parquet
+                    // resolve to the right adapter.
                     let resolver: Arc<dyn tiled_catalog::adapter::LeafResolver> =
-                        Arc::new(tiled_catalog::adapter::UnresolvedLeaf);
+                        Arc::new(tiled_server::file_resolver::FileLeafResolver);
                     Arc::new(tiled_catalog::CatalogAdapter::root(cat.clone(), resolver))
                 } else if demo {
                     tracing::info!("Starting with demo dataset");

@@ -3,6 +3,13 @@ name = "tiled-server"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = ["csv-adapter"]
+csv-adapter = ["tiled-adapters/csv-adapter"]
+parquet-adapter = ["tiled-adapters/parquet"]
+tiff-adapter = ["tiled-adapters/tiff"]
+hdf5-adapter = ["tiled-adapters/hdf5"]
+
 [dependencies]
 tiled-core = { workspace = true }
 tiled-adapters = { workspace = true }

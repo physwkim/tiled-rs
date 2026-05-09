@@ -4,6 +4,7 @@ pub mod auth_router;
 pub mod core;
 pub mod error;
 pub mod extractors;
+pub mod file_resolver;
 pub mod router;
 pub mod state;
 
