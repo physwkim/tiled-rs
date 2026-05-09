@@ -25,6 +25,34 @@ use tiled_core::error::{Result, TiledError};
 use tiled_core::ndslice::{NDSlice, SliceDim};
 use tiled_core::structures::{ArrayStructure, Spec, StructureFamily};
 
+/// File-locking policy for the HDF5 reader. Mirrors upstream tiled
+/// PR #1164 + rust-hdf5 0.2.8's `FileLocking` enum:
+///
+/// * `Default` — defer to `HDF5_USE_FILE_LOCKING` env var, else
+///   acquire the lock (the libhdf5 default).
+/// * `Disabled` — skip locking entirely. Useful on filesystems
+///   without working flock (some NFS exports, certain FUSE mounts).
+/// * `BestEffort` — try to lock; if it fails, proceed without one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Hdf5Locking {
+    #[default]
+    Default,
+    Disabled,
+    BestEffort,
+}
+
+impl Hdf5Locking {
+    fn open(self, path: &std::path::Path) -> std::result::Result<rust_hdf5::H5File, rust_hdf5::Hdf5Error> {
+        match self {
+            Self::Default => rust_hdf5::H5File::open(path),
+            Self::Disabled => rust_hdf5::H5File::options().no_locking().open(path),
+            Self::BestEffort => {
+                rust_hdf5::H5File::options().best_effort_locking().open(path)
+            }
+        }
+    }
+}
+
 pub struct Hdf5Adapter {
     path: PathBuf,
     dataset: String,
@@ -36,6 +64,7 @@ pub struct Hdf5Adapter {
     /// shape=[1] for the structure but pass empty offsets/counts to
     /// `read_slice` so libhdf5 accepts the call.
     scalar_promoted: bool,
+    locking: Hdf5Locking,
 }
 
 impl Hdf5Adapter {
@@ -44,7 +73,20 @@ impl Hdf5Adapter {
         dataset: &str,
         metadata: serde_json::Value,
     ) -> Result<Self> {
-        let file = rust_hdf5::H5File::open(&path)
+        Self::from_path_with_locking(path, dataset, metadata, Hdf5Locking::default())
+    }
+
+    /// Open with an explicit file-locking policy (upstream tiled #1164).
+    /// Use `Disabled` on filesystems without working flock; `BestEffort`
+    /// when you'd rather still serve the file than fail to open it.
+    pub fn from_path_with_locking(
+        path: PathBuf,
+        dataset: &str,
+        metadata: serde_json::Value,
+        locking: Hdf5Locking,
+    ) -> Result<Self> {
+        let file = locking
+            .open(&path)
             .map_err(|e| TiledError::Internal(format!("hdf5 open: {e}")))?;
         let ds = file
             .dataset(dataset)
@@ -97,6 +139,7 @@ impl Hdf5Adapter {
             metadata,
             specs: vec![Spec::new("hdf5")],
             scalar_promoted,
+            locking,
         })
     }
 
@@ -110,7 +153,9 @@ impl Hdf5Adapter {
                 shape.clone(),
             ));
         }
-        let file = rust_hdf5::H5File::open(&self.path)
+        let file = self
+            .locking
+            .open(&self.path)
             .map_err(|e| TiledError::Internal(format!("hdf5 reopen: {e}")))?;
         let ds = file
             .dataset(&self.dataset)

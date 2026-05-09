@@ -25,7 +25,7 @@ pub use csv_adapter::CsvAdapter;
 #[cfg(feature = "tiff")]
 pub use tiff_adapter::TiffAdapter;
 #[cfg(feature = "hdf5")]
-pub use hdf5_adapter::Hdf5Adapter;
+pub use hdf5_adapter::{Hdf5Adapter, Hdf5Locking};
 #[cfg(feature = "parquet")]
 pub use parquet_adapter::ParquetAdapter;
 #[cfg(feature = "zarr")]
