@@ -30,3 +30,4 @@ rmp-serde = { workspace = true, optional = true }
 parquet = { workspace = true, optional = true }
 tiff = { workspace = true, optional = true }
 image = { workspace = true, optional = true }
+zip = "2"

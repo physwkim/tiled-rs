@@ -4,11 +4,13 @@ version.workspace = true
 edition.workspace = true
 
 [features]
-default = ["csv-adapter"]
+default = ["csv-adapter", "image-serializer", "parquet-serializer"]
 csv-adapter = ["tiled-adapters/csv-adapter"]
 parquet-adapter = ["tiled-adapters/parquet"]
 tiff-adapter = ["tiled-adapters/tiff"]
 hdf5-adapter = ["tiled-adapters/hdf5"]
+image-serializer = ["tiled-serialization/image"]
+parquet-serializer = ["tiled-serialization/parquet"]
 
 [dependencies]
 tiled-core = { workspace = true }

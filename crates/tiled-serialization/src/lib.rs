@@ -1,6 +1,15 @@
 pub mod array;
+pub mod html_container;
+pub mod json_seq;
 pub mod registry;
 pub mod table;
+
+#[cfg(feature = "image")]
+pub mod image_array;
+#[cfg(feature = "parquet")]
+pub mod parquet_table;
+#[cfg(feature = "csv")]
+pub mod excel_table;
 
 pub use registry::{SerializationRegistry, resolve_media_type};
 
@@ -9,5 +18,13 @@ pub fn default_registry() -> SerializationRegistry {
     let reg = SerializationRegistry::new();
     array::register_array_serializers(&reg);
     table::register_table_serializers(&reg);
+    html_container::register_html_serializer(&reg);
+    json_seq::register_json_seq_serializer(&reg);
+    #[cfg(feature = "image")]
+    image_array::register_image_serializers(&reg);
+    #[cfg(feature = "parquet")]
+    parquet_table::register_parquet_serializer(&reg);
+    #[cfg(feature = "csv")]
+    excel_table::register_excel_serializer(&reg);
     reg
 }
