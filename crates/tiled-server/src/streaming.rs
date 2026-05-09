@@ -27,7 +27,7 @@ use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
-use crate::auth_context::AuthContext;
+use crate::auth_context::{AuthContext, AuthKind};
 use crate::error::ServerError;
 use crate::state::AppState;
 
@@ -246,10 +246,16 @@ pub async fn ws_subscribe(
     State(state): State<AppState>,
     OriginalUri(uri): OriginalUri,
     Query(q): Query<SubscribeQuery>,
-    auth: AuthContext,
+    headers: axum::http::HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Result<axum::response::Response, ServerError> {
-    auth.require(tiled_auth::Scope::ReadMetadata)?;
+    // The route is mounted OUTSIDE the auth middleware (tiled#1351) so
+    // browsers — which can't set Authorization on WS — can authenticate
+    // via a first JSON message after the upgrade. We still accept
+    // header-based auth here as a fast path so non-browser clients keep
+    // working.
+    let header_auth = crate::app::resolve_header_auth(&state, &headers).await;
+
     let prefix_starts = ["/api/v1/array/subscribe/", "/api/v1/container/subscribe/", "/api/v1/table/subscribe/"];
     let path = uri.path();
     let segments: Vec<String> = prefix_starts
@@ -282,8 +288,17 @@ pub async fn ws_subscribe(
         Some(seq) => bus.history_since(&path_str, seq),
         None => Vec::new(),
     };
+    let state_for_handshake = state.clone();
     Ok(ws.on_upgrade(move |socket| {
-        run_subscription(socket, bus, path_str, schema, replay)
+        run_subscription(
+            socket,
+            state_for_handshake,
+            bus,
+            path_str,
+            schema,
+            replay,
+            header_auth,
+        )
     }))
 }
 
@@ -337,13 +352,45 @@ async fn build_schema_payload(
 
 async fn run_subscription(
     socket: WebSocket,
+    state: AppState,
     bus: StreamingBus,
     path: String,
     schema: serde_json::Value,
     replay: Vec<UpdateEnvelope>,
+    header_auth: Option<AuthContext>,
 ) {
     let (mut tx, mut rx) = futures::StreamExt::split(socket);
     use futures::SinkExt;
+
+    // Resolve the authentication context. Prefer the header-based auth
+    // (Bearer JWT, Apikey) collected before the upgrade — that's how
+    // non-browser clients usually arrive. Fall back to a first-message
+    // handshake (tiled#1351) if the headers carried nothing usable.
+    let auth_ctx = match header_auth {
+        Some(ctx) if !matches!(ctx.kind, AuthKind::Anonymous)
+            || (state.api_key.is_none() && state.auth_db.is_none()) =>
+        {
+            ctx
+        }
+        _ => match handshake_auth(&state, &mut tx, &mut rx).await {
+            Ok(ctx) => ctx,
+            Err(close_reason) => {
+                tracing::info!(target: "tiled.streaming", "ws auth failed: {close_reason}");
+                let _ = tx
+                    .send(Message::Text(close_reason.into()))
+                    .await;
+                let _ = tx.send(Message::Close(None)).await;
+                return;
+            }
+        },
+    };
+    if !auth_ctx.scopes.contains(tiled_auth::Scope::ReadMetadata) {
+        let _ = tx
+            .send(Message::Text("forbidden: missing read:metadata".into()))
+            .await;
+        let _ = tx.send(Message::Close(None)).await;
+        return;
+    }
 
     // Initial schema message — full structure of the node so the
     // client can interpret subsequent updates without an extra GET.
@@ -414,4 +461,60 @@ async fn run_subscription(
             }
         }
     }
+}
+
+async fn handshake_auth(
+    state: &AppState,
+    tx: &mut futures::stream::SplitSink<WebSocket, Message>,
+    rx: &mut futures::stream::SplitStream<WebSocket>,
+) -> Result<AuthContext, String> {
+    use futures::SinkExt;
+    use tokio::time::Duration;
+
+    // Anonymous mode: no auth backend at all → grant full scopes
+    // immediately, matching the HTTP middleware policy. Skip the
+    // handshake to keep latency down for unprotected demos.
+    if state.api_key.is_none() && state.auth_db.is_none() {
+        return Ok(AuthContext {
+            principal: None,
+            scopes: tiled_auth::ScopeSet::full(),
+            kind: AuthKind::Anonymous,
+        });
+    }
+    // Otherwise wait briefly for the client's first message — must be a
+    // JSON object: {"type": "auth", "apikey"|"bearer": "..."}.
+    let first = match tokio::time::timeout(Duration::from_secs(10), futures::StreamExt::next(rx))
+        .await
+    {
+        Ok(Some(Ok(Message::Text(text)))) => text,
+        Ok(Some(Ok(Message::Binary(bytes)))) => match std::str::from_utf8(&bytes) {
+            Ok(s) => s.to_string().into(),
+            Err(_) => return Err("auth handshake: non-utf8 binary".into()),
+        },
+        Ok(Some(Ok(Message::Close(_)))) | Ok(None) => {
+            return Err("auth handshake: client closed".into());
+        }
+        Ok(Some(Err(e))) => return Err(format!("auth handshake: {e}")),
+        Ok(Some(Ok(_))) => return Err("auth handshake: unexpected frame type".into()),
+        Err(_) => return Err("auth handshake: timeout".into()),
+    };
+    let parsed: serde_json::Value = match serde_json::from_str(&first) {
+        Ok(v) => v,
+        Err(e) => return Err(format!("auth handshake: invalid JSON: {e}")),
+    };
+    if parsed.get("type").and_then(|v| v.as_str()) != Some("auth") {
+        return Err("auth handshake: first message must be {\"type\": \"auth\"}".into());
+    }
+    if let Some(token) = parsed.get("bearer").and_then(|v| v.as_str()) {
+        return crate::app::validate_bearer(state, token)
+            .await
+            .map_err(|e| format!("bearer: {e}"));
+    }
+    if let Some(key) = parsed.get("apikey").and_then(|v| v.as_str()) {
+        return crate::app::validate_apikey(state, key)
+            .await
+            .map_err(|e| format!("apikey: {e}"));
+    }
+    let _ = tx;
+    Err("auth handshake: provide 'bearer' or 'apikey'".into())
 }

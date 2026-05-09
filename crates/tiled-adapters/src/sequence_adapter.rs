@@ -37,6 +37,10 @@ pub struct SequenceAdapter {
     paths: Vec<PathBuf>,
     opener: Arc<dyn FrameOpener>,
     inner_shape: Vec<usize>,
+    /// Reshape applied to the flat frame list. `[N]` for a flat
+    /// sequence; `[a, b, c]` (with a*b*c == paths.len()) for a
+    /// multi-axis declaration via `from_paths_reshaped`.
+    outer_shape: Vec<usize>,
     dtype: BuiltinDType,
     structure: ArrayStructure,
     metadata: serde_json::Value,
@@ -83,10 +87,77 @@ impl SequenceAdapter {
             dims: None,
             resizable: Default::default(),
         };
+        let n_paths = paths.len();
         Ok(Self {
             paths,
             opener,
             inner_shape,
+            outer_shape: vec![n_paths],
+            dtype,
+            structure,
+            metadata,
+            specs: vec![Spec::new("file_sequence")],
+        })
+    }
+
+    /// Construct with an explicit outer reshape. `outer_shape` declares
+    /// how the flat frame list is folded into multiple leading axes — for
+    /// example, 100 frames declared as `outer_shape = [10, 10]` exposes
+    /// the dataset as 4-D `[10, 10, ...inner]` instead of 3-D
+    /// `[100, ...inner]`. Mirrors tiled#1326.
+    ///
+    /// `outer_shape.iter().product()` must equal `paths.len()`. Each
+    /// leading axis gets a single-frame chunk grid (1 frame = 1 chunk),
+    /// matching tiled's `frame_per_point`-driven layout.
+    pub fn from_paths_reshaped(
+        paths: Vec<PathBuf>,
+        outer_shape: Vec<usize>,
+        opener: Arc<dyn FrameOpener>,
+        metadata: serde_json::Value,
+    ) -> Result<Self> {
+        if paths.is_empty() {
+            return Err(TiledError::Validation(
+                "sequence requires at least one path".into(),
+            ));
+        }
+        let prod: usize = outer_shape.iter().product();
+        if prod != paths.len() {
+            return Err(TiledError::Validation(format!(
+                "outer_shape product {prod} doesn't match {} files",
+                paths.len()
+            )));
+        }
+        let first = opener.open(paths[0].clone(), 0)?;
+        let first_struct = first.structure();
+        let inner_shape = first_struct.shape.clone();
+        let dtype = match &first_struct.data_type {
+            DType::Builtin(b) => b.clone(),
+            other => {
+                return Err(TiledError::Validation(format!(
+                    "sequence adapter only supports builtin dtypes, got {other:?}"
+                )));
+            }
+        };
+        let mut full_shape = outer_shape.clone();
+        full_shape.extend_from_slice(&inner_shape);
+        // One chunk per outer index along each outer axis; inner axes are
+        // single-chunked.
+        let mut chunks: Vec<Vec<usize>> = outer_shape.iter().map(|d| vec![1; *d]).collect();
+        for &d in &inner_shape {
+            chunks.push(vec![d]);
+        }
+        let structure = ArrayStructure {
+            data_type: DType::Builtin(dtype.clone()),
+            chunks,
+            shape: full_shape,
+            dims: None,
+            resizable: Default::default(),
+        };
+        Ok(Self {
+            paths,
+            opener,
+            inner_shape,
+            outer_shape,
             dtype,
             structure,
             metadata,
@@ -96,6 +167,28 @@ impl SequenceAdapter {
 
     fn frame_size_bytes(&self) -> usize {
         self.inner_shape.iter().product::<usize>() * self.dtype.element_size()
+    }
+
+    /// Convert a multi-D outer block index (one entry per outer axis)
+    /// into the flat frame index. Row-major (C-order).
+    fn outer_block_to_frame(&self, outer_block: &[usize]) -> Result<usize> {
+        if outer_block.len() != self.outer_shape.len() {
+            return Err(TiledError::Validation(format!(
+                "expected {} outer block indices, got {}",
+                self.outer_shape.len(),
+                outer_block.len()
+            )));
+        }
+        let mut idx = 0usize;
+        for (axis, (&i, &d)) in outer_block.iter().zip(self.outer_shape.iter()).enumerate() {
+            if i >= d {
+                return Err(TiledError::Validation(format!(
+                    "outer block index {i} out of range on axis {axis} (extent {d})"
+                )));
+            }
+            idx = idx * d + i;
+        }
+        Ok(idx)
     }
 }
 
@@ -152,17 +245,13 @@ impl ArrayAdapterRead for SequenceAdapter {
                     block.len()
                 )));
             }
-            let frame_idx = block[0];
-            if frame_idx >= self.paths.len() {
-                return Err(TiledError::Validation(format!(
-                    "frame {frame_idx} out of range ({} frames)",
-                    self.paths.len()
-                )));
-            }
-            for (axis, &b) in block.iter().enumerate().skip(1) {
+            let outer_dims = self.outer_shape.len();
+            let outer_block = &block[..outer_dims];
+            let frame_idx = self.outer_block_to_frame(outer_block)?;
+            for (axis, &b) in block.iter().enumerate().skip(outer_dims) {
                 if b != 0 {
                     return Err(TiledError::Validation(format!(
-                        "axis {axis} is single-chunk; block index must be 0"
+                        "inner axis {axis} is single-chunk; block index must be 0"
                     )));
                 }
             }
@@ -176,8 +265,9 @@ impl ArrayAdapterRead for SequenceAdapter {
                     dyn_arr.shape, self.inner_shape
                 )));
             }
-            // The block is a single frame so its shape is `1 × inner_shape`.
-            let mut block_shape = vec![1usize];
+            // The block is a single frame so its shape is
+            // `[1, 1, ...] × inner_shape` — one for each outer axis.
+            let mut block_shape = vec![1usize; outer_dims];
             block_shape.extend_from_slice(&self.inner_shape);
             Ok(DynNDArray::new(
                 dyn_arr.data,
@@ -244,6 +334,33 @@ mod tests {
         for _ in 0..(w * h) {
             f.write_all(&value.to_le_bytes()).unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn reshape_outer_axes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut paths = Vec::new();
+        for i in 0..6 {
+            let p = dir.path().join(format!("frame_{i}.npy"));
+            write_simple_npy(&p, i as f64, 2, 2);
+            paths.push(p);
+        }
+        let seq = SequenceAdapter::from_paths_reshaped(
+            paths,
+            vec![2, 3],
+            Arc::new(NpyFrameOpener),
+            serde_json::json!({}),
+        )
+        .unwrap();
+        // shape = [2, 3, 2, 2]; outer chunks each = 1.
+        assert_eq!(seq.structure().shape, vec![2, 3, 2, 2]);
+        // Block (1, 2, 0, 0) → frame index 1*3 + 2 = 5.
+        let block = seq
+            .read_block(&[1, 2, 0, 0], &NDSlice::empty())
+            .await
+            .unwrap();
+        let value = f64::from_le_bytes(block.data[0..8].try_into().unwrap());
+        assert_eq!(value, 5.0);
     }
 
     #[tokio::test]

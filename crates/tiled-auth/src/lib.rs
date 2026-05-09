@@ -18,6 +18,8 @@ pub mod authenticator;
 pub mod db;
 pub mod device_code;
 pub mod error;
+#[cfg(feature = "oidc")]
+pub mod external_oidc;
 pub mod jwt;
 pub mod migrate;
 pub mod principal;
@@ -28,6 +30,8 @@ pub use api_key::{ApiKeyCreate, ApiKeyRecord, KeyMaterial};
 pub use authenticator::{Authenticator, DummyAuthenticator, ProxiedHeaderAuthenticator};
 pub use db::AuthDb;
 pub use error::{AuthError, Result};
+#[cfg(feature = "oidc")]
+pub use external_oidc::{ExternalOidcValidator, OidcProvider, ValidatedToken};
 pub use jwt::{AccessClaims, Issuer, RefreshClaims};
 pub use principal::{Identity, Principal};
 pub use scopes::{Scope, ScopeSet};

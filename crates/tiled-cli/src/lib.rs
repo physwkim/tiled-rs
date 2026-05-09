@@ -412,6 +412,7 @@ pub async fn run(command: Command) -> Result<()> {
                 issuer: issuer_handle,
                 authenticators: authenticators_built,
                 proxied_header_auth: proxied_auth,
+                external_oidc: None,
         forwarded_allow_ips: None,
         max_request_body_bytes: 10 * 1024 * 1024,
         streaming_bus: tiled_server::streaming::StreamingBus::new(),

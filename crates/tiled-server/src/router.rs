@@ -752,6 +752,22 @@ pub async fn patch_metadata(
         .await
         .map_err(map_catalog_err)?
         .ok_or_else(|| ServerError::NotFound(format!("'{}' not found", segments.join("/"))))?;
+    // Per-node AccessPolicy decision (tiled#287). When a policy is
+    // wired, this narrows the session's scopes by what the policy says
+    // about THIS node (e.g. tag-based). The require() check that
+    // follows uses the narrowed set, so policy denials surface as 403.
+    let auth = auth
+        .narrow_for_node(
+            state.access_policy.as_deref(),
+            tiled_access::NodeContext {
+                path: &segments,
+                structure_family: &node.structure_family,
+                metadata: &node.metadata,
+                access_blob: &node.access_blob,
+            },
+        )
+        .await;
+    auth.require(tiled_auth::Scope::WriteMetadata)?;
     let metadata = req
         .get("metadata")
         .cloned()
@@ -876,6 +892,18 @@ pub async fn delete_metadata(
         .await
         .map_err(map_catalog_err)?
         .ok_or_else(|| ServerError::NotFound(format!("'{}' not found", segments.join("/"))))?;
+    let auth = auth
+        .narrow_for_node(
+            state.access_policy.as_deref(),
+            tiled_access::NodeContext {
+                path: &segments,
+                structure_family: &node.structure_family,
+                metadata: &node.metadata,
+                access_blob: &node.access_blob,
+            },
+        )
+        .await;
+    auth.require(tiled_auth::Scope::DeleteNode)?;
     catalog.delete_node(node.id).await.map_err(map_catalog_err)?;
     let path = segments.join("/");
     state

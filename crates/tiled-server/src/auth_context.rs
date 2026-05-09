@@ -49,6 +49,33 @@ impl AuthContext {
             )))
         }
     }
+
+    /// Apply per-node policy decision, returning a narrowed `AuthContext`.
+    /// Used by handlers that resolved the target node and want the
+    /// AccessPolicy (tiled#287) to weigh in. Falls through to `self` when
+    /// no policy is wired.
+    pub async fn narrow_for_node<'a>(
+        &self,
+        policy: Option<&dyn tiled_access::AccessPolicy>,
+        ctx: tiled_access::NodeContext<'a>,
+    ) -> AuthContext {
+        let Some(policy) = policy else {
+            return self.clone();
+        };
+        let decision = match self.principal.as_ref() {
+            Some(p) => {
+                policy
+                    .principal_decision(p.as_ref(), &self.scopes, ctx)
+                    .await
+            }
+            None => policy.anonymous_decision(ctx).await,
+        };
+        AuthContext {
+            principal: self.principal.clone(),
+            scopes: decision.scopes,
+            kind: self.kind.clone(),
+        }
+    }
 }
 
 impl<S: Send + Sync> FromRequestParts<S> for AuthContext {

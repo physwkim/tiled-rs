@@ -43,6 +43,11 @@ pub struct AppState {
     /// Optional proxy-header authenticator. Honoured only when
     /// `trust_forwarded_headers` is also true.
     pub proxied_header_auth: Option<Arc<tiled_auth::ProxiedHeaderAuthenticator>>,
+    /// Optional external OIDC validator. Bearer tokens that aren't
+    /// signed by the local Issuer fall through to this validator
+    /// (tiled#1364, #1343). When validation succeeds, the matching
+    /// principal is upserted into `auth_db` automatically.
+    pub external_oidc: Option<Arc<tiled_auth::ExternalOidcValidator>>,
     /// CIDR/IP list permitted to set X-Forwarded-* headers when
     /// `trust_forwarded_headers` is on. `None` = trust the headers from
     /// any peer (only safe when the listener is bound to a private

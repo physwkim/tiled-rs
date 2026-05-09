@@ -70,9 +70,13 @@ pub fn build_app(state: AppState) -> Router {
             delete(auth_router::api_key_revoke),
         );
 
-    // Data API endpoints — auth middleware always runs and either
-    // populates AuthContext or returns 401.
-    let api = Router::new()
+    // WebSocket subscribe routes are intentionally OUTSIDE the auth
+    // middleware — browsers can't set the `Authorization` header on
+    // WebSocket connections, so we accept the upgrade unauthenticated
+    // and run a first-message handshake inside the handler (tiled#1351).
+    // Server-side auth still happens before any data flows; if the
+    // handshake fails the socket is closed.
+    let ws = Router::new()
         .route(
             "/api/v1/array/subscribe/{*path}",
             get(crate::streaming::ws_subscribe),
@@ -84,7 +88,11 @@ pub fn build_app(state: AppState) -> Router {
         .route(
             "/api/v1/table/subscribe/{*path}",
             get(crate::streaming::ws_subscribe),
-        )
+        );
+
+    // Data API endpoints — auth middleware always runs and either
+    // populates AuthContext or returns 401.
+    let api = Router::new()
         .route("/api/v1/", get(router::about))
         .route("/api/v1/metadata/", get(router::metadata_root))
         .route("/api/v1/metadata/{*path}", get(router::metadata))
@@ -108,7 +116,7 @@ pub fn build_app(state: AppState) -> Router {
             state.clone(),
             auth_middleware,
         ));
-    app = app.merge(public_auth).merge(guarded);
+    app = app.merge(public_auth).merge(ws).merge(guarded);
 
     let body_limit = state.max_request_body_bytes;
     app.layer(axum::extract::DefaultBodyLimit::max(body_limit))
@@ -207,46 +215,122 @@ async fn resolve_auth_owned(
     resolve_auth_inner(state, headers, query).await
 }
 
+/// Header-based auth resolution shared with the WebSocket handler so it
+/// can honour an `Authorization: Bearer ...` or `?api_key=` upgrade
+/// without going through the HTTP middleware (the WS routes are
+/// mounted outside the middleware to support tiled#1351 first-message
+/// auth). Returns `None` when no header credential was supplied or the
+/// presented one was rejected; the caller falls back to the in-band
+/// handshake.
+pub async fn resolve_header_auth(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+) -> Option<AuthContext> {
+    resolve_auth_inner(state, headers, "").await.ok()
+}
+
+/// Validate a Bearer JWT outside the request middleware (used by the WS
+/// handshake). Tries the local Issuer first; falls through to the
+/// configured external OIDC validator (tiled#1364, #1343).
+pub async fn validate_bearer(state: &AppState, token: &str) -> Result<AuthContext, String> {
+    let db = state
+        .auth_db
+        .as_ref()
+        .ok_or_else(|| "server has no auth_db; bearer not supported".to_string())?;
+    if let Some(issuer) = state.issuer.as_ref() {
+        if let Ok(claims) = issuer.verify_access(token) {
+            let session = db
+                .lookup_session(&claims.sid)
+                .await
+                .map_err(|_| "session not found".to_string())?;
+            if session.revoked {
+                return Err("session revoked".into());
+            }
+            if session.expiration_time <= chrono::Utc::now() {
+                return Err("session expired".into());
+            }
+            db.touch_session(&claims.sid).await.ok();
+            let principal = db
+                .get_principal(session.principal_id)
+                .await
+                .map_err(|_| "principal lookup failed".to_string())?
+                .ok_or_else(|| "principal not found".to_string())?;
+            return Ok(AuthContext {
+                principal: Some(Arc::new(principal)),
+                scopes: claims.scopes.intersect(&session.scopes),
+                kind: AuthKind::Session,
+            });
+        }
+    }
+    if let Some(validator) = state.external_oidc.as_ref() {
+        let validated = validator
+            .validate(token)
+            .await
+            .map_err(|e| format!("external oidc: {e}"))?;
+        let (principal, identity) = db
+            .ensure_principal(&validated.provider, &validated.sub)
+            .await
+            .map_err(|e| format!("ensure principal: {e}"))?;
+        db.touch_identity_login(identity.id).await.ok();
+        return Ok(AuthContext {
+            principal: Some(Arc::new(principal)),
+            scopes: state.default_login_scopes.clone(),
+            kind: AuthKind::Session,
+        });
+    }
+    Err("no JWT issuer or external OIDC configured".into())
+}
+
+/// Validate an Apikey outside the request middleware. Multi-user DB
+/// first, single-user CLI flag fallback. Same constant-time compare
+/// the middleware uses (R3 timing-attack fix).
+pub async fn validate_apikey(state: &AppState, key: &str) -> Result<AuthContext, String> {
+    if let Some(db) = state.auth_db.as_ref() {
+        if let Ok(record) = db.verify_api_key(key).await {
+            let principal = db
+                .get_principal(record.principal_id)
+                .await
+                .map_err(|_| "principal lookup failed".to_string())?
+                .ok_or_else(|| "principal vanished".to_string())?;
+            return Ok(AuthContext {
+                principal: Some(Arc::new(principal)),
+                scopes: record.scopes,
+                kind: AuthKind::ApiKey,
+            });
+        }
+    }
+    if let Some(expected) = state.api_key.as_ref() {
+        if expected.is_empty() {
+            return Err("server misconfigured: empty api_key".into());
+        }
+        use subtle::ConstantTimeEq;
+        if key.as_bytes().ct_eq(expected.as_bytes()).into() {
+            return Ok(AuthContext {
+                principal: None,
+                scopes: ScopeSet::full(),
+                kind: AuthKind::SingleUserKey,
+            });
+        }
+    }
+    Err("invalid api key".into())
+}
+
 async fn resolve_auth_inner(
     state: &AppState,
     headers: &axum::http::HeaderMap,
     query: &str,
 ) -> Result<AuthContext, axum::response::Response> {
     // ---- 1. Bearer JWT ----
-    if let (Some(db), Some(issuer)) = (state.auth_db.as_ref(), state.issuer.as_ref()) {
-        if let Some(auth) = headers.get("authorization").and_then(|v| v.to_str().ok())
-            && let Some(token) = auth.strip_prefix("Bearer ")
-        {
-            return match issuer.verify_access(token) {
-                Ok(claims) => {
-                    // Honour session revocation in real time.
-                    let session = match db.lookup_session(&claims.sid).await {
-                        Ok(s) => s,
-                        Err(_) => return Err(unauthorized("session not found")),
-                    };
-                    if session.revoked {
-                        return Err(unauthorized("session revoked"));
-                    }
-                    if session.expiration_time <= chrono::Utc::now() {
-                        return Err(unauthorized("session expired"));
-                    }
-                    db.touch_session(&claims.sid).await.ok();
-                    let principal = match db
-                        .get_principal(session.principal_id)
-                        .await
-                    {
-                        Ok(Some(p)) => Arc::new(p),
-                        _ => return Err(unauthorized("principal not found")),
-                    };
-                    Ok(AuthContext {
-                        principal: Some(principal),
-                        scopes: claims.scopes.intersect(&session.scopes),
-                        kind: AuthKind::Session,
-                    })
-                }
-                Err(_) => Err(unauthorized("invalid bearer token")),
-            };
-        }
+    // Local Issuer first; falls through to ExternalOidcValidator
+    // (tiled#1364, #1343) for tokens issued by upstream IdPs (Entra,
+    // Auth0, Keycloak, …) when one is configured.
+    if state.auth_db.is_some()
+        && let Some(auth) = headers.get("authorization").and_then(|v| v.to_str().ok())
+        && let Some(token) = auth.strip_prefix("Bearer ")
+    {
+        return validate_bearer(state, token)
+            .await
+            .map_err(|e| unauthorized(&e));
     }
 
     // ---- 2. Apikey (multi-user → single-user fallback) ----

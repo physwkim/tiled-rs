@@ -58,6 +58,7 @@ async fn spawn_server(api_key: Option<String>) -> String {
         issuer: None,
         authenticators: vec![],
         proxied_header_auth: None,
+        external_oidc: None,
         forwarded_allow_ips: None,
         max_request_body_bytes: 10 * 1024 * 1024,
         streaming_bus: tiled_server::streaming::StreamingBus::new(),
