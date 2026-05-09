@@ -11,6 +11,31 @@ pub struct TiledConfig {
     pub trees: Vec<TreeConfig>,
     #[serde(default)]
     pub authentication: Option<AuthConfig>,
+    /// Optional `web:` section. Right now only `spec_views` is read —
+    /// mirrors upstream tiled PR #1349.
+    #[serde(default)]
+    pub web: Option<WebConfig>,
+}
+
+/// `web:` block. Currently only spec-view registrations live here;
+/// other web-related options (theming, auth-button labels, etc.) can
+/// land here later without breaking compatibility.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct WebConfig {
+    /// External viewer registrations exposed via `GET /settings.json`.
+    #[serde(default)]
+    pub spec_views: Vec<SpecViewConfig>,
+}
+
+/// One `spec_views[*]` entry. Wire-compatible with `tiled_web::SpecViewEntry`
+/// — we keep a separate type so the CLI doesn't depend on tiled-web when
+/// the `web` feature is off.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SpecViewConfig {
+    pub spec: String,
+    pub url: String,
+    #[serde(default)]
+    pub label: Option<String>,
 }
 
 /// A single tree (data source) definition.

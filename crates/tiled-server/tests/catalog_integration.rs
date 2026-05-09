@@ -48,6 +48,8 @@ async fn build_test_app() -> (axum::Router, tempfile::TempDir) {
         default_login_scopes: tiled_auth::ScopeSet::full(),
         enable_web: true,
         web_assets_dir: None,
+        #[cfg(feature = "web")]
+        spec_views: Vec::new(),
     };
     (tiled_server::build_app(state), dir)
 }

@@ -5046,6 +5046,7 @@ dependencies = [
  "tiled-mongo",
  "tiled-serialization",
  "tiled-server",
+ "tiled-web",
  "tokio",
  "tracing",
  "tracing-subscriber",

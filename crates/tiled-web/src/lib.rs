@@ -51,6 +51,23 @@ pub struct WebState {
     /// drop the prebuilt bluesky/tiled WebUI bundle here to swap the
     /// UI without recompiling.
     pub assets_dir: Option<std::path::PathBuf>,
+    /// Spec-view config returned by `GET /settings.json`. Operators
+    /// can populate this from YAML config to register external viewers
+    /// for specific tag specs (e.g. {"BlueskyRunV1": "https://…"}).
+    /// Mirrors upstream tiled PR #1349's `spec_views` settings entry.
+    pub spec_views: Vec<SpecViewEntry>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct SpecViewEntry {
+    /// Spec name to match against `attributes.specs[].name`.
+    pub spec: String,
+    /// External viewer URL. May contain `{path}` and `{metadata}`
+    /// placeholders that the SPA substitutes before navigating.
+    pub url: String,
+    /// Display label for the link/button. Defaults to "Open in <spec>".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
 }
 
 impl std::fmt::Debug for WebState {
@@ -69,6 +86,29 @@ impl std::fmt::Debug for WebState {
 /// prefix.
 pub fn build_router(state: WebState) -> Router {
     let spa = assets::spa_router_with(state.assets_dir.clone());
+    let settings_json = build_settings_json(&state.spec_views);
+    let settings = Router::new().route(
+        "/settings.json",
+        axum::routing::get(move || {
+            let body = settings_json.clone();
+            async move {
+                (
+                    [(
+                        axum::http::header::CONTENT_TYPE,
+                        "application/json",
+                    )],
+                    body,
+                )
+            }
+        }),
+    );
     let admin = admin::admin_router(state);
-    spa.merge(admin)
+    spa.merge(settings).merge(admin)
+}
+
+fn build_settings_json(spec_views: &[SpecViewEntry]) -> String {
+    serde_json::to_string(&serde_json::json!({
+        "spec_views": spec_views,
+    }))
+    .unwrap_or_else(|_| "{\"spec_views\":[]}".into())
 }

@@ -3,7 +3,14 @@ name = "tiled-cli"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = ["web"]
+# Forwards to tiled-server's `web` feature so the same `#[cfg(feature = "web")]`
+# gate works on AppState field initialisations in this crate.
+web = ["tiled-server/web", "dep:tiled-web"]
+
 [dependencies]
+tiled-web = { workspace = true, optional = true }
 tiled-core = { workspace = true }
 tiled-server = { workspace = true }
 tiled-adapters = { workspace = true }

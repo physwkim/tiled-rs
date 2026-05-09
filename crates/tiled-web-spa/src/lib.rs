@@ -9,6 +9,7 @@ mod api;
 mod auth;
 mod components;
 mod pages;
+mod settings;
 
 use leptos::prelude::*;
 use leptos::task::spawn_local;
@@ -17,6 +18,7 @@ use leptos_router::path;
 use wasm_bindgen::prelude::*;
 
 use auth::{provide_auth, use_auth};
+use settings::{provide_settings, use_settings};
 
 #[wasm_bindgen(start)]
 pub fn main() {
@@ -27,12 +29,16 @@ pub fn main() {
 #[component]
 pub fn App() -> impl IntoView {
     provide_auth();
+    provide_settings();
 
     // Bootstrap: fetch /api/v1/ once at mount to populate providers +
     // `required`. After this resolves the login page knows what to
     // render. Done outside any route so the header can also display
-    // server info if it wants.
+    // server info if it wants. Same shape for /settings.json — the
+    // operator-supplied spec_views map is small and read-only, fetch
+    // once at boot and cache in context.
     let auth = use_auth();
+    let settings_state = use_settings();
     spawn_local(async move {
         // Failure (server unreachable or 5xx) is intentionally
         // swallowed — downstream UI surfaces the error per-request.
@@ -41,6 +47,12 @@ pub fn App() -> impl IntoView {
             auth.providers.set(about.authentication.providers);
         }
         auth.loaded.set(true);
+    });
+    spawn_local(async move {
+        if let Ok(s) = settings::fetch_settings().await {
+            settings_state.spec_views.set(s.spec_views);
+        }
+        settings_state.loaded.set(true);
     });
 
     view! {

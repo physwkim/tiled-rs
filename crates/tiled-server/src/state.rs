@@ -87,6 +87,12 @@ pub struct AppState {
     /// the compiled-in placeholder bundle. Honoured only when the
     /// `web` feature is compiled in.
     pub web_assets_dir: Option<std::path::PathBuf>,
+    /// Operator-configured spec → external-viewer URL mappings, returned
+    /// to the SPA via `GET /settings.json` (mirrors upstream tiled
+    /// PR #1349's `spec_views` settings entry). Empty by default —
+    /// configure via the YAML `web.spec_views` section.
+    #[cfg(feature = "web")]
+    pub spec_views: Vec<tiled_web::SpecViewEntry>,
 }
 
 impl AppState {

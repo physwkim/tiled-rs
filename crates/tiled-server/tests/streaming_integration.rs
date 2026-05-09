@@ -49,6 +49,8 @@ async fn spawn_server() -> (String, tempfile::TempDir) {
         default_login_scopes: tiled_auth::ScopeSet::full(),
         enable_web: true,
         web_assets_dir: None,
+        #[cfg(feature = "web")]
+        spec_views: Vec::new(),
     };
     let app = tiled_server::build_app(state);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -4,6 +4,7 @@ use leptos_router::hooks::use_params_map;
 use crate::api;
 use crate::auth::use_auth;
 use crate::components::array_view::{ArrayInfo, ArrayView};
+use crate::settings::{SpecView, render_url, use_settings};
 
 #[component]
 pub fn CatalogView() -> impl IntoView {
@@ -56,6 +57,11 @@ pub fn CatalogView() -> impl IntoView {
                                         <ArrayView info=info />
                                     </div>
                                 })}
+                                {render_spec_views(
+                                    env.data.attributes.specs.clone(),
+                                    env.data.id.clone(),
+                                    env.data.attributes.metadata.clone(),
+                                )}
                                 <details class="mt-3 text-xs">
                                     <summary class="cursor-pointer text-slate-600">"raw metadata"</summary>
                                     <pre class="mt-2 overflow-x-auto rounded bg-slate-50 p-3 font-mono">
@@ -87,6 +93,77 @@ pub fn CatalogView() -> impl IntoView {
             </section>
         </div>
     }
+}
+
+/// Render the configured spec_view links for any spec on this resource
+/// that the operator has registered. Mirrors upstream tiled PR #1349 +
+/// #1365 — but as outbound links instead of dynamic React components,
+/// since we're a WASM SPA. Each link gets `{path}` and `{metadata}`
+/// placeholders substituted at render time so the receiving viewer can
+/// pick up the resource id and metadata via URL.
+fn render_spec_views(
+    specs: Vec<serde_json::Value>,
+    resource_id: String,
+    metadata: Option<serde_json::Value>,
+) -> AnyView {
+    let settings = use_settings();
+    let spec_names: Vec<String> = specs
+        .into_iter()
+        .filter_map(|s| {
+            s.as_str()
+                .map(String::from)
+                .or_else(|| s.get("name").and_then(|n| n.as_str()).map(String::from))
+        })
+        .collect();
+    if spec_names.is_empty() {
+        return ().into_any();
+    }
+    let metadata_json = metadata
+        .map(|m| serde_json::to_string(&m).unwrap_or_default())
+        .unwrap_or_default();
+
+    let configured: Vec<SpecView> = settings.spec_views.get();
+    let matched: Vec<(String, SpecView)> = spec_names
+        .iter()
+        .flat_map(|name| {
+            configured
+                .iter()
+                .filter(move |sv| sv.spec == *name)
+                .cloned()
+                .map(|sv| (name.clone(), sv))
+        })
+        .collect();
+    if matched.is_empty() {
+        return ().into_any();
+    }
+
+    view! {
+        <div class="mt-4 border-t border-slate-200 pt-3">
+            <h3 class="text-sm font-semibold text-slate-700 mb-2">
+                "Open in external viewer"
+            </h3>
+            <ul class="space-y-1 text-sm">
+                {matched.into_iter().map(|(name, sv)| {
+                    let href = render_url(&sv.url, &resource_id, &metadata_json);
+                    let label = sv.label.clone()
+                        .unwrap_or_else(|| format!("Open as {name}"));
+                    view! {
+                        <li>
+                            <a
+                                href=href
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                class="text-blue-700 hover:underline"
+                            >
+                                {label}
+                            </a>
+                        </li>
+                    }
+                }).collect::<Vec<_>>()}
+            </ul>
+        </div>
+    }
+    .into_any()
 }
 
 #[component]
