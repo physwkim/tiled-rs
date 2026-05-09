@@ -35,7 +35,12 @@ pub fn build_app(state: AppState) -> Router {
     let mut app = Router::new()
         // Operational endpoints (never require auth)
         .route("/health", get(router::health))
-        .route("/ready", get(router::ready));
+        .route("/ready", get(router::ready))
+        // Discovery endpoint — clients (incl. the SPA) need to fetch
+        // this BEFORE they can authenticate, since it advertises which
+        // providers are available. Mirrors upstream tiled, which also
+        // exposes `/api/v1/` anonymously.
+        .route("/api/v1/", get(router::about));
 
     // Public auth endpoints — login/refresh/device/initiate must work
     // without prior auth (otherwise login is unreachable). Each handler
@@ -93,7 +98,6 @@ pub fn build_app(state: AppState) -> Router {
     // Data API endpoints — auth middleware always runs and either
     // populates AuthContext or returns 401.
     let api = Router::new()
-        .route("/api/v1/", get(router::about))
         .route("/api/v1/metadata/", get(router::metadata_root))
         .route("/api/v1/metadata/{*path}", get(router::metadata))
         .route("/api/v1/search/", get(router::search_root))

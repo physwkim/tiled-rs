@@ -67,6 +67,34 @@ pub async fn about(State(state): State<AppState>, BaseUrl(base_url): BaseUrl) ->
     let formats = state.serialization_registry.all_formats();
     let aliases = state.serialization_registry.all_aliases();
 
+    // Surface configured authenticators so the SPA can render the right
+    // login form. Internal authenticators expose a password endpoint;
+    // external OIDC exposes a redirect URL. Mirrors upstream tiled's
+    // `AboutAuthenticationProvider` shape (provider, mode, links).
+    let mut providers: Vec<serde_json::Value> = state
+        .authenticators
+        .iter()
+        .map(|a| {
+            serde_json::json!({
+                "provider": a.name(),
+                "mode": "internal",
+                "links": {
+                    "auth_endpoint": format!("{base_url}/api/v1/auth/{}/login", a.name()),
+                },
+            })
+        })
+        .collect();
+    if state.external_oidc.is_some() {
+        providers.push(serde_json::json!({
+            "provider": "oidc",
+            "mode": "external",
+            "links": {
+                "auth_endpoint": format!("{base_url}/api/v1/auth/oidc/authorize"),
+            },
+        }));
+    }
+    let auth_required = !providers.is_empty();
+
     let about = About {
         api_version: 0,
         library_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -74,8 +102,8 @@ pub async fn about(State(state): State<AppState>, BaseUrl(base_url): BaseUrl) ->
         aliases,
         queries: state.query_names.clone(),
         authentication: AboutAuthentication {
-            required: false,
-            providers: vec![],
+            required: auth_required,
+            providers,
             links: None,
         },
         links: HashMap::from([

@@ -1,10 +1,12 @@
 use leptos::prelude::*;
 
 use crate::api;
+use crate::auth::use_auth;
 
 #[component]
 pub fn Home() -> impl IntoView {
-    let about = LocalResource::new(api::fetch_about);
+    let auth = use_auth();
+    let about = LocalResource::new(move || async move { api::fetch_about(&auth).await });
 
     view! {
         <div class="grid gap-4">

@@ -593,17 +593,22 @@ fn build_app_with_api_key(key: &str) -> axum::Router {
     tiled_server::build_app(state)
 }
 
+// `/api/v1/` is intentionally public (discovery endpoint — clients
+// fetch it before they have credentials to learn which auth providers
+// exist). These tests target `/api/v1/metadata/` instead, which is on
+// the auth-gated lane.
+
 #[tokio::test]
 async fn test_api_key_rejects_without_key() {
     let app = build_app_with_api_key("secret123");
-    let (status, _) = get(&app, "/api/v1/").await;
+    let (status, _) = get(&app, "/api/v1/metadata/").await;
     assert_eq!(status, 401);
 }
 
 #[tokio::test]
 async fn test_api_key_accepts_query_param() {
     let app = build_app_with_api_key("secret123");
-    let (status, _) = get(&app, "/api/v1/?api_key=secret123").await;
+    let (status, _) = get(&app, "/api/v1/metadata/?api_key=secret123").await;
     assert_eq!(status, 200);
 }
 
@@ -611,7 +616,7 @@ async fn test_api_key_accepts_query_param() {
 async fn test_api_key_accepts_header() {
     let app = build_app_with_api_key("secret123");
     let req = Request::builder()
-        .uri("/api/v1/")
+        .uri("/api/v1/metadata/")
         .header("authorization", "Apikey secret123")
         .body(Body::empty())
         .unwrap();
@@ -622,8 +627,15 @@ async fn test_api_key_accepts_header() {
 #[tokio::test]
 async fn test_api_key_rejects_wrong_key() {
     let app = build_app_with_api_key("secret123");
-    let (status, _) = get(&app, "/api/v1/?api_key=wrong").await;
+    let (status, _) = get(&app, "/api/v1/metadata/?api_key=wrong").await;
     assert_eq!(status, 401);
+}
+
+#[tokio::test]
+async fn test_about_is_public() {
+    let app = build_app_with_api_key("secret123");
+    let (status, _) = get(&app, "/api/v1/").await;
+    assert_eq!(status, 200);
 }
 
 #[tokio::test]

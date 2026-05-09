@@ -2,9 +2,11 @@ use leptos::prelude::*;
 use leptos_router::hooks::use_params_map;
 
 use crate::api;
+use crate::auth::use_auth;
 
 #[component]
 pub fn CatalogView() -> impl IntoView {
+    let auth = use_auth();
     let params = use_params_map();
     let path = Memo::new(move |_| {
         params
@@ -16,11 +18,11 @@ pub fn CatalogView() -> impl IntoView {
 
     let children = LocalResource::new(move || {
         let p = path.get();
-        async move { api::fetch_children(&p).await }
+        async move { api::fetch_children(&auth, &p).await }
     });
     let metadata = LocalResource::new(move || {
         let p = path.get();
-        async move { api::fetch_metadata(&p).await }
+        async move { api::fetch_metadata(&auth, &p).await }
     });
 
     view! {

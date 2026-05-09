@@ -34,6 +34,17 @@ pub struct TokensResponse {
     pub refresh_token: String,
     pub token_type: &'static str,
     pub expires_in: i64,
+    /// Identity of the just-logged-in principal. SPA reads this to show
+    /// the username in the header without an extra `/whoami` round-trip.
+    /// `None` for endpoints that don't issue identity (refresh, device).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity: Option<IdentityPayload>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct IdentityPayload {
+    pub id: String,
+    pub provider: String,
 }
 
 fn require_auth_db(state: &AppState) -> Result<(&tiled_auth::AuthDb, &tiled_auth::Issuer), ServerError> {
@@ -91,6 +102,10 @@ pub async fn login(
         refresh_token: refresh,
         token_type: "Bearer",
         expires_in: issuer.access_ttl.num_seconds(),
+        identity: Some(IdentityPayload {
+            id: subject.sub.clone(),
+            provider: subject.provider.clone(),
+        }),
     }))
 }
 
@@ -233,6 +248,7 @@ pub async fn device_token(
                 refresh_token: refresh,
                 token_type: "Bearer",
                 expires_in: issuer.access_ttl.num_seconds(),
+                identity: None,
             }))
         }
     }
