@@ -43,24 +43,38 @@ impl Dialect {
 
     /// SQL fragment that pulls JSON value at `key` as text.
     fn json_text(self, column: &str, key: &str) -> String {
+        let safe = sanitize_json_key(key);
         match self {
-            // Caller must double-quote escape `key`; we keep it simple by
-            // assuming sane key names (Tiled metadata keys don't contain
-            // `'` in practice).
-            Self::Sqlite => format!("json_extract({column}, '$.{key}')"),
-            Self::Postgres => format!("({column} ->> '{key}')"),
+            Self::Sqlite => format!("json_extract({column}, '$.{safe}')"),
+            Self::Postgres => format!("({column} ->> '{safe}')"),
         }
     }
 
     /// SQL fragment that pulls JSON value at `key` as JSON (for type-safe
     /// array containment etc.).
     fn json_value(self, column: &str, key: &str) -> String {
+        let safe = sanitize_json_key(key);
         match self {
-            Self::Sqlite => format!("json_extract({column}, '$.{key}')"),
-            Self::Postgres => format!("({column} -> '{key}')"),
+            Self::Sqlite => format!("json_extract({column}, '$.{safe}')"),
+            Self::Postgres => format!("({column} -> '{safe}')"),
         }
     }
+}
 
+/// Strip every byte that isn't alphanumeric / `_` / `.` / `-` from a JSON
+/// key before splicing it into a SQL fragment. The query interface is the
+/// only place a remote attacker can supply this string, and we don't want
+/// `'); DROP TABLE …` getting through. Legitimate Tiled metadata keys are
+/// alphanumeric in practice; an unfortunate user with a key containing
+/// special characters will simply not match — which is preferable to SQL
+/// injection.
+fn sanitize_json_key(key: &str) -> String {
+    key.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+        .collect()
+}
+
+impl Dialect {
     fn metadata_full_text(self) -> &'static str {
         match self {
             Self::Sqlite => "metadata",
