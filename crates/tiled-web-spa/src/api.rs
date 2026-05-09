@@ -145,6 +145,17 @@ pub async fn fetch_children(state: &AuthState, path: &str) -> Result<SearchEnvel
     resp.json().await.map_err(|e| e.to_string())
 }
 
+/// Fetch a binary payload (raw bytes / image) with the bearer token
+/// attached + 401-refresh handling. Used by the array viewer for both
+/// `Accept: image/png` and `Accept: application/octet-stream` paths.
+pub async fn fetch_bytes(state: &AuthState, url: &str) -> Result<Vec<u8>, String> {
+    let resp = authed_get(state, url).await?;
+    if !resp.ok() {
+        return Err(format!("HTTP {}", resp.status()));
+    }
+    resp.binary().await.map_err(|e| e.to_string())
+}
+
 /// POST `/api/v1/auth/{provider}/login` with username + password.
 pub async fn login(
     state: &AuthState,

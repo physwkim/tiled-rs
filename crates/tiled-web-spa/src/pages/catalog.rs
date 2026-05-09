@@ -3,6 +3,7 @@ use leptos_router::hooks::use_params_map;
 
 use crate::api;
 use crate::auth::use_auth;
+use crate::components::array_view::{ArrayInfo, ArrayView};
 
 #[component]
 pub fn CatalogView() -> impl IntoView {
@@ -32,22 +33,39 @@ pub fn CatalogView() -> impl IntoView {
                 <h2 class="text-lg font-semibold mb-2">"Metadata"</h2>
                 <Suspense fallback=move || view! { <p class="text-slate-500">"loading..."</p> }>
                     {move || metadata.get().map(|res| match res.take() {
-                        Ok(env) => view! {
-                            <dl class="grid grid-cols-[max-content_1fr] gap-x-4 gap-y-1 text-sm">
-                                <dt class="text-slate-500">"id"</dt>
-                                <dd class="font-mono">{env.data.id}</dd>
-                                <dt class="text-slate-500">"family"</dt>
-                                <dd>{env.data.attributes.structure_family.unwrap_or_else(|| "?".into())}</dd>
-                            </dl>
-                            <details class="mt-3 text-xs">
-                                <summary class="cursor-pointer text-slate-600">"raw metadata"</summary>
-                                <pre class="mt-2 overflow-x-auto rounded bg-slate-50 p-3 font-mono">
-                                    {env.data.attributes.metadata
-                                        .map(|m| serde_json::to_string_pretty(&m).unwrap_or_default())
-                                        .unwrap_or_default()}
-                                </pre>
-                            </details>
-                        }.into_any(),
+                        Ok(env) => {
+                            let family = env.data.attributes.structure_family
+                                .clone()
+                                .unwrap_or_else(|| "?".into());
+                            let array_info = if family == "array" {
+                                env.data.attributes.structure
+                                    .as_ref()
+                                    .and_then(|s| ArrayInfo::from_resource(s, &env.data.links))
+                            } else {
+                                None
+                            };
+                            view! {
+                                <dl class="grid grid-cols-[max-content_1fr] gap-x-4 gap-y-1 text-sm">
+                                    <dt class="text-slate-500">"id"</dt>
+                                    <dd class="font-mono">{env.data.id.clone()}</dd>
+                                    <dt class="text-slate-500">"family"</dt>
+                                    <dd>{family}</dd>
+                                </dl>
+                                {array_info.map(|info| view! {
+                                    <div class="mt-4">
+                                        <ArrayView info=info />
+                                    </div>
+                                })}
+                                <details class="mt-3 text-xs">
+                                    <summary class="cursor-pointer text-slate-600">"raw metadata"</summary>
+                                    <pre class="mt-2 overflow-x-auto rounded bg-slate-50 p-3 font-mono">
+                                        {env.data.attributes.metadata
+                                            .map(|m| serde_json::to_string_pretty(&m).unwrap_or_default())
+                                            .unwrap_or_default()}
+                                    </pre>
+                                </details>
+                            }.into_any()
+                        }
                         Err(e) => view! {
                             <p class="text-red-600 text-sm">{format!("error: {e}")}</p>
                         }.into_any(),

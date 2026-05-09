@@ -424,6 +424,33 @@ pub async fn array_block(
 }
 
 // ---------------------------------------------------------------------------
+// GET /api/v1/array/full/{*path}
+// ---------------------------------------------------------------------------
+//
+// Returns the entire array with optional `?slice=...` numpy-style slicing.
+// For single-block adapters this is the natural read path. Multi-chunk
+// adapters currently return only block 0,0,...,0 — concat across blocks
+// is a follow-up. Mirrors upstream tiled's `/array/full/` endpoint, which
+// the SPA uses via `links.full`.
+pub async fn array_full(
+    state: State<AppState>,
+    OriginalUri(uri): OriginalUri,
+    Query(mut params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    auth: crate::AuthContext,
+) -> Result<impl IntoResponse, ServerError> {
+    // Translate /array/full/<p> → /array/block/<p> with implicit
+    // block=0,0,...,0. The block handler already does the right thing
+    // when the param is absent.
+    let path = uri.path().replacen("/api/v1/array/full/", "/api/v1/array/block/", 1);
+    let new_uri: axum::http::Uri = path.parse().map_err(|e| {
+        ServerError::Internal(format!("malformed /array/full/ URI: {e}"))
+    })?;
+    params.remove("block");
+    array_block(state, OriginalUri(new_uri), Query(params), headers, auth).await
+}
+
+// ---------------------------------------------------------------------------
 // GET /api/v1/table/partition/{*path}
 // ---------------------------------------------------------------------------
 
