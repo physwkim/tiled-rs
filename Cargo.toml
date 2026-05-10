@@ -104,7 +104,7 @@ tiff = "0.9"
 image = "0.25"
 
 # HDF5 (feature-gated) — pure-Rust HDF5 reader/writer, no system libhdf5
-rust-hdf5 = { version = "0.2.8", features = ["deflate"] }
+rust-hdf5 = { version = "0.2.12", features = ["deflate"] }
 
 # Zarr
 zarrs = { version = "0.20", features = ["filesystem"] }
