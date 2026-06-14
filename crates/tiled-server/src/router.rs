@@ -89,8 +89,7 @@ pub async fn about(State(state): State<AppState>, BaseUrl(base_url): BaseUrl) ->
             })
         })
         .collect();
-    let auth_required =
-        !providers.is_empty() || state.external_oidc.is_some();
+    let auth_required = !providers.is_empty() || state.external_oidc.is_some();
 
     let about = About {
         api_version: 0,
@@ -188,14 +187,15 @@ pub async fn metadata(
 
 pub async fn search_root(
     state: State<AppState>,
-    params: Query<HashMap<String, String>>,
+    // Vec<(K,V)> preserves repeated keys so multiple same-type filters all survive.
+    Query(params): Query<Vec<(String, String)>>,
     base_url: BaseUrl,
     auth: crate::AuthContext,
 ) -> Result<impl IntoResponse, ServerError> {
     search(
         state,
         OriginalUri("/api/v1/search/".parse().expect("static URI")),
-        params,
+        Query(params),
         base_url,
         auth,
     )
@@ -205,7 +205,8 @@ pub async fn search_root(
 pub async fn search(
     State(state): State<AppState>,
     OriginalUri(uri): OriginalUri,
-    Query(params): Query<HashMap<String, String>>,
+    // Vec<(K,V)> preserves repeated keys so multiple same-type filters all survive.
+    Query(params): Query<Vec<(String, String)>>,
     BaseUrl(base_url): BaseUrl,
     auth: crate::AuthContext,
 ) -> Result<impl IntoResponse, ServerError> {
@@ -213,19 +214,20 @@ pub async fn search(
     let segments = segments_from_uri(&uri, "/api/v1/search/");
 
     let offset: usize = params
-        .get("page[offset]")
-        .and_then(|v| v.parse().ok())
+        .iter()
+        .find(|(k, _)| k == "page[offset]")
+        .and_then(|(_, v)| v.parse().ok())
         .unwrap_or(0);
     let limit: usize = params
-        .get("page[limit]")
-        .and_then(|v| v.parse().ok())
+        .iter()
+        .find(|(k, _)| k == "page[limit]")
+        .and_then(|(_, v)| v.parse().ok())
         .unwrap_or(links::DEFAULT_PAGE_SIZE)
         .min(links::MAX_PAGE_SIZE);
 
     let filter_params: Vec<(String, String)> = params
-        .iter()
+        .into_iter()
         .filter(|(k, _)| k.starts_with("filter["))
-        .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     let queries = tiled_core::queries::decode_query_filters(&filter_params);
 
@@ -261,9 +263,8 @@ pub async fn search(
         let entries: Vec<tiled_core::schemas::Resource> = rows
             .into_iter()
             .map(|node| {
-                let family = parse_structure_family(&node.structure_family).unwrap_or(
-                    tiled_core::structures::StructureFamily::Container,
-                );
+                let family = parse_structure_family(&node.structure_family)
+                    .unwrap_or(tiled_core::structures::StructureFamily::Container);
                 let child_path = if path_trimmed.is_empty() {
                     node.key.clone()
                 } else {
@@ -465,8 +466,12 @@ fn serve_with_range(
             let mut resp = (
                 StatusCode::PARTIAL_CONTENT,
                 [
-                    (header::CONTENT_TYPE, HeaderValue::from_str(content_type)
-                        .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"))),
+                    (
+                        header::CONTENT_TYPE,
+                        HeaderValue::from_str(content_type).unwrap_or_else(|_| {
+                            HeaderValue::from_static("application/octet-stream")
+                        }),
+                    ),
                     accept_ranges,
                     (
                         header::CONTENT_RANGE,
@@ -484,8 +489,11 @@ fn serve_with_range(
         }
         _ => (
             [
-                (header::CONTENT_TYPE, HeaderValue::from_str(content_type)
-                    .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"))),
+                (
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_str(content_type)
+                        .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
+                ),
                 accept_ranges,
             ],
             body,
@@ -514,7 +522,9 @@ fn parse_range(header: &str, total: usize) -> Option<(usize, usize)> {
     }
     let start: usize = start_s.parse().ok()?;
     let end = if end_s.is_empty() {
-        if total == 0 { return None; }
+        if total == 0 {
+            return None;
+        }
         total - 1
     } else {
         end_s.parse().ok()?
@@ -557,12 +567,13 @@ pub async fn array_append(
             )));
         }
     };
-    let writable = array_adapter
-        .as_writable()
-        .ok_or_else(|| ServerError::Validation(
+    let writable = array_adapter.as_writable().ok_or_else(|| {
+        ServerError::Validation(
             "this array adapter does not support append; only adapters whose \
-             underlying store can grow (zarr, ND-streaming) implement it".into(),
-        ))?;
+             underlying store can grow (zarr, ND-streaming) implement it"
+                .into(),
+        )
+    })?;
 
     let append_along: usize = params
         .get("append_along")
@@ -756,12 +767,9 @@ pub async fn container_full(
     } else {
         pre_warm_walk(&state, &segments).await?;
         let adapter = core::walk_tree(state.root_tree.as_ref(), &segments)?;
-        adapter
-            .as_container()
-            .ok_or_else(|| ServerError::Validation(format!(
-                "'{}' is not a container",
-                segments.join("/")
-            )))?
+        adapter.as_container().ok_or_else(|| {
+            ServerError::Validation(format!("'{}' is not a container", segments.join("/")))
+        })?
     };
 
     // Build the same Vec<Resource> shape /search emits — that's what
@@ -770,14 +778,16 @@ pub async fn container_full(
     let children: Vec<tiled_core::schemas::Resource> = container
         .keys()
         .iter()
-        .filter_map(|k| container.get(k).map(|child| {
-            let child_path = if path.is_empty() {
-                k.clone()
-            } else {
-                format!("{path}/{k}")
-            };
-            core::construct_resource(child, k, &child_path, &base_url)
-        }))
+        .filter_map(|k| {
+            container.get(k).map(|child| {
+                let child_path = if path.is_empty() {
+                    k.clone()
+                } else {
+                    format!("{path}/{k}")
+                };
+                core::construct_resource(child, k, &child_path, &base_url)
+            })
+        })
         .collect();
     let body_json =
         serde_json::to_vec(&children).map_err(|e| ServerError::Internal(format!("encode: {e}")))?;
@@ -804,10 +814,10 @@ pub async fn container_full(
     )
     .unwrap_or_else(|| "text/html".to_string());
 
-    let body = if let Some(serializer) = state
-        .serialization_registry
-        .dispatch(tiled_core::structures::StructureFamily::Container, &media_type)
-    {
+    let body = if let Some(serializer) = state.serialization_registry.dispatch(
+        tiled_core::structures::StructureFamily::Container,
+        &media_type,
+    ) {
         let meta = serde_json::json!({"path": path});
         serializer(&body_json, &meta).map_err(|e| ServerError::Internal(e.to_string()))?
     } else {
@@ -842,8 +852,8 @@ async fn export_container_as_zip(
     let mut buf = Vec::new();
     {
         let mut writer = zip::ZipWriter::new(Cursor::new(&mut buf));
-        let opts = SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Deflated);
+        let opts =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
         for (name, bytes) in entries {
             writer
                 .start_file(&name, opts)
@@ -867,7 +877,9 @@ fn collect_zip_entries<'a>(
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ServerError>> + Send + 'a>> {
     Box::pin(async move {
         for key in container.keys() {
-            let Some(child) = container.get(&key) else { continue };
+            let Some(child) = container.get(&key) else {
+                continue;
+            };
             let entry_name = if prefix.is_empty() {
                 key.clone()
             } else {
@@ -1150,10 +1162,12 @@ pub async fn array_full(
     // Translate /array/full/<p> → /array/block/<p> with implicit
     // block=0,0,...,0. The block handler already does the right thing
     // when the param is absent.
-    let path = uri.path().replacen("/api/v1/array/full/", "/api/v1/array/block/", 1);
-    let new_uri: axum::http::Uri = path.parse().map_err(|e| {
-        ServerError::Internal(format!("malformed /array/full/ URI: {e}"))
-    })?;
+    let path = uri
+        .path()
+        .replacen("/api/v1/array/full/", "/api/v1/array/block/", 1);
+    let new_uri: axum::http::Uri = path
+        .parse()
+        .map_err(|e| ServerError::Internal(format!("malformed /array/full/ URI: {e}")))?;
     params.remove("block");
     array_block(state, OriginalUri(new_uri), Query(params), headers, auth).await
 }
@@ -1424,15 +1438,13 @@ pub async fn register(
         // container hears about the new child) and the new node itself
         // (so any "watch this path" subscriber that connected first sees
         // the create event).
-        state
-            .streaming_bus
-            .publish(
-                &path,
-                crate::streaming::UpdateKind::ChildCreated {
-                    key: node.key.clone(),
-                    structure_family: structure_family.clone(),
-                },
-            );
+        state.streaming_bus.publish(
+            &path,
+            crate::streaming::UpdateKind::ChildCreated {
+                key: node.key.clone(),
+                structure_family: structure_family.clone(),
+            },
+        );
         let links = tiled_core::links::links_for_node(req.structure_family, &base_url, &child_path);
         let resp = tiled_core::schemas::PostMetadataResponse {
             id: node.key,
@@ -1513,12 +1525,13 @@ pub async fn patch_metadata(
         .map(|v| matches!(v.as_str(), "true" | "True" | "1" | "yes"))
         .unwrap_or(false);
     let segments = segments_from_uri(&uri, "/api/v1/metadata/");
-    let catalog = state
-        .catalog
-        .as_ref()
-        .ok_or_else(|| ServerError::Validation("server has no catalog DB; PATCH not supported".into()))?;
+    let catalog = state.catalog.as_ref().ok_or_else(|| {
+        ServerError::Validation("server has no catalog DB; PATCH not supported".into())
+    })?;
     if segments.is_empty() {
-        return Err(ServerError::Validation("cannot PATCH the catalog root".into()));
+        return Err(ServerError::Validation(
+            "cannot PATCH the catalog root".into(),
+        ));
     }
     let node = catalog
         .lookup(&segments)
@@ -1586,15 +1599,11 @@ pub async fn patch_metadata(
                 "metadata": node.metadata,
                 "specs": node.specs,
             });
-            let patch: json_patch::Patch = serde_json::from_value(
-                serde_json::Value::Array(ops_array.clone()),
-            )
-            .map_err(|e| {
-                ServerError::Validation(format!("invalid json-patch: {e}"))
-            })?;
-            json_patch::patch(&mut working, &patch).map_err(|e| {
-                ServerError::Validation(format!("json-patch failed: {e}"))
-            })?;
+            let patch: json_patch::Patch =
+                serde_json::from_value(serde_json::Value::Array(ops_array.clone()))
+                    .map_err(|e| ServerError::Validation(format!("invalid json-patch: {e}")))?;
+            json_patch::patch(&mut working, &patch)
+                .map_err(|e| ServerError::Validation(format!("json-patch failed: {e}")))?;
             let metadata = working
                 .get("metadata")
                 .cloned()
@@ -1664,12 +1673,13 @@ pub async fn put_data_source(
     auth.require(tiled_auth::Scope::WriteData)
         .or_else(|_| auth.require(tiled_auth::Scope::WriteMetadata))?;
     let segments = segments_from_uri(&uri, "/api/v1/data_source/");
-    let catalog = state
-        .catalog
-        .as_ref()
-        .ok_or_else(|| ServerError::Validation("server has no catalog DB; PUT not supported".into()))?;
+    let catalog = state.catalog.as_ref().ok_or_else(|| {
+        ServerError::Validation("server has no catalog DB; PUT not supported".into())
+    })?;
     if segments.is_empty() {
-        return Err(ServerError::Validation("PUT /data_source requires a node path".into()));
+        return Err(ServerError::Validation(
+            "PUT /data_source requires a node path".into(),
+        ));
     }
     let node = catalog
         .lookup(&segments)
@@ -1729,12 +1739,13 @@ pub async fn delete_metadata(
 ) -> Result<impl IntoResponse, ServerError> {
     auth.require(tiled_auth::Scope::DeleteNode)?;
     let segments = segments_from_uri(&uri, "/api/v1/metadata/");
-    let catalog = state
-        .catalog
-        .as_ref()
-        .ok_or_else(|| ServerError::Validation("server has no catalog DB; DELETE not supported".into()))?;
+    let catalog = state.catalog.as_ref().ok_or_else(|| {
+        ServerError::Validation("server has no catalog DB; DELETE not supported".into())
+    })?;
     if segments.is_empty() {
-        return Err(ServerError::Validation("cannot DELETE the catalog root".into()));
+        return Err(ServerError::Validation(
+            "cannot DELETE the catalog root".into(),
+        ));
     }
     let node = catalog
         .lookup(&segments)
@@ -1770,7 +1781,10 @@ pub async fn delete_metadata(
             )));
         }
     }
-    catalog.delete_node(node.id).await.map_err(map_catalog_err)?;
+    catalog
+        .delete_node(node.id)
+        .await
+        .map_err(map_catalog_err)?;
     let path = segments.join("/");
     state
         .streaming_bus
@@ -1786,7 +1800,9 @@ async fn catalog_metadata_resource(
     segments: &[String],
     base_url: &str,
 ) -> Result<tiled_core::schemas::Resource, ServerError> {
-    use tiled_core::schemas::{NodeAttributes, NodeStructure, Resource, SortingItem, SortDirection};
+    use tiled_core::schemas::{
+        NodeAttributes, NodeStructure, Resource, SortDirection, SortingItem,
+    };
     if segments.is_empty() {
         let count = catalog
             .count_children(None)
@@ -1883,9 +1899,7 @@ async fn catalog_metadata_resource(
     })
 }
 
-fn parse_structure_family(
-    s: &str,
-) -> Result<tiled_core::structures::StructureFamily, ServerError> {
+fn parse_structure_family(s: &str) -> Result<tiled_core::structures::StructureFamily, ServerError> {
     use tiled_core::structures::StructureFamily as SF;
     match s {
         "container" => Ok(SF::Container),
@@ -1961,12 +1975,7 @@ mod block_parser_tests {
         let mut result = vec![0u8; 16];
         let chunk = vec![b'a', b'b', b'c', b'd'];
         copy_chunk_into_result(&mut result, &[4, 4], &[1, 1], &chunk, &[2, 2], 1);
-        let expected = vec![
-            0, 0, 0, 0,
-            0, b'a', b'b', 0,
-            0, b'c', b'd', 0,
-            0, 0, 0, 0,
-        ];
+        let expected = vec![0, 0, 0, 0, 0, b'a', b'b', 0, 0, b'c', b'd', 0, 0, 0, 0, 0];
         assert_eq!(result, expected);
     }
 
@@ -1975,9 +1984,12 @@ mod block_parser_tests {
         // 2x2 result, chunk is 1x2 placed at (1, 0). element_size=2
         // Each 2-byte element is little-endian u16; values 100, 200
         let mut result = vec![0u8; 8];
-        let chunk = (100u16).to_le_bytes().iter()
+        let chunk = (100u16)
+            .to_le_bytes()
+            .iter()
             .chain((200u16).to_le_bytes().iter())
-            .copied().collect::<Vec<_>>();
+            .copied()
+            .collect::<Vec<_>>();
         copy_chunk_into_result(&mut result, &[2, 2], &[1, 0], &chunk, &[1, 2], 2);
         // Bytes 4..6 = 100, bytes 6..8 = 200.
         assert_eq!(&result[4..6], &(100u16).to_le_bytes());

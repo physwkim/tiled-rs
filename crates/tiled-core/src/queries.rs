@@ -229,106 +229,111 @@ impl Query {
     ///
     /// Returns pairs like `("filter[eq][condition][key]", "color")`,
     /// `("filter[eq][condition][value]", "\"red\"")`.
-    pub fn encode(&self) -> HashMap<String, String> {
+    ///
+    /// Multiple queries of the same type (e.g. two `Comparison` bounds for a
+    /// range) must be encoded together: concatenate the `Vec`s from each call
+    /// and append every pair with `url.query_pairs_mut().append_pair`. Using a
+    /// `HashMap` to build the URL would silently drop repeated keys.
+    pub fn encode(&self) -> Vec<(String, String)> {
         let name = self.query_name();
         let prefix = format!("filter[{name}][condition]");
-        let mut params = HashMap::new();
+        let mut params: Vec<(String, String)> = Vec::new();
         match self {
             Self::FullText(q) => {
-                params.insert(format!("{prefix}[text]"), q.text.clone());
+                params.push((format!("{prefix}[text]"), q.text.clone()));
             }
             Self::Lookup(q) => {
-                params.insert(format!("{prefix}[key]"), q.key.clone());
+                params.push((format!("{prefix}[key]"), q.key.clone()));
             }
             Self::KeysFilter(q) => {
                 let v = serde_json::to_string(&q.keys).unwrap_or_default();
-                params.insert(format!("{prefix}[keys]"), v);
+                params.push((format!("{prefix}[keys]"), v));
             }
             Self::Regex(q) => {
-                params.insert(format!("{prefix}[key]"), q.key.clone());
-                params.insert(format!("{prefix}[pattern]"), q.pattern.clone());
+                params.push((format!("{prefix}[key]"), q.key.clone()));
+                params.push((format!("{prefix}[pattern]"), q.pattern.clone()));
                 if !q.case_sensitive {
-                    params.insert(format!("{prefix}[case_sensitive]"), "false".into());
+                    params.push((format!("{prefix}[case_sensitive]"), "false".into()));
                 }
             }
             Self::Eq(q) => {
-                params.insert(format!("{prefix}[key]"), q.key.clone());
-                params.insert(
+                params.push((format!("{prefix}[key]"), q.key.clone()));
+                params.push((
                     format!("{prefix}[value]"),
                     serde_json::to_string(&q.value).unwrap_or_default(),
-                );
+                ));
             }
             Self::NotEq(q) => {
-                params.insert(format!("{prefix}[key]"), q.key.clone());
-                params.insert(
+                params.push((format!("{prefix}[key]"), q.key.clone()));
+                params.push((
                     format!("{prefix}[value]"),
                     serde_json::to_string(&q.value).unwrap_or_default(),
-                );
+                ));
             }
             Self::Comparison(q) => {
-                params.insert(format!("{prefix}[operator]"), q.operator.to_string());
-                params.insert(format!("{prefix}[key]"), q.key.clone());
-                params.insert(
+                params.push((format!("{prefix}[operator]"), q.operator.to_string()));
+                params.push((format!("{prefix}[key]"), q.key.clone()));
+                params.push((
                     format!("{prefix}[value]"),
                     serde_json::to_string(&q.value).unwrap_or_default(),
-                );
+                ));
             }
             Self::Contains(q) => {
-                params.insert(format!("{prefix}[key]"), q.key.clone());
-                params.insert(
+                params.push((format!("{prefix}[key]"), q.key.clone()));
+                params.push((
                     format!("{prefix}[value]"),
                     serde_json::to_string(&q.value).unwrap_or_default(),
-                );
+                ));
             }
             Self::In(q) => {
-                params.insert(format!("{prefix}[key]"), q.key.clone());
-                params.insert(
+                params.push((format!("{prefix}[key]"), q.key.clone()));
+                params.push((
                     format!("{prefix}[value]"),
                     serde_json::to_string(&q.value).unwrap_or_default(),
-                );
+                ));
             }
             Self::NotIn(q) => {
-                params.insert(format!("{prefix}[key]"), q.key.clone());
-                params.insert(
+                params.push((format!("{prefix}[key]"), q.key.clone()));
+                params.push((
                     format!("{prefix}[value]"),
                     serde_json::to_string(&q.value).unwrap_or_default(),
-                );
+                ));
             }
             Self::KeyPresent(q) => {
-                params.insert(format!("{prefix}[key]"), q.key.clone());
+                params.push((format!("{prefix}[key]"), q.key.clone()));
                 if !q.exists {
-                    params.insert(format!("{prefix}[exists]"), "false".into());
+                    params.push((format!("{prefix}[exists]"), "false".into()));
                 }
             }
             Self::Like(q) => {
-                params.insert(format!("{prefix}[key]"), q.key.clone());
-                params.insert(format!("{prefix}[pattern]"), q.pattern.clone());
+                params.push((format!("{prefix}[key]"), q.key.clone()));
+                params.push((format!("{prefix}[pattern]"), q.pattern.clone()));
             }
             Self::Specs(q) => {
-                params.insert(
+                params.push((
                     format!("{prefix}[include]"),
                     serde_json::to_string(&q.include).unwrap_or_default(),
-                );
+                ));
                 if !q.exclude.is_empty() {
-                    params.insert(
+                    params.push((
                         format!("{prefix}[exclude]"),
                         serde_json::to_string(&q.exclude).unwrap_or_default(),
-                    );
+                    ));
                 }
             }
             Self::AccessBlobFilter(q) => {
                 if let Some(ref uid) = q.user_id {
-                    params.insert(format!("{prefix}[user_id]"), uid.clone());
+                    params.push((format!("{prefix}[user_id]"), uid.clone()));
                 }
                 if !q.tags.is_empty() {
-                    params.insert(
+                    params.push((
                         format!("{prefix}[tags]"),
                         serde_json::to_string(&q.tags).unwrap_or_default(),
-                    );
+                    ));
                 }
             }
             Self::StructureFamily(q) => {
-                params.insert(format!("{prefix}[value]"), q.value.to_string());
+                params.push((format!("{prefix}[value]"), q.value.to_string()));
             }
         }
         params
@@ -344,21 +349,40 @@ static FILTER_PARAM_PATTERN: std::sync::LazyLock<regex::Regex> = std::sync::Lazy
 /// Decode query filter parameters from URL query pairs.
 ///
 /// Parses pairs like `("filter[eq][condition][key]", "color")` into `Query` variants.
+///
+/// Repeated keys for the same filter type are collected into per-field lists and
+/// reconstructed via positional zip (index 0 → first query, index 1 → second, …).
+/// This matches Python's wire format where `params[key].append(value)` builds
+/// per-field lists and the server iterates `i = 0, 1, …` until `IndexError`.
 pub fn decode_query_filters(params: &[(String, String)]) -> Vec<Query> {
-    let mut groups: HashMap<String, HashMap<String, String>> = HashMap::new();
+    // name → field → ordered list of values (one entry per query of that type)
+    let mut groups: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
     for (key, value) in params {
         if let Some(caps) = FILTER_PARAM_PATTERN.captures(key) {
             groups
                 .entry(caps[1].to_string())
                 .or_default()
-                .insert(caps[2].to_string(), value.clone());
+                .entry(caps[2].to_string())
+                .or_default()
+                .push(value.clone());
         }
     }
 
-    groups
-        .iter()
-        .filter_map(|(name, fields)| decode_single_query(name, fields))
-        .collect()
+    let mut queries = Vec::new();
+    for (name, field_lists) in &groups {
+        // Number of queries of this type = length of the shortest per-field list.
+        let n = field_lists.values().map(|v| v.len()).min().unwrap_or(0);
+        for i in 0..n {
+            let fields: HashMap<String, String> = field_lists
+                .iter()
+                .map(|(f, vs)| (f.clone(), vs[i].clone()))
+                .collect();
+            if let Some(q) = decode_single_query(name, &fields) {
+                queries.push(q);
+            }
+        }
+    }
+    queries
 }
 
 fn decode_single_query(name: &str, fields: &HashMap<String, String>) -> Option<Query> {
@@ -565,8 +589,7 @@ mod tests {
     #[test]
     fn test_encode_decode_roundtrip_eq() {
         let q = Key::new("color").eq("red");
-        let params = q.encode();
-        let pairs: Vec<(String, String)> = params.into_iter().collect();
+        let pairs = q.encode();
         let decoded = decode_query_filters(&pairs);
         assert_eq!(decoded.len(), 1);
         assert_eq!(decoded[0].query_name(), "eq");
@@ -584,8 +607,7 @@ mod tests {
         let q = Query::FullText(FullText {
             text: "hello world".into(),
         });
-        let params = q.encode();
-        let pairs: Vec<(String, String)> = params.into_iter().collect();
+        let pairs = q.encode();
         let decoded = decode_query_filters(&pairs);
         assert_eq!(decoded.len(), 1);
         match &decoded[0] {
@@ -597,8 +619,7 @@ mod tests {
     #[test]
     fn test_encode_decode_roundtrip_comparison() {
         let q = Key::new("temperature").gt(300);
-        let params = q.encode();
-        let pairs: Vec<(String, String)> = params.into_iter().collect();
+        let pairs = q.encode();
         let decoded = decode_query_filters(&pairs);
         assert_eq!(decoded.len(), 1);
         match &decoded[0] {
@@ -617,8 +638,7 @@ mod tests {
             include: vec!["xdi".into(), "xas".into()],
             exclude: vec!["draft".into()],
         });
-        let params = q.encode();
-        let pairs: Vec<(String, String)> = params.into_iter().collect();
+        let pairs = q.encode();
         let decoded = decode_query_filters(&pairs);
         assert_eq!(decoded.len(), 1);
         match &decoded[0] {
@@ -635,8 +655,7 @@ mod tests {
         let q = Query::StructureFamily(StructureFamilyQuery {
             value: StructureFamily::Array,
         });
-        let params = q.encode();
-        let pairs: Vec<(String, String)> = params.into_iter().collect();
+        let pairs = q.encode();
         let decoded = decode_query_filters(&pairs);
         assert_eq!(decoded.len(), 1);
         match &decoded[0] {
@@ -645,5 +664,38 @@ mod tests {
             }
             _ => panic!("Expected StructureFamily"),
         }
+    }
+
+    /// H4: Two Comparison queries of the same type must both survive encode+decode.
+    /// A gt lower bound and an lt upper bound form a range; previously only one
+    /// survived because encode() returned HashMap (duplicate keys) and decode()
+    /// grouped per-name into a single HashMap (last value wins).
+    #[test]
+    fn test_encode_decode_roundtrip_two_comparisons_range() {
+        let gt = Key::new("temperature").gt(300);
+        let lt = Key::new("temperature").lt(400);
+        // Concatenate both encodings — same keys appear twice.
+        let mut pairs = gt.encode();
+        pairs.extend(lt.encode());
+
+        let decoded = decode_query_filters(&pairs);
+        assert_eq!(
+            decoded.len(),
+            2,
+            "both range bounds must survive round-trip"
+        );
+
+        let mut ops: Vec<Operator> = decoded
+            .iter()
+            .filter_map(|q| {
+                if let Query::Comparison(c) = q {
+                    Some(c.operator)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        ops.sort_by_key(|o| o.to_string());
+        assert_eq!(ops, vec![Operator::Gt, Operator::Lt]);
     }
 }
