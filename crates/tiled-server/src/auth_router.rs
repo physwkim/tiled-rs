@@ -47,7 +47,9 @@ pub struct IdentityPayload {
     pub provider: String,
 }
 
-fn require_auth_db(state: &AppState) -> Result<(&tiled_auth::AuthDb, &tiled_auth::Issuer), ServerError> {
+fn require_auth_db(
+    state: &AppState,
+) -> Result<(&tiled_auth::AuthDb, &tiled_auth::Issuer), ServerError> {
     let db = state
         .auth_db
         .as_ref()
@@ -63,7 +65,11 @@ fn lookup_authenticator<'a>(
     state: &'a AppState,
     name: &str,
 ) -> Option<Arc<dyn tiled_auth::Authenticator>> {
-    state.authenticators.iter().find(|a| a.name() == name).cloned()
+    state
+        .authenticators
+        .iter()
+        .find(|a| a.name() == name)
+        .cloned()
 }
 
 pub async fn login(
@@ -88,7 +94,11 @@ pub async fn login(
     // touching every endpoint. API keys can still narrow the set.
     let scopes = state.default_login_scopes.clone();
     let session = db
-        .create_session(principal.id, scopes.clone(), Utc::now() + issuer.refresh_ttl)
+        .create_session(
+            principal.id,
+            scopes.clone(),
+            Utc::now() + issuer.refresh_ttl,
+        )
         .await
         .map_err(map_auth_err)?;
     let access = issuer
@@ -124,7 +134,9 @@ pub async fn refresh(
         .map_err(map_auth_err)?;
     let session = db.lookup_session(&claims.sid).await.map_err(map_auth_err)?;
     if session.revoked || session.expiration_time <= Utc::now() {
-        return Err(ServerError::Unauthorized("session revoked or expired".into()));
+        return Err(ServerError::Unauthorized(
+            "session revoked or expired".into(),
+        ));
     }
     let access = issuer
         .issue_access(&claims.sub, &claims.sid, session.scopes)
@@ -150,9 +162,9 @@ pub async fn logout(
     // request extension. For simplicity, look up the session by user
     // principal — for now we revoke ALL sessions of the principal.
     let (db, _) = require_auth_db(&state)?;
-    let principal = auth.principal.ok_or_else(|| {
-        ServerError::Internal("session auth without principal".into())
-    })?;
+    let principal = auth
+        .principal
+        .ok_or_else(|| ServerError::Internal("session auth without principal".into()))?;
     db.revoke_all_sessions(principal.id)
         .await
         .map_err(map_auth_err)?;
@@ -234,7 +246,11 @@ pub async fn device_token(
                 .ok_or_else(|| ServerError::Internal("granted principal vanished".into()))?;
             let scopes = state.default_login_scopes.clone();
             let session = db
-                .create_session(principal_id, scopes.clone(), Utc::now() + issuer.refresh_ttl)
+                .create_session(
+                    principal_id,
+                    scopes.clone(),
+                    Utc::now() + issuer.refresh_ttl,
+                )
                 .await
                 .map_err(map_auth_err)?;
             let access = issuer
@@ -293,7 +309,7 @@ pub async fn api_key_create(
     auth: AuthContext,
     Json(req): Json<ApiKeyCreateRequest>,
 ) -> Result<impl IntoResponse, ServerError> {
-    auth.require(tiled_auth::Scope::ApiKeyCreate)?;
+    auth.require(tiled_auth::Scope::CreateApiKeys)?;
     let principal = auth
         .principal
         .clone()
@@ -304,9 +320,8 @@ pub async fn api_key_create(
         Some(names) => {
             let mut set = ScopeSet::default();
             for name in names {
-                let s = tiled_auth::Scope::parse(&name).ok_or_else(|| {
-                    ServerError::Validation(format!("unknown scope: {name}"))
-                })?;
+                let s = tiled_auth::Scope::parse(&name)
+                    .ok_or_else(|| ServerError::Validation(format!("unknown scope: {name}")))?;
                 if !auth.scopes.contains(s) {
                     return Err(ServerError::Forbidden(format!(
                         "cannot grant a scope ({}) you don't hold",
@@ -344,10 +359,7 @@ pub async fn api_key_list(
 ) -> Result<impl IntoResponse, ServerError> {
     let (db, _) = require_auth_db(&state)?;
     let principal_id = auth.principal.as_ref().map(|p| p.id);
-    let keys = db
-        .list_api_keys(principal_id)
-        .await
-        .map_err(map_auth_err)?;
+    let keys = db.list_api_keys(principal_id).await.map_err(map_auth_err)?;
     Ok(Json(
         keys.into_iter()
             .map(|k| {
@@ -370,11 +382,12 @@ pub async fn api_key_revoke(
     auth: AuthContext,
     Path(first_eight): Path<String>,
 ) -> Result<impl IntoResponse, ServerError> {
-    auth.require(tiled_auth::Scope::ApiKeyRevoke)?;
+    auth.require(tiled_auth::Scope::RevokeApiKeys)?;
     let (db, _) = require_auth_db(&state)?;
-    let principal = auth.principal.clone().ok_or_else(|| {
-        ServerError::Unauthorized("login required to revoke an api key".into())
-    })?;
+    let principal = auth
+        .principal
+        .clone()
+        .ok_or_else(|| ServerError::Unauthorized("login required to revoke an api key".into()))?;
     // Look up the key owner before revoking so a non-admin can't drop a
     // key that belongs to someone else (just having ApiKeyRevoke scope on
     // your own session would otherwise be enough).

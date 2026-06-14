@@ -14,12 +14,15 @@ pub enum Scope {
     ReadData,
     WriteMetadata,
     WriteData,
-    Create,
-    Register, // alias the Python world keeps for "register a new node"
+    CreateNode,
+    Register,
     DeleteNode,
     DeleteRevision,
-    ApiKeyCreate,
-    ApiKeyRevoke,
+    CreateApiKeys,
+    RevokeApiKeys,
+    AdminApiKeys,
+    ReadPrincipals,
+    WritePrincipals,
     Inherit,
     Metrics,
     Admin,
@@ -36,12 +39,15 @@ impl Scope {
         Self::ReadData,
         Self::WriteMetadata,
         Self::WriteData,
-        Self::Create,
+        Self::CreateNode,
         Self::Register,
         Self::DeleteNode,
         Self::DeleteRevision,
-        Self::ApiKeyCreate,
-        Self::ApiKeyRevoke,
+        Self::CreateApiKeys,
+        Self::RevokeApiKeys,
+        Self::AdminApiKeys,
+        Self::ReadPrincipals,
+        Self::WritePrincipals,
         Self::Inherit,
         Self::Metrics,
         Self::Admin,
@@ -55,12 +61,15 @@ impl Scope {
             Self::ReadData => "read:data",
             Self::WriteMetadata => "write:metadata",
             Self::WriteData => "write:data",
-            Self::Create => "create",
+            Self::CreateNode => "create:node",
             Self::Register => "register",
             Self::DeleteNode => "delete:node",
             Self::DeleteRevision => "delete:revision",
-            Self::ApiKeyCreate => "apikeys:create",
-            Self::ApiKeyRevoke => "apikeys:revoke",
+            Self::CreateApiKeys => "create:apikeys",
+            Self::RevokeApiKeys => "revoke:apikeys",
+            Self::AdminApiKeys => "admin:apikeys",
+            Self::ReadPrincipals => "read:principals",
+            Self::WritePrincipals => "write:principals",
             Self::Inherit => "inherit",
             Self::Metrics => "metrics",
             Self::Admin => "admin",
@@ -83,9 +92,8 @@ impl Serialize for Scope {
 impl<'de> Deserialize<'de> for Scope {
     fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
         let s = String::deserialize(de)?;
-        Scope::parse(&s).ok_or_else(|| {
-            <D::Error as serde::de::Error>::custom(format!("unknown scope: {s}"))
-        })
+        Scope::parse(&s)
+            .ok_or_else(|| <D::Error as serde::de::Error>::custom(format!("unknown scope: {s}")))
     }
 }
 
@@ -105,15 +113,7 @@ impl ScopeSet {
     }
 
     pub fn read_only() -> Self {
-        Self(
-            [Scope::ReadMetadata, Scope::ReadData]
-                .into_iter()
-                .collect(),
-        )
-    }
-
-    pub fn from_iter<I: IntoIterator<Item = Scope>>(iter: I) -> Self {
-        Self(iter.into_iter().collect())
+        Self([Scope::ReadMetadata, Scope::ReadData].into_iter().collect())
     }
 
     /// Parse from JSON-array text (`'["read:metadata", "read:data"]'`).
@@ -153,6 +153,12 @@ impl ScopeSet {
     }
 }
 
+impl FromIterator<Scope> for ScopeSet {
+    fn from_iter<I: IntoIterator<Item = Scope>>(iter: I) -> Self {
+        Self(iter.into_iter().collect())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,12 +175,41 @@ mod tests {
     fn admin_implies_everything() {
         let s = ScopeSet::from_iter([Scope::Admin]);
         assert!(s.contains(Scope::DeleteNode));
-        assert!(s.contains(Scope::ApiKeyCreate));
+        assert!(s.contains(Scope::CreateApiKeys));
+        assert!(s.contains(Scope::AdminApiKeys));
     }
 
     #[test]
     fn unknown_scope_rejected() {
         let err = ScopeSet::from_json("[\"foo\"]").unwrap_err();
         assert!(matches!(err, crate::error::AuthError::Validation(_)));
+    }
+
+    /// Every canonical string from Python tiled scopes.py must parse and
+    /// round-trip through as_str without loss.
+    #[test]
+    fn canonical_python_scope_strings_parse_and_roundtrip() {
+        let canonical = [
+            "read:metadata",
+            "read:data",
+            "write:metadata",
+            "write:data",
+            "delete:revision",
+            "delete:node",
+            "create:node",
+            "register",
+            "metrics",
+            "create:apikeys",
+            "revoke:apikeys",
+            "admin:apikeys",
+            "read:principals",
+            "write:principals",
+            "read:webhooks",
+            "write:webhooks",
+        ];
+        for s in canonical {
+            let scope = Scope::parse(s).unwrap_or_else(|| panic!("failed to parse: {s}"));
+            assert_eq!(scope.as_str(), s, "as_str mismatch for {s}");
+        }
     }
 }
