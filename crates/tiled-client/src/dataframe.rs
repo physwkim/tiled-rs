@@ -66,7 +66,8 @@ impl TableClient {
     }
 
     /// Read one partition as Arrow record batches. Optional column projection
-    /// matches the server's `field=` query parameter.
+    /// emits one `column=` query param per name, matching the server's repeated
+    /// `column=` key and the upstream Python client (`params["column"] = columns`).
     pub async fn read_partition(
         &self,
         partition: usize,
@@ -77,10 +78,10 @@ impl TableClient {
         {
             let mut q = url.query_pairs_mut();
             q.append_pair("partition", &partition.to_string());
-            if let Some(cols) = columns
-                && !cols.is_empty()
-            {
-                q.append_pair("field", &cols.join(","));
+            if let Some(cols) = columns {
+                for col in cols {
+                    q.append_pair("column", col);
+                }
             }
         }
         let bytes = retry(|| async {
