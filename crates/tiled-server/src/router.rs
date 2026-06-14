@@ -1422,7 +1422,9 @@ pub async fn array_full(
 pub async fn table_partition(
     State(state): State<AppState>,
     OriginalUri(uri): OriginalUri,
-    Query(params): Query<HashMap<String, String>>,
+    // Vec<(K,V)> preserves repeated keys so ?column=A&column=B all survive.
+    Query(params): Query<Vec<(String, String)>>,
+    headers: HeaderMap,
     auth: crate::AuthContext,
 ) -> Result<impl IntoResponse, ServerError> {
     auth.require(tiled_auth::Scope::ReadData)?;
@@ -1431,12 +1433,41 @@ pub async fn table_partition(
     let _ = resolve_entry(&state, auth.clone(), &segments, tiled_auth::Scope::ReadData).await?;
 
     let partition: usize = params
-        .get("partition")
-        .and_then(|v| v.parse().ok())
+        .iter()
+        .find(|(k, _)| k == "partition")
+        .and_then(|(_, v)| v.parse().ok())
         .unwrap_or(0);
-    let fields: Option<Vec<String>> = params
-        .get("field")
-        .map(|f| f.split(',').map(|s| s.trim().to_string()).collect());
+
+    // Collect column projection: `column` (preferred) + `field` (deprecated alias).
+    // Both may be repeated: ?column=A&column=B selects columns A and B.
+    // Upstream router.py:1058-1059 accepts both keys.
+    let columns: Vec<String> = params
+        .iter()
+        .filter(|(k, _)| k == "column" || k == "field")
+        .map(|(_, v)| v.clone())
+        .collect();
+    let fields: Option<Vec<String>> = if columns.is_empty() {
+        None
+    } else {
+        Some(columns)
+    };
+
+    let format_param = params
+        .iter()
+        .find(|(k, _)| k == "format")
+        .map(|(_, v)| v.clone());
+    let accept = headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let media_type = tiled_serialization::negotiate_media_type(
+        format_param.as_deref(),
+        &accept,
+        tiled_core::structures::StructureFamily::Table,
+        &state.serialization_registry,
+    )
+    .unwrap_or_else(|| tiled_core::media_type::mime::ARROW_FILE.to_string());
 
     // Async A + A3: ONE spawn_blocking owns the tree walk (safe for adapters
     // that call Handle::block_on) and the Arrow IPC encode (CPU-bound).
@@ -1445,7 +1476,7 @@ pub async fn table_partition(
     let handle = tokio::runtime::Handle::current();
     let state_c = state.clone();
     let segs = segments.clone();
-    let buf = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, ServerError> {
+    let ipc_bytes = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, ServerError> {
         let adapter = core::walk_tree(state_c.root_tree.as_ref(), &segs)?;
         let table_adapter = adapter.as_table().ok_or_else(|| {
             ServerError::Validation(format!("'{}' is not a table", segs.join("/")))
@@ -1471,14 +1502,21 @@ pub async fn table_partition(
     .await
     .map_err(|e| ServerError::Internal(format!("blocking task failed: {e}")))??;
 
-    Ok((
-        [(
-            axum::http::header::CONTENT_TYPE,
-            "application/vnd.apache.arrow.file".to_string(),
-        )],
-        buf,
-    )
-        .into_response())
+    // Route the Arrow IPC bytes through the serialization registry so
+    // format negotiation applies (e.g., parquet re-encodes the IPC bytes).
+    let body = if let Some(serializer) = state
+        .serialization_registry
+        .dispatch(tiled_core::structures::StructureFamily::Table, &media_type)
+    {
+        tokio::task::spawn_blocking(move || serializer(&ipc_bytes, &serde_json::Value::Null))
+            .await
+            .map_err(|e| ServerError::Internal(format!("serialize task failed: {e}")))?
+            .map_err(|e| ServerError::Internal(e.to_string()))?
+    } else {
+        bytes::Bytes::from(ipc_bytes)
+    };
+
+    Ok(serve_with_range(&headers, &media_type, body))
 }
 
 // ---------------------------------------------------------------------------
