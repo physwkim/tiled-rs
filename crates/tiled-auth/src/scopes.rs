@@ -116,6 +116,30 @@ impl ScopeSet {
         Self([Scope::ReadMetadata, Scope::ReadData].into_iter().collect())
     }
 
+    /// Scopes granted to principals with the named role. Mirrors Python's
+    /// `create_default_roles` in `tiled/authn_database/core.py`.
+    ///
+    /// * `"user"` — all node I/O scopes plus `create:apikeys`/`revoke:apikeys`.
+    /// * `"admin"` — all scopes (equivalent to `full()`).
+    /// * any other string — empty (deny-by-default; log a warning at call site).
+    pub fn for_role(role: &str) -> Self {
+        match role {
+            "user" => Self::from_iter([
+                Scope::ReadMetadata,
+                Scope::ReadData,
+                Scope::CreateNode,
+                Scope::WriteMetadata,
+                Scope::WriteData,
+                Scope::DeleteRevision,
+                Scope::DeleteNode,
+                Scope::CreateApiKeys,
+                Scope::RevokeApiKeys,
+            ]),
+            "admin" => Self::full(),
+            _ => Self::new(),
+        }
+    }
+
     /// Parse from JSON-array text (`'["read:metadata", "read:data"]'`).
     /// Unknown scope names produce `Validation` errors so we never silently
     /// drop a misspelled scope from a CLI invocation.

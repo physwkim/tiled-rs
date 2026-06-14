@@ -13,7 +13,7 @@ use tiled_catalog::Catalog;
 use tiled_core::adapters::ContainerAdapter;
 use tiled_core::queries::Query;
 
-async fn build_test_app() -> (axum::Router, tempfile::TempDir, Catalog) {
+async fn build_test_app() -> (axum::Router, tempfile::TempDir, Catalog, AuthDb) {
     let dir = tempfile::tempdir().unwrap();
     let cat_uri = format!("sqlite://{}", dir.path().join("catalog.db").display());
     let auth_uri = format!("sqlite://{}", dir.path().join("auth.db").display());
@@ -47,7 +47,7 @@ async fn build_test_app() -> (axum::Router, tempfile::TempDir, Catalog) {
         trust_forwarded_headers: false,
         api_key: None,
         catalog: Some(catalog.clone()),
-        auth_db: Some(auth_db),
+        auth_db: Some(auth_db.clone()),
         issuer: Some(issuer),
         authenticators: vec![Arc::new(dummy)],
         proxied_header_auth: None,
@@ -62,7 +62,7 @@ async fn build_test_app() -> (axum::Router, tempfile::TempDir, Catalog) {
         spec_views: Vec::new(),
         webhook_config: None,
     };
-    (tiled_server::build_app(state), dir, catalog)
+    (tiled_server::build_app(state), dir, catalog, auth_db)
 }
 
 async fn json_request(
@@ -95,7 +95,7 @@ async fn json_request(
 
 #[tokio::test]
 async fn login_yields_jwt_then_jwt_authorizes_metadata_read() {
-    let (app, _dir, _cat) = build_test_app().await;
+    let (app, _dir, _cat, _auth_db) = build_test_app().await;
 
     // Anonymous read is rejected.
     let (status, _) = json_request(&app, Method::GET, "/api/v1/metadata/", &[], None).await;
@@ -172,7 +172,7 @@ async fn login_yields_jwt_then_jwt_authorizes_metadata_read() {
 
 #[tokio::test]
 async fn api_key_via_db_grants_scope_subset() {
-    let (app, _dir, _cat) = build_test_app().await;
+    let (app, _dir, _cat, _auth_db) = build_test_app().await;
 
     // Login → access token with full scopes.
     let (_, body) = json_request(
@@ -257,7 +257,28 @@ async fn api_key_via_db_grants_scope_subset() {
 
 #[tokio::test]
 async fn write_endpoint_demands_write_scope() {
-    let (app, _dir, _cat) = build_test_app().await;
+    let (app, _dir, _cat, auth_db) = build_test_app().await;
+
+    // First login creates alice as a 'user' role principal. We need 'register'
+    // scope for POST /register/, which is only in the admin role (Python parity:
+    // user role does not include 'register'). Upgrade alice to admin so the
+    // second login issues a token with full scopes including 'register'.
+    let (_, body) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/auth/dummy/login",
+        &[],
+        Some(json!({"username": "alice", "password": "wonderland"})),
+    )
+    .await;
+    let alice_sub = body["identity"]["id"].as_str().unwrap().to_string();
+    let (alice, _) = auth_db.ensure_principal("dummy", &alice_sub).await.unwrap();
+    auth_db
+        .update_principal_role(alice.id, "admin")
+        .await
+        .unwrap();
+
+    // Log in again so the new session reflects admin scopes (includes 'register').
     let (_, body) = json_request(
         &app,
         Method::POST,
@@ -268,7 +289,7 @@ async fn write_endpoint_demands_write_scope() {
     .await;
     let access = body["access_token"].as_str().unwrap().to_string();
 
-    // POST register with full scopes — passes.
+    // POST register with admin scopes — passes.
     let (status, _) = json_request(
         &app,
         Method::POST,

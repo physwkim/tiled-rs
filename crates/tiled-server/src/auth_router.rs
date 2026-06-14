@@ -89,10 +89,11 @@ pub async fn login(
         .await
         .map_err(map_auth_err)?;
     db.touch_identity_login(identity.id).await.ok();
-    // Login-issued scopes default to AppState::default_login_scopes so an
-    // operator can lock down what a fresh session inherits without
-    // touching every endpoint. API keys can still narrow the set.
-    let scopes = state.default_login_scopes.clone();
+    // Derive scopes from the principal's role (Python parity: create_default_roles
+    // in authn_database/core.py), then intersect with the operator cap so
+    // `default_login_scopes` can still restrict all sessions server-wide.
+    let role_scopes = tiled_auth::ScopeSet::for_role(&principal.role);
+    let scopes = role_scopes.intersect(&state.default_login_scopes);
     let session = db
         .create_session(
             principal.id,
@@ -244,7 +245,8 @@ pub async fn device_token(
                 .await
                 .map_err(map_auth_err)?
                 .ok_or_else(|| ServerError::Internal("granted principal vanished".into()))?;
-            let scopes = state.default_login_scopes.clone();
+            let role_scopes = tiled_auth::ScopeSet::for_role(&principal.role);
+            let scopes = role_scopes.intersect(&state.default_login_scopes);
             let session = db
                 .create_session(
                     principal_id,

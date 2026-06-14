@@ -19,13 +19,17 @@ async fn migrate_and_principal_lifecycle() {
     let (db, _dir) = fresh_db().await;
     assert_eq!(
         db.applied_migrations().await.unwrap(),
-        vec!["0001_initial".to_string()]
+        vec![
+            "0001_initial".to_string(),
+            "0002_add_principal_role".to_string()
+        ]
     );
 
     let (p, ident) = db.ensure_principal("dummy", "alice").await.unwrap();
     assert!(p.id > 0);
     assert_eq!(ident.provider, "dummy");
     assert_eq!(ident.sub, "alice");
+    assert_eq!(p.role, "user", "new principals default to 'user' role");
 
     // Calling again returns the same principal.
     let (p2, _) = db.ensure_principal("dummy", "alice").await.unwrap();
@@ -125,6 +129,55 @@ async fn dummy_authenticator_password_check() {
     let s = auth.authenticate("alice", "open-sesame").await.unwrap();
     assert_eq!(s.sub, "alice");
     auth.authenticate("alice", "wrong").await.unwrap_err();
+}
+
+/// Python parity: `create_default_roles` in authn_database/core.py defines
+/// the `user` and `admin` roles. Verify the Rust mapping matches.
+#[test]
+fn role_scopes_user_matches_python_defaults() {
+    let user_scopes = ScopeSet::for_role("user");
+    // Must include all Python 'user' role scopes.
+    for s in [
+        Scope::ReadMetadata,
+        Scope::ReadData,
+        Scope::CreateNode,
+        Scope::WriteMetadata,
+        Scope::WriteData,
+        Scope::DeleteRevision,
+        Scope::DeleteNode,
+        Scope::CreateApiKeys,
+        Scope::RevokeApiKeys,
+    ] {
+        assert!(user_scopes.0.contains(&s), "user role must contain {s:?}");
+    }
+    // Must NOT include admin-only scopes.
+    for s in [
+        Scope::AdminApiKeys,
+        Scope::ReadPrincipals,
+        Scope::WritePrincipals,
+        Scope::Admin,
+    ] {
+        assert!(
+            !user_scopes.0.contains(&s),
+            "user role must NOT contain {s:?}"
+        );
+    }
+}
+
+#[test]
+fn role_scopes_admin_is_full() {
+    let admin_scopes = ScopeSet::for_role("admin");
+    assert_eq!(
+        admin_scopes,
+        ScopeSet::full(),
+        "admin role must be full scopes"
+    );
+}
+
+#[test]
+fn role_scopes_unknown_is_empty() {
+    let unknown = ScopeSet::for_role("superuser");
+    assert!(unknown.0.is_empty(), "unknown role must yield empty scopes");
 }
 
 #[tokio::test]
