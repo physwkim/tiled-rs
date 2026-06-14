@@ -141,49 +141,40 @@ impl Hdf5Adapter {
             locking,
         })
     }
+}
 
-    fn read_with_slice(&self, slice: &NDSlice) -> Result<DynNDArray> {
-        let shape = &self.structure.shape;
-        // Empty arrays: surface a zero-byte buffer with the structure shape.
-        if shape.contains(&0) {
-            return Ok(DynNDArray::new(
-                Bytes::new(),
-                self.dtype.clone(),
-                shape.clone(),
-            ));
-        }
-        let file = self
-            .locking
-            .open(&self.path)
-            .map_err(|e| TiledError::Internal(format!("hdf5 reopen: {e}")))?;
-        let ds = file
-            .dataset(&self.dataset)
-            .map_err(|e| TiledError::Internal(format!("hdf5 dataset {}: {e}", self.dataset)))?;
-
-        // Scalar (zero-rank) read: bypass slice planning, call read_slice
-        // with empty offsets/counts so rust-hdf5 reads the single element.
-        // The promoted shape stays [1] for the result.
-        if self.scalar_promoted {
-            let (raw, _dtype) = read_native(&ds, self.dtype.element_size(), &[], &[])?;
-            return Ok(DynNDArray::new(
-                Bytes::from(raw),
-                self.dtype.clone(),
-                vec![1],
-            ));
-        }
-
-        let plan = SlicePlan::from_ndslice(slice, shape)?;
-        let (raw, _dtype) =
-            read_native(&ds, self.dtype.element_size(), &plan.offsets, &plan.counts)?;
-        // Apply striding + integer-index dim reduction in Rust where the
-        // HDF5 layer can't (stride>1, Index() collapse).
-        let (final_bytes, final_shape) = postprocess(raw, &plan, self.dtype.element_size());
-        Ok(DynNDArray::new(
-            Bytes::from(final_bytes),
-            self.dtype.clone(),
-            final_shape,
-        ))
+fn read_hdf5_slice(
+    path: std::path::PathBuf,
+    dataset: String,
+    dtype: BuiltinDType,
+    shape: Vec<usize>,
+    scalar_promoted: bool,
+    locking: Hdf5Locking,
+    slice: NDSlice,
+) -> Result<DynNDArray> {
+    if shape.contains(&0) {
+        return Ok(DynNDArray::new(Bytes::new(), dtype, shape));
     }
+    let file = locking
+        .open(&path)
+        .map_err(|e| TiledError::Internal(format!("hdf5 reopen: {e}")))?;
+    let ds = file
+        .dataset(&dataset)
+        .map_err(|e| TiledError::Internal(format!("hdf5 dataset {dataset}: {e}")))?;
+
+    if scalar_promoted {
+        let (raw, _) = read_native(&ds, dtype.element_size(), &[], &[])?;
+        return Ok(DynNDArray::new(Bytes::from(raw), dtype, vec![1]));
+    }
+
+    let plan = SlicePlan::from_ndslice(&slice, &shape)?;
+    let (raw, _) = read_native(&ds, dtype.element_size(), &plan.offsets, &plan.counts)?;
+    let (final_bytes, final_shape) = postprocess(raw, &plan, dtype.element_size());
+    Ok(DynNDArray::new(
+        Bytes::from(final_bytes),
+        dtype,
+        final_shape,
+    ))
 }
 
 /// Computed hyperslab + post-processing instructions for a slice read.
@@ -422,13 +413,34 @@ impl ArrayAdapterRead for Hdf5Adapter {
         &self.structure
     }
     fn read<'a>(&'a self, slice: &'a NDSlice) -> BoxFuture<'a, Result<DynNDArray>> {
-        Box::pin(async move { self.read_with_slice(slice) })
+        let path = self.path.clone();
+        let dataset = self.dataset.clone();
+        let dtype = self.dtype.clone();
+        let shape = self.structure.shape.clone();
+        let scalar_promoted = self.scalar_promoted;
+        let locking = self.locking;
+        let slice = slice.clone();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || {
+                read_hdf5_slice(path, dataset, dtype, shape, scalar_promoted, locking, slice)
+            })
+            .await
+            .map_err(|e| TiledError::Internal(format!("hdf5 spawn: {e}")))?
+        })
     }
     fn read_block<'a>(
         &'a self,
         block: &'a [usize],
         slice: &'a NDSlice,
     ) -> BoxFuture<'a, Result<DynNDArray>> {
+        let path = self.path.clone();
+        let dataset = self.dataset.clone();
+        let dtype = self.dtype.clone();
+        let shape = self.structure.shape.clone();
+        let scalar_promoted = self.scalar_promoted;
+        let locking = self.locking;
+        let slice = slice.clone();
+        let block = block.to_vec();
         Box::pin(async move {
             for (axis, &b) in block.iter().enumerate() {
                 if b != 0 {
@@ -437,7 +449,11 @@ impl ArrayAdapterRead for Hdf5Adapter {
                     )));
                 }
             }
-            self.read_with_slice(slice)
+            tokio::task::spawn_blocking(move || {
+                read_hdf5_slice(path, dataset, dtype, shape, scalar_promoted, locking, slice)
+            })
+            .await
+            .map_err(|e| TiledError::Internal(format!("hdf5 spawn: {e}")))?
         })
     }
 }
