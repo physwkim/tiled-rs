@@ -347,8 +347,8 @@ async fn api_keys_revoke(
         .list_api_keys(Some(session.principal.id))
         .await
         .unwrap_or_default();
-    let allowed =
-        owned.iter().any(|k| k.first_eight == first_eight) || session.scopes.contains(Scope::Admin);
+    let is_admin = session.scopes.contains(Scope::AdminApiKeys);
+    let allowed = owned.iter().any(|k| k.first_eight == first_eight) || is_admin;
     if !allowed {
         return render_api_keys(
             &state,
@@ -358,7 +358,12 @@ async fn api_keys_revoke(
         )
         .await;
     }
-    if let Err(e) = db.revoke_api_key(&first_eight).await {
+    let caller_id = if is_admin {
+        None
+    } else {
+        Some(session.principal.id)
+    };
+    if let Err(e) = db.revoke_api_key(&first_eight, caller_id).await {
         return render_api_keys(&state, &session, Some(format!("revoke: {e}")), None).await;
     }
     render_api_keys(

@@ -395,15 +395,16 @@ pub async fn api_key_revoke(
         .list_api_keys(Some(principal.id))
         .await
         .map_err(map_auth_err)?;
-    let allowed = candidates.iter().any(|k| k.first_eight == first_eight)
-        || auth.scopes.contains(tiled_auth::Scope::Admin);
+    let is_admin = auth.scopes.contains(tiled_auth::Scope::AdminApiKeys);
+    let allowed = candidates.iter().any(|k| k.first_eight == first_eight) || is_admin;
     if !allowed {
         return Err(ServerError::Forbidden(
             "api key does not belong to this principal".into(),
         ));
     }
+    let caller_id = if is_admin { None } else { Some(principal.id) };
     let _ = db
-        .revoke_api_key(&first_eight)
+        .revoke_api_key(&first_eight, caller_id)
         .await
         .map_err(map_auth_err)?;
     Ok(StatusCode::NO_CONTENT)

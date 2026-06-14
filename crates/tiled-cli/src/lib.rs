@@ -366,32 +366,32 @@ pub async fn run(command: Command) -> Result<()> {
                 }
             };
 
-            let root_tree: Arc<dyn tiled_core::adapters::ContainerAdapter> =
-                if let Some(ref uri) = resolved_mongo_uri {
-                    tracing::info!("Connecting to MongoDB: {}", redact_mongo_uri(uri));
-                    let catalog = tiled_mongo::MongoCatalog::from_uri(uri)
-                        .map_err(|e| anyhow::anyhow!("MongoDB connection failed: {e}"))?;
-                    tracing::info!("MongoDB catalog loaded ({} runs)", catalog.len());
-                    Arc::new(catalog)
-                } else if let Some(ref cat) = catalog_handle {
-                    // Wire the file-format adapters so leaves backed by
-                    // CSV / NPY / TIFF / HDF5 / PNG / JPEG / Parquet
-                    // resolve to the right adapter. The allow-list is
-                    // empty by default — set --allowed-data-dir to lock
-                    // server reads down to specific directories.
-                    let resolver: Arc<dyn tiled_catalog::adapter::LeafResolver> =
-                        Arc::new(tiled_server::file_resolver::FileLeafResolver::new(
-                            allowed_data_dirs.clone(),
-                        ));
-                    Arc::new(tiled_catalog::CatalogAdapter::root(cat.clone(), resolver))
-                } else if demo {
-                    tracing::info!("Starting with demo dataset");
-                    Arc::new(build_demo_tree())
-                } else {
-                    anyhow::bail!(
-                        "Specify --demo, --mongo-uri, --catalog-uri, or --config to start the server"
-                    );
-                };
+            let root_tree: Arc<dyn tiled_core::adapters::ContainerAdapter> = if let Some(ref uri) =
+                resolved_mongo_uri
+            {
+                tracing::info!("Connecting to MongoDB: {}", redact_mongo_uri(uri));
+                let catalog = tiled_mongo::MongoCatalog::from_uri(uri)
+                    .map_err(|e| anyhow::anyhow!("MongoDB connection failed: {e}"))?;
+                tracing::info!("MongoDB catalog loaded ({} runs)", catalog.len());
+                Arc::new(catalog)
+            } else if let Some(ref cat) = catalog_handle {
+                // Wire the file-format adapters so leaves backed by
+                // CSV / NPY / TIFF / HDF5 / PNG / JPEG / Parquet
+                // resolve to the right adapter. The allow-list is
+                // empty by default — set --allowed-data-dir to lock
+                // server reads down to specific directories.
+                let resolver: Arc<dyn tiled_catalog::adapter::LeafResolver> = Arc::new(
+                    tiled_server::file_resolver::FileLeafResolver::new(allowed_data_dirs.clone()),
+                );
+                Arc::new(tiled_catalog::CatalogAdapter::root(cat.clone(), resolver))
+            } else if demo {
+                tracing::info!("Starting with demo dataset");
+                Arc::new(build_demo_tree())
+            } else {
+                anyhow::bail!(
+                    "Specify --demo, --mongo-uri, --catalog-uri, or --config to start the server"
+                );
+            };
 
             let registry = Arc::new(tiled_serialization::default_registry());
 
@@ -451,32 +451,32 @@ pub async fn run(command: Command) -> Result<()> {
                 authenticators: authenticators_built,
                 proxied_header_auth: proxied_auth,
                 external_oidc: None,
-        forwarded_allow_ips: None,
-        max_request_body_bytes: 10 * 1024 * 1024,
-        streaming_bus: tiled_server::streaming::StreamingBus::new(),
-        access_policy: None,
-        default_login_scopes: tiled_auth::ScopeSet::full(),
-        enable_web: !no_web,
-        web_assets_dir,
-        spec_views: file_config
-            .as_ref()
-            .and_then(|c| c.web.as_ref())
-            .map(|w| {
-                w.spec_views
-                    .iter()
-                    .map(|s| tiled_server::state::SpecViewEntry {
-                        spec: s.spec.clone(),
-                        url: s.url.clone(),
-                        label: s.label.clone(),
+                forwarded_allow_ips: None,
+                max_request_body_bytes: 10 * 1024 * 1024,
+                streaming_bus: tiled_server::streaming::StreamingBus::new(),
+                access_policy: None,
+                default_login_scopes: tiled_auth::ScopeSet::full(),
+                enable_web: !no_web,
+                web_assets_dir,
+                spec_views: file_config
+                    .as_ref()
+                    .and_then(|c| c.web.as_ref())
+                    .map(|w| {
+                        w.spec_views
+                            .iter()
+                            .map(|s| tiled_server::state::SpecViewEntry {
+                                spec: s.spec.clone(),
+                                url: s.url.clone(),
+                                label: s.label.clone(),
+                            })
+                            .collect()
                     })
-                    .collect()
-            })
-            .unwrap_or_default(),
-        // Enable the webhook subsystem when a catalog is configured —
-        // webhooks need a DB to persist registrations and deliveries.
-        // Move catalog_handle's presence check before AppState consumes
-        // it; otherwise the borrow-after-move check fires.
-        webhook_config: webhook_config_value,
+                    .unwrap_or_default(),
+                // Enable the webhook subsystem when a catalog is configured —
+                // webhooks need a DB to persist registrations and deliveries.
+                // Move catalog_handle's presence check before AppState consumes
+                // it; otherwise the borrow-after-move check fires.
+                webhook_config: webhook_config_value,
             };
 
             let app = tiled_server::build_app(state);
@@ -561,9 +561,7 @@ pub async fn run(command: Command) -> Result<()> {
                     }
                     set
                 };
-                let exp = expires_in.map(|s| {
-                    chrono::Utc::now() + chrono::Duration::seconds(s)
-                });
+                let exp = expires_in.map(|s| chrono::Utc::now() + chrono::Duration::seconds(s));
                 let material = db
                     .create_api_key(tiled_auth::ApiKeyCreate {
                         principal_id,
@@ -644,10 +642,13 @@ pub async fn run(command: Command) -> Result<()> {
                     .await
                     .map_err(|e| anyhow::anyhow!("auth migrate: {e}"))?;
                 let removed = db
-                    .revoke_api_key(&first_eight)
+                    .revoke_api_key(&first_eight, None)
                     .await
                     .map_err(|e| anyhow::anyhow!("revoke: {e}"))?;
-                println!("revoked api key {} (id={})", removed.first_eight, removed.id);
+                println!(
+                    "revoked api key {} (id={})",
+                    removed.first_eight, removed.id
+                );
                 Ok(())
             }
         },
@@ -676,9 +677,8 @@ async fn build_auth_state(
             "--user / --proxied-auth-header require --auth-db-uri so the server can persist sessions"
         )
     })?;
-    let secret_str = jwt_secret.ok_or_else(|| {
-        anyhow::anyhow!("--auth-db-uri requires --jwt-secret (>= 16 bytes)")
-    })?;
+    let secret_str = jwt_secret
+        .ok_or_else(|| anyhow::anyhow!("--auth-db-uri requires --jwt-secret (>= 16 bytes)"))?;
     let issuer = tiled_auth::Issuer::new(secret_str.as_bytes())
         .map_err(|e| anyhow::anyhow!("jwt secret: {e}"))?;
     let db = tiled_auth::AuthDb::connect(auth_uri)
@@ -691,9 +691,9 @@ async fn build_auth_state(
     let mut dummy = tiled_auth::DummyAuthenticator::new(provider_name);
     let mut total = 0;
     for entry in users {
-        let (name, secret) = entry.split_once(':').ok_or_else(|| {
-            anyhow::anyhow!("--user expects 'name:password', got '{entry}'")
-        })?;
+        let (name, secret) = entry
+            .split_once(':')
+            .ok_or_else(|| anyhow::anyhow!("--user expects 'name:password', got '{entry}'"))?;
         dummy
             .add_user(name, secret)
             .map_err(|e| anyhow::anyhow!("add user {name}: {e}"))?;
