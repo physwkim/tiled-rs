@@ -877,20 +877,17 @@ async fn get_with_headers(
 /// `negotiate_media_type`, which resolves it before consulting Accept.
 ///
 /// This test sends `Accept: application/octet-stream` (the default) alongside
-/// `?format=text/csv`.  The format param must win → response Content-Type must
-/// be text/csv and the body must be CSV-shaped.
-///
-/// Note: the shorthand `?format=csv` does NOT work because `SerializationRegistry`
-/// has no `.csv` / `csv` alias registered for arrays (only `tiled_core::media_type::
-/// resolve_alias` knows it, but that function is not called by `negotiate_media_type`).
-/// This is tracked under UNFIXED in the test-hardening report.
+/// `?format=csv` (bare extension shorthand).  The format param must win →
+/// response Content-Type must be text/csv and the body must be CSV-shaped.
+/// The shorthand resolves via `tiled_core::media_type::resolve_alias` (step 3
+/// in negotiate_media_type), which maps "csv" → "text/csv".
 #[tokio::test]
 async fn array_full_format_param_beats_accept_header() {
     let app = build_app();
-    // Accept says raw bytes; format param says CSV — format param must win.
+    // Accept says raw bytes; bare-extension format param says CSV — format param must win.
     let (status, headers, body) = get_with_headers(
         &app,
-        "/api/v1/array/full/some_array?format=text/csv",
+        "/api/v1/array/full/some_array?format=csv",
         &[("accept", "application/octet-stream")],
     )
     .await;

@@ -126,10 +126,18 @@ impl Default for SerializationRegistry {
 /// Resolve the appropriate media type, honoring an explicit `?format=` query
 /// param before falling back to the Accept header.
 ///
-/// Tries `format_param` as a registered alias (with and without a leading
-/// dot so bare extensions like `"png"` and dotted forms like `".png"` both
-/// work), then as a verbatim media-type string (e.g. `"image/png"`). Falls
-/// back to [`resolve_media_type`] when no match is found.
+/// Resolution order for `format_param`:
+///  1. Verbatim full MIME type (e.g. `"text/csv"`) — accepted only when a
+///     serializer is registered for this `family`.
+///  2. Registry alias table — bare extensions and dotted forms
+///     (e.g. `"png"` / `".png"`) registered via [`SerializationRegistry::register_alias`].
+///     No family check here; the router may handle some formats (e.g. `application/zip`)
+///     outside the serializer registry.
+///  3. [`tiled_core::media_type::resolve_alias`] — for bare extensions known to
+///     the core alias table but not explicitly registered in this registry instance
+///     (e.g. `"csv"` → `"text/csv"`). Accepted only when a serializer is registered
+///     for this `family`.
+///  4. Fall back to the `Accept` header via [`resolve_media_type`].
 pub fn negotiate_media_type(
     format_param: Option<&str>,
     accept: &str,
@@ -137,6 +145,12 @@ pub fn negotiate_media_type(
     registry: &SerializationRegistry,
 ) -> Option<String> {
     if let Some(fmt) = format_param {
+        // (1) Verbatim full MIME type — only accepted if a serializer for this family exists.
+        if fmt.contains('/') && registry.dispatch(family, fmt).is_some() {
+            return Some(fmt.to_string());
+        }
+
+        // (2) Registry alias table — bare or dotted extension.
         if let Some(mt) = registry.resolve_alias(fmt) {
             return Some(mt);
         }
@@ -145,11 +159,14 @@ pub fn negotiate_media_type(
         {
             return Some(mt);
         }
-        if fmt.contains('/') {
-            let available = registry.media_types(family);
-            if available.iter().any(|m| m == fmt) {
-                return Some(fmt.to_string());
-            }
+
+        // (3) Core alias table — handles extensions not explicitly registered in the
+        // registry (e.g. "csv" → "text/csv"). Only accepted when a serializer is
+        // registered for this family.
+        if let Some(mt) = tiled_core::media_type::resolve_alias(fmt)
+            && registry.dispatch(family, mt).is_some()
+        {
+            return Some(mt.to_string());
         }
     }
     resolve_media_type(accept, family, registry)
