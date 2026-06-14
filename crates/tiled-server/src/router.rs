@@ -25,22 +25,114 @@ fn segments_from_uri(uri: &axum::http::Uri, prefix: &str) -> Vec<String> {
     PathSegments::from_raw_path(uri.path(), prefix).0
 }
 
-/// Run `walk_tree` on the blocking pool for its side effect of warming any
-/// lazy adapter caches (e.g. `tiled_mongo::MongoCatalog::load_runs`). The
-/// caller can then do the real walk synchronously in async context — by
-/// then `OnceLock`-cached children are present and `get()` is O(1).
+/// Walk `segments` through the catalog (when present) or the in-memory
+/// tree, apply the per-node access policy at each level, and verify the
+/// caller's narrowed scopes include `required_scope`.
 ///
-/// Returns the same path-not-found error the caller would see from a
-/// direct walk, so handlers can `?` it before re-walking.
-async fn pre_warm_walk(state: &AppState, segments: &[String]) -> Result<(), ServerError> {
-    let state = state.clone();
-    let segments = segments.to_vec();
-    tokio::task::spawn_blocking(move || -> Result<(), ServerError> {
-        let _ = core::walk_tree(state.root_tree.as_ref(), &segments)?;
-        Ok(())
-    })
+/// 404 when the path is missing OR when the policy narrows the caller to
+/// no `ReadMetadata` at any level (Python SecureEntry: "if you can't read
+/// metadata the node doesn't exist for you").
+/// 403 when the final narrowed context lacks `required_scope`.
+/// Returns the final narrowed [`AuthContext`].
+async fn resolve_entry(
+    state: &AppState,
+    auth: crate::AuthContext,
+    segments: &[String],
+    required_scope: tiled_auth::Scope,
+) -> Result<crate::AuthContext, ServerError> {
+    if segments.is_empty() {
+        auth.require(required_scope)?;
+        return Ok(auth);
+    }
+    let narrowed = if state.catalog.is_some() {
+        resolve_entry_catalog(state, auth, segments).await?
+    } else {
+        resolve_entry_tree(state, auth, segments).await?
+    };
+    narrowed.require(required_scope)?;
+    Ok(narrowed)
+}
+
+/// Catalog-backed path: call `catalog.lookup` for each prefix of `segments`,
+/// narrow auth at each level (404 when the narrowed scopes lose ReadMetadata).
+async fn resolve_entry_catalog(
+    state: &AppState,
+    mut auth: crate::AuthContext,
+    segments: &[String],
+) -> Result<crate::AuthContext, ServerError> {
+    let catalog = state
+        .catalog
+        .as_ref()
+        .expect("resolve_entry_catalog requires catalog");
+    for i in 0..segments.len() {
+        let prefix = &segments[..=i];
+        let node = catalog
+            .lookup(prefix)
+            .await
+            .map_err(map_catalog_err)?
+            .ok_or_else(|| ServerError::NotFound(format!("'{}' not found", segments.join("/"))))?;
+        auth = auth
+            .narrow_for_node(
+                state.access_policy.as_deref(),
+                tiled_access::NodeContext {
+                    path: prefix,
+                    structure_family: &node.structure_family,
+                    metadata: &node.metadata,
+                    access_blob: &node.access_blob,
+                },
+            )
+            .await;
+        if !auth.scopes.contains(tiled_auth::Scope::ReadMetadata) {
+            return Err(ServerError::NotFound(format!(
+                "'{}' not found",
+                segments.join("/")
+            )));
+        }
+    }
+    Ok(auth)
+}
+
+/// In-memory tree path: verify existence in `spawn_blocking` (adapters may
+/// call `Handle::block_on` internally), then narrow at the terminal node with
+/// empty access_blob (in-memory adapters carry no per-node blob).
+async fn resolve_entry_tree(
+    state: &AppState,
+    auth: crate::AuthContext,
+    segments: &[String],
+) -> Result<crate::AuthContext, ServerError> {
+    let state_c = state.clone();
+    let segs = segments.to_vec();
+    let (sf, metadata) = tokio::task::spawn_blocking(
+        move || -> Result<(String, serde_json::Value), ServerError> {
+            let adapter = core::walk_tree(state_c.root_tree.as_ref(), &segs)?;
+            Ok((
+                adapter.structure_family().to_string(),
+                adapter.metadata().clone(),
+            ))
+        },
+    )
     .await
-    .map_err(|e| ServerError::Internal(format!("blocking walk: {e}")))?
+    .map_err(|e| ServerError::Internal(format!("blocking task: {e}")))??;
+
+    let access_blob = serde_json::Value::Object(Default::default());
+    let narrowed = auth
+        .narrow_for_node(
+            state.access_policy.as_deref(),
+            tiled_access::NodeContext {
+                path: segments,
+                structure_family: &sf,
+                metadata: &metadata,
+                access_blob: &access_blob,
+            },
+        )
+        .await;
+    if !narrowed.scopes.contains(tiled_auth::Scope::ReadMetadata) {
+        return Err(ServerError::NotFound(format!(
+            "'{}' not found",
+            segments.join("/")
+        )));
+    }
+    Ok(narrowed)
 }
 
 // ---------------------------------------------------------------------------
@@ -144,6 +236,16 @@ pub async fn metadata(
     // segment rather than being split apart by axum's `Path<String>` (which
     // percent-decodes before splitting).
     let segments = segments_from_uri(&uri, "/api/v1/metadata/");
+    // H2: per-node access policy check at each path segment.
+    if !segments.is_empty() {
+        let _ = resolve_entry(
+            &state,
+            auth.clone(),
+            &segments,
+            tiled_auth::Scope::ReadMetadata,
+        )
+        .await?;
+    }
     // When a SQL catalog is wired, read directly through it: the
     // CatalogAdapter caches children eagerly to satisfy the sync trait,
     // and PATCH/DELETE write past that cache, so a same-request read after
@@ -362,64 +464,76 @@ pub async fn array_block(
 ) -> Result<impl IntoResponse, ServerError> {
     auth.require(tiled_auth::Scope::ReadData)?;
     let segments = segments_from_uri(&uri, "/api/v1/array/block/");
-    pre_warm_walk(&state, &segments).await?;
+    // H2: per-node policy check.
+    let _ = resolve_entry(&state, auth.clone(), &segments, tiled_auth::Scope::ReadData).await?;
 
-    let adapter = core::walk_tree(state.root_tree.as_ref(), &segments)?;
-    let array_adapter = match adapter {
-        AnyAdapter::Array(a) => a.as_ref(),
-        _ => {
-            return Err(ServerError::Validation(format!(
-                "'{}' is not an array",
-                segments.join("/")
-            )));
-        }
-    };
-
-    let block_str = params.get("block").map(|s| s.as_str()).unwrap_or("");
-    let block_specs: Vec<BlockSpec> = if block_str.is_empty() {
-        vec![BlockSpec::Single(0); array_adapter.structure().ndim()]
-    } else {
-        block_str
-            .split(',')
-            .map(|s| BlockSpec::parse(s.trim()))
-            .collect::<Result<Vec<_>, _>>()?
-    };
-
-    // Honor the `slice` query parameter (numpy-style). Empty / missing →
-    // full block.
-    let slice = match params.get("slice").map(|s| s.as_str()) {
-        None | Some("") => tiled_core::ndslice::NDSlice::empty(),
-        Some(s) => tiled_core::ndslice::NDSlice::from_numpy_str(s)
-            .map_err(|e| ServerError::Validation(format!("Invalid slice '{s}': {e}")))?,
-    };
-    // Single-chunk fast path = every axis is BlockSpec::Single. Mirrors
-    // pre-#1302 behaviour exactly so existing callers see no change.
-    let single_chunk: Option<Vec<usize>> = block_specs
-        .iter()
-        .map(|s| match s {
-            BlockSpec::Single(i) => Some(*i),
-            BlockSpec::Range(_, _) => None,
-        })
-        .collect();
-    let data = if let Some(block) = single_chunk {
-        array_adapter
-            .read_block(&block, &slice)
-            .await
-            .map_err(ServerError::from)?
-    } else {
-        // Multi-chunk read — upstream tiled PR #1302. Slicing within a
-        // multi-chunk block requires applying the slice to the
-        // assembled buffer; restrict to "no slice" for the first port
-        // and surface a clear 422 if both are combined. Slice across a
-        // chunk range is a follow-up (needs a contiguous-buffer
-        // apply_slice helper).
-        if !slice.is_empty() {
-            return Err(ServerError::Validation(
-                "?slice= combined with a multi-chunk ?block= range is not yet supported".into(),
-            ));
-        }
-        read_block_range(array_adapter, &block_specs).await?
-    };
+    // Async A: ONE spawn_blocking owns the tree walk AND all reads so adapters
+    // that call Handle::block_on internally (CatalogAdapter, FileLeafResolver)
+    // are always on the blocking pool, never on an async worker thread.
+    let block_str = params
+        .get("block")
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+    let slice_str = params
+        .get("slice")
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+    let handle = tokio::runtime::Handle::current();
+    let state_c = state.clone();
+    let segs = segments.clone();
+    let data = tokio::task::spawn_blocking(
+        move || -> Result<tiled_core::dtype::DynNDArray, ServerError> {
+            let adapter = core::walk_tree(state_c.root_tree.as_ref(), &segs)?;
+            let array_adapter = adapter.as_array().ok_or_else(|| {
+                ServerError::Validation(format!("'{}' is not an array", segs.join("/")))
+            })?;
+            let block_specs: Vec<BlockSpec> = if block_str.is_empty() {
+                vec![BlockSpec::Single(0); array_adapter.structure().ndim()]
+            } else {
+                block_str
+                    .split(',')
+                    .map(|s| BlockSpec::parse(s.trim()))
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+            // Honor the `slice` query parameter (numpy-style). Empty / missing →
+            // full block.
+            let slice = match slice_str.as_str() {
+                "" => tiled_core::ndslice::NDSlice::empty(),
+                s => tiled_core::ndslice::NDSlice::from_numpy_str(s)
+                    .map_err(|e| ServerError::Validation(format!("Invalid slice '{s}': {e}")))?,
+            };
+            // Single-chunk fast path = every axis is BlockSpec::Single. Mirrors
+            // pre-#1302 behaviour exactly so existing callers see no change.
+            let single_chunk: Option<Vec<usize>> = block_specs
+                .iter()
+                .map(|s| match s {
+                    BlockSpec::Single(i) => Some(*i),
+                    BlockSpec::Range(_, _) => None,
+                })
+                .collect();
+            if let Some(block) = single_chunk {
+                handle
+                    .block_on(array_adapter.read_block(&block, &slice))
+                    .map_err(ServerError::from)
+            } else {
+                // Multi-chunk read — upstream tiled PR #1302. Slicing within a
+                // multi-chunk block requires applying the slice to the
+                // assembled buffer; restrict to "no slice" for the first port
+                // and surface a clear 422 if both are combined. Slice across a
+                // chunk range is a follow-up (needs a contiguous-buffer
+                // apply_slice helper).
+                if !slice.is_empty() {
+                    return Err(ServerError::Validation(
+                        "?slice= combined with a multi-chunk ?block= range is not yet supported"
+                            .into(),
+                    ));
+                }
+                handle.block_on(read_block_range(array_adapter, &block_specs))
+            }
+        },
+    )
+    .await
+    .map_err(|e| ServerError::Internal(format!("blocking task failed: {e}")))??;
 
     let accept = headers
         .get("accept")
@@ -571,82 +685,82 @@ pub async fn array_append(
 ) -> Result<impl IntoResponse, ServerError> {
     auth.require(tiled_auth::Scope::WriteData)?;
     let segments = segments_from_uri(&uri, "/api/v1/array/full/");
-    pre_warm_walk(&state, &segments).await?;
-
-    let adapter = core::walk_tree(state.root_tree.as_ref(), &segments)?;
-    let array_adapter = match adapter {
-        AnyAdapter::Array(a) => a.as_ref(),
-        _ => {
-            return Err(ServerError::Validation(format!(
-                "'{}' is not an array",
-                segments.join("/")
-            )));
-        }
-    };
-    let writable = array_adapter.as_writable().ok_or_else(|| {
-        ServerError::Validation(
-            "this array adapter does not support append; only adapters whose \
-             underlying store can grow (zarr, ND-streaming) implement it"
-                .into(),
-        )
-    })?;
 
     let append_along: usize = params
         .get("append_along")
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
-    let structure = array_adapter.structure();
-    if append_along >= structure.shape.len() {
-        return Err(ServerError::Validation(format!(
-            "append_along={append_along} out of range (ndim={})",
-            structure.shape.len()
-        )));
-    }
 
-    // Construct a DynNDArray view over the request body. Shape is the
-    // existing structure's shape with `shape[append_along]` swapped for
-    // the inferred number of new elements (body bytes / element size /
-    // product of remaining dims).
-    let elem_size = match &structure.data_type {
-        tiled_core::dtype::DType::Builtin(b) => b.element_size(),
-        _ => {
+    // Async A: ONE spawn_blocking owns the tree walk AND the async write so
+    // adapters that call Handle::block_on internally never run on an async
+    // worker thread. The async write is driven via handle.block_on().
+    let handle = tokio::runtime::Handle::current();
+    let state_c = state.clone();
+    let segs = segments.clone();
+    let new_axis_len = tokio::task::spawn_blocking(move || -> Result<usize, ServerError> {
+        let adapter = core::walk_tree(state_c.root_tree.as_ref(), &segs)?;
+        let array_adapter = adapter.as_array().ok_or_else(|| {
+            ServerError::Validation(format!("'{}' is not an array", segs.join("/")))
+        })?;
+        let writable = array_adapter.as_writable().ok_or_else(|| {
+            ServerError::Validation(
+                "this array adapter does not support append; only adapters whose \
+                     underlying store can grow (zarr, ND-streaming) implement it"
+                    .into(),
+            )
+        })?;
+        let structure = array_adapter.structure();
+        if append_along >= structure.shape.len() {
+            return Err(ServerError::Validation(format!(
+                "append_along={append_along} out of range (ndim={})",
+                structure.shape.len()
+            )));
+        }
+        // Construct a DynNDArray view over the request body. Shape is the
+        // existing structure's shape with `shape[append_along]` swapped for
+        // the inferred number of new elements (body bytes / element size /
+        // product of remaining dims).
+        let elem_size = match &structure.data_type {
+            tiled_core::dtype::DType::Builtin(b) => b.element_size(),
+            _ => {
+                return Err(ServerError::Validation(
+                    "append: only Builtin dtypes are supported".into(),
+                ));
+            }
+        };
+        let mut new_shape = structure.shape.clone();
+        let other_axes: usize = structure
+            .shape
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != append_along)
+            .map(|(_, d)| *d)
+            .product();
+        if elem_size == 0 || other_axes == 0 {
             return Err(ServerError::Validation(
-                "append: only Builtin dtypes are supported".into(),
+                "append: structure has zero-element-size or zero-area cross-section".into(),
             ));
         }
-    };
-    let mut new_shape = structure.shape.clone();
-    let other_axes: usize = structure
-        .shape
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| *i != append_along)
-        .map(|(_, d)| *d)
-        .product();
-    if elem_size == 0 || other_axes == 0 {
-        return Err(ServerError::Validation(
-            "append: structure has zero-element-size or zero-area cross-section".into(),
-        ));
-    }
-    let row_bytes = other_axes * elem_size;
-    if !body.len().is_multiple_of(row_bytes) {
-        return Err(ServerError::Validation(format!(
-            "append: body length {} is not a multiple of cross-section bytes {row_bytes}",
-            body.len()
-        )));
-    }
-    let added_along_axis = body.len() / row_bytes;
-    new_shape[append_along] = added_along_axis;
-    let dtype = match &structure.data_type {
-        tiled_core::dtype::DType::Builtin(b) => b.clone(),
-        _ => unreachable!("checked above"),
-    };
-    let payload = tiled_core::dtype::DynNDArray::new(body, dtype, new_shape);
-
-    let new_axis_len = writable
-        .append(payload, append_along)
-        .await
-        .map_err(ServerError::from)?;
+        let row_bytes = other_axes * elem_size;
+        if !body.len().is_multiple_of(row_bytes) {
+            return Err(ServerError::Validation(format!(
+                "append: body length {} is not a multiple of cross-section bytes {row_bytes}",
+                body.len()
+            )));
+        }
+        let added_along_axis = body.len() / row_bytes;
+        new_shape[append_along] = added_along_axis;
+        let dtype = match &structure.data_type {
+            tiled_core::dtype::DType::Builtin(b) => b.clone(),
+            _ => unreachable!("checked above"),
+        };
+        let payload = tiled_core::dtype::DynNDArray::new(body, dtype, new_shape);
+        handle
+            .block_on(writable.append(payload, append_along))
+            .map_err(ServerError::from)
+    })
+    .await
+    .map_err(|e| ServerError::Internal(format!("blocking task failed: {e}")))??;
 
     let path = segments.join("/");
     state.streaming_bus.publish(
@@ -775,53 +889,123 @@ pub async fn container_full(
 ) -> Result<impl IntoResponse, ServerError> {
     auth.require(tiled_auth::Scope::ReadData)?;
     let segments = segments_from_uri(&uri, "/api/v1/container/full/");
-    // walk_tree NotFound's on empty segments by design; pre_warm_walk
-    // proxies that. Skip both for the root export and use root_tree
-    // directly as the container.
-    let container: &dyn ContainerAdapter = if segments.is_empty() {
-        state.root_tree.as_ref()
-    } else {
-        pre_warm_walk(&state, &segments).await?;
-        let adapter = core::walk_tree(state.root_tree.as_ref(), &segments)?;
-        adapter.as_container().ok_or_else(|| {
-            ServerError::Validation(format!("'{}' is not a container", segments.join("/")))
-        })?
-    };
-
-    // Build the same Vec<Resource> shape /search emits — that's what
-    // the registered container serializers (html, json-seq) consume.
-    let path = segments.join("/");
-    let children: Vec<tiled_core::schemas::Resource> = container
-        .keys()
-        .iter()
-        .filter_map(|k| {
-            container.get(k).map(|child| {
-                let child_path = if path.is_empty() {
-                    k.clone()
-                } else {
-                    format!("{path}/{k}")
-                };
-                core::construct_resource(child, k, &child_path, &base_url)
-            })
-        })
-        .collect();
-    let body_json =
-        serde_json::to_vec(&children).map_err(|e| ServerError::Internal(format!("encode: {e}")))?;
+    // H2: per-node policy check.
+    if !segments.is_empty() {
+        let _ = resolve_entry(&state, auth.clone(), &segments, tiled_auth::Scope::ReadData).await?;
+    }
 
     let accept = headers
         .get("accept")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/json");
+    let path = segments.join("/");
 
-    // Deep-export branch (upstream tiled #660): when the caller asks
-    // for `application/zip`, walk every leaf in the subtree and zip
-    // their per-format bytes together. Other Accept values still go
-    // through the existing container-serializer dispatch (HTML index,
-    // json-seq listing).
+    // H3: compute access filter once (async) so it can be pushed into the
+    // listing inside spawn_blocking.
+    let access_filter = if let Some(ref policy) = state.access_policy {
+        policy
+            .list_filter(auth.principal.as_deref(), &auth.scopes)
+            .await
+    } else {
+        None
+    };
+
+    // Async A: ONE spawn_blocking owns the tree walk AND all container
+    // method calls (keys/get). Adapters that call Handle::block_on
+    // internally are safe only on the blocking pool.
+    let root_arc = state.root_tree.clone();
+    let segs = segments.clone();
+    let path_c = path.clone();
+    let base_url_c = base_url.clone();
+    let filter_c = access_filter.clone();
+
+    // Deep-export branch (upstream tiled #660): build the zip entirely
+    // inside one spawn_blocking using Handle::block_on for async reads.
     if accept.contains("application/zip") {
-        let bytes = export_container_as_zip(container, &path).await?;
+        let handle = tokio::runtime::Handle::current();
+        let bytes = tokio::task::spawn_blocking(move || -> Result<bytes::Bytes, ServerError> {
+            let container: &dyn ContainerAdapter = if segs.is_empty() {
+                root_arc.as_ref()
+            } else {
+                core::walk_tree(root_arc.as_ref(), &segs)?
+                    .as_container()
+                    .ok_or_else(|| {
+                        ServerError::Validation(format!("'{}' is not a container", segs.join("/")))
+                    })?
+            };
+            let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
+            collect_zip_entries_blocking(
+                container,
+                "",
+                &path_c,
+                &mut entries,
+                &handle,
+                filter_c.as_ref(),
+            )?;
+            // Deflate-compress on the blocking thread (CPU-bound).
+            use std::io::{Cursor, Write};
+            use zip::write::SimpleFileOptions;
+            let mut buf = Vec::new();
+            {
+                let mut writer = zip::ZipWriter::new(Cursor::new(&mut buf));
+                let opts = SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Deflated);
+                for (name, data) in entries {
+                    writer
+                        .start_file(&name, opts)
+                        .map_err(|e| ServerError::Internal(format!("zip: {e}")))?;
+                    writer
+                        .write_all(&data)
+                        .map_err(|e| ServerError::Internal(format!("zip write: {e}")))?;
+                }
+                writer
+                    .finish()
+                    .map_err(|e| ServerError::Internal(format!("zip finalize: {e}")))?;
+            }
+            Ok(bytes::Bytes::from(buf))
+        })
+        .await
+        .map_err(|e| ServerError::Internal(format!("zip task failed: {e}")))??;
         return Ok(serve_with_range(&headers, "application/zip", bytes));
     }
+
+    // Non-zip: build Vec<Resource> inside spawn_blocking (Async A).
+    let body_json = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, ServerError> {
+        let container: &dyn ContainerAdapter = if segs.is_empty() {
+            root_arc.as_ref()
+        } else {
+            core::walk_tree(root_arc.as_ref(), &segs)?
+                .as_container()
+                .ok_or_else(|| {
+                    ServerError::Validation(format!("'{}' is not a container", segs.join("/")))
+                })?
+        };
+        // H3: apply access filter to listing.
+        let queries: Vec<tiled_core::queries::Query> = filter_c
+            .map(|f| vec![tiled_core::queries::Query::AccessBlobFilter(f)])
+            .unwrap_or_default();
+        let visible_keys = if queries.is_empty() {
+            container.keys()
+        } else {
+            container.search(&queries)
+        };
+        let children: Vec<tiled_core::schemas::Resource> = visible_keys
+            .iter()
+            .filter_map(|k| {
+                container.get(k).map(|child| {
+                    let child_path = if path_c.is_empty() {
+                        k.clone()
+                    } else {
+                        format!("{path_c}/{k}")
+                    };
+                    core::construct_resource(child, k, &child_path, &base_url_c)
+                })
+            })
+            .collect();
+        serde_json::to_vec(&children).map_err(|e| ServerError::Internal(format!("encode: {e}")))
+    })
+    .await
+    .map_err(|e| ServerError::Internal(format!("blocking task failed: {e}")))??;
 
     let media_type = tiled_serialization::resolve_media_type(
         accept,
@@ -849,113 +1033,82 @@ pub async fn container_full(
     Ok(serve_with_range(&headers, &media_type, body))
 }
 
-/// Walk every leaf below `container` and zip their per-family bytes
-/// together (upstream tiled #660). Path components are preserved as
-/// directory separators in the zip entry name; arrays go in as
-/// `application/octet-stream` (`.bin`), tables as Arrow-IPC
-/// (`.arrow`), sub-containers recurse. Empty containers produce a
-/// zero-entry zip (still well-formed).
-///
-/// Two-phase: collect every leaf's bytes asynchronously into a Vec,
-/// then build the zip synchronously. Avoids juggling a `&mut
-/// ZipWriter` across `.await` points (the writer borrows the output
-/// buffer mutably + reads/writes to disk in scope).
-async fn export_container_as_zip(
+/// Recursively collect every leaf below `container` as (path, bytes) pairs.
+/// Must be called from a `spawn_blocking` thread so adapters that call
+/// `Handle::block_on` internally (CatalogAdapter, FileLeafResolver) do not
+/// panic. Async reads are driven via `handle.block_on(...)`.
+/// H3: `access_filter` (when Some) is applied at each level to skip children
+/// the caller is not permitted to see.
+fn collect_zip_entries_blocking(
     container: &dyn ContainerAdapter,
+    prefix: &str,
     base_path: &str,
-) -> Result<bytes::Bytes, ServerError> {
-    let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
-    collect_zip_entries(container, "", base_path, &mut entries).await?;
-
-    // Deflate compression of the whole subtree is CPU-bound; run it on a
-    // blocking thread so it doesn't stall the async runtime.
-    let buf = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, ServerError> {
-        use std::io::{Cursor, Write};
-        use zip::write::SimpleFileOptions;
-        let mut buf = Vec::new();
-        {
-            let mut writer = zip::ZipWriter::new(Cursor::new(&mut buf));
-            let opts =
-                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
-            for (name, bytes) in entries {
-                writer
-                    .start_file(&name, opts)
-                    .map_err(|e| ServerError::Internal(format!("zip: {e}")))?;
-                writer
-                    .write_all(&bytes)
-                    .map_err(|e| ServerError::Internal(format!("zip write: {e}")))?;
+    entries: &mut Vec<(String, Vec<u8>)>,
+    handle: &tokio::runtime::Handle,
+    access_filter: Option<&tiled_core::queries::AccessBlobFilter>,
+) -> Result<(), ServerError> {
+    let visible_keys = match access_filter {
+        Some(f) => container.search(&[tiled_core::queries::Query::AccessBlobFilter(f.clone())]),
+        None => container.keys(),
+    };
+    for key in visible_keys {
+        let Some(child) = container.get(&key) else {
+            continue;
+        };
+        let entry_name = if prefix.is_empty() {
+            key.clone()
+        } else {
+            format!("{prefix}/{key}")
+        };
+        match child {
+            AnyAdapter::Array(a) => {
+                let data = handle
+                    .block_on(a.read(&tiled_core::ndslice::NDSlice::empty()))
+                    .map_err(ServerError::from)?;
+                entries.push((format!("{entry_name}.bin"), data.data.to_vec()));
             }
-            writer
-                .finish()
-                .map_err(|e| ServerError::Internal(format!("zip finalize: {e}")))?;
-        }
-        Ok(buf)
-    })
-    .await
-    .map_err(|e| ServerError::Internal(format!("zip task failed: {e}")))??;
-    Ok(bytes::Bytes::from(buf))
-}
-
-fn collect_zip_entries<'a>(
-    container: &'a dyn ContainerAdapter,
-    prefix: &'a str,
-    base_path: &'a str,
-    entries: &'a mut Vec<(String, Vec<u8>)>,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ServerError>> + Send + 'a>> {
-    Box::pin(async move {
-        for key in container.keys() {
-            let Some(child) = container.get(&key) else {
-                continue;
-            };
-            let entry_name = if prefix.is_empty() {
-                key.clone()
-            } else {
-                format!("{prefix}/{key}")
-            };
-            match child {
-                AnyAdapter::Array(a) => {
-                    let data = a
-                        .read(&tiled_core::ndslice::NDSlice::empty())
-                        .await
-                        .map_err(ServerError::from)?;
-                    entries.push((format!("{entry_name}.bin"), data.data.to_vec()));
-                }
-                AnyAdapter::Container(child_c) => {
-                    collect_zip_entries(child_c.as_ref(), &entry_name, base_path, entries).await?;
-                }
-                AnyAdapter::Table(t) => {
-                    let table = t.read(None).await.map_err(ServerError::from)?;
-                    let mut ipc_bytes = Vec::new();
-                    {
-                        let mut writer_ipc =
-                            arrow::ipc::writer::FileWriter::try_new(&mut ipc_bytes, &table.schema)
-                                .map_err(|e| ServerError::Internal(format!("arrow ipc: {e}")))?;
-                        for batch in &table.batches {
-                            writer_ipc
-                                .write(batch)
-                                .map_err(|e| ServerError::Internal(format!("arrow ipc: {e}")))?;
-                        }
+            AnyAdapter::Container(child_c) => {
+                collect_zip_entries_blocking(
+                    child_c.as_ref(),
+                    &entry_name,
+                    base_path,
+                    entries,
+                    handle,
+                    access_filter,
+                )?;
+            }
+            AnyAdapter::Table(t) => {
+                let table = handle.block_on(t.read(None)).map_err(ServerError::from)?;
+                let mut ipc_bytes = Vec::new();
+                {
+                    let mut writer_ipc =
+                        arrow::ipc::writer::FileWriter::try_new(&mut ipc_bytes, &table.schema)
+                            .map_err(|e| ServerError::Internal(format!("arrow ipc: {e}")))?;
+                    for batch in &table.batches {
                         writer_ipc
-                            .finish()
+                            .write(batch)
                             .map_err(|e| ServerError::Internal(format!("arrow ipc: {e}")))?;
                     }
-                    entries.push((format!("{entry_name}.arrow"), ipc_bytes));
+                    writer_ipc
+                        .finish()
+                        .map_err(|e| ServerError::Internal(format!("arrow ipc: {e}")))?;
                 }
-                other => {
-                    let crumb = serde_json::json!({
-                        "path": format!("{base_path}/{entry_name}"),
-                        "structure_family": format!("{:?}", other.structure_family()),
-                        "note": "leaf format not yet bundled in deep export",
-                    });
-                    entries.push((
-                        format!("{entry_name}.json"),
-                        serde_json::to_vec(&crumb).unwrap(),
-                    ));
-                }
+                entries.push((format!("{entry_name}.arrow"), ipc_bytes));
+            }
+            other => {
+                let crumb = serde_json::json!({
+                    "path": format!("{base_path}/{entry_name}"),
+                    "structure_family": format!("{:?}", other.structure_family()),
+                    "note": "leaf format not yet bundled in deep export",
+                });
+                entries.push((
+                    format!("{entry_name}.json"),
+                    serde_json::to_vec(&crumb).unwrap(),
+                ));
             }
         }
-        Ok(())
-    })
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1211,46 +1364,49 @@ pub async fn table_partition(
 ) -> Result<impl IntoResponse, ServerError> {
     auth.require(tiled_auth::Scope::ReadData)?;
     let segments = segments_from_uri(&uri, "/api/v1/table/partition/");
-    pre_warm_walk(&state, &segments).await?;
-
-    let adapter = core::walk_tree(state.root_tree.as_ref(), &segments)?;
-    let table_adapter = match adapter {
-        AnyAdapter::Table(t) => t.as_ref(),
-        _ => {
-            return Err(ServerError::Validation(format!(
-                "'{}' is not a table",
-                segments.join("/")
-            )));
-        }
-    };
+    // H2: per-node policy check.
+    let _ = resolve_entry(&state, auth.clone(), &segments, tiled_auth::Scope::ReadData).await?;
 
     let partition: usize = params
         .get("partition")
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
-
     let fields: Option<Vec<String>> = params
         .get("field")
         .map(|f| f.split(',').map(|s| s.trim().to_string()).collect());
 
-    let table = table_adapter
-        .read_partition(partition, fields.as_deref())
-        .await
-        .map_err(ServerError::from)?;
-
-    let mut buf = Vec::new();
-    {
-        let mut writer = arrow::ipc::writer::FileWriter::try_new(&mut buf, &table.schema)
-            .map_err(|e| ServerError::Internal(format!("Arrow IPC write error: {e}")))?;
-        for batch in &table.batches {
+    // Async A + A3: ONE spawn_blocking owns the tree walk (safe for adapters
+    // that call Handle::block_on) and the Arrow IPC encode (CPU-bound).
+    // Uses Handle::current().block_on() to drive the async read inside the
+    // blocking pool thread where it is safe.
+    let handle = tokio::runtime::Handle::current();
+    let state_c = state.clone();
+    let segs = segments.clone();
+    let buf = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, ServerError> {
+        let adapter = core::walk_tree(state_c.root_tree.as_ref(), &segs)?;
+        let table_adapter = adapter.as_table().ok_or_else(|| {
+            ServerError::Validation(format!("'{}' is not a table", segs.join("/")))
+        })?;
+        let table = handle
+            .block_on(table_adapter.read_partition(partition, fields.as_deref()))
+            .map_err(ServerError::from)?;
+        let mut buf = Vec::new();
+        {
+            let mut writer = arrow::ipc::writer::FileWriter::try_new(&mut buf, &table.schema)
+                .map_err(|e| ServerError::Internal(format!("Arrow IPC write error: {e}")))?;
+            for batch in &table.batches {
+                writer
+                    .write(batch)
+                    .map_err(|e| ServerError::Internal(format!("Arrow IPC write error: {e}")))?;
+            }
             writer
-                .write(batch)
+                .finish()
                 .map_err(|e| ServerError::Internal(format!("Arrow IPC write error: {e}")))?;
         }
-        writer
-            .finish()
-            .map_err(|e| ServerError::Internal(format!("Arrow IPC write error: {e}")))?;
-    }
+        Ok(buf)
+    })
+    .await
+    .map_err(|e| ServerError::Internal(format!("blocking task failed: {e}")))??;
 
     Ok((
         [(
@@ -1278,50 +1434,59 @@ pub async fn get_documents(
             "Path to a BlueskyRun is required".into(),
         ));
     }
-    pre_warm_walk(&state, &segments).await?;
+    // H2: per-node policy check.
+    let _ = resolve_entry(&state, auth.clone(), &segments, tiled_auth::Scope::ReadData).await?;
 
-    let adapter = core::walk_tree(state.root_tree.as_ref(), &segments)?;
+    // Async A: ONE spawn_blocking owns walk + metadata reads so
+    // Handle::block_on calls inside adapters stay on the blocking pool.
+    let state_c = state.clone();
+    let segs = segments.clone();
+    let body = tokio::task::spawn_blocking(move || -> Result<String, ServerError> {
+        let adapter = core::walk_tree(state_c.root_tree.as_ref(), &segs)?;
 
-    // The run must be a container (BlueskyRun).
-    let run = adapter
-        .as_container()
-        .ok_or_else(|| ServerError::Validation("This is not a BlueskyRun".into()))?;
+        // The run must be a container (BlueskyRun).
+        let run: &dyn ContainerAdapter = adapter
+            .as_container()
+            .ok_or_else(|| ServerError::Validation("This is not a BlueskyRun".into()))?;
 
-    // Build a JSON-seq response with the run's metadata as documents.
-    // Format: {"name": "start", "doc": {...}}\n{"name": "stop", "doc": {...}}\n
-    let meta = run.metadata();
-    let mut lines = Vec::new();
+        // Build a JSON-seq response with the run's metadata as documents.
+        // Format: {"name": "start", "doc": {...}}\n{"name": "stop", "doc": {...}}\n
+        let meta = run.metadata();
+        let mut lines = Vec::new();
 
-    // Emit start document.
-    if let Some(start) = meta.get("start") {
-        let line = serde_json::json!({"name": "start", "doc": start});
-        lines.push(serde_json::to_string(&line).unwrap_or_default());
-    }
+        // Emit start document.
+        if let Some(start) = meta.get("start") {
+            let line = serde_json::json!({"name": "start", "doc": start});
+            lines.push(serde_json::to_string(&line).unwrap_or_default());
+        }
 
-    // Emit descriptor documents from each stream.
-    for stream_key in run.keys() {
-        if let Some(AnyAdapter::Container(stream)) = run.get(&stream_key) {
-            let stream_meta = stream.metadata();
-            if let Some(descriptors) = stream_meta.get("descriptors")
-                && let Some(arr) = descriptors.as_array()
-            {
-                for desc in arr {
-                    let line = serde_json::json!({"name": "descriptor", "doc": desc});
-                    lines.push(serde_json::to_string(&line).unwrap_or_default());
+        // Emit descriptor documents from each stream.
+        for stream_key in run.keys() {
+            if let Some(AnyAdapter::Container(stream)) = run.get(&stream_key) {
+                let stream_meta = stream.metadata();
+                if let Some(descriptors) = stream_meta.get("descriptors")
+                    && let Some(arr) = descriptors.as_array()
+                {
+                    for desc in arr {
+                        let line = serde_json::json!({"name": "descriptor", "doc": desc});
+                        lines.push(serde_json::to_string(&line).unwrap_or_default());
+                    }
                 }
             }
         }
-    }
 
-    // Emit stop document.
-    if let Some(stop) = meta.get("stop")
-        && !stop.is_null()
-    {
-        let line = serde_json::json!({"name": "stop", "doc": stop});
-        lines.push(serde_json::to_string(&line).unwrap_or_default());
-    }
+        // Emit stop document.
+        if let Some(stop) = meta.get("stop")
+            && !stop.is_null()
+        {
+            let line = serde_json::json!({"name": "stop", "doc": stop});
+            lines.push(serde_json::to_string(&line).unwrap_or_default());
+        }
 
-    let body = lines.join("\n") + "\n";
+        Ok(lines.join("\n") + "\n")
+    })
+    .await
+    .map_err(|e| ServerError::Internal(format!("blocking task failed: {e}")))??;
 
     Ok((
         [(
@@ -1724,6 +1889,20 @@ pub async fn put_data_source(
         .await
         .map_err(map_catalog_err)?
         .ok_or_else(|| ServerError::NotFound(format!("'{}' not found", segments.join("/"))))?;
+    // H2: per-node policy check, mirroring patch_metadata / delete_metadata.
+    let auth = auth
+        .narrow_for_node(
+            state.access_policy.as_deref(),
+            tiled_access::NodeContext {
+                path: &segments,
+                structure_family: &node.structure_family,
+                metadata: &node.metadata,
+                access_blob: &node.access_blob,
+            },
+        )
+        .await;
+    auth.require(tiled_auth::Scope::WriteData)
+        .or_else(|_| auth.require(tiled_auth::Scope::WriteMetadata))?;
     let body = req
         .get("data_source")
         .ok_or_else(|| ServerError::Validation("body missing 'data_source'".into()))?;
