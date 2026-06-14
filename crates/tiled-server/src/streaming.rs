@@ -390,34 +390,31 @@ async fn run_subscription(
             }
         },
     };
-    // H4: when an access policy is configured, resolve per-node narrowing for
-    // the subscribed path.  Deny (SecureEntry 404-style: not found or access
-    // denied) if the narrowed scopes lose ReadMetadata.  Without a policy
-    // there is nothing to narrow — fall through to the plain scope check so
-    // subscriptions to non-existent paths are still allowed (they just
-    // receive no updates).
-    if !segments.is_empty()
-        && state.access_policy.is_some()
-        && crate::router::resolve_entry(
-            &state,
-            auth_ctx.clone(),
-            &segments,
-            tiled_auth::Scope::ReadMetadata,
-        )
-        .await
-        .is_err()
-    {
+    // The base principal must hold read:metadata at all. With no access
+    // policy this is the only gate — subscriptions to non-existent paths
+    // are still allowed (they simply never receive anything).
+    if !auth_ctx.scopes.contains(tiled_auth::Scope::ReadMetadata) {
         let _ = tx
-            .send(Message::Text(
-                "subscription denied: node not found or access denied".into(),
-            ))
+            .send(Message::Text("forbidden: missing read:metadata".into()))
             .await;
         let _ = tx.send(Message::Close(None)).await;
         return;
     }
-    if !auth_ctx.scopes.contains(tiled_auth::Scope::ReadMetadata) {
+
+    // F4: authorize the initial schema by the subscription node itself —
+    // the same per-message delivery rule applied to every fanned event in
+    // the loop below. `publish` fans events up to every ancestor channel
+    // (including the root ""), so authorizing only the subscription point
+    // leaks descendant and whole-tree metadata. Root and non-root resolve
+    // uniformly here: there is no `is_empty` special case — an empty path
+    // resolves to the base scope check inside `resolve_entry`. With no
+    // access policy `delivery_allowed` is a single `is_none` check, so
+    // behavior is unchanged (including subscriptions to missing paths).
+    if !delivery_allowed(&state, &auth_ctx, &segments).await {
         let _ = tx
-            .send(Message::Text("forbidden: missing read:metadata".into()))
+            .send(Message::Text(
+                "subscription denied: node not found or access denied".into(),
+            ))
             .await;
         let _ = tx.send(Message::Close(None)).await;
         return;
@@ -450,6 +447,11 @@ async fn run_subscription(
     // live channel may also still hold a buffered copy of these events;
     // sequence numbers are monotonic so the client dedupes by `sequence`.
     for env in replay {
+        // Replayed history is fanned the same way as live events, so it
+        // carries descendant updates too — authorize each one (F4).
+        if !delivery_allowed(&state, &auth_ctx, &event_target_segments(&env)).await {
+            continue;
+        }
         let payload = match rmp_serde::to_vec_named(&env) {
             Ok(v) => v,
             Err(e) => {
@@ -469,6 +471,12 @@ async fn run_subscription(
             update = receiver.recv() => {
                 match update {
                     Ok(env) => {
+                        // F4: every event was fanned up from its own source
+                        // node, which may be a descendant the subscriber is
+                        // not authorized for. Authorize delivery per event.
+                        if !delivery_allowed(&state, &auth_ctx, &event_target_segments(&env)).await {
+                            continue;
+                        }
                         let payload = match rmp_serde::to_vec_named(&env) {
                             Ok(v) => v,
                             Err(e) => {
@@ -492,6 +500,51 @@ async fn run_subscription(
             }
         }
     }
+}
+
+/// F4 per-message delivery authorization.
+///
+/// `publish` fans every event up to all ancestor channels (seeded with
+/// the root `""`), so a subscriber's channel receives events sourced from
+/// arbitrary descendants. Authorize the node a delivered message concerns
+/// against the subscriber's *base* auth context — re-narrowing from the
+/// principal each call, exactly as the HTTP read surface does in
+/// `resolve_entry`. Returns `false` (skip) when the node is denied or no
+/// longer resolves.
+///
+/// With no access policy there is nothing to narrow: a single `is_none`
+/// check short-circuits to `true`, so delivery cost is unchanged.
+async fn delivery_allowed(state: &AppState, auth_ctx: &AuthContext, segments: &[String]) -> bool {
+    if state.access_policy.is_none() {
+        return true;
+    }
+    crate::router::resolve_entry(
+        state,
+        auth_ctx.clone(),
+        segments,
+        tiled_auth::Scope::ReadMetadata,
+    )
+    .await
+    .is_ok()
+}
+
+/// The node a fanned event actually concerns, used as the authorization
+/// target. For most kinds this is the published source path. A
+/// `ChildCreated` event is published on the *parent* path but reveals a
+/// new child (its key and structure family), so the authorized node is
+/// that child (`path + key`) — otherwise a subscriber permitted on the
+/// parent but not the child would learn the restricted child's existence.
+fn event_target_segments(env: &UpdateEnvelope) -> Vec<String> {
+    let mut segments: Vec<String> = env
+        .path
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect();
+    if let UpdateKind::ChildCreated { key, .. } = &env.kind {
+        segments.push(key.clone());
+    }
+    segments
 }
 
 async fn handshake_auth(
