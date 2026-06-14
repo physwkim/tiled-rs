@@ -62,14 +62,8 @@ impl std::fmt::Debug for Issuer {
 }
 
 impl Issuer {
-    /// `secret` is HMAC-SHA256 keying material. Length should be ≥ 32 bytes
-    /// so a brute-force on the secret is infeasible.
+    /// `secret` is HMAC-SHA256 keying material.
     pub fn new(secret: &[u8]) -> Result<Self> {
-        if secret.len() < 16 {
-            return Err(AuthError::Validation(
-                "JWT secret must be at least 16 bytes".into(),
-            ));
-        }
         Ok(Self {
             encoding: EncodingKey::from_secret(secret),
             decoding: DecodingKey::from_secret(secret),
