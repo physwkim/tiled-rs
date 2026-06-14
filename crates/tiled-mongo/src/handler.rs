@@ -23,12 +23,12 @@ pub trait FileHandler: Send + Sync {
     fn read(&self, datum_kwargs: &serde_json::Value) -> Result<(Vec<u8>, Vec<usize>)>;
 }
 
+type HandlerFactory =
+    Arc<dyn Fn(&str, &str, &serde_json::Value) -> Result<Box<dyn FileHandler>> + Send + Sync>;
+
 /// Registry of spec → handler factory.
 pub struct HandlerRegistry {
-    factories: HashMap<
-        String,
-        Arc<dyn Fn(&str, &str, &serde_json::Value) -> Result<Box<dyn FileHandler>> + Send + Sync>,
-    >,
+    factories: HashMap<String, HandlerFactory>,
     root_map: HashMap<String, String>,
 }
 
@@ -254,7 +254,9 @@ impl FileHandler for Hdf5Handler {
         // would overflow back into a small value that silently passes the
         // bounds check below.
         let point_number = usize::try_from(point_signed).map_err(|_| {
-            TiledError::Validation(format!("HDF5 point_number must be non-negative, got {point_signed}"))
+            TiledError::Validation(format!(
+                "HDF5 point_number must be non-negative, got {point_signed}"
+            ))
         })?;
 
         let file = rust_hdf5::H5File::open(&self.file_path)
@@ -274,19 +276,23 @@ impl FileHandler for Hdf5Handler {
         }
 
         // Use checked_mul so a giant kwargs value can't silently wrap.
-        let start = point_number.checked_mul(self.frame_per_point).ok_or_else(|| {
-            TiledError::Validation(format!(
-                "HDF5 point_number {point_number} * frame_per_point {} overflows",
-                self.frame_per_point
-            ))
-        })?;
+        let start = point_number
+            .checked_mul(self.frame_per_point)
+            .ok_or_else(|| {
+                TiledError::Validation(format!(
+                    "HDF5 point_number {point_number} * frame_per_point {} overflows",
+                    self.frame_per_point
+                ))
+            })?;
         if start >= full_shape[0] {
             return Err(TiledError::Validation(format!(
                 "Point {point_number} out of range for dataset with {} frames",
                 full_shape[0]
             )));
         }
-        let end = start.saturating_add(self.frame_per_point).min(full_shape[0]);
+        let end = start
+            .saturating_add(self.frame_per_point)
+            .min(full_shape[0]);
 
         // Build a hyperslab covering [start..end] on axis 0 and the full
         // extent on every other axis.

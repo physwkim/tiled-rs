@@ -20,6 +20,16 @@ use tiled_core::structures::{ArrayStructure, Spec, StructureFamily};
 
 use crate::filler::Filler;
 
+/// Arguments for [`ArrayColumnAdapter::new_data`].
+pub struct DataColumnConfig {
+    pub field_name: String,
+    pub num_events: usize,
+    pub inner_shape: Vec<usize>,
+    pub dtype_str: String,
+    pub is_external: bool,
+    pub filler: Option<Arc<Filler>>,
+}
+
 /// A single array column backed by MongoDB event documents.
 #[derive(Clone)]
 pub struct ArrayColumnAdapter {
@@ -70,16 +80,16 @@ impl ArrayColumnAdapter {
     }
 
     /// Create a data variable column (may be inline or external).
-    pub fn new_data(
-        db: Database,
-        descriptor_uids: Vec<String>,
-        field_name: String,
-        num_events: usize,
-        inner_shape: Vec<usize>,
-        dtype_str: String,
-        is_external: bool,
-        filler: Option<Arc<Filler>>,
-    ) -> Self {
+    pub fn new_data(db: Database, descriptor_uids: Vec<String>, cfg: DataColumnConfig) -> Self {
+        let DataColumnConfig {
+            field_name,
+            num_events,
+            inner_shape,
+            dtype_str,
+            is_external,
+            filler,
+        } = cfg;
+
         let dtype = guess_dtype(&dtype_str);
 
         let mut shape = vec![num_events];
@@ -164,8 +174,14 @@ impl ArrayColumnAdapter {
         let mut out = Vec::new();
         for result in cursor {
             let doc = result.map_err(|e| TiledError::Internal(e.to_string()))?;
-            let seq = doc.get_i64("seq_num").or_else(|_| doc.get_i32("seq_num").map(i64::from)).unwrap_or(0);
-            let value = doc.get("value").and_then(|v| v.as_f64()).unwrap_or(f64::NAN);
+            let seq = doc
+                .get_i64("seq_num")
+                .or_else(|_| doc.get_i32("seq_num").map(i64::from))
+                .unwrap_or(0);
+            let value = doc
+                .get("value")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(f64::NAN);
             if seq >= 1 {
                 out.push((seq, value));
             }
@@ -199,7 +215,11 @@ impl ArrayColumnAdapter {
             (row_start as i64) + 1,
             (row_end as i64) + 1,
         )?;
-        Ok(Self::scatter_pairs(pairs, row_start as i64, row_end - row_start))
+        Ok(Self::scatter_pairs(
+            pairs,
+            row_start as i64,
+            row_end - row_start,
+        ))
     }
 
     fn fetch_inline_column(&self) -> Result<Vec<f64>> {
@@ -221,7 +241,11 @@ impl ArrayColumnAdapter {
             (row_start as i64) + 1,
             (row_end as i64) + 1,
         )?;
-        Ok(Self::scatter_pairs(pairs, row_start as i64, row_end - row_start))
+        Ok(Self::scatter_pairs(
+            pairs,
+            row_start as i64,
+            row_end - row_start,
+        ))
     }
 
     fn fetch_external_column(&self) -> Result<Vec<u8>> {
@@ -319,19 +343,20 @@ impl ArrayAdapterRead for ArrayColumnAdapter {
             let me = self.clone();
             let dtype = me.dtype.clone();
             let shape = me.shape.clone();
-            let raw = tokio::task::spawn_blocking(move || -> std::result::Result<Vec<u8>, TiledError> {
-                if me.is_time {
-                    let values = me.fetch_time_column()?;
-                    Ok(values.iter().flat_map(|v| v.to_le_bytes()).collect())
-                } else if me.is_external {
-                    me.fetch_external_column()
-                } else {
-                    let values = me.fetch_inline_column()?;
-                    Ok(values.iter().flat_map(|v| v.to_le_bytes()).collect())
-                }
-            })
-            .await
-            .map_err(|e| TiledError::Internal(format!("blocking read: {e}")))??;
+            let raw =
+                tokio::task::spawn_blocking(move || -> std::result::Result<Vec<u8>, TiledError> {
+                    if me.is_time {
+                        let values = me.fetch_time_column()?;
+                        Ok(values.iter().flat_map(|v| v.to_le_bytes()).collect())
+                    } else if me.is_external {
+                        me.fetch_external_column()
+                    } else {
+                        let values = me.fetch_inline_column()?;
+                        Ok(values.iter().flat_map(|v| v.to_le_bytes()).collect())
+                    }
+                })
+                .await
+                .map_err(|e| TiledError::Internal(format!("blocking read: {e}")))??;
 
             Ok(DynNDArray::new(bytes::Bytes::from(raw), dtype, shape))
         })
