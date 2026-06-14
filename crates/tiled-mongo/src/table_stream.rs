@@ -97,10 +97,7 @@ impl EventStreamTable {
         }
     }
 
-    fn read_batches(
-        &self,
-        fields: Option<&[String]>,
-    ) -> Result<Vec<RecordBatch>> {
+    fn read_batches(&self, fields: Option<&[String]>) -> Result<Vec<RecordBatch>> {
         if self.descriptors.is_empty() || self.cutoff_seq_num <= 1 {
             return Ok(vec![]);
         }
@@ -131,14 +128,16 @@ impl EventStreamTable {
                             .fields()
                             .iter()
                             .position(|f| f.name() == name)
-                            .ok_or_else(|| TiledError::Validation(format!(
-                                "unknown column: {name}"
-                            )))
+                            .ok_or_else(|| {
+                                TiledError::Validation(format!("unknown column: {name}"))
+                            })
                     })
                     .collect::<Result<Vec<_>>>()?;
-                Arc::new(self.schema.project(&indices).map_err(|e| {
-                    TiledError::Internal(format!("project schema: {e}"))
-                })?)
+                Arc::new(
+                    self.schema
+                        .project(&indices)
+                        .map_err(|e| TiledError::Internal(format!("project schema: {e}")))?,
+                )
             }
         };
 
@@ -157,11 +156,7 @@ impl EventStreamTable {
                 col.push_f64(time);
             }
             // Pull the data subdocument once per event.
-            let data = event
-                .get_document("data")
-                .ok()
-                .cloned()
-                .unwrap_or_default();
+            let data = event.get_document("data").ok().cloned().unwrap_or_default();
             for (name, builder) in columns.iter_mut() {
                 if name == "time" {
                     continue;
@@ -276,7 +271,8 @@ fn bluesky_dtype_to_arrow(dtype: &str) -> DataType {
 
 fn encode_schema(schema: &Schema) -> String {
     use base64::Engine;
-    let buf = arrow::ipc::convert::schema_to_fb(schema)
+    let buf = arrow::ipc::convert::IpcSchemaEncoder::new()
+        .schema_to_fb(schema)
         .finished_data()
         .to_vec();
     let b64 = base64::engine::general_purpose::STANDARD.encode(buf);

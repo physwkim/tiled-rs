@@ -68,25 +68,23 @@ impl MongoCatalog {
                 .build();
 
             if let Ok(cursor) = collection.find(doc! {}).with_options(opts).run() {
-                for result in cursor {
-                    if let Ok(start_doc) = result {
-                        let uid = start_doc.get_str("uid").unwrap_or_default().to_string();
-                        if uid.is_empty() {
-                            continue;
-                        }
-
-                        // Look up the corresponding stop document.
-                        let stop_doc = self
-                            .db
-                            .collection::<Document>("run_stop")
-                            .find_one(doc! { "run_start": &uid })
-                            .run()
-                            .ok()
-                            .flatten();
-
-                        let run = BlueskyRunAdapter::new(self.db.clone(), start_doc, stop_doc);
-                        mapping.insert(uid, AnyAdapter::Container(Box::new(run)));
+                for start_doc in cursor.flatten() {
+                    let uid = start_doc.get_str("uid").unwrap_or_default().to_string();
+                    if uid.is_empty() {
+                        continue;
                     }
+
+                    // Look up the corresponding stop document.
+                    let stop_doc = self
+                        .db
+                        .collection::<Document>("run_stop")
+                        .find_one(doc! { "run_start": &uid })
+                        .run()
+                        .ok()
+                        .flatten();
+
+                    let run = BlueskyRunAdapter::new(self.db.clone(), start_doc, stop_doc);
+                    mapping.insert(uid, AnyAdapter::Container(Box::new(run)));
                 }
             }
             mapping

@@ -12,7 +12,8 @@ use mongodb::sync::Database;
 use tiled_core::adapters::{AnyAdapter, BaseAdapter, ContainerAdapter};
 use tiled_core::structures::{ContainerStructure, Spec, StructureFamily};
 
-use crate::array_col::ArrayColumnAdapter;
+use crate::array_col::{ArrayColumnAdapter, DataColumnConfig};
+use crate::bson_ext::bson_to_i64;
 use crate::filler::Filler;
 
 /// An event stream (e.g. "primary") containing data columns.
@@ -100,7 +101,7 @@ impl EventStreamAdapter {
                         .ok()
                         .map(|arr| {
                             arr.iter()
-                                .filter_map(|v| v.as_i64().map(|n| n as usize))
+                                .filter_map(|v| bson_to_i64(v).map(|n| n as usize))
                                 .collect()
                         })
                         .unwrap_or_default();
@@ -113,15 +114,17 @@ impl EventStreamAdapter {
                     let col = ArrayColumnAdapter::new_data(
                         self.db.clone(),
                         descriptor_uids.clone(),
-                        key.clone(),
-                        num_events,
-                        shape,
-                        dtype_str.to_string(),
-                        is_external,
-                        if is_external {
-                            self.filler.clone()
-                        } else {
-                            None
+                        DataColumnConfig {
+                            field_name: key.clone(),
+                            num_events,
+                            inner_shape: shape,
+                            dtype_str: dtype_str.to_string(),
+                            is_external,
+                            filler: if is_external {
+                                self.filler.clone()
+                            } else {
+                                None
+                            },
                         },
                     );
                     mapping.insert(key.clone(), AnyAdapter::Array(Box::new(col)));

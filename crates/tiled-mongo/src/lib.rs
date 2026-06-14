@@ -7,6 +7,7 @@
 //! (Area Detector HDF5, NPY sequences, TIFF images) via the handler/filler system.
 
 pub mod array_col;
+pub mod bson_ext;
 pub mod catalog;
 pub mod filler;
 pub mod handler;
