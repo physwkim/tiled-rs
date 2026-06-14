@@ -213,12 +213,14 @@ pub async fn about(State(state): State<AppState>, BaseUrl(base_url): BaseUrl) ->
 
 pub async fn metadata_root(
     state: State<AppState>,
+    Query(params): Query<HashMap<String, String>>,
     base_url: BaseUrl,
     auth: crate::AuthContext,
 ) -> Result<impl IntoResponse, ServerError> {
     metadata(
         state,
         OriginalUri("/api/v1/metadata/".parse().expect("static URI")),
+        Query(params),
         base_url,
         auth,
     )
@@ -228,6 +230,7 @@ pub async fn metadata_root(
 pub async fn metadata(
     State(state): State<AppState>,
     OriginalUri(uri): OriginalUri,
+    Query(params): Query<HashMap<String, String>>,
     BaseUrl(base_url): BaseUrl,
     auth: crate::AuthContext,
 ) -> Result<impl IntoResponse, ServerError> {
@@ -246,13 +249,17 @@ pub async fn metadata(
         )
         .await?;
     }
+    let include_data_sources = params
+        .get("include_data_sources")
+        .map(|v| matches!(v.as_str(), "true" | "True" | "1"))
+        .unwrap_or(false);
     // When a SQL catalog is wired, read directly through it: the
     // CatalogAdapter caches children eagerly to satisfy the sync trait,
     // and PATCH/DELETE write past that cache, so a same-request read after
     // a write would otherwise see stale data. Direct DB lookup keeps
     // metadata responses consistent with the latest committed write.
     let resource = if let Some(ref catalog) = state.catalog {
-        catalog_metadata_resource(catalog, &segments, &base_url).await?
+        catalog_metadata_resource(catalog, &segments, &base_url, include_data_sources).await?
     } else {
         // The tree walk + Resource construction may invoke blocking
         // adapters (e.g. `MongoCatalog::get` triggers a sync MongoDB
@@ -1809,6 +1816,52 @@ fn map_catalog_err(e: tiled_catalog::CatalogError) -> ServerError {
     }
 }
 
+/// Convert a catalog ORM DataSource row (+ its asset rows) into the
+/// `tiled_core::data_source::DataSource` wire type used in API responses.
+fn catalog_ds_to_core_ds(
+    ds: tiled_catalog::orm::DataSource,
+    assets: Vec<tiled_catalog::orm::Asset>,
+) -> tiled_core::data_source::DataSource {
+    let management = serde_json::from_value(serde_json::Value::String(ds.management.clone()))
+        .unwrap_or(tiled_core::data_source::Management::Writable);
+    let structure_family = ds
+        .structure_family
+        .parse::<tiled_core::structures::StructureFamily>()
+        .unwrap_or(tiled_core::structures::StructureFamily::Container);
+    let core_assets = assets
+        .into_iter()
+        .map(|a| tiled_core::data_source::Asset {
+            data_uri: a.data_uri,
+            is_directory: a.is_directory,
+            parameter: if a.parameter.is_empty() {
+                None
+            } else {
+                Some(a.parameter)
+            },
+            num: a.num.map(|n| n as usize),
+            id: Some(a.id),
+        })
+        .collect();
+    tiled_core::data_source::DataSource {
+        structure_family,
+        structure: serde_json::from_value::<Option<tiled_core::structures::AnyStructure>>(
+            ds.structure,
+        )
+        .ok()
+        .flatten(),
+        id: Some(ds.id),
+        mimetype: if ds.mimetype.is_empty() {
+            None
+        } else {
+            Some(ds.mimetype)
+        },
+        parameters: ds.parameters,
+        properties: serde_json::Value::Null,
+        assets: core_assets,
+        management,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // PATCH /api/v1/metadata/{*path} — update metadata + specs
 // ---------------------------------------------------------------------------
@@ -2088,6 +2141,7 @@ async fn catalog_metadata_resource(
     catalog: &tiled_catalog::Catalog,
     segments: &[String],
     base_url: &str,
+    include_data_sources: bool,
 ) -> Result<tiled_core::schemas::Resource, ServerError> {
     use tiled_core::schemas::{
         NodeAttributes, NodeStructure, Resource, SortDirection, SortingItem,
@@ -2141,29 +2195,44 @@ async fn catalog_metadata_resource(
     } else {
         vec![]
     };
-    // For container nodes, surface the child count so the client doesn't
-    // need an extra `/search/` round-trip. Leaves carry their data-source
-    // structure when present.
-    let structure_value = if matches!(family, tiled_core::structures::StructureFamily::Container) {
-        let count = catalog
-            .count_children(Some(node.id))
-            .await
-            .map_err(map_catalog_err)?;
-        Some(
-            serde_json::to_value(&NodeStructure {
-                contents: None,
-                count: count as usize,
-            })
-            .unwrap_or_default(),
-        )
-    } else {
-        catalog
-            .list_data_sources(node.id)
-            .await
-            .map_err(map_catalog_err)?
-            .first()
-            .map(|ds| ds.structure.clone())
-    };
+    // For container nodes, surface the child count. Leaves carry their
+    // data-source structure; when include_data_sources is set, also return
+    // the full data_sources list (with assets) so clients can inspect asset
+    // URIs, mimetypes, and management info without a separate request.
+    let (structure_value, data_sources) =
+        if matches!(family, tiled_core::structures::StructureFamily::Container) {
+            let count = catalog
+                .count_children(Some(node.id))
+                .await
+                .map_err(map_catalog_err)?;
+            (
+                Some(
+                    serde_json::to_value(&NodeStructure {
+                        contents: None,
+                        count: count as usize,
+                    })
+                    .unwrap_or_default(),
+                ),
+                None,
+            )
+        } else {
+            let ds_rows = catalog
+                .list_data_sources(node.id)
+                .await
+                .map_err(map_catalog_err)?;
+            let sv = ds_rows.first().map(|ds| ds.structure.clone());
+            let ds_list = if include_data_sources {
+                let mut result = Vec::with_capacity(ds_rows.len());
+                for ds in ds_rows {
+                    let asset_rows = catalog.list_assets(ds.id).await.map_err(map_catalog_err)?;
+                    result.push(catalog_ds_to_core_ds(ds, asset_rows));
+                }
+                Some(result)
+            } else {
+                None
+            };
+            (sv, ds_list)
+        };
     let sorting = if matches!(family, tiled_core::structures::StructureFamily::Container) {
         Some(vec![SortingItem {
             key: "_".into(),
@@ -2182,7 +2251,7 @@ async fn catalog_metadata_resource(
             structure: structure_value,
             access_blob: Some(node.access_blob),
             sorting,
-            data_sources: None,
+            data_sources,
         },
         links,
     })
