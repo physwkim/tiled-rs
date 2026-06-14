@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use axum::Json;
 use axum::extract::{OriginalUri, Query, State};
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use serde::Deserialize;
 
@@ -146,10 +146,21 @@ pub async fn health() -> impl IntoResponse {
 pub async fn ready(State(state): State<AppState>) -> impl IntoResponse {
     // Use the blocking pool — for adapters like tiled_mongo's MongoCatalog,
     // the first `.len()` may trigger a sync DB load.
-    let count = tokio::task::spawn_blocking(move || state.root_tree.len())
-        .await
-        .unwrap_or(0);
-    Json(serde_json::json!({"status": "ok", "nodes": count}))
+    match tokio::task::spawn_blocking(move || state.root_tree.len()).await {
+        Ok(count) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "ok", "nodes": count})),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!(target: "tiled.server", "ready check failed: {e}");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"status": "error", "message": "service unavailable"})),
+            )
+                .into_response()
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
