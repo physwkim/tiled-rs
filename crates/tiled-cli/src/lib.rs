@@ -26,8 +26,9 @@ pub enum Command {
         #[arg(short, long)]
         config: Option<String>,
 
-        /// Host to bind to
-        #[arg(long, default_value = "0.0.0.0")]
+        /// Host to bind to. Defaults to loopback; use 0.0.0.0 to expose on all
+        /// interfaces (explicit opt-in required).
+        #[arg(long, default_value = "127.0.0.1")]
         host: String,
 
         /// Port to bind to
@@ -353,6 +354,19 @@ pub async fn run(command: Command) -> Result<()> {
                 anyhow::bail!(
                     "--api-key (or config single_user_api_key) is empty; \
                      either omit it for anonymous access or supply a non-empty key"
+                );
+            }
+
+            // Warn early: explicit 0.0.0.0 bind with no operator-configured auth.
+            // auth_db_uri.is_some() means multi-user JWT mode; api_key.is_some()
+            // means single-user key mode. Neither set → server would be fully open
+            // to any network peer if an interface-wide bind is allowed.
+            if host == "0.0.0.0" && api_key.is_none() && auth_db_uri.is_none() {
+                tracing::warn!(
+                    "Binding 0.0.0.0 with no authentication configured. \
+                     The server is reachable on all network interfaces without \
+                     credentials. A single-user API key will be generated for \
+                     this session. Pass --api-key or restrict to --host 127.0.0.1."
                 );
             }
 
@@ -744,5 +758,35 @@ async fn find_principal_by_uuid(
             .await
             .map_err(|e| anyhow::anyhow!("lookup: {e}"))?
             .map(|r| r.get::<i64, _>("id"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct TestCli {
+        #[command(subcommand)]
+        command: Command,
+    }
+
+    #[test]
+    fn serve_default_host_is_loopback() {
+        let cli = TestCli::parse_from(["tiled", "serve", "--demo"]);
+        let Command::Serve { host, .. } = cli.command else {
+            panic!("expected Serve variant");
+        };
+        assert_eq!(host, "127.0.0.1");
+    }
+
+    #[test]
+    fn serve_explicit_host_0000_overrides_default() {
+        let cli = TestCli::parse_from(["tiled", "serve", "--host", "0.0.0.0", "--demo"]);
+        let Command::Serve { host, .. } = cli.command else {
+            panic!("expected Serve variant");
+        };
+        assert_eq!(host, "0.0.0.0");
     }
 }
