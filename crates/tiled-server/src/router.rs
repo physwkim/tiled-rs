@@ -497,6 +497,7 @@ async fn build_array_response(
         let ser_meta = serde_json::json!({
             "itemsize": data.dtype.element_size(),
             "kind": String::from(data.dtype.kind.to_numpy_char()),
+            "byteorder": String::from(data.dtype.endianness.to_numpy_char()),
             "shape": data.shape,
         });
         // Serializers run CPU-bound encode work (and, for HDF5, blocking file
