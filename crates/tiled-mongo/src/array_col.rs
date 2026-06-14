@@ -133,15 +133,16 @@ impl ArrayColumnAdapter {
         }
     }
 
-    /// Fetch (seq_num, value) pairs in `[seq_start, seq_end_excl)`.
-    /// Caller scatters into a fixed-size column.
-    fn fetch_seq_value_pairs(
+    /// Fetch raw (seq_num, Bson-value) pairs in `[seq_start, seq_end_excl)`.
+    /// Returns the value field as an owned `Bson` so callers can encode it
+    /// to any target dtype without a second trip to MongoDB.
+    fn fetch_seq_bson_pairs(
         &self,
         project: &Document,
         push_path: &str,
         seq_start: i64,
         seq_end_excl: i64,
-    ) -> Result<Vec<(i64, f64)>> {
+    ) -> Result<Vec<(i64, Bson)>> {
         let collection = self.db.collection::<Document>("event");
         let pipeline = vec![
             doc! {
@@ -179,17 +180,15 @@ impl ArrayColumnAdapter {
                 .get_i64("seq_num")
                 .or_else(|_| doc.get_i32("seq_num").map(i64::from))
                 .unwrap_or(0);
-            let value = doc.get("value").and_then(bson_to_f64).unwrap_or(f64::NAN);
             if seq >= 1 {
+                let value = doc.get("value").cloned().unwrap_or(Bson::Null);
                 out.push((seq, value));
             }
         }
         Ok(out)
     }
 
-    /// Scatter `(seq_num, value)` pairs into a `len`-element column with the
-    /// row indexed by `seq_num - seq_offset - 1`. Missing seq_nums stay
-    /// `NaN`, preserving the declared shape regardless of MongoDB gaps.
+    /// Scatter (seq_num, f64) pairs into a NaN-filled column.
     fn scatter_pairs(pairs: Vec<(i64, f64)>, seq_offset: i64, len: usize) -> Vec<f64> {
         let mut col = vec![f64::NAN; len];
         for (seq, value) in pairs {
@@ -201,30 +200,61 @@ impl ArrayColumnAdapter {
         col
     }
 
+    /// Scatter (seq_num, Bson) pairs into a raw byte buffer sized for `len`
+    /// elements of `dtype`. Missing seq_nums leave the pre-filled default
+    /// (NaN for Float, zero bytes for Boolean / Unicode / other).
+    fn scatter_bson_to_bytes(
+        pairs: Vec<(i64, Bson)>,
+        seq_offset: i64,
+        len: usize,
+        dtype: &BuiltinDType,
+    ) -> Vec<u8> {
+        let itemsize = dtype.itemsize;
+        let mut buf = vec![0u8; len * itemsize];
+        if dtype.kind == Kind::Float && itemsize == 8 {
+            let nan = f64::NAN.to_le_bytes();
+            for chunk in buf.chunks_exact_mut(8) {
+                chunk.copy_from_slice(&nan);
+            }
+        }
+        for (seq, value) in pairs {
+            let idx = seq - seq_offset - 1;
+            if idx >= 0 && (idx as usize) < len {
+                let off = (idx as usize) * itemsize;
+                encode_bson_into(value, dtype.kind, itemsize, &mut buf[off..off + itemsize]);
+            }
+        }
+        buf
+    }
+
     fn fetch_time_column(&self) -> Result<Vec<f64>> {
         self.fetch_time_column_range(0, self.num_events)
     }
 
     fn fetch_time_column_range(&self, row_start: usize, row_end: usize) -> Result<Vec<f64>> {
         let project = doc! {"descriptor": 1, "seq_num": 1, "time": 1};
-        let pairs = self.fetch_seq_value_pairs(
+        let bson_pairs = self.fetch_seq_bson_pairs(
             &project,
             "$doc.time",
             (row_start as i64) + 1,
             (row_end as i64) + 1,
         )?;
+        let f64_pairs: Vec<(i64, f64)> = bson_pairs
+            .into_iter()
+            .map(|(s, v)| (s, bson_to_f64(&v).unwrap_or(f64::NAN)))
+            .collect();
         Ok(Self::scatter_pairs(
-            pairs,
+            f64_pairs,
             row_start as i64,
             row_end - row_start,
         ))
     }
 
-    fn fetch_inline_column(&self) -> Result<Vec<f64>> {
+    fn fetch_inline_column(&self) -> Result<Vec<u8>> {
         self.fetch_inline_column_range(0, self.num_events)
     }
 
-    fn fetch_inline_column_range(&self, row_start: usize, row_end: usize) -> Result<Vec<f64>> {
+    fn fetch_inline_column_range(&self, row_start: usize, row_end: usize) -> Result<Vec<u8>> {
         let field_path = format!("data.{}", self.field_name);
         let push_path = format!("$doc.data.{}", self.field_name);
         let project = doc! {
@@ -233,16 +263,17 @@ impl ArrayColumnAdapter {
             "time": 1,
             &field_path: 1,
         };
-        let pairs = self.fetch_seq_value_pairs(
+        let pairs = self.fetch_seq_bson_pairs(
             &project,
             &push_path,
             (row_start as i64) + 1,
             (row_end as i64) + 1,
         )?;
-        Ok(Self::scatter_pairs(
+        Ok(Self::scatter_bson_to_bytes(
             pairs,
             row_start as i64,
             row_end - row_start,
+            &self.dtype,
         ))
     }
 
@@ -349,8 +380,7 @@ impl ArrayAdapterRead for ArrayColumnAdapter {
                     } else if me.is_external {
                         me.fetch_external_column()
                     } else {
-                        let values = me.fetch_inline_column()?;
-                        Ok(values.iter().flat_map(|v| v.to_le_bytes()).collect())
+                        me.fetch_inline_column()
                     }
                 })
                 .await
@@ -407,8 +437,7 @@ impl ArrayAdapterRead for ArrayColumnAdapter {
                     } else if me.is_external {
                         me.fetch_external_column_range(row_start, row_end)
                     } else {
-                        let values = me.fetch_inline_column_range(row_start, row_end)?;
-                        Ok(values.iter().flat_map(|v| v.to_le_bytes()).collect())
+                        me.fetch_inline_column_range(row_start, row_end)
                     }
                 })
                 .await
@@ -446,13 +475,47 @@ fn guess_dtype(dtype_str: &str) -> BuiltinDType {
     }
 }
 
+/// Write one BSON value into `slot` according to `kind` and `itemsize`.
+/// Slot bytes not written by this function keep their pre-filled default
+/// (caller is responsible for initializing the buffer, e.g. NaN or zeros).
+fn encode_bson_into(value: Bson, kind: Kind, itemsize: usize, slot: &mut [u8]) {
+    use crate::bson_ext::bson_to_f64;
+    match kind {
+        Kind::Float if itemsize == 8 => {
+            let f = bson_to_f64(&value).unwrap_or(f64::NAN);
+            slot.copy_from_slice(&f.to_le_bytes());
+        }
+        Kind::Boolean if itemsize == 1 => {
+            slot[0] = match value {
+                Bson::Boolean(b) => b as u8,
+                Bson::Int32(n) => u8::from(n != 0),
+                Bson::Int64(n) => u8::from(n != 0),
+                _ => 0,
+            };
+        }
+        Kind::Unicode => {
+            // Numpy '<U10' layout: each Unicode code point is 4 bytes LE,
+            // max_chars = itemsize / 4.  Remaining bytes stay zero (null pad).
+            if let Bson::String(s) = value {
+                let max_chars = itemsize / 4;
+                for (i, c) in s.chars().take(max_chars).enumerate() {
+                    let bytes = (c as u32).to_le_bytes();
+                    slot[i * 4..i * 4 + 4].copy_from_slice(&bytes);
+                }
+            }
+        }
+        _ => {} // leave slot at its pre-filled default
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use mongodb::bson::Bson;
 
-    /// Regression test: inline Int32 values must not become NaN.
-    /// Bson::as_f64() rejected Int32; bson_to_f64 accepts Int32|Int64|Double.
+    // ---- Finding 2 regressions ----
+
+    /// Inline Int32 values must not become NaN.
     #[test]
     fn int32_inline_value_is_not_nan() {
         assert!(bson_to_f64(&Bson::Int32(42)).unwrap().is_finite());
@@ -463,5 +526,74 @@ mod tests {
     #[test]
     fn int64_inline_value_is_not_nan() {
         assert!(bson_to_f64(&Bson::Int64(1_000_000)).unwrap().is_finite());
+    }
+
+    // ---- H4: dtype-correct byte width ----
+
+    fn float_dtype() -> BuiltinDType {
+        BuiltinDType::new(Endianness::Little, Kind::Float, 8)
+    }
+    fn bool_dtype() -> BuiltinDType {
+        BuiltinDType::new(Endianness::NotApplicable, Kind::Boolean, 1)
+    }
+    fn unicode_dtype() -> BuiltinDType {
+        BuiltinDType::new(Endianness::Little, Kind::Unicode, 40)
+    }
+
+    #[test]
+    fn scatter_float_int32_emits_8_bytes_not_nan() {
+        let dtype = float_dtype();
+        let pairs = vec![(1i64, Bson::Int32(99))];
+        let bytes = ArrayColumnAdapter::scatter_bson_to_bytes(pairs, 0, 1, &dtype);
+        assert_eq!(bytes.len(), 8);
+        let f = f64::from_le_bytes(bytes.try_into().unwrap());
+        assert_eq!(f, 99.0);
+    }
+
+    #[test]
+    fn scatter_float_missing_slot_is_nan() {
+        let dtype = float_dtype();
+        let pairs: Vec<(i64, Bson)> = vec![];
+        let bytes = ArrayColumnAdapter::scatter_bson_to_bytes(pairs, 0, 1, &dtype);
+        assert_eq!(bytes.len(), 8);
+        let f = f64::from_le_bytes(bytes.try_into().unwrap());
+        assert!(f.is_nan());
+    }
+
+    #[test]
+    fn scatter_boolean_emits_one_byte_per_event() {
+        let dtype = bool_dtype();
+        let pairs = vec![(1i64, Bson::Boolean(true)), (3i64, Bson::Boolean(false))];
+        let bytes = ArrayColumnAdapter::scatter_bson_to_bytes(pairs, 0, 4, &dtype);
+        assert_eq!(bytes.len(), 4, "4 events × 1 byte");
+        assert_eq!(bytes[0], 1, "seq 1 → true");
+        assert_eq!(bytes[1], 0, "seq 2 → missing → 0");
+        assert_eq!(bytes[2], 0, "seq 3 → false");
+        assert_eq!(bytes[3], 0, "seq 4 → missing → 0");
+    }
+
+    #[test]
+    fn scatter_string_emits_40_bytes_per_event_utf32le() {
+        let dtype = unicode_dtype();
+        let pairs = vec![(1i64, Bson::String("AB".to_string()))];
+        let bytes = ArrayColumnAdapter::scatter_bson_to_bytes(pairs, 0, 2, &dtype);
+        assert_eq!(bytes.len(), 80, "2 events × 40 bytes");
+        // 'A' (U+0041) in UTF-32-LE
+        assert_eq!(&bytes[0..4], &[0x41, 0x00, 0x00, 0x00]);
+        // 'B' (U+0042) in UTF-32-LE
+        assert_eq!(&bytes[4..8], &[0x42, 0x00, 0x00, 0x00]);
+        // rest of first event: zero-padded
+        assert_eq!(&bytes[8..40], &[0u8; 32]);
+        // second event missing → all zeros
+        assert_eq!(&bytes[40..80], &[0u8; 40]);
+    }
+
+    #[test]
+    fn guess_dtype_byte_widths() {
+        assert_eq!(guess_dtype("number").itemsize, 8);
+        assert_eq!(guess_dtype("integer").itemsize, 8);
+        assert_eq!(guess_dtype("boolean").itemsize, 1);
+        assert_eq!(guess_dtype("string").itemsize, 40);
+        assert_eq!(guess_dtype("array").itemsize, 8);
     }
 }
