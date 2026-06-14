@@ -3,7 +3,7 @@
 //! Corresponds to `databroker.mongo_normalized.MongoAdapter`.
 //! Lists BlueskyRuns from the `run_start` collection.
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use indexmap::IndexMap;
 use mongodb::bson::{Document, doc};
@@ -84,7 +84,7 @@ impl MongoCatalog {
                         .flatten();
 
                     let run = BlueskyRunAdapter::new(self.db.clone(), start_doc, stop_doc);
-                    mapping.insert(uid, AnyAdapter::Container(Box::new(run)));
+                    mapping.insert(uid, AnyAdapter::Container(Arc::new(run)));
                 }
             }
             mapping

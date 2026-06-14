@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use crate::dtype::{ArrowTable, DynNDArray};
 use crate::error::Result;
@@ -46,7 +47,7 @@ pub trait ArrayAdapterRead: BaseAdapter {
     /// underlying store supports `write_block` / `append` override this
     /// to return `Some(self)`; the rest leave it `None`. Lets the
     /// router pick a write path at request time without giving up the
-    /// existing `Box<dyn ArrayAdapterRead>` storage in
+    /// existing `Arc<dyn ArrayAdapterRead>` storage in
     /// `AnyAdapter::Array`. Mirrors the spirit of upstream tiled
     /// PR #802 (extendable arrays) on the trait side.
     fn as_writable(&self) -> Option<&dyn ArrayAdapterWrite> {
@@ -161,12 +162,21 @@ pub trait ContainerAdapter: BaseAdapter {
 // AnyAdapter — type-erased adapter enum
 // ---------------------------------------------------------------------------
 
+/// Leaf adapters are held behind `Arc`, not `Box`, so a tree walk can hand
+/// back an owned, `'static` clone of the leaf (a cheap refcount bump) and the
+/// async `read*` future can then be awaited on the executor instead of being
+/// driven via `Handle::block_on` on a blocking-pool thread. File/DB-backed
+/// adapter reads offload their own blocking internally, so driving them with
+/// `block_on` parked a second pool thread per read — at high concurrency that
+/// exhausts the blocking pool and deadlocks. Arc storage lets the read run on
+/// the executor with exactly one pool thread per read (the adapter's own
+/// inner offload).
 pub enum AnyAdapter {
-    Array(Box<dyn ArrayAdapterRead>),
-    Table(Box<dyn TableAdapterRead>),
-    Sparse(Box<dyn SparseAdapterRead>),
-    Awkward(Box<dyn AwkwardAdapterRead>),
-    Container(Box<dyn ContainerAdapter>),
+    Array(Arc<dyn ArrayAdapterRead>),
+    Table(Arc<dyn TableAdapterRead>),
+    Sparse(Arc<dyn SparseAdapterRead>),
+    Awkward(Arc<dyn AwkwardAdapterRead>),
+    Container(Arc<dyn ContainerAdapter>),
 }
 
 impl AnyAdapter {
@@ -236,6 +246,28 @@ impl AnyAdapter {
     pub fn as_table(&self) -> Option<&dyn TableAdapterRead> {
         match self {
             Self::Table(t) => Some(t.as_ref()),
+            _ => None,
+        }
+    }
+
+    /// Owned, `'static` clone of the array leaf (a refcount bump). Returned
+    /// from a `spawn_blocking` tree walk so the caller can `await` the
+    /// adapter's `read*` future on the executor rather than driving it via
+    /// `Handle::block_on` on the blocking pool. See the [`AnyAdapter`] doc
+    /// comment for why this avoids the nested blocking-pool deadlock.
+    #[inline]
+    pub fn as_array_arc(&self) -> Option<Arc<dyn ArrayAdapterRead>> {
+        match self {
+            Self::Array(a) => Some(Arc::clone(a)),
+            _ => None,
+        }
+    }
+
+    /// Owned, `'static` clone of the table leaf. See [`AnyAdapter::as_array_arc`].
+    #[inline]
+    pub fn as_table_arc(&self) -> Option<Arc<dyn TableAdapterRead>> {
+        match self {
+            Self::Table(t) => Some(Arc::clone(t)),
             _ => None,
         }
     }

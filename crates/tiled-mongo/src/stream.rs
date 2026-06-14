@@ -77,7 +77,7 @@ impl EventStreamAdapter {
             // Add "time" coordinate column (always inline).
             let time_col =
                 ArrayColumnAdapter::new_time(self.db.clone(), descriptor_uids.clone(), num_events);
-            mapping.insert("time".to_string(), AnyAdapter::Array(Box::new(time_col)));
+            mapping.insert("time".to_string(), AnyAdapter::Array(Arc::new(time_col)));
 
             // Aggregate data_keys across every descriptor in the stream.
             // A run that swaps descriptors mid-stream still exposes every
@@ -127,7 +127,7 @@ impl EventStreamAdapter {
                             },
                         },
                     );
-                    mapping.insert(key.clone(), AnyAdapter::Array(Box::new(col)));
+                    mapping.insert(key.clone(), AnyAdapter::Array(Arc::new(col)));
                 }
             }
 

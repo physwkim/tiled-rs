@@ -17,17 +17,17 @@ fn build_root() -> MapAdapter {
     // 1D float64 array.
     let data: Vec<f64> = (0..10).map(|i| i as f64).collect();
     let arr = ArrayAdapter::from_f64_1d(&data, serde_json::json!({"element": "Cu"}));
-    mapping.insert("some_array".into(), AnyAdapter::Array(Box::new(arr)));
+    mapping.insert("some_array".into(), AnyAdapter::Array(Arc::new(arr)));
 
     // Nested container.
     let mut inner = IndexMap::new();
     let inner_data: Vec<f64> = vec![1.0, 2.0, 3.0];
     let inner_arr = ArrayAdapter::from_f64_1d(&inner_data, serde_json::json!({}));
-    inner.insert("nested_arr".into(), AnyAdapter::Array(Box::new(inner_arr)));
+    inner.insert("nested_arr".into(), AnyAdapter::Array(Arc::new(inner_arr)));
     let inner_container = MapAdapter::new(inner, serde_json::json!({"nested": true}), vec![]);
     mapping.insert(
         "subgroup".into(),
-        AnyAdapter::Container(Box::new(inner_container)),
+        AnyAdapter::Container(Arc::new(inner_container)),
     );
 
     MapAdapter::new(

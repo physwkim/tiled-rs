@@ -246,7 +246,7 @@ mod tests {
         let mut mapping = IndexMap::new();
         for i in 0..10 {
             let child = MapAdapter::new(IndexMap::new(), serde_json::json!({}), vec![]);
-            mapping.insert(format!("item_{i}"), AnyAdapter::Container(Box::new(child)));
+            mapping.insert(format!("item_{i}"), AnyAdapter::Container(Arc::new(child)));
         }
         let adapter = MapAdapter::new(mapping, serde_json::json!({}), vec![]);
         assert_eq!(adapter.len(), 10);
@@ -263,7 +263,7 @@ mod tests {
         let mut mapping = IndexMap::new();
         mapping.insert(
             "a".to_string(),
-            AnyAdapter::Container(Box::new(MapAdapter::new(
+            AnyAdapter::Container(Arc::new(MapAdapter::new(
                 IndexMap::new(),
                 serde_json::json!({}),
                 vec![],

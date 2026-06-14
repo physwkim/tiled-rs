@@ -8,6 +8,7 @@
 //! this resolver.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use tiled_catalog::Catalog;
 use tiled_catalog::adapter::LeafResolver;
@@ -91,14 +92,14 @@ impl LeafResolver for FileLeafResolver {
             "application/x-npy" | "application/x-numpy" | "npy" => {
                 let adapter = tiled_adapters::NpyAdapter::from_path(path, metadata)
                     .map_err(|e| CatalogError::Validation(e.to_string()))?;
-                AnyAdapter::Array(Box::new(adapter))
+                AnyAdapter::Array(Arc::new(adapter))
             }
             "image/tiff" | "image/x-tiff" | "tiff" => {
                 #[cfg(feature = "tiff-adapter")]
                 {
                     let adapter = tiled_adapters::TiffAdapter::from_path(path, metadata)
                         .map_err(|e| CatalogError::Validation(e.to_string()))?;
-                    AnyAdapter::Array(Box::new(adapter))
+                    AnyAdapter::Array(Arc::new(adapter))
                 }
                 #[cfg(not(feature = "tiff-adapter"))]
                 {
@@ -110,7 +111,7 @@ impl LeafResolver for FileLeafResolver {
                 {
                     let adapter = tiled_adapters::ImageAdapter::from_path(path, metadata)
                         .map_err(|e| CatalogError::Validation(e.to_string()))?;
-                    AnyAdapter::Array(Box::new(adapter))
+                    AnyAdapter::Array(Arc::new(adapter))
                 }
                 #[cfg(not(feature = "tiff-adapter"))]
                 {
@@ -129,7 +130,7 @@ impl LeafResolver for FileLeafResolver {
                         .unwrap_or("entry/data/data");
                     let adapter = tiled_adapters::Hdf5Adapter::from_path(path, dataset, metadata)
                         .map_err(|e| CatalogError::Validation(e.to_string()))?;
-                    AnyAdapter::Array(Box::new(adapter))
+                    AnyAdapter::Array(Arc::new(adapter))
                 }
                 #[cfg(not(feature = "hdf5-adapter"))]
                 {
@@ -141,7 +142,7 @@ impl LeafResolver for FileLeafResolver {
                 {
                     let adapter = tiled_adapters::CsvAdapter::from_path(path, metadata)
                         .map_err(|e| CatalogError::Validation(e.to_string()))?;
-                    AnyAdapter::Table(Box::new(adapter))
+                    AnyAdapter::Table(Arc::new(adapter))
                 }
                 #[cfg(not(feature = "csv-adapter"))]
                 {
@@ -153,7 +154,7 @@ impl LeafResolver for FileLeafResolver {
                 {
                     let adapter = tiled_adapters::ParquetAdapter::from_path(path, metadata)
                         .map_err(|e| CatalogError::Validation(e.to_string()))?;
-                    AnyAdapter::Table(Box::new(adapter))
+                    AnyAdapter::Table(Arc::new(adapter))
                 }
                 #[cfg(not(feature = "parquet-adapter"))]
                 {

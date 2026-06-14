@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::io::{Cursor, Seek, Write};
+use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::{OriginalUri, Query, State};
@@ -576,62 +577,68 @@ pub async fn array_block(
         .map(|s| s.to_string())
         .unwrap_or_default();
     let format_str = params.get("format").map(|s| s.to_string());
-    let handle = tokio::runtime::Handle::current();
+    // The tree walk needs a blocking thread (adapters may call
+    // `Handle::block_on` internally), so resolve the leaf there and hand back an
+    // owned `Arc` clone. The read itself is a `Send` future that offloads its
+    // own blocking, so it is awaited on the executor below — driving it via
+    // `block_on` on this thread would park a second blocking-pool thread per
+    // read and deadlock the pool under load.
     let state_c = state.clone();
     let segs = segments.clone();
-    let data = tokio::task::spawn_blocking(
-        move || -> Result<tiled_core::dtype::DynNDArray, ServerError> {
-            let adapter = core::walk_tree(state_c.root_tree.as_ref(), &segs)?;
-            let array_adapter = adapter.as_array().ok_or_else(|| {
-                ServerError::Validation(format!("'{}' is not an array", segs.join("/")))
-            })?;
-            let block_specs: Vec<BlockSpec> = if block_str.is_empty() {
-                vec![BlockSpec::Single(0); array_adapter.structure().ndim()]
-            } else {
-                block_str
-                    .split(',')
-                    .map(|s| BlockSpec::parse(s.trim()))
-                    .collect::<Result<Vec<_>, _>>()?
-            };
-            // Honor the `slice` query parameter (numpy-style). Empty / missing →
-            // full block.
-            let slice = match slice_str.as_str() {
-                "" => tiled_core::ndslice::NDSlice::empty(),
-                s => tiled_core::ndslice::NDSlice::from_numpy_str(s)
-                    .map_err(|e| ServerError::Validation(format!("Invalid slice '{s}': {e}")))?,
-            };
-            // Single-chunk fast path = every axis is BlockSpec::Single. Mirrors
-            // pre-#1302 behaviour exactly so existing callers see no change.
-            let single_chunk: Option<Vec<usize>> = block_specs
-                .iter()
-                .map(|s| match s {
-                    BlockSpec::Single(i) => Some(*i),
-                    BlockSpec::Range(_, _) => None,
+    let array_adapter: Arc<dyn tiled_core::adapters::ArrayAdapterRead> =
+        tokio::task::spawn_blocking(
+            move || -> Result<Arc<dyn tiled_core::adapters::ArrayAdapterRead>, ServerError> {
+                let adapter = core::walk_tree(state_c.root_tree.as_ref(), &segs)?;
+                adapter.as_array_arc().ok_or_else(|| {
+                    ServerError::Validation(format!("'{}' is not an array", segs.join("/")))
                 })
-                .collect();
-            if let Some(block) = single_chunk {
-                handle
-                    .block_on(array_adapter.read_block(&block, &slice))
-                    .map_err(ServerError::from)
-            } else {
-                // Multi-chunk read — upstream tiled PR #1302. Slicing within a
-                // multi-chunk block requires applying the slice to the
-                // assembled buffer; restrict to "no slice" for the first port
-                // and surface a clear 422 if both are combined. Slice across a
-                // chunk range is a follow-up (needs a contiguous-buffer
-                // apply_slice helper).
-                if !slice.is_empty() {
-                    return Err(ServerError::Validation(
-                        "?slice= combined with a multi-chunk ?block= range is not yet supported"
-                            .into(),
-                    ));
-                }
-                handle.block_on(read_block_range(array_adapter, &block_specs))
-            }
-        },
-    )
-    .await
-    .map_err(|e| ServerError::Internal(format!("blocking task failed: {e}")))??;
+            },
+        )
+        .await
+        .map_err(|e| ServerError::Internal(format!("blocking task failed: {e}")))??;
+
+    let block_specs: Vec<BlockSpec> = if block_str.is_empty() {
+        vec![BlockSpec::Single(0); array_adapter.structure().ndim()]
+    } else {
+        block_str
+            .split(',')
+            .map(|s| BlockSpec::parse(s.trim()))
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    // Honor the `slice` query parameter (numpy-style). Empty / missing →
+    // full block.
+    let slice = match slice_str.as_str() {
+        "" => tiled_core::ndslice::NDSlice::empty(),
+        s => tiled_core::ndslice::NDSlice::from_numpy_str(s)
+            .map_err(|e| ServerError::Validation(format!("Invalid slice '{s}': {e}")))?,
+    };
+    // Single-chunk fast path = every axis is BlockSpec::Single. Mirrors
+    // pre-#1302 behaviour exactly so existing callers see no change.
+    let single_chunk: Option<Vec<usize>> = block_specs
+        .iter()
+        .map(|s| match s {
+            BlockSpec::Single(i) => Some(*i),
+            BlockSpec::Range(_, _) => None,
+        })
+        .collect();
+    let data = if let Some(block) = single_chunk {
+        array_adapter
+            .read_block(&block, &slice)
+            .await
+            .map_err(ServerError::from)?
+    } else {
+        // Multi-chunk read — upstream tiled PR #1302. Slicing within a
+        // multi-chunk block requires applying the slice to the assembled
+        // buffer; restrict to "no slice" for the first port and surface a clear
+        // 422 if both are combined. Slice across a chunk range is a follow-up
+        // (needs a contiguous-buffer apply_slice helper).
+        if !slice.is_empty() {
+            return Err(ServerError::Validation(
+                "?slice= combined with a multi-chunk ?block= range is not yet supported".into(),
+            ));
+        }
+        read_block_range(array_adapter.as_ref(), &block_specs).await?
+    };
 
     build_array_response(data, format_str.as_deref(), &headers, &state).await
 }
@@ -764,76 +771,84 @@ pub async fn array_append(
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
 
-    // Async A: ONE spawn_blocking owns the tree walk AND the async write so
-    // adapters that call Handle::block_on internally never run on an async
-    // worker thread. The async write is driven via handle.block_on().
-    let handle = tokio::runtime::Handle::current();
+    // The tree walk needs a blocking thread (adapters may call
+    // `Handle::block_on` internally); resolve the leaf there and hand back an
+    // owned `Arc` clone, then run validation + the async append on the executor.
+    // No writable adapter offloads `append` internally yet, so this is latent
+    // today, but kept uniform with `array_block` so a future appendable store
+    // (whose append would offload) does not reintroduce the nested
+    // blocking-pool deadlock.
     let state_c = state.clone();
     let segs = segments.clone();
-    let new_axis_len = tokio::task::spawn_blocking(move || -> Result<usize, ServerError> {
-        let adapter = core::walk_tree(state_c.root_tree.as_ref(), &segs)?;
-        let array_adapter = adapter.as_array().ok_or_else(|| {
-            ServerError::Validation(format!("'{}' is not an array", segs.join("/")))
-        })?;
-        let writable = array_adapter.as_writable().ok_or_else(|| {
-            ServerError::Validation(
-                "this array adapter does not support append; only adapters whose \
-                     underlying store can grow (zarr, ND-streaming) implement it"
-                    .into(),
-            )
-        })?;
-        let structure = array_adapter.structure();
-        if append_along >= structure.shape.len() {
-            return Err(ServerError::Validation(format!(
-                "append_along={append_along} out of range (ndim={})",
-                structure.shape.len()
-            )));
-        }
-        // Construct a DynNDArray view over the request body. Shape is the
-        // existing structure's shape with `shape[append_along]` swapped for
-        // the inferred number of new elements (body bytes / element size /
-        // product of remaining dims).
-        let elem_size = match &structure.data_type {
-            tiled_core::dtype::DType::Builtin(b) => b.element_size(),
-            _ => {
-                return Err(ServerError::Validation(
-                    "append: only Builtin dtypes are supported".into(),
-                ));
-            }
-        };
-        let mut new_shape = structure.shape.clone();
-        let other_axes: usize = structure
-            .shape
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| *i != append_along)
-            .map(|(_, d)| *d)
-            .product();
-        if elem_size == 0 || other_axes == 0 {
+    let array_adapter: Arc<dyn tiled_core::adapters::ArrayAdapterRead> =
+        tokio::task::spawn_blocking(
+            move || -> Result<Arc<dyn tiled_core::adapters::ArrayAdapterRead>, ServerError> {
+                let adapter = core::walk_tree(state_c.root_tree.as_ref(), &segs)?;
+                adapter.as_array_arc().ok_or_else(|| {
+                    ServerError::Validation(format!("'{}' is not an array", segs.join("/")))
+                })
+            },
+        )
+        .await
+        .map_err(|e| ServerError::Internal(format!("blocking task failed: {e}")))??;
+
+    let writable = array_adapter.as_writable().ok_or_else(|| {
+        ServerError::Validation(
+            "this array adapter does not support append; only adapters whose \
+                 underlying store can grow (zarr, ND-streaming) implement it"
+                .into(),
+        )
+    })?;
+    let structure = array_adapter.structure();
+    if append_along >= structure.shape.len() {
+        return Err(ServerError::Validation(format!(
+            "append_along={append_along} out of range (ndim={})",
+            structure.shape.len()
+        )));
+    }
+    // Construct a DynNDArray view over the request body. Shape is the
+    // existing structure's shape with `shape[append_along]` swapped for
+    // the inferred number of new elements (body bytes / element size /
+    // product of remaining dims).
+    let elem_size = match &structure.data_type {
+        tiled_core::dtype::DType::Builtin(b) => b.element_size(),
+        _ => {
             return Err(ServerError::Validation(
-                "append: structure has zero-element-size or zero-area cross-section".into(),
+                "append: only Builtin dtypes are supported".into(),
             ));
         }
-        let row_bytes = other_axes * elem_size;
-        if !body.len().is_multiple_of(row_bytes) {
-            return Err(ServerError::Validation(format!(
-                "append: body length {} is not a multiple of cross-section bytes {row_bytes}",
-                body.len()
-            )));
-        }
-        let added_along_axis = body.len() / row_bytes;
-        new_shape[append_along] = added_along_axis;
-        let dtype = match &structure.data_type {
-            tiled_core::dtype::DType::Builtin(b) => b.clone(),
-            _ => unreachable!("checked above"),
-        };
-        let payload = tiled_core::dtype::DynNDArray::new(body, dtype, new_shape);
-        handle
-            .block_on(writable.append(payload, append_along))
-            .map_err(ServerError::from)
-    })
-    .await
-    .map_err(|e| ServerError::Internal(format!("blocking task failed: {e}")))??;
+    };
+    let mut new_shape = structure.shape.clone();
+    let other_axes: usize = structure
+        .shape
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != append_along)
+        .map(|(_, d)| *d)
+        .product();
+    if elem_size == 0 || other_axes == 0 {
+        return Err(ServerError::Validation(
+            "append: structure has zero-element-size or zero-area cross-section".into(),
+        ));
+    }
+    let row_bytes = other_axes * elem_size;
+    if !body.len().is_multiple_of(row_bytes) {
+        return Err(ServerError::Validation(format!(
+            "append: body length {} is not a multiple of cross-section bytes {row_bytes}",
+            body.len()
+        )));
+    }
+    let added_along_axis = body.len() / row_bytes;
+    new_shape[append_along] = added_along_axis;
+    let dtype = match &structure.data_type {
+        tiled_core::dtype::DType::Builtin(b) => b.clone(),
+        _ => unreachable!("checked above"),
+    };
+    let payload = tiled_core::dtype::DynNDArray::new(body, dtype, new_shape);
+    let new_axis_len = writable
+        .append(payload, append_along)
+        .await
+        .map_err(ServerError::from)?;
 
     let path = segments.join("/");
     state.streaming_bus.publish(
@@ -1442,27 +1457,35 @@ pub async fn array_full(
         .map(|s| s.to_string())
         .unwrap_or_default();
     let format_str = params.get("format").map(|s| s.to_string());
-    let handle = tokio::runtime::Handle::current();
+    // The tree walk needs a blocking thread (adapters may call
+    // `Handle::block_on` internally); resolve the leaf there and hand back an
+    // owned `Arc` clone, then await the read on the executor — its future
+    // offloads its own blocking, so driving it via block_on here would park a
+    // second blocking-pool thread per read and deadlock under load (see
+    // array_block).
     let state_c = state.clone();
     let segs = segments.clone();
-    let data = tokio::task::spawn_blocking(
-        move || -> Result<tiled_core::dtype::DynNDArray, ServerError> {
-            let adapter = core::walk_tree(state_c.root_tree.as_ref(), &segs)?;
-            let array_adapter = adapter.as_array().ok_or_else(|| {
-                ServerError::Validation(format!("'{}' is not an array", segs.join("/")))
-            })?;
-            let slice = match slice_str.as_str() {
-                "" => tiled_core::ndslice::NDSlice::empty(),
-                s => tiled_core::ndslice::NDSlice::from_numpy_str(s)
-                    .map_err(|e| ServerError::Validation(format!("Invalid slice '{s}': {e}")))?,
-            };
-            handle
-                .block_on(array_adapter.read(&slice))
-                .map_err(ServerError::from)
-        },
-    )
-    .await
-    .map_err(|e| ServerError::Internal(format!("blocking task failed: {e}")))??;
+    let array_adapter: Arc<dyn tiled_core::adapters::ArrayAdapterRead> =
+        tokio::task::spawn_blocking(
+            move || -> Result<Arc<dyn tiled_core::adapters::ArrayAdapterRead>, ServerError> {
+                let adapter = core::walk_tree(state_c.root_tree.as_ref(), &segs)?;
+                adapter.as_array_arc().ok_or_else(|| {
+                    ServerError::Validation(format!("'{}' is not an array", segs.join("/")))
+                })
+            },
+        )
+        .await
+        .map_err(|e| ServerError::Internal(format!("blocking task failed: {e}")))??;
+
+    let slice = match slice_str.as_str() {
+        "" => tiled_core::ndslice::NDSlice::empty(),
+        s => tiled_core::ndslice::NDSlice::from_numpy_str(s)
+            .map_err(|e| ServerError::Validation(format!("Invalid slice '{s}': {e}")))?,
+    };
+    let data = array_adapter
+        .read(&slice)
+        .await
+        .map_err(ServerError::from)?;
 
     build_array_response(data, format_str.as_deref(), &headers, &state).await
 }
@@ -1521,21 +1544,33 @@ pub async fn table_partition(
     )
     .unwrap_or_else(|| tiled_core::media_type::mime::ARROW_FILE.to_string());
 
-    // Async A + A3: ONE spawn_blocking owns the tree walk (safe for adapters
-    // that call Handle::block_on) and the Arrow IPC encode (CPU-bound).
-    // Uses Handle::current().block_on() to drive the async read inside the
-    // blocking pool thread where it is safe.
-    let handle = tokio::runtime::Handle::current();
+    // Separate the three concerns: the tree walk needs a blocking thread
+    // (adapters may call Handle::block_on internally) and hands back an owned
+    // `Arc` leaf; the partition read is a `Send` future that offloads its own
+    // blocking, so it is awaited on the executor (driving it via block_on would
+    // park a second blocking-pool thread per read and deadlock under load — see
+    // array_block); the Arrow IPC encode is CPU-bound and offloaded on its own.
     let state_c = state.clone();
     let segs = segments.clone();
+    let table_adapter: Arc<dyn tiled_core::adapters::TableAdapterRead> =
+        tokio::task::spawn_blocking(
+            move || -> Result<Arc<dyn tiled_core::adapters::TableAdapterRead>, ServerError> {
+                let adapter = core::walk_tree(state_c.root_tree.as_ref(), &segs)?;
+                adapter.as_table_arc().ok_or_else(|| {
+                    ServerError::Validation(format!("'{}' is not a table", segs.join("/")))
+                })
+            },
+        )
+        .await
+        .map_err(|e| ServerError::Internal(format!("blocking task failed: {e}")))??;
+
+    let table = table_adapter
+        .read_partition(partition, fields.as_deref())
+        .await
+        .map_err(ServerError::from)?;
+
+    // Arrow IPC encode is CPU-bound with no inner async — offload it.
     let ipc_bytes = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, ServerError> {
-        let adapter = core::walk_tree(state_c.root_tree.as_ref(), &segs)?;
-        let table_adapter = adapter.as_table().ok_or_else(|| {
-            ServerError::Validation(format!("'{}' is not a table", segs.join("/")))
-        })?;
-        let table = handle
-            .block_on(table_adapter.read_partition(partition, fields.as_deref()))
-            .map_err(ServerError::from)?;
         let mut buf = Vec::new();
         {
             let mut writer = arrow::ipc::writer::FileWriter::try_new(&mut buf, &table.schema)

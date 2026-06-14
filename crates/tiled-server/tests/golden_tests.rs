@@ -21,7 +21,7 @@ fn build_test_tree() -> MapAdapter {
     // A small 1D array
     let data: Vec<f64> = (0..10).map(|i| i as f64).collect();
     let arr = ArrayAdapter::from_f64_1d(&data, serde_json::json!({"element": "Cu"}));
-    mapping.insert("some_array".to_string(), AnyAdapter::Array(Box::new(arr)));
+    mapping.insert("some_array".to_string(), AnyAdapter::Array(Arc::new(arr)));
 
     // A nested container
     let mut inner = IndexMap::new();
@@ -29,12 +29,12 @@ fn build_test_tree() -> MapAdapter {
     let inner_arr = ArrayAdapter::from_f64_1d(&inner_data, serde_json::json!({}));
     inner.insert(
         "nested_arr".to_string(),
-        AnyAdapter::Array(Box::new(inner_arr)),
+        AnyAdapter::Array(Arc::new(inner_arr)),
     );
     let inner_container = MapAdapter::new(inner, serde_json::json!({"nested": true}), vec![]);
     mapping.insert(
         "subgroup".to_string(),
-        AnyAdapter::Container(Box::new(inner_container)),
+        AnyAdapter::Container(Arc::new(inner_container)),
     );
 
     MapAdapter::new(
@@ -711,7 +711,7 @@ async fn test_metadata_handles_percent_encoded_slash_in_key() {
     let mut mapping = IndexMap::new();
     let data: Vec<f64> = vec![1.0, 2.0, 3.0];
     let arr = ArrayAdapter::from_f64_1d(&data, serde_json::json!({}));
-    mapping.insert("a/b".to_string(), AnyAdapter::Array(Box::new(arr)));
+    mapping.insert("a/b".to_string(), AnyAdapter::Array(Arc::new(arr)));
     let root: Arc<dyn tiled_core::adapters::ContainerAdapter> =
         Arc::new(MapAdapter::new(mapping, serde_json::json!({}), vec![]));
     let registry = Arc::new(tiled_serialization::default_registry());

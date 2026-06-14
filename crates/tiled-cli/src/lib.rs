@@ -234,7 +234,7 @@ fn build_demo_tree() -> MapAdapter {
         &data_1d,
         serde_json::json!({"description": "A 1D array of 100 floats"}),
     );
-    mapping.insert("small_1d".to_string(), AnyAdapter::Array(Box::new(arr_1d)));
+    mapping.insert("small_1d".to_string(), AnyAdapter::Array(Arc::new(arr_1d)));
 
     // 2D array of floats
     let data_2d: Vec<f64> = (0..200).map(|i| (i as f64) * 0.5).collect();
@@ -244,7 +244,7 @@ fn build_demo_tree() -> MapAdapter {
         20,
         serde_json::json!({"description": "A 10x20 array of floats"}),
     );
-    mapping.insert("medium_2d".to_string(), AnyAdapter::Array(Box::new(arr_2d)));
+    mapping.insert("medium_2d".to_string(), AnyAdapter::Array(Arc::new(arr_2d)));
 
     // Nested container
     let mut inner_mapping = IndexMap::new();
@@ -255,7 +255,7 @@ fn build_demo_tree() -> MapAdapter {
     );
     inner_mapping.insert(
         "spectrum".to_string(),
-        AnyAdapter::Array(Box::new(inner_arr)),
+        AnyAdapter::Array(Arc::new(inner_arr)),
     );
 
     let inner_container = MapAdapter::new(
@@ -265,7 +265,7 @@ fn build_demo_tree() -> MapAdapter {
     );
     mapping.insert(
         "sample_data".to_string(),
-        AnyAdapter::Container(Box::new(inner_container)),
+        AnyAdapter::Container(Arc::new(inner_container)),
     );
 
     // Larger arrays for benchmarking
@@ -276,7 +276,7 @@ fn build_demo_tree() -> MapAdapter {
     );
     mapping.insert(
         "large_1d".to_string(),
-        AnyAdapter::Array(Box::new(arr_large_1d)),
+        AnyAdapter::Array(Arc::new(arr_large_1d)),
     );
 
     let large_2d: Vec<f64> = (0..1_000_000).map(|i| (i as f64) * 0.001).collect();
@@ -288,7 +288,7 @@ fn build_demo_tree() -> MapAdapter {
     );
     mapping.insert(
         "large_2d".to_string(),
-        AnyAdapter::Array(Box::new(arr_large_2d)),
+        AnyAdapter::Array(Arc::new(arr_large_2d)),
     );
 
     MapAdapter::new(

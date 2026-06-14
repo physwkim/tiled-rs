@@ -114,7 +114,7 @@ impl BlueskyRunAdapter {
                         cutoff_seq_num,
                         Some(filler.clone()),
                     );
-                    mapping.insert(stream_name.clone(), AnyAdapter::Container(Box::new(stream)));
+                    mapping.insert(stream_name.clone(), AnyAdapter::Container(Arc::new(stream)));
                     // Surface a table-shaped sibling so clients that want
                     // a flat Arrow view (pandas / polars / datafusion)
                     // can read it without composing per-column reads.
@@ -126,7 +126,7 @@ impl BlueskyRunAdapter {
                     );
                     mapping.insert(
                         format!("{stream_name}_table"),
-                        AnyAdapter::Table(Box::new(table)),
+                        AnyAdapter::Table(Arc::new(table)),
                     );
                 }
             }

@@ -117,7 +117,7 @@ impl CatalogAdapter {
                 }
                 for node in &nodes {
                     let adapter = if matches!(node.structure_family.as_str(), "container") {
-                        AnyAdapter::Container(Box::new(self.child_container(node)))
+                        AnyAdapter::Container(Arc::new(self.child_container(node)))
                     } else {
                         match self.leaf_resolver.resolve(&self.catalog, node) {
                             Ok(a) => a,
