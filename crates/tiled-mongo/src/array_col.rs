@@ -18,6 +18,7 @@ use tiled_core::error::{Result, TiledError};
 use tiled_core::ndslice::NDSlice;
 use tiled_core::structures::{ArrayStructure, Spec, StructureFamily};
 
+use crate::bson_ext::bson_to_f64;
 use crate::filler::Filler;
 
 /// Arguments for [`ArrayColumnAdapter::new_data`].
@@ -178,10 +179,7 @@ impl ArrayColumnAdapter {
                 .get_i64("seq_num")
                 .or_else(|_| doc.get_i32("seq_num").map(i64::from))
                 .unwrap_or(0);
-            let value = doc
-                .get("value")
-                .and_then(|v| v.as_f64())
-                .unwrap_or(f64::NAN);
+            let value = doc.get("value").and_then(bson_to_f64).unwrap_or(f64::NAN);
             if seq >= 1 {
                 out.push((seq, value));
             }
@@ -445,5 +443,25 @@ fn guess_dtype(dtype_str: &str) -> BuiltinDType {
         "boolean" => BuiltinDType::new(Endianness::NotApplicable, Kind::Boolean, 1),
         "array" => BuiltinDType::new(Endianness::Little, Kind::Float, 8),
         _ => BuiltinDType::new(Endianness::Little, Kind::Float, 8),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mongodb::bson::Bson;
+
+    /// Regression test: inline Int32 values must not become NaN.
+    /// Bson::as_f64() rejected Int32; bson_to_f64 accepts Int32|Int64|Double.
+    #[test]
+    fn int32_inline_value_is_not_nan() {
+        assert!(bson_to_f64(&Bson::Int32(42)).unwrap().is_finite());
+        assert_eq!(bson_to_f64(&Bson::Int32(0)), Some(0.0));
+        assert_eq!(bson_to_f64(&Bson::Int32(-7)), Some(-7.0));
+    }
+
+    #[test]
+    fn int64_inline_value_is_not_nan() {
+        assert!(bson_to_f64(&Bson::Int64(1_000_000)).unwrap().is_finite());
     }
 }
