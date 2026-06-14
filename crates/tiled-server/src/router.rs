@@ -1,6 +1,7 @@
 //! Route handlers for the Tiled API.
 
 use std::collections::HashMap;
+use std::io::{Cursor, Seek, Write};
 
 use axum::Json;
 use axum::extract::{OriginalUri, Query, State};
@@ -1003,31 +1004,24 @@ pub async fn container_full(
                         ServerError::Validation(format!("'{}' is not a container", segs.join("/")))
                     })?
             };
-            let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
-            collect_zip_entries_blocking(
-                container,
-                "",
-                &path_c,
-                &mut entries,
-                &handle,
-                filter_c.as_ref(),
-            )?;
-            // Deflate-compress on the blocking thread (CPU-bound).
-            use std::io::{Cursor, Write};
+            // Stream each leaf directly into the ZipWriter — bytes are deflated
+            // and dropped as we go, bounding live memory to one leaf + zip state
+            // rather than Σ(all decoded leaves) before the compress stage.
             use zip::write::SimpleFileOptions;
             let mut buf = Vec::new();
             {
                 let mut writer = zip::ZipWriter::new(Cursor::new(&mut buf));
                 let opts = SimpleFileOptions::default()
                     .compression_method(zip::CompressionMethod::Deflated);
-                for (name, data) in entries {
-                    writer
-                        .start_file(&name, opts)
-                        .map_err(|e| ServerError::Internal(format!("zip: {e}")))?;
-                    writer
-                        .write_all(&data)
-                        .map_err(|e| ServerError::Internal(format!("zip write: {e}")))?;
-                }
+                collect_zip_entries_blocking(
+                    container,
+                    "",
+                    &path_c,
+                    &mut writer,
+                    opts,
+                    &handle,
+                    filter_c.as_ref(),
+                )?;
                 writer
                     .finish()
                     .map_err(|e| ServerError::Internal(format!("zip finalize: {e}")))?;
@@ -1102,11 +1096,12 @@ pub async fn container_full(
 /// panic. Async reads are driven via `handle.block_on(...)`.
 /// H3: `access_filter` (when Some) is applied at each level to skip children
 /// the caller is not permitted to see.
-fn collect_zip_entries_blocking(
+fn collect_zip_entries_blocking<W: Write + Seek>(
     container: &dyn ContainerAdapter,
     prefix: &str,
     base_path: &str,
-    entries: &mut Vec<(String, Vec<u8>)>,
+    writer: &mut zip::ZipWriter<W>,
+    opts: zip::write::SimpleFileOptions,
     handle: &tokio::runtime::Handle,
     access_filter: Option<&tiled_core::queries::AccessBlobFilter>,
 ) -> Result<(), ServerError> {
@@ -1128,14 +1123,21 @@ fn collect_zip_entries_blocking(
                 let data = handle
                     .block_on(a.read(&tiled_core::ndslice::NDSlice::empty()))
                     .map_err(ServerError::from)?;
-                entries.push((format!("{entry_name}.bin"), data.data.to_vec()));
+                writer
+                    .start_file(format!("{entry_name}.bin"), opts)
+                    .map_err(|e| ServerError::Internal(format!("zip: {e}")))?;
+                writer
+                    .write_all(&data.data)
+                    .map_err(|e| ServerError::Internal(format!("zip write: {e}")))?;
+                // data is dropped here — one leaf at a time in memory
             }
             AnyAdapter::Container(child_c) => {
                 collect_zip_entries_blocking(
                     child_c.as_ref(),
                     &entry_name,
                     base_path,
-                    entries,
+                    writer,
+                    opts,
                     handle,
                     access_filter,
                 )?;
@@ -1156,7 +1158,13 @@ fn collect_zip_entries_blocking(
                         .finish()
                         .map_err(|e| ServerError::Internal(format!("arrow ipc: {e}")))?;
                 }
-                entries.push((format!("{entry_name}.arrow"), ipc_bytes));
+                writer
+                    .start_file(format!("{entry_name}.arrow"), opts)
+                    .map_err(|e| ServerError::Internal(format!("zip: {e}")))?;
+                writer
+                    .write_all(&ipc_bytes)
+                    .map_err(|e| ServerError::Internal(format!("zip write: {e}")))?;
+                // ipc_bytes dropped here
             }
             other => {
                 let crumb = serde_json::json!({
@@ -1164,10 +1172,14 @@ fn collect_zip_entries_blocking(
                     "structure_family": format!("{:?}", other.structure_family()),
                     "note": "leaf format not yet bundled in deep export",
                 });
-                entries.push((
-                    format!("{entry_name}.json"),
-                    serde_json::to_vec(&crumb).unwrap(),
-                ));
+                let crumb_bytes = serde_json::to_vec(&crumb)
+                    .map_err(|e| ServerError::Internal(format!("json: {e}")))?;
+                writer
+                    .start_file(format!("{entry_name}.json"), opts)
+                    .map_err(|e| ServerError::Internal(format!("zip: {e}")))?;
+                writer
+                    .write_all(&crumb_bytes)
+                    .map_err(|e| ServerError::Internal(format!("zip write: {e}")))?;
             }
         }
     }
