@@ -207,6 +207,12 @@ impl ContainerAdapter for CatalogAdapter {
     }
 }
 
+/// Evaluate one query filter against an adapter's in-memory state.
+///
+/// This path is called only from `CatalogAdapter::search`, whose only
+/// reachable callers pass an `AccessBlobFilter`-only query list for
+/// access-control screening.  The SQL path (`Catalog::search_children`)
+/// is the authoritative evaluator for all user-visible queries.
 fn matches_query(adapter: &AnyAdapter, access_blob: &serde_json::Value, query: &Query) -> bool {
     use Query::*;
     let meta = adapter.metadata();
@@ -217,7 +223,20 @@ fn matches_query(adapter: &AnyAdapter, access_blob: &serde_json::Value, query: &
         KeyPresent(kp) => meta.get(&kp.key).is_some() == kp.exists,
         StructureFamily(sf) => adapter.structure_family() == sf.value,
         AccessBlobFilter(f) => matches_access_blob_filter(access_blob, f),
-        _ => true, // Conservative — let unknown queries fall through.
+        // Lookup and KeysFilter filter by node key (tree position), not by
+        // metadata — they cannot be evaluated against the in-memory adapter
+        // representation.  Pass them through so that an AccessBlobFilter +
+        // Lookup combination (if ever issued) does not accidentally exclude
+        // every node before the SQL path resolves the key constraint.
+        Lookup(_) | KeysFilter(_) => true,
+        // All remaining variants (In, NotIn, Comparison, Contains, Like,
+        // Regex, Specs) express metadata predicates that this in-memory path
+        // does not implement.  Return false rather than true so a future
+        // caller that mistakenly routes user queries here does not receive
+        // silently unfiltered results.  Upstream tiled raises
+        // UnsupportedQueryType (HTTP 400) for variants it cannot evaluate;
+        // false is the safe in-process equivalent.
+        _ => false,
     }
 }
 
@@ -289,5 +308,162 @@ impl LeafResolver for UnresolvedLeaf {
             "no leaf resolver registered for structure_family={} (node {})",
             node.structure_family, node.key
         )))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use serde_json::json;
+    use tiled_core::adapters::{AnyAdapter, BaseAdapter, ContainerAdapter};
+    use tiled_core::queries::{
+        AccessBlobFilter, Eq as EqQ, In as InQ, KeyLookup, KeysFilter, NotIn as NotInQ, Query,
+    };
+    use tiled_core::structures::{ContainerStructure, Spec, StructureFamily};
+
+    use super::matches_query;
+
+    struct StubContainer {
+        metadata: serde_json::Value,
+        structure: ContainerStructure,
+    }
+
+    impl BaseAdapter for StubContainer {
+        fn structure_family(&self) -> StructureFamily {
+            StructureFamily::Container
+        }
+        fn metadata(&self) -> &serde_json::Value {
+            &self.metadata
+        }
+        fn specs(&self) -> &[Spec] {
+            &[]
+        }
+    }
+
+    impl ContainerAdapter for StubContainer {
+        fn structure(&self) -> &ContainerStructure {
+            &self.structure
+        }
+        fn get(&self, _key: &str) -> Option<&AnyAdapter> {
+            None
+        }
+        fn keys(&self) -> Vec<String> {
+            vec![]
+        }
+        fn len(&self) -> usize {
+            0
+        }
+    }
+
+    fn adapter(meta: serde_json::Value) -> AnyAdapter {
+        AnyAdapter::Container(Arc::new(StubContainer {
+            metadata: meta,
+            structure: ContainerStructure { keys: vec![] },
+        }))
+    }
+
+    // L-1: unsupported metadata-predicate variants must return false, not true.
+
+    #[test]
+    fn unsupported_in_returns_false_not_true() {
+        // metadata has count=5, so In([5]) WOULD match if implemented.
+        // The old `_ => true` arm would return true regardless — this test
+        // catches a regression back to that behaviour.
+        let a = adapter(json!({"count": 5}));
+        let blob = json!({});
+        let q = Query::In(InQ {
+            key: "count".into(),
+            value: vec![json!(5)],
+        });
+        assert!(
+            !matches_query(&a, &blob, &q),
+            "In must return false in-memory (unsupported), not silently pass"
+        );
+    }
+
+    #[test]
+    fn unsupported_not_in_returns_false_not_true() {
+        let a = adapter(json!({"tag": "x"}));
+        let blob = json!({});
+        let q = Query::NotIn(NotInQ {
+            key: "tag".into(),
+            value: vec![json!("y")],
+        });
+        assert!(
+            !matches_query(&a, &blob, &q),
+            "NotIn must return false in-memory, not silently pass"
+        );
+    }
+
+    // Lookup / KeysFilter must still pass through (genuinely inapplicable
+    // in-memory; the SQL path owns key-based filtering).
+
+    #[test]
+    fn lookup_passes_through() {
+        let a = adapter(json!({}));
+        let blob = json!({});
+        let q = Query::Lookup(KeyLookup {
+            key: "anything".into(),
+        });
+        assert!(matches_query(&a, &blob, &q), "Lookup must pass through");
+    }
+
+    #[test]
+    fn keys_filter_passes_through() {
+        let a = adapter(json!({}));
+        let blob = json!({});
+        let q = Query::KeysFilter(KeysFilter {
+            keys: vec!["k".into()],
+        });
+        assert!(matches_query(&a, &blob, &q), "KeysFilter must pass through");
+    }
+
+    // AccessBlobFilter must still work (the reachable use-case).
+
+    #[test]
+    fn access_blob_filter_matches_tagged_node() {
+        let a = adapter(json!({}));
+        let blob = json!({"tags": ["team_a"]});
+        let q = Query::AccessBlobFilter(AccessBlobFilter {
+            tags: vec!["team_a".into()],
+            ..Default::default()
+        });
+        assert!(matches_query(&a, &blob, &q));
+    }
+
+    #[test]
+    fn access_blob_filter_denies_unmatched_node() {
+        let a = adapter(json!({}));
+        let blob = json!({"tags": ["team_b"]});
+        let q = Query::AccessBlobFilter(AccessBlobFilter {
+            tags: vec!["team_a".into()],
+            ..Default::default()
+        });
+        assert!(!matches_query(&a, &blob, &q));
+    }
+
+    // Supported metadata variants (Eq, NotEq) must continue to work.
+
+    #[test]
+    fn eq_matches_correct_value() {
+        let a = adapter(json!({"x": 1}));
+        let blob = json!({});
+        assert!(matches_query(
+            &a,
+            &blob,
+            &Query::Eq(EqQ {
+                key: "x".into(),
+                value: json!(1)
+            })
+        ));
+        assert!(!matches_query(
+            &a,
+            &blob,
+            &Query::Eq(EqQ {
+                key: "x".into(),
+                value: json!(2)
+            })
+        ));
     }
 }
