@@ -175,10 +175,12 @@ fn matches_query(adapter: &AnyAdapter, query: &Query) -> bool {
                 && !s.exclude.iter().any(|n| names.contains(n.as_str()))
         }
         // Lookup is resolved at the search endpoint via direct key lookup;
-        // KeysFilter / AccessBlobFilter are filters the in-memory adapter
-        // does not implement (always-true keeps results unchanged rather
-        // than dropping everything silently).
-        Query::Lookup(_) | Query::KeysFilter(_) | Query::AccessBlobFilter(_) => true,
+        // KeysFilter the in-memory adapter does not implement — pass through.
+        // AccessBlobFilter: in-memory nodes have no access_blob (untagged),
+        // so they match only when include_untagged is true (fail-closed on
+        // tagged filters that cannot be evaluated).
+        Query::Lookup(_) | Query::KeysFilter(_) => true,
+        Query::AccessBlobFilter(f) => f.include_untagged,
     }
 }
 
