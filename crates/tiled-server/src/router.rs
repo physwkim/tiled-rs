@@ -229,7 +229,16 @@ pub async fn search(
         .into_iter()
         .filter(|(k, _)| k.starts_with("filter["))
         .collect();
-    let queries = tiled_core::queries::decode_query_filters(&filter_params);
+    let mut queries = tiled_core::queries::decode_query_filters(&filter_params);
+
+    // Inject the access-policy list filter so the SQL/in-memory path
+    // only returns nodes the principal is permitted to see.
+    if let Some(ref policy) = state.access_policy {
+        let principal_ref = auth.principal.as_deref();
+        if let Some(f) = policy.list_filter(principal_ref, &auth.scopes).await {
+            queries.insert(0, tiled_core::queries::Query::AccessBlobFilter(f));
+        }
+    }
 
     if let Some(ref catalog) = state.catalog {
         // Push filters down to SQL — avoids materialising every child in

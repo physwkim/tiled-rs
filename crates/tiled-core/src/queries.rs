@@ -146,11 +146,23 @@ pub struct SpecsQuery {
 }
 
 /// Filter by access_blob — user_id and/or tags.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// A row matches when ANY of the following is true:
+/// * `user_id` is `Some(id)` and `access_blob.user == id`
+/// * `access_blob.tags` contains any tag in `tags`
+/// * `include_untagged` is `true` and `access_blob.tags` is absent or empty
+///
+/// When all three conditions are vacuously false the row is excluded.
+/// (Empty `tags`, no `user_id`, and `include_untagged = false` → deny all.)
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct AccessBlobFilter {
     pub user_id: Option<String>,
     #[serde(default)]
     pub tags: Vec<String>,
+    /// When `true` rows whose `access_blob.tags` is absent or empty are
+    /// treated as "public" and always match regardless of `user_id`/`tags`.
+    #[serde(default)]
+    pub include_untagged: bool,
 }
 
 /// Filter by structure family.
@@ -480,7 +492,11 @@ fn decode_single_query(name: &str, fields: &HashMap<String, String>) -> Option<Q
                 .get("tags")
                 .and_then(|s| serde_json::from_str(s).ok())
                 .unwrap_or_default();
-            Some(Query::AccessBlobFilter(AccessBlobFilter { user_id, tags }))
+            Some(Query::AccessBlobFilter(AccessBlobFilter {
+                user_id,
+                tags,
+                include_untagged: false,
+            }))
         }
         "structure_family" => {
             let value: StructureFamily = fields.get("value")?.parse().ok()?;

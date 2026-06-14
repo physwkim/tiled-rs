@@ -31,7 +31,10 @@ pub struct CatalogAdapter {
     node_id: Option<i64>,
     metadata: serde_json::Value,
     specs: Vec<Spec>,
-    children: OnceLock<IndexMap<String, AnyAdapter>>,
+    /// Children keyed by name; each entry carries the adapter and the raw
+    /// `access_blob` JSON so that `AccessBlobFilter` queries can be
+    /// evaluated in-memory without a second round-trip to the DB.
+    children: OnceLock<IndexMap<String, (AnyAdapter, serde_json::Value)>>,
     structure_cache: OnceLock<ContainerStructure>,
     /// Resolver that turns a leaf `Node` into a concrete adapter (Array,
     /// Table, ...). Phase C wires the real implementations; today we ship
@@ -76,7 +79,7 @@ impl CatalogAdapter {
         }
     }
 
-    fn load_children(&self) -> &IndexMap<String, AnyAdapter> {
+    fn load_children(&self) -> &IndexMap<String, (AnyAdapter, serde_json::Value)> {
         self.children.get_or_init(|| {
             // We're called from sync trait methods. The router invokes
             // those inside `spawn_blocking`, so it's safe to dive back into
@@ -127,7 +130,7 @@ impl CatalogAdapter {
                             }
                         }
                     };
-                    map.insert(node.key.clone(), adapter);
+                    map.insert(node.key.clone(), (adapter, node.access_blob.clone()));
                 }
                 if nodes.len() < PAGE as usize {
                     break;
@@ -174,7 +177,7 @@ impl ContainerAdapter for CatalogAdapter {
     }
 
     fn get(&self, key: &str) -> Option<&AnyAdapter> {
-        self.load_children().get(key)
+        self.load_children().get(key).map(|(a, _)| a)
     }
 
     fn keys(&self) -> Vec<String> {
@@ -194,13 +197,17 @@ impl ContainerAdapter for CatalogAdapter {
         }
         self.load_children()
             .iter()
-            .filter(|(_, adapter)| queries.iter().all(|q| matches_query(adapter, q)))
+            .filter(|(_, (adapter, access_blob))| {
+                queries
+                    .iter()
+                    .all(|q| matches_query(adapter, access_blob, q))
+            })
             .map(|(k, _)| k.clone())
             .collect()
     }
 }
 
-fn matches_query(adapter: &AnyAdapter, query: &Query) -> bool {
+fn matches_query(adapter: &AnyAdapter, access_blob: &serde_json::Value, query: &Query) -> bool {
     use Query::*;
     let meta = adapter.metadata();
     match query {
@@ -209,8 +216,40 @@ fn matches_query(adapter: &AnyAdapter, query: &Query) -> bool {
         NotEq(neq) => meta.get(&neq.key).is_none_or(|v| v != &neq.value),
         KeyPresent(kp) => meta.get(&kp.key).is_some() == kp.exists,
         StructureFamily(sf) => adapter.structure_family() == sf.value,
+        AccessBlobFilter(f) => matches_access_blob_filter(access_blob, f),
         _ => true, // Conservative — let unknown queries fall through.
     }
+}
+
+fn matches_access_blob_filter(
+    access_blob: &serde_json::Value,
+    f: &tiled_core::queries::AccessBlobFilter,
+) -> bool {
+    // Empty filter → deny all (mirrors push_access_blob_filter "1 = 0").
+    if f.user_id.is_none() && f.tags.is_empty() && !f.include_untagged {
+        return false;
+    }
+    let node_tags: Vec<&str> = access_blob
+        .get("tags")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+
+    // include_untagged: rows with absent or empty tags are public.
+    if f.include_untagged && node_tags.is_empty() {
+        return true;
+    }
+    // Tag intersection.
+    if !f.tags.is_empty() && node_tags.iter().any(|t| f.tags.iter().any(|ft| ft == t)) {
+        return true;
+    }
+    // User ownership.
+    if let Some(ref uid) = f.user_id
+        && access_blob.get("user").and_then(|v| v.as_str()) == Some(uid.as_str())
+    {
+        return true;
+    }
+    false
 }
 
 fn parse_specs(value: &serde_json::Value) -> Vec<Spec> {
