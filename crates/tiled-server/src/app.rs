@@ -370,9 +370,14 @@ pub async fn validate_apikey(state: &AppState, key: &str) -> Result<AuthContext,
             .await
             .map_err(|_| "principal lookup failed".to_string())?
             .ok_or_else(|| "principal vanished".to_string())?;
+        // Intersect with the principal's current role cap so a downgraded
+        // principal's existing keys lose the elevated scopes immediately.
+        let scopes = record
+            .scopes
+            .intersect(&mint_session_scopes(&principal, state));
         return Ok(AuthContext {
             principal: Some(Arc::new(principal)),
-            scopes: record.scopes,
+            scopes,
             kind: AuthKind::ApiKey,
         });
     }
@@ -420,9 +425,14 @@ async fn resolve_auth_inner(
                 Ok(Some(p)) => Arc::new(p),
                 _ => return Err(unauthorized("principal vanished")),
             };
+            // Intersect with the principal's current role cap so a downgraded
+            // principal's existing keys lose the elevated scopes immediately.
+            let scopes = record
+                .scopes
+                .intersect(&mint_session_scopes(&principal, state));
             return Ok(AuthContext {
                 principal: Some(principal),
-                scopes: record.scopes,
+                scopes,
                 kind: AuthKind::ApiKey,
             });
         }
