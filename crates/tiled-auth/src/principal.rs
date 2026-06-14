@@ -16,6 +16,9 @@ pub struct Principal {
     pub id: i64,
     pub uuid: String,
     pub r#type: String, // 'user' | 'service'
+    /// Role that determines the principal's scope ceiling at login.
+    /// Known roles: `"user"` (default), `"admin"`. See `ScopeSet::for_role`.
+    pub role: String,
     pub time_created: chrono::DateTime<chrono::Utc>,
 }
 
@@ -51,13 +54,33 @@ impl AuthDb {
         Ok((principal, identity))
     }
 
+    pub async fn update_principal_role(&self, principal_id: i64, role: &str) -> Result<()> {
+        match self.pool() {
+            AuthPool::Sqlite(pool) => {
+                sqlx::query("UPDATE principals SET role = ? WHERE id = ?")
+                    .bind(role)
+                    .bind(principal_id)
+                    .execute(pool)
+                    .await?;
+            }
+            AuthPool::Postgres(pool) => {
+                sqlx::query("UPDATE principals SET role = $1 WHERE id = $2")
+                    .bind(role)
+                    .bind(principal_id)
+                    .execute(pool)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
     pub async fn create_principal(&self, kind: &str) -> Result<Principal> {
         let new_uuid = Uuid::new_v4().to_string();
         match self.pool() {
             AuthPool::Sqlite(pool) => {
                 let row = sqlx::query(
                     "INSERT INTO principals (uuid, type) VALUES (?, ?)
-                     RETURNING id, uuid, type, time_created",
+                     RETURNING id, uuid, type, role, time_created",
                 )
                 .bind(&new_uuid)
                 .bind(kind)
@@ -68,7 +91,7 @@ impl AuthDb {
             AuthPool::Postgres(pool) => {
                 let row = sqlx::query(
                     "INSERT INTO principals (uuid, type) VALUES ($1, $2)
-                     RETURNING id, uuid, type, time_created",
+                     RETURNING id, uuid, type, role, time_created",
                 )
                 .bind(&new_uuid)
                 .bind(kind)
@@ -82,16 +105,17 @@ impl AuthDb {
     pub async fn get_principal(&self, id: i64) -> Result<Option<Principal>> {
         match self.pool() {
             AuthPool::Sqlite(pool) => {
-                let row =
-                    sqlx::query("SELECT id, uuid, type, time_created FROM principals WHERE id = ?")
-                        .bind(id)
-                        .fetch_optional(pool)
-                        .await?;
+                let row = sqlx::query(
+                    "SELECT id, uuid, type, role, time_created FROM principals WHERE id = ?",
+                )
+                .bind(id)
+                .fetch_optional(pool)
+                .await?;
                 row.map(|r| principal_from_sqlite(&r)).transpose()
             }
             AuthPool::Postgres(pool) => {
                 let row = sqlx::query(
-                    "SELECT id, uuid, type, time_created FROM principals WHERE id = $1",
+                    "SELECT id, uuid, type, role, time_created FROM principals WHERE id = $1",
                 )
                 .bind(id)
                 .fetch_optional(pool)
@@ -193,6 +217,7 @@ fn principal_from_sqlite(row: &sqlx::sqlite::SqliteRow) -> Result<Principal> {
         id: row.get("id"),
         uuid: row.get("uuid"),
         r#type: row.get("type"),
+        role: row.get("role"),
         time_created: parse_dt_sqlite(row.get::<String, _>("time_created"))?,
     })
 }
@@ -202,6 +227,7 @@ fn principal_from_postgres(row: &sqlx::postgres::PgRow) -> Result<Principal> {
         id: row.get("id"),
         uuid: row.get("uuid"),
         r#type: row.get("type"),
+        role: row.get("role"),
         time_created: row.get("time_created"),
     })
 }

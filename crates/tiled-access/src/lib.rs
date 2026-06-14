@@ -11,6 +11,7 @@
 //! external-PDP policy can all plug in without touching the server.
 
 use async_trait::async_trait;
+use tiled_core::queries::AccessBlobFilter;
 
 pub use tiled_auth::{Principal, Scope, ScopeSet};
 
@@ -31,10 +32,6 @@ pub struct Decision {
     /// Effective scopes the principal has on this node. Always a
     /// subset of the principal's session scopes.
     pub scopes: ScopeSet,
-    /// Optional filter to AND into a search query so listings only
-    /// return rows the principal can actually see. `None` = no extra
-    /// filter.
-    pub search_filter: Option<serde_json::Value>,
 }
 
 #[async_trait]
@@ -52,6 +49,21 @@ pub trait AccessPolicy: Send + Sync {
         session_scopes: &ScopeSet,
         ctx: NodeContext<'_>,
     ) -> Decision;
+
+    /// Filter to AND into listing/search queries so a principal only sees
+    /// nodes they are permitted to access. `None` means no extra filter
+    /// (all nodes visible — passthrough behaviour).
+    ///
+    /// Called once per search/list request, NOT per node.  The returned
+    /// filter is pushed down to SQL via [`AccessBlobFilter`] so that
+    /// unpermitted rows never leave the database.
+    async fn list_filter(
+        &self,
+        _principal: Option<&Principal>,
+        _session_scopes: &ScopeSet,
+    ) -> Option<AccessBlobFilter> {
+        None
+    }
 }
 
 /// Built-in: trust the session — anonymous gets read-only metadata,
@@ -64,7 +76,6 @@ impl AccessPolicy for PassthroughPolicy {
     async fn anonymous_decision(&self, _ctx: NodeContext<'_>) -> Decision {
         Decision {
             scopes: ScopeSet::default(),
-            search_filter: None,
         }
     }
 
@@ -76,7 +87,6 @@ impl AccessPolicy for PassthroughPolicy {
     ) -> Decision {
         Decision {
             scopes: session_scopes.clone(),
-            search_filter: None,
         }
     }
 }
@@ -129,12 +139,10 @@ impl AccessPolicy for TagBasedPolicy {
         if Self::node_tags(&ctx).is_empty() {
             Decision {
                 scopes: ScopeSet::from_iter([Scope::ReadMetadata, Scope::ReadData]),
-                search_filter: None,
             }
         } else {
             Decision {
                 scopes: ScopeSet::default(),
-                search_filter: None,
             }
         }
     }
@@ -155,13 +163,34 @@ impl AccessPolicy for TagBasedPolicy {
         if visible {
             Decision {
                 scopes: session_scopes.intersect(&self.default_scopes),
-                search_filter: None,
             }
         } else {
             Decision {
                 scopes: ScopeSet::default(),
-                search_filter: None,
             }
         }
+    }
+
+    async fn list_filter(
+        &self,
+        principal: Option<&Principal>,
+        _session_scopes: &ScopeSet,
+    ) -> Option<AccessBlobFilter> {
+        let (user_id, tags) = match principal {
+            None => (None, vec![]),
+            Some(p) => {
+                let granted = self
+                    .principal_tags
+                    .get(&p.uuid)
+                    .cloned()
+                    .unwrap_or_default();
+                (Some(p.uuid.clone()), granted)
+            }
+        };
+        Some(AccessBlobFilter {
+            user_id,
+            tags,
+            include_untagged: true,
+        })
     }
 }
