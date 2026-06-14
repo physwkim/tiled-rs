@@ -33,7 +33,8 @@ pub struct OidcProvider {
     pub jwks_url: String,
     /// Required `iss` claim — rejects tokens issued elsewhere.
     pub issuer: String,
-    /// Required `aud` claim. Empty = don't check audience.
+    /// Required `aud` claim. Must be non-empty — `ExternalOidcValidator::new`
+    /// rejects an empty list (OIDC Core §3.1.3.7 #3 / RFC 8725 §3.1).
     pub audiences: Vec<String>,
     /// Override the JWT claim used as the principal subject. Defaults
     /// to `sub`; some IdPs prefer `oid` (Entra) or `email`.
@@ -82,13 +83,26 @@ impl std::fmt::Debug for ExternalOidcValidator {
 }
 
 impl ExternalOidcValidator {
-    pub fn new(providers: Vec<OidcProvider>) -> Self {
-        Self {
+    /// Construct the validator. Returns an error if any provider has an empty
+    /// `audiences` list — audience validation is mandatory per OIDC Core
+    /// §3.1.3.7 #3 and RFC 8725 §3.1; omitting it allows cross-relying-party
+    /// token replay attacks.
+    pub fn new(providers: Vec<OidcProvider>) -> Result<Self> {
+        for p in &providers {
+            if p.audiences.is_empty() {
+                return Err(AuthError::Validation(format!(
+                    "OIDC provider '{}': `audiences` must not be empty \
+                     (OIDC Core §3.1.3.7 #3 / RFC 8725 §3.1 require aud validation)",
+                    p.name
+                )));
+            }
+        }
+        Ok(Self {
             providers: Arc::new(providers),
             cache: Arc::new(RwLock::new(HashMap::new())),
             cache_ttl: Duration::hours(1),
             http: reqwest::Client::new(),
-        }
+        })
     }
 
     pub fn with_cache_ttl(mut self, ttl: Duration) -> Self {
@@ -130,12 +144,9 @@ impl ExternalOidcValidator {
         let key = self.fetch_key(provider, &kid).await?;
         let mut validation = Validation::new(header.alg);
         validation.set_issuer(&[&provider.issuer]);
-        if !provider.audiences.is_empty() {
-            let refs: Vec<&str> = provider.audiences.iter().map(|s| s.as_str()).collect();
-            validation.set_audience(&refs);
-        } else {
-            validation.validate_aud = false;
-        }
+        // Non-empty audiences is guaranteed by ExternalOidcValidator::new.
+        let refs: Vec<&str> = provider.audiences.iter().map(|s| s.as_str()).collect();
+        validation.set_audience(&refs);
 
         let claims = decode::<serde_json::Value>(token, &key, &validation)
             .map_err(AuthError::from)?
