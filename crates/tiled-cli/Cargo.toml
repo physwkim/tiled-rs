@@ -29,6 +29,7 @@ axum = { workspace = true }
 tiled-mongo = { workspace = true }
 tiled-catalog = { workspace = true }
 tiled-auth = { workspace = true }
+tiled-access = { workspace = true }
 chrono = { workspace = true }
 sqlx = { workspace = true }
 rand = "0.8"

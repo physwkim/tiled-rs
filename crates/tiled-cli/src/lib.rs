@@ -466,7 +466,13 @@ pub async fn run(command: Command) -> Result<()> {
 
             let trust_forwarded_headers = trust_proxy || proxied_auth_header;
 
-            // Decide BEFORE the struct literal moves catalog_handle.
+            // Decide BEFORE the struct literal moves auth_db_handle / catalog_handle.
+            let access_policy_value: Option<Arc<dyn tiled_access::AccessPolicy>> =
+                if auth_db_handle.is_some() {
+                    Some(Arc::new(tiled_access::PassthroughPolicy))
+                } else {
+                    None
+                };
             let webhook_config_value = if catalog_handle.is_some() {
                 Some(tiled_server::webhook_dispatch::WebhookConfig {
                     allow_http: webhooks_allow_http,
@@ -497,8 +503,8 @@ pub async fn run(command: Command) -> Result<()> {
                 forwarded_allow_ips: None,
                 max_request_body_bytes: 10 * 1024 * 1024,
                 streaming_bus: tiled_server::streaming::StreamingBus::new(),
-                access_policy: None,
-                default_login_scopes: tiled_auth::ScopeSet::full(),
+                access_policy: access_policy_value,
+                default_login_scopes: tiled_auth::ScopeSet::read_only(),
                 enable_web: !no_web,
                 web_assets_dir,
                 spec_views: file_config
