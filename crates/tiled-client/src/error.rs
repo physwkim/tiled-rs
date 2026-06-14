@@ -34,6 +34,9 @@ pub enum ClientError {
     #[error("authentication required: {0}")]
     AuthRequired(String),
 
+    #[error("permission denied: {0}")]
+    PermissionDenied(String),
+
     #[error("key not found: {0}")]
     KeyNotFound(String),
 

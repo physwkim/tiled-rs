@@ -89,8 +89,11 @@ pub async fn handle_error(resp: Response) -> Result<Response> {
     if status == 410 {
         return Err(ClientError::KeyNotFound(format!("broken link: {body}")));
     }
-    if status == 401 || status == 403 {
+    if status == 401 {
         return Err(ClientError::AuthRequired(format!("{status}: {body}")));
+    }
+    if status == 403 {
+        return Err(ClientError::PermissionDenied(format!("{status}: {body}")));
     }
 
     let detail = if ctype.starts_with(JSON_MIME_TYPE) {
