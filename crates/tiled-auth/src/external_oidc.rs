@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::{DateTime, Duration, Utc};
-use jsonwebtoken::{DecodingKey, Validation, decode, decode_header};
+use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
@@ -39,6 +39,12 @@ pub struct OidcProvider {
     /// Override the JWT claim used as the principal subject. Defaults
     /// to `sub`; some IdPs prefer `oid` (Entra) or `email`.
     pub subject_claim: String,
+    /// Allowed signing algorithms. When non-empty, tokens whose `alg`
+    /// header is not in this list are rejected before signature
+    /// verification. When empty, the algorithm is derived from the
+    /// matched JWK's `alg` field (RS256/ES256 fallback by key type).
+    /// Never populated from the attacker-controlled token header.
+    pub algorithms: Vec<Algorithm>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -56,10 +62,14 @@ struct Jwk {
     y: Option<String>,
     #[serde(rename = "use")]
     use_: Option<String>,
+    /// Signing algorithm declared by the IdP in the JWKS. Used to pin
+    /// the algorithm at the key-fetch layer so we never rely on the
+    /// attacker-controlled token header.
+    alg: Option<Algorithm>,
 }
 
 struct CachedKeys {
-    keys: HashMap<String, DecodingKey>,
+    keys: HashMap<String, (DecodingKey, Algorithm)>,
     expires_at: DateTime<Utc>,
 }
 
@@ -141,8 +151,16 @@ impl ExternalOidcValidator {
             .find(|p| p.issuer == issuer)
             .ok_or_else(|| AuthError::Unauthorized(format!("unknown token issuer: {issuer}")))?;
 
-        let key = self.fetch_key(provider, &kid).await?;
-        let mut validation = Validation::new(header.alg);
+        let (key, jwk_alg) = self.fetch_key(provider, &kid).await?;
+        // Pin algorithms from provider config or JWKS — never from the
+        // attacker-controlled token header (alg-confusion defence).
+        let algorithms: Vec<Algorithm> = if provider.algorithms.is_empty() {
+            vec![jwk_alg]
+        } else {
+            provider.algorithms.clone()
+        };
+        let mut validation = Validation::new(algorithms[0]);
+        validation.algorithms = algorithms;
         validation.set_issuer(&[&provider.issuer]);
         // Non-empty audiences is guaranteed by ExternalOidcValidator::new.
         let refs: Vec<&str> = provider.audiences.iter().map(|s| s.as_str()).collect();
@@ -165,7 +183,11 @@ impl ExternalOidcValidator {
         })
     }
 
-    async fn fetch_key(&self, provider: &OidcProvider, kid: &str) -> Result<DecodingKey> {
+    async fn fetch_key(
+        &self,
+        provider: &OidcProvider,
+        kid: &str,
+    ) -> Result<(DecodingKey, Algorithm)> {
         if let Some(cached) = self.cache.read().await.get(&provider.name)
             && cached.expires_at > Utc::now()
             && let Some(k) = cached.keys.get(kid)
@@ -216,20 +238,28 @@ pub struct ValidatedToken {
     pub claims: serde_json::Value,
 }
 
-fn jwk_to_decoding_key(jwk: &Jwk) -> Option<DecodingKey> {
+/// Returns the decoding key and the signing algorithm to use.
+///
+/// Algorithm priority: JWK `alg` field (IdP-declared) > kty-based
+/// default (RS256 for RSA, ES256 for EC). The caller pins
+/// `validation.algorithms` to this value so the token `alg` header
+/// can never promote a weaker or wrong algorithm.
+fn jwk_to_decoding_key(jwk: &Jwk) -> Option<(DecodingKey, Algorithm)> {
     if jwk.use_.as_deref() == Some("enc") {
         return None;
     }
     match jwk.kty.as_str() {
         "RSA" => {
             let (n, e) = (jwk.n.as_ref()?, jwk.e.as_ref()?);
-            DecodingKey::from_rsa_components(n, e).ok()
+            let key = DecodingKey::from_rsa_components(n, e).ok()?;
+            let alg = jwk.alg.unwrap_or(Algorithm::RS256);
+            Some((key, alg))
         }
         "EC" => {
             let (x, y) = (jwk.x.as_ref()?, jwk.y.as_ref()?);
-            // Need curve to pick the right key flavour; jsonwebtoken
-            // uses `from_ec_components` which infers from the points.
-            DecodingKey::from_ec_components(x, y).ok()
+            let key = DecodingKey::from_ec_components(x, y).ok()?;
+            let alg = jwk.alg.unwrap_or(Algorithm::ES256);
+            Some((key, alg))
         }
         _ => None,
     }
