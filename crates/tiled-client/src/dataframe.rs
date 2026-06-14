@@ -77,10 +77,10 @@ impl TableClient {
         {
             let mut q = url.query_pairs_mut();
             q.append_pair("partition", &partition.to_string());
-            if let Some(cols) = columns {
-                if !cols.is_empty() {
-                    q.append_pair("field", &cols.join(","));
-                }
+            if let Some(cols) = columns
+                && !cols.is_empty()
+            {
+                q.append_pair("field", &cols.join(","));
             }
         }
         let bytes = retry(|| async {

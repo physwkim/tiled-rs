@@ -14,7 +14,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use bytes::{Bytes, BytesMut};
+use bytes::BytesMut;
 
 use tiled_core::adapters::{ArrayAdapterRead, BaseAdapter, BoxFuture};
 use tiled_core::dtype::{BuiltinDType, DType, DynNDArray};
@@ -25,11 +25,7 @@ use tiled_core::structures::{ArrayStructure, Spec, StructureFamily};
 /// Strategy for opening one file in the sequence. Returns the adapter
 /// for that single frame.
 pub trait FrameOpener: Send + Sync {
-    fn open(
-        &self,
-        path: PathBuf,
-        index: usize,
-    ) -> Result<Box<dyn ArrayAdapterRead>>;
+    fn open(&self, path: PathBuf, index: usize) -> Result<Box<dyn ArrayAdapterRead>>;
 }
 
 /// Stacks `paths.len()` frames along a new leading axis.
@@ -255,9 +251,7 @@ impl ArrayAdapterRead for SequenceAdapter {
                     )));
                 }
             }
-            let frame = self
-                .opener
-                .open(self.paths[frame_idx].clone(), frame_idx)?;
+            let frame = self.opener.open(self.paths[frame_idx].clone(), frame_idx)?;
             let dyn_arr = frame.read(&NDSlice::empty()).await?;
             if dyn_arr.shape != self.inner_shape {
                 return Err(TiledError::Validation(format!(
@@ -282,11 +276,7 @@ impl ArrayAdapterRead for SequenceAdapter {
 pub struct NpyFrameOpener;
 
 impl FrameOpener for NpyFrameOpener {
-    fn open(
-        &self,
-        path: PathBuf,
-        _index: usize,
-    ) -> Result<Box<dyn ArrayAdapterRead>> {
+    fn open(&self, path: PathBuf, _index: usize) -> Result<Box<dyn ArrayAdapterRead>> {
         Ok(Box::new(crate::NpyAdapter::from_path(
             path,
             serde_json::json!({}),
@@ -299,11 +289,7 @@ pub struct TiffFrameOpener;
 
 #[cfg(feature = "tiff")]
 impl FrameOpener for TiffFrameOpener {
-    fn open(
-        &self,
-        path: PathBuf,
-        _index: usize,
-    ) -> Result<Box<dyn ArrayAdapterRead>> {
+    fn open(&self, path: PathBuf, _index: usize) -> Result<Box<dyn ArrayAdapterRead>> {
         Ok(Box::new(crate::TiffAdapter::from_path(
             path,
             serde_json::json!({}),
@@ -317,9 +303,7 @@ mod tests {
     use std::io::Write;
 
     fn write_simple_npy(path: &std::path::Path, value: f64, w: usize, h: usize) {
-        let header = format!(
-            "{{'descr': '<f8', 'fortran_order': False, 'shape': ({h}, {w}), }}"
-        );
+        let header = format!("{{'descr': '<f8', 'fortran_order': False, 'shape': ({h}, {w}), }}");
         let mut header = header.into_bytes();
         // Pad to 64-byte alignment of (10 + len) per spec.
         while (10 + header.len()) % 64 != 63 {

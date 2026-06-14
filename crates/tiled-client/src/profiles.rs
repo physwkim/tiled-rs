@@ -204,7 +204,7 @@ fn resolve_precedence(levels: &[HashMap<PathBuf, serde_yaml::Value>]) -> Profile
             let content = level
                 .get(&filepath)
                 .and_then(|m| m.as_mapping())
-                .and_then(|m| m.get(&serde_yaml::Value::String(name.clone())))
+                .and_then(|m| m.get(serde_yaml::Value::String(name.clone())))
                 .cloned();
             if let Some(content) = content {
                 combined.insert(name, (filepath, content));
@@ -371,6 +371,10 @@ pub async fn from_profile(name: &str) -> Result<crate::any_client::AnyClient> {
     crate::constructors::from_uri_with_options(&uri, opts, false).await
 }
 
+// Silence unused-import in lib if no caller uses Path directly.
+#[allow(dead_code)]
+fn _path_token(_p: &Path) {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -387,12 +391,12 @@ mod tests {
         let value: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
         let m = value.as_mapping().unwrap();
         let inner = m
-            .get(&serde_yaml::Value::String("test".into()))
+            .get(serde_yaml::Value::String("test".into()))
             .unwrap()
             .as_mapping()
             .unwrap();
         assert_eq!(
-            inner.get(&serde_yaml::Value::String("uri".into())).unwrap(),
+            inner.get(serde_yaml::Value::String("uri".into())).unwrap(),
             &serde_yaml::Value::String("http://localhost:8000".into())
         );
     }
@@ -431,13 +435,9 @@ mod tests {
         let (_, content) = resolved.profiles.get("x").unwrap();
         let uri = content
             .as_mapping()
-            .and_then(|m| m.get(&serde_yaml::Value::String("uri".into())))
+            .and_then(|m| m.get(serde_yaml::Value::String("uri".into())))
             .and_then(|v| v.as_str())
             .unwrap();
         assert_eq!(uri, "http://high");
     }
 }
-
-// Silence unused-import in lib if no caller uses Path directly.
-#[allow(dead_code)]
-fn _path_token(_p: &Path) {}

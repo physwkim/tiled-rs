@@ -17,9 +17,7 @@ use std::sync::{Arc, OnceLock};
 
 use indexmap::IndexMap;
 
-use tiled_core::adapters::{
-    AnyAdapter, BaseAdapter, ContainerAdapter,
-};
+use tiled_core::adapters::{AnyAdapter, BaseAdapter, ContainerAdapter};
 use tiled_core::queries::Query;
 use tiled_core::structures::{ContainerStructure, Spec, StructureFamily};
 
@@ -103,13 +101,14 @@ impl CatalogAdapter {
             const PAGE: i64 = 10_000;
             let mut offset: i64 = 0;
             loop {
-                let nodes = match handle.block_on(self.catalog.list_children(self.node_id, offset, PAGE)) {
-                    Ok(n) => n,
-                    Err(e) => {
-                        tracing::error!(target: "tiled.catalog", "list_children failed: {e}");
-                        break;
-                    }
-                };
+                let nodes =
+                    match handle.block_on(self.catalog.list_children(self.node_id, offset, PAGE)) {
+                        Ok(n) => n,
+                        Err(e) => {
+                            tracing::error!(target: "tiled.catalog", "list_children failed: {e}");
+                            break;
+                        }
+                    };
                 if nodes.is_empty() {
                     break;
                 }

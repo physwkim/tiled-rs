@@ -42,13 +42,16 @@ pub enum Hdf5Locking {
 }
 
 impl Hdf5Locking {
-    fn open(self, path: &std::path::Path) -> std::result::Result<rust_hdf5::H5File, rust_hdf5::Hdf5Error> {
+    fn open(
+        self,
+        path: &std::path::Path,
+    ) -> std::result::Result<rust_hdf5::H5File, rust_hdf5::Hdf5Error> {
         match self {
             Self::Default => rust_hdf5::H5File::open(path),
             Self::Disabled => rust_hdf5::H5File::options().no_locking().open(path),
-            Self::BestEffort => {
-                rust_hdf5::H5File::options().best_effort_locking().open(path)
-            }
+            Self::BestEffort => rust_hdf5::H5File::options()
+                .best_effort_locking()
+                .open(path),
         }
     }
 }
@@ -68,11 +71,7 @@ pub struct Hdf5Adapter {
 }
 
 impl Hdf5Adapter {
-    pub fn from_path(
-        path: PathBuf,
-        dataset: &str,
-        metadata: serde_json::Value,
-    ) -> Result<Self> {
+    pub fn from_path(path: PathBuf, dataset: &str, metadata: serde_json::Value) -> Result<Self> {
         Self::from_path_with_locking(path, dataset, metadata, Hdf5Locking::default())
     }
 
@@ -103,7 +102,7 @@ impl Hdf5Adapter {
         } else {
             raw_shape.clone()
         };
-        let has_zero_axis = shape.iter().any(|d| *d == 0);
+        let has_zero_axis = shape.contains(&0);
         let element_size = ds.element_size();
         // Probe dtype on the actual (raw) shape so rust-hdf5's hyperslab
         // accepts the offsets/counts. For empty arrays we skip the read
@@ -146,7 +145,7 @@ impl Hdf5Adapter {
     fn read_with_slice(&self, slice: &NDSlice) -> Result<DynNDArray> {
         let shape = &self.structure.shape;
         // Empty arrays: surface a zero-byte buffer with the structure shape.
-        if shape.iter().any(|d| *d == 0) {
+        if shape.contains(&0) {
             return Ok(DynNDArray::new(
                 Bytes::new(),
                 self.dtype.clone(),
@@ -165,8 +164,7 @@ impl Hdf5Adapter {
         // with empty offsets/counts so rust-hdf5 reads the single element.
         // The promoted shape stays [1] for the result.
         if self.scalar_promoted {
-            let (raw, _dtype) =
-                read_native(&ds, self.dtype.element_size(), &[], &[])?;
+            let (raw, _dtype) = read_native(&ds, self.dtype.element_size(), &[], &[])?;
             return Ok(DynNDArray::new(
                 Bytes::from(raw),
                 self.dtype.clone(),
@@ -175,16 +173,11 @@ impl Hdf5Adapter {
         }
 
         let plan = SlicePlan::from_ndslice(slice, shape)?;
-        let (raw, _dtype) = read_native(
-            &ds,
-            self.dtype.element_size(),
-            &plan.offsets,
-            &plan.counts,
-        )?;
+        let (raw, _dtype) =
+            read_native(&ds, self.dtype.element_size(), &plan.offsets, &plan.counts)?;
         // Apply striding + integer-index dim reduction in Rust where the
         // HDF5 layer can't (stride>1, Index() collapse).
-        let (final_bytes, final_shape) =
-            postprocess(raw, &plan, self.dtype.element_size());
+        let (final_bytes, final_shape) = postprocess(raw, &plan, self.dtype.element_size());
         Ok(DynNDArray::new(
             Bytes::from(final_bytes),
             self.dtype.clone(),
@@ -233,11 +226,7 @@ impl SlicePlan {
             let axis_len = shape[axis];
             match dim {
                 SliceDim::Index(i) => {
-                    let normalised = if *i < 0 {
-                        i + axis_len as isize
-                    } else {
-                        *i
-                    };
+                    let normalised = if *i < 0 { i + axis_len as isize } else { *i };
                     if normalised < 0 || (normalised as usize) >= axis_len {
                         return Err(TiledError::InvalidSlice(format!(
                             "index {i} out of bounds for axis {axis} (len {axis_len})"
@@ -254,8 +243,7 @@ impl SlicePlan {
                         // Negative-step slices need a separate code
                         // path — punt for now (rare in API usage).
                         return Err(TiledError::InvalidSlice(
-                            "negative-step slices not supported in HDF5 slice plan"
-                                .into(),
+                            "negative-step slices not supported in HDF5 slice plan".into(),
                         ));
                     }
                     let start_n = match start {
@@ -319,11 +307,7 @@ fn expand_ellipsis(slice: &NDSlice, ndim: usize) -> Result<Vec<SliceDim>> {
 }
 
 /// Stride down + collapse Index dims after the HDF5 read.
-fn postprocess(
-    raw: Vec<u8>,
-    plan: &SlicePlan,
-    element_size: usize,
-) -> (Vec<u8>, Vec<usize>) {
+fn postprocess(raw: Vec<u8>, plan: &SlicePlan, element_size: usize) -> (Vec<u8>, Vec<usize>) {
     // If every stride is 1, just drop integer-indexed dims — no copy needed.
     if plan.strides.iter().all(|&s| s == 1) {
         let final_shape: Vec<usize> = plan
@@ -349,10 +333,7 @@ fn postprocess(
     let mut linear = 0usize;
     while linear < total {
         // Are all axes on a stride boundary?
-        let take = idx
-            .iter()
-            .zip(&plan.strides)
-            .all(|(i, s)| i % s == 0);
+        let take = idx.iter().zip(&plan.strides).all(|(i, s)| i % s == 0);
         if take {
             let start = linear * element_size;
             out.extend_from_slice(&raw[start..start + element_size]);

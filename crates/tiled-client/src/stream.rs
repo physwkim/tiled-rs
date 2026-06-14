@@ -292,13 +292,13 @@ impl Subscription {
                 .map_err(|e| ClientError::Invalid(format!("ws auth: {e}")))?;
             req.headers_mut()
                 .insert(HeaderName::from_static("authorization"), value);
-        } else if let Some(auth) = self.context.auth().await {
-            if let Some(h) = auth.auth_header().await {
-                let value = HeaderValue::from_str(&h)
-                    .map_err(|e| ClientError::Invalid(format!("ws bearer: {e}")))?;
-                req.headers_mut()
-                    .insert(HeaderName::from_static("authorization"), value);
-            }
+        } else if let Some(auth) = self.context.auth().await
+            && let Some(h) = auth.auth_header().await
+        {
+            let value = HeaderValue::from_str(&h)
+                .map_err(|e| ClientError::Invalid(format!("ws bearer: {e}")))?;
+            req.headers_mut()
+                .insert(HeaderName::from_static("authorization"), value);
         }
 
         let cfg = WebSocketConfig::default();

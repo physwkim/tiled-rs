@@ -8,8 +8,8 @@ use axum::http::{Method, Request, StatusCode};
 use serde_json::json;
 use tower::ServiceExt;
 
-use tiled_auth::{AuthDb, DummyAuthenticator, Issuer, Scope, ScopeSet};
-use tiled_catalog::{Catalog, RegisterRequest};
+use tiled_auth::{AuthDb, DummyAuthenticator, Issuer};
+use tiled_catalog::Catalog;
 use tiled_core::adapters::ContainerAdapter;
 use tiled_core::queries::Query;
 
@@ -29,9 +29,10 @@ async fn build_test_app() -> (axum::Router, tempfile::TempDir, Catalog) {
 
     let resolver: Arc<dyn tiled_catalog::adapter::LeafResolver> =
         Arc::new(tiled_catalog::adapter::UnresolvedLeaf);
-    let root_tree: Arc<dyn ContainerAdapter> = Arc::new(
-        tiled_catalog::CatalogAdapter::root(catalog.clone(), resolver),
-    );
+    let root_tree: Arc<dyn ContainerAdapter> = Arc::new(tiled_catalog::CatalogAdapter::root(
+        catalog.clone(),
+        resolver,
+    ));
     let registry = Arc::new(tiled_serialization::default_registry());
 
     let state = tiled_server::AppState {
@@ -88,8 +89,7 @@ async fn json_request(
     let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
         .await
         .unwrap();
-    let v: serde_json::Value =
-        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
     (status, v)
 }
 
@@ -98,14 +98,7 @@ async fn login_yields_jwt_then_jwt_authorizes_metadata_read() {
     let (app, _dir, _cat) = build_test_app().await;
 
     // Anonymous read is rejected.
-    let (status, _) = json_request(
-        &app,
-        Method::GET,
-        "/api/v1/metadata/",
-        &[],
-        None,
-    )
-    .await;
+    let (status, _) = json_request(&app, Method::GET, "/api/v1/metadata/", &[], None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 
     // Login with the dummy authenticator.

@@ -613,7 +613,7 @@ pub async fn array_append(
         ));
     }
     let row_bytes = other_axes * elem_size;
-    if body.len() % row_bytes != 0 {
+    if !body.len().is_multiple_of(row_bytes) {
         return Err(ServerError::Validation(format!(
             "append: body length {} is not a multiple of cross-section bytes {row_bytes}",
             body.len()
@@ -1101,7 +1101,7 @@ fn copy_chunk_into_result(
     elem_size: usize,
 ) {
     let ndim = result_shape.len();
-    if ndim == 0 || chunk_shape.iter().any(|d| *d == 0) {
+    if ndim == 0 || chunk_shape.contains(&0) {
         return;
     }
     if ndim == 1 {
@@ -1275,23 +1275,23 @@ pub async fn get_documents(
     for stream_key in run.keys() {
         if let Some(AnyAdapter::Container(stream)) = run.get(&stream_key) {
             let stream_meta = stream.metadata();
-            if let Some(descriptors) = stream_meta.get("descriptors") {
-                if let Some(arr) = descriptors.as_array() {
-                    for desc in arr {
-                        let line = serde_json::json!({"name": "descriptor", "doc": desc});
-                        lines.push(serde_json::to_string(&line).unwrap_or_default());
-                    }
+            if let Some(descriptors) = stream_meta.get("descriptors")
+                && let Some(arr) = descriptors.as_array()
+            {
+                for desc in arr {
+                    let line = serde_json::json!({"name": "descriptor", "doc": desc});
+                    lines.push(serde_json::to_string(&line).unwrap_or_default());
                 }
             }
         }
     }
 
     // Emit stop document.
-    if let Some(stop) = meta.get("stop") {
-        if !stop.is_null() {
-            let line = serde_json::json!({"name": "stop", "doc": stop});
-            lines.push(serde_json::to_string(&line).unwrap_or_default());
-        }
+    if let Some(stop) = meta.get("stop")
+        && !stop.is_null()
+    {
+        let line = serde_json::json!({"name": "stop", "doc": stop});
+        lines.push(serde_json::to_string(&line).unwrap_or_default());
     }
 
     let body = lines.join("\n") + "\n";

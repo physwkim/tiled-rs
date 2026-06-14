@@ -82,12 +82,11 @@ impl AuthDb {
     pub async fn get_principal(&self, id: i64) -> Result<Option<Principal>> {
         match self.pool() {
             AuthPool::Sqlite(pool) => {
-                let row = sqlx::query(
-                    "SELECT id, uuid, type, time_created FROM principals WHERE id = ?",
-                )
-                .bind(id)
-                .fetch_optional(pool)
-                .await?;
+                let row =
+                    sqlx::query("SELECT id, uuid, type, time_created FROM principals WHERE id = ?")
+                        .bind(id)
+                        .fetch_optional(pool)
+                        .await?;
                 row.map(|r| principal_from_sqlite(&r)).transpose()
             }
             AuthPool::Postgres(pool) => {
@@ -138,11 +137,7 @@ impl AuthDb {
         }
     }
 
-    pub async fn find_identity(
-        &self,
-        provider: &str,
-        sub: &str,
-    ) -> Result<Option<Identity>> {
+    pub async fn find_identity(&self, provider: &str, sub: &str) -> Result<Option<Identity>> {
         match self.pool() {
             AuthPool::Sqlite(pool) => {
                 let row = sqlx::query(
@@ -238,8 +233,7 @@ pub(crate) fn parse_dt_sqlite(s: String) -> Result<chrono::DateTime<chrono::Utc>
     chrono::DateTime::parse_from_rfc3339(&s)
         .map(|d| d.with_timezone(&chrono::Utc))
         .or_else(|_| {
-            chrono::NaiveDateTime::parse_from_str(&s, "%Y-%m-%dT%H:%M:%S%.fZ")
-                .map(|n| n.and_utc())
+            chrono::NaiveDateTime::parse_from_str(&s, "%Y-%m-%dT%H:%M:%S%.fZ").map(|n| n.and_utc())
         })
         .map_err(|e| AuthError::Validation(format!("bad timestamp {s}: {e}")))
 }

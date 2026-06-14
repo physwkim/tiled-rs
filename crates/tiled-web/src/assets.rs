@@ -42,10 +42,7 @@ async fn serve_index(State(state): State<Arc<AssetsState>>) -> Response {
     serve_path(&state, "index.html")
 }
 
-async fn serve_static(
-    State(state): State<Arc<AssetsState>>,
-    Path(file): Path<String>,
-) -> Response {
+async fn serve_static(State(state): State<Arc<AssetsState>>, Path(file): Path<String>) -> Response {
     serve_path(&state, &file)
 }
 

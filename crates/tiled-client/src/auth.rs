@@ -41,10 +41,7 @@ impl std::fmt::Debug for Tokens {
         f.debug_struct("Tokens")
             .field("access_token", &"<set>")
             .field("refresh_token", &"<set>")
-            .field(
-                "id_token",
-                &self.id_token.as_ref().map(|_| "<set>"),
-            )
+            .field("id_token", &self.id_token.as_ref().map(|_| "<set>"))
             .finish()
     }
 }

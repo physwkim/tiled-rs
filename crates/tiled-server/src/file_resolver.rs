@@ -47,15 +47,10 @@ impl FileLeafResolver {
         // Resolve symlinks before comparing so a malicious symlink inside
         // an allowed dir can't escape.
         let canonical = path.canonicalize().map_err(|e| {
-            CatalogError::Validation(format!(
-                "data path {} not accessible: {e}",
-                path.display()
-            ))
+            CatalogError::Validation(format!("data path {} not accessible: {e}", path.display()))
         })?;
         for allowed in &self.allowed_data_dirs {
-            let allowed_canon = allowed
-                .canonicalize()
-                .unwrap_or_else(|_| allowed.clone());
+            let allowed_canon = allowed.canonicalize().unwrap_or_else(|_| allowed.clone());
             if canonical.starts_with(&allowed_canon) {
                 return Ok(());
             }
@@ -81,17 +76,11 @@ impl LeafResolver for FileLeafResolver {
     ) -> std::result::Result<AnyAdapter, CatalogError> {
         let data_sources = block_on(catalog.list_data_sources(node.id))?;
         let ds = data_sources.first().ok_or_else(|| {
-            CatalogError::Validation(format!(
-                "node {} has no data_sources to resolve",
-                node.key
-            ))
+            CatalogError::Validation(format!("node {} has no data_sources to resolve", node.key))
         })?;
         let assets = block_on(catalog.list_assets(ds.id))?;
         let asset = assets.first().ok_or_else(|| {
-            CatalogError::Validation(format!(
-                "data_source {} has no assets",
-                ds.id
-            ))
+            CatalogError::Validation(format!("data_source {} has no assets", ds.id))
         })?;
         let path = uri_to_path(&asset.data_uri)?;
         self.check_allowed(&path)?;
@@ -113,9 +102,7 @@ impl LeafResolver for FileLeafResolver {
                 }
                 #[cfg(not(feature = "tiff-adapter"))]
                 {
-                    return Err(CatalogError::Validation(
-                        "tiff support not built in".into(),
-                    ));
+                    return Err(CatalogError::Validation("tiff support not built in".into()));
                 }
             }
             "image/png" | "image/jpeg" => {
@@ -140,16 +127,13 @@ impl LeafResolver for FileLeafResolver {
                         .get("dataset")
                         .and_then(|v| v.as_str())
                         .unwrap_or("entry/data/data");
-                    let adapter =
-                        tiled_adapters::Hdf5Adapter::from_path(path, dataset, metadata)
-                            .map_err(|e| CatalogError::Validation(e.to_string()))?;
+                    let adapter = tiled_adapters::Hdf5Adapter::from_path(path, dataset, metadata)
+                        .map_err(|e| CatalogError::Validation(e.to_string()))?;
                     AnyAdapter::Array(Box::new(adapter))
                 }
                 #[cfg(not(feature = "hdf5-adapter"))]
                 {
-                    return Err(CatalogError::Validation(
-                        "hdf5 support not built in".into(),
-                    ));
+                    return Err(CatalogError::Validation("hdf5 support not built in".into()));
                 }
             }
             "text/csv" => {
@@ -161,9 +145,7 @@ impl LeafResolver for FileLeafResolver {
                 }
                 #[cfg(not(feature = "csv-adapter"))]
                 {
-                    return Err(CatalogError::Validation(
-                        "csv support not built in".into(),
-                    ));
+                    return Err(CatalogError::Validation("csv support not built in".into()));
                 }
             }
             "application/x-parquet" => {

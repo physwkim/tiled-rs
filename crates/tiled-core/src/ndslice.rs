@@ -247,7 +247,8 @@ impl NDSlice {
         }
         if !self.is_expanded() {
             return Err(TiledError::InvalidSlice(
-                "Composition with the left slice requires fully-expanded dims (no '...' or '/-1')".into(),
+                "Composition with the left slice requires fully-expanded dims (no '...' or '/-1')"
+                    .into(),
             ));
         }
         // Reject Ellipsis in `other` except as the trailing element.
@@ -420,11 +421,13 @@ fn compose_slc_with_slc(slc1: &SliceDim, slc2: &SliceDim) -> Result<SliceDim> {
         SliceDim::Slice { start, stop, step } => {
             let step2 = step.unwrap_or(1);
             if step2 == 0 {
-                return Err(TiledError::InvalidSlice(
-                    "slice step cannot be zero".into(),
-                ));
+                return Err(TiledError::InvalidSlice("slice step cannot be zero".into()));
             }
-            let (default_start, default_stop) = if step2 > 0 { (0, length) } else { (length - 1, -1) };
+            let (default_start, default_stop) = if step2 > 0 {
+                (0, length)
+            } else {
+                (length - 1, -1)
+            };
             // Normalise relative starts/stops against the post-slc1 length.
             let normalise = |v: Option<isize>, default_v: isize| -> isize {
                 let mut x = v.unwrap_or(default_v);
@@ -624,7 +627,14 @@ mod tests {
         let a = NDSlice::from_numpy_str("0:10").unwrap();
         let b = NDSlice::from_numpy_str("2:8").unwrap();
         let c = a.compose(&b).unwrap();
-        assert_eq!(c.0[0], SliceDim::Slice { start: Some(2), stop: Some(8), step: Some(1) });
+        assert_eq!(
+            c.0[0],
+            SliceDim::Slice {
+                start: Some(2),
+                stop: Some(8),
+                step: Some(1)
+            }
+        );
     }
 
     #[test]
@@ -636,7 +646,11 @@ mod tests {
         let c = a.compose(&b).unwrap();
         assert_eq!(
             c.0[0],
-            SliceDim::Slice { start: Some(1), stop: Some(7), step: Some(2) }
+            SliceDim::Slice {
+                start: Some(1),
+                stop: Some(7),
+                step: Some(2)
+            }
         );
     }
 
@@ -660,7 +674,11 @@ mod tests {
         assert_eq!(c.0[0], SliceDim::Index(5));
         assert_eq!(
             c.0[1],
-            SliceDim::Slice { start: Some(1), stop: Some(4), step: Some(1) }
+            SliceDim::Slice {
+                start: Some(1),
+                stop: Some(4),
+                step: Some(1)
+            }
         );
     }
 

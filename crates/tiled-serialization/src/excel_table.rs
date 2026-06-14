@@ -11,15 +11,14 @@ use std::io::Cursor;
 use std::io::Write;
 
 use bytes::Bytes;
-use zip::write::SimpleFileOptions;
 use zip::ZipWriter;
+use zip::write::SimpleFileOptions;
 
 use tiled_core::structures::StructureFamily;
 
 use crate::registry::{SerializationRegistry, SerializerFn};
 
-pub const XLSX_MIME: &str =
-    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+pub const XLSX_MIME: &str = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
 
 pub fn register_excel_serializer(reg: &SerializationRegistry) {
     reg.register(StructureFamily::Table, XLSX_MIME, excel_serializer());
@@ -27,71 +26,72 @@ pub fn register_excel_serializer(reg: &SerializationRegistry) {
 }
 
 fn excel_serializer() -> SerializerFn {
-    Box::new(|data, _meta| -> Result<Bytes, crate::registry::SerializeError> {
-        // Read Arrow IPC and stream rows directly into the worksheet
-        // string buffer — no intermediate Vec<Vec<String>> for the whole
-        // table.
-        use arrow::ipc::reader::FileReader;
-        let cursor = Cursor::new(data.to_vec());
-        let reader =
-            FileReader::try_new(cursor, None).map_err(|e| format!("ipc reader: {e}"))?;
-        let schema = reader.schema();
-        let header: Vec<String> =
-            schema.fields().iter().map(|f| f.name().clone()).collect();
-        // Build the sheet body incrementally so we don't hold every row
-        // both as Vec<String> and as XML at the same time.
-        let mut sheet_body = String::new();
-        let mut row_number: usize = 1;
-        for batch in reader {
-            let batch = batch.map_err(|e| format!("ipc batch: {e}"))?;
-            for r in 0..batch.num_rows() {
-                row_number += 1;
-                sheet_body.push_str(&format!("<row r=\"{row_number}\">"));
-                for c in 0..batch.num_columns() {
-                    let cell = arrow_cell_string(batch.column(c).as_ref(), r);
-                    sheet_body.push_str(&format!(
-                        "<c r=\"{}{row_number}\" t=\"inlineStr\"><is><t>{}</t></is></c>",
-                        col_letter(c),
-                        xml_escape(&cell)
-                    ));
+    Box::new(
+        |data, _meta| -> Result<Bytes, crate::registry::SerializeError> {
+            // Read Arrow IPC and stream rows directly into the worksheet
+            // string buffer — no intermediate Vec<Vec<String>> for the whole
+            // table.
+            use arrow::ipc::reader::FileReader;
+            let cursor = Cursor::new(data.to_vec());
+            let reader =
+                FileReader::try_new(cursor, None).map_err(|e| format!("ipc reader: {e}"))?;
+            let schema = reader.schema();
+            let header: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
+            // Build the sheet body incrementally so we don't hold every row
+            // both as Vec<String> and as XML at the same time.
+            let mut sheet_body = String::new();
+            let mut row_number: usize = 1;
+            for batch in reader {
+                let batch = batch.map_err(|e| format!("ipc batch: {e}"))?;
+                for r in 0..batch.num_rows() {
+                    row_number += 1;
+                    sheet_body.push_str(&format!("<row r=\"{row_number}\">"));
+                    for c in 0..batch.num_columns() {
+                        let cell = arrow_cell_string(batch.column(c).as_ref(), r);
+                        sheet_body.push_str(&format!(
+                            "<c r=\"{}{row_number}\" t=\"inlineStr\"><is><t>{}</t></is></c>",
+                            col_letter(c),
+                            xml_escape(&cell)
+                        ));
+                    }
+                    sheet_body.push_str("</row>");
                 }
-                sheet_body.push_str("</row>");
             }
-        }
 
-        let mut buf = Cursor::new(Vec::new());
-        let mut zip = ZipWriter::new(&mut buf);
-        let opts = SimpleFileOptions::default();
+            let mut buf = Cursor::new(Vec::new());
+            let mut zip = ZipWriter::new(&mut buf);
+            let opts = SimpleFileOptions::default();
 
-        zip.start_file("[Content_Types].xml", opts)
-            .map_err(|e| format!("zip: {e}"))?;
-        zip.write_all(CONTENT_TYPES_XML.as_bytes())
-            .map_err(|e| format!("zip write: {e}"))?;
+            zip.start_file("[Content_Types].xml", opts)
+                .map_err(|e| format!("zip: {e}"))?;
+            zip.write_all(CONTENT_TYPES_XML.as_bytes())
+                .map_err(|e| format!("zip write: {e}"))?;
 
-        zip.start_file("_rels/.rels", opts)
-            .map_err(|e| format!("zip: {e}"))?;
-        zip.write_all(ROOT_RELS_XML.as_bytes())
-            .map_err(|e| format!("zip: {e}"))?;
+            zip.start_file("_rels/.rels", opts)
+                .map_err(|e| format!("zip: {e}"))?;
+            zip.write_all(ROOT_RELS_XML.as_bytes())
+                .map_err(|e| format!("zip: {e}"))?;
 
-        zip.start_file("xl/_rels/workbook.xml.rels", opts)
-            .map_err(|e| format!("zip: {e}"))?;
-        zip.write_all(WORKBOOK_RELS_XML.as_bytes())
-            .map_err(|e| format!("zip: {e}"))?;
+            zip.start_file("xl/_rels/workbook.xml.rels", opts)
+                .map_err(|e| format!("zip: {e}"))?;
+            zip.write_all(WORKBOOK_RELS_XML.as_bytes())
+                .map_err(|e| format!("zip: {e}"))?;
 
-        zip.start_file("xl/workbook.xml", opts)
-            .map_err(|e| format!("zip: {e}"))?;
-        zip.write_all(WORKBOOK_XML.as_bytes())
-            .map_err(|e| format!("zip: {e}"))?;
+            zip.start_file("xl/workbook.xml", opts)
+                .map_err(|e| format!("zip: {e}"))?;
+            zip.write_all(WORKBOOK_XML.as_bytes())
+                .map_err(|e| format!("zip: {e}"))?;
 
-        zip.start_file("xl/worksheets/sheet1.xml", opts)
-            .map_err(|e| format!("zip: {e}"))?;
-        let sheet = render_sheet_streaming(&header, sheet_body);
-        zip.write_all(sheet.as_bytes())
-            .map_err(|e| format!("zip: {e}"))?;
+            zip.start_file("xl/worksheets/sheet1.xml", opts)
+                .map_err(|e| format!("zip: {e}"))?;
+            let sheet = render_sheet_streaming(&header, sheet_body);
+            zip.write_all(sheet.as_bytes())
+                .map_err(|e| format!("zip: {e}"))?;
 
-        zip.finish().map_err(|e| format!("zip finish: {e}"))?;
-        Ok(Bytes::from(buf.into_inner()))
-    })
+            zip.finish().map_err(|e| format!("zip finish: {e}"))?;
+            Ok(Bytes::from(buf.into_inner()))
+        },
+    )
 }
 
 fn render_sheet_streaming(header: &[String], body: String) -> String {
@@ -129,11 +129,12 @@ fn col_letter(i: usize) -> String {
 }
 
 fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 fn arrow_cell_string(array: &dyn arrow::array::Array, row: usize) -> String {
-    use arrow::array::Array;
     if array.is_null(row) {
         return String::new();
     }

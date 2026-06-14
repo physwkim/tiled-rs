@@ -13,14 +13,12 @@ pub const SESSION_COOKIE: &str = "tiled_session";
 /// seconds. `secure=false` allows plain HTTP for development; production
 /// deployments behind TLS should pass true.
 pub fn build_session_cookie(jwt: &str, max_age: i64, secure: bool) -> HeaderValue {
-    let mut s = format!(
-        "{SESSION_COOKIE}={jwt}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}"
-    );
+    let mut s =
+        format!("{SESSION_COOKIE}={jwt}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}");
     if secure {
         s.push_str("; Secure");
     }
-    HeaderValue::from_str(&s)
-        .unwrap_or_else(|_| HeaderValue::from_static(""))
+    HeaderValue::from_str(&s).unwrap_or_else(|_| HeaderValue::from_static(""))
 }
 
 /// Header value that clears the session cookie — used by `/admin/logout`.
@@ -29,8 +27,7 @@ pub fn clear_session_cookie(secure: bool) -> HeaderValue {
     if secure {
         s.push_str("; Secure");
     }
-    HeaderValue::from_str(&s)
-        .unwrap_or_else(|_| HeaderValue::from_static(""))
+    HeaderValue::from_str(&s).unwrap_or_else(|_| HeaderValue::from_static(""))
 }
 
 /// Read the session cookie from a Cookie request header. Returns the

@@ -47,11 +47,7 @@ impl CsvAdapter {
         for b in reader {
             batches.push(b.map_err(|e| TiledError::Internal(format!("csv read: {e}")))?);
         }
-        let columns: Vec<String> = schema
-            .fields()
-            .iter()
-            .map(|f| f.name().clone())
-            .collect();
+        let columns: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
         let structure = TableStructure {
             arrow_schema: encode_schema(schema.as_ref()),
             npartitions: 1,
@@ -124,14 +120,17 @@ fn project(
                 .ok_or_else(|| TiledError::Validation(format!("unknown column: {name}")))
         })
         .collect::<Result<Vec<_>>>()?;
-    let projected_schema = Arc::new(schema.project(&indices).map_err(|e| {
-        TiledError::Internal(format!("project schema: {e}"))
-    })?);
+    let projected_schema = Arc::new(
+        schema
+            .project(&indices)
+            .map_err(|e| TiledError::Internal(format!("project schema: {e}")))?,
+    );
     let mut out = Vec::with_capacity(batches.len());
     for b in batches {
-        out.push(b.project(&indices).map_err(|e| {
-            TiledError::Internal(format!("project batch: {e}"))
-        })?);
+        out.push(
+            b.project(&indices)
+                .map_err(|e| TiledError::Internal(format!("project batch: {e}")))?,
+        );
     }
     Ok(ArrowTable {
         schema: projected_schema,
@@ -141,7 +140,8 @@ fn project(
 
 fn encode_schema(schema: &arrow::datatypes::Schema) -> String {
     use base64::Engine;
-    let buf = arrow::ipc::convert::schema_to_fb(schema)
+    let buf = arrow::ipc::convert::IpcSchemaEncoder::new()
+        .schema_to_fb(schema)
         .finished_data()
         .to_vec();
     let b64 = base64::engine::general_purpose::STANDARD.encode(buf);

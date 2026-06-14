@@ -293,15 +293,15 @@ impl HttpCache {
 
     /// In-place variant: caller already holds both locks.
     async fn ensure_loaded_locked(backend: &mut Backend, used: &mut usize) -> Result<()> {
-        if let Backend::Sqlite(b) = backend {
-            if b.pool.is_none() {
-                let pool = open_pool(&b.path).await?;
-                ensure_schema(&pool).await?;
-                let (entries, total) = load_all_entries(&pool).await?;
-                b.in_memory_index = entries;
-                *used = total;
-                b.pool = Some(pool);
-            }
+        if let Backend::Sqlite(b) = backend
+            && b.pool.is_none()
+        {
+            let pool = open_pool(&b.path).await?;
+            ensure_schema(&pool).await?;
+            let (entries, total) = load_all_entries(&pool).await?;
+            b.in_memory_index = entries;
+            *used = total;
+            b.pool = Some(pool);
         }
         Ok(())
     }
@@ -552,15 +552,15 @@ impl HttpCache {
             Backend::Sqlite(b) => b.in_memory_index.get(&key).cloned(),
         };
         if let Some(e) = entry {
-            if let Some(etag) = e.etag {
-                if let Ok(v) = HeaderValue::from_str(&etag) {
-                    headers.insert(reqwest::header::IF_NONE_MATCH, v);
-                }
+            if let Some(etag) = e.etag
+                && let Ok(v) = HeaderValue::from_str(&etag)
+            {
+                headers.insert(reqwest::header::IF_NONE_MATCH, v);
             }
-            if let Some(lm) = e.last_modified {
-                if let Ok(v) = HeaderValue::from_str(&lm) {
-                    headers.insert(reqwest::header::IF_MODIFIED_SINCE, v);
-                }
+            if let Some(lm) = e.last_modified
+                && let Ok(v) = HeaderValue::from_str(&lm)
+            {
+                headers.insert(reqwest::header::IF_MODIFIED_SINCE, v);
             }
         }
         Ok(headers)
@@ -658,12 +658,13 @@ fn rebuild_response(status: u16, headers: &[(String, String)], body: Bytes) -> R
 // ---------------------------------------------------------------------------
 
 async fn open_pool(path: &std::path::Path) -> Result<SqlitePool> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() && !parent.exists() {
-            tokio::fs::create_dir_all(parent).await.map_err(|e| {
-                ClientError::Invalid(format!("create cache dir {}: {e}", parent.display()))
-            })?;
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+        && !parent.exists()
+    {
+        tokio::fs::create_dir_all(parent).await.map_err(|e| {
+            ClientError::Invalid(format!("create cache dir {}: {e}", parent.display()))
+        })?;
     }
     let opts = SqliteConnectOptions::new()
         .filename(path)

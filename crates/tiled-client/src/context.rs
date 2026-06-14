@@ -84,27 +84,26 @@ impl Context {
 
         // Strip any `?api_key=` from the URL — promote it to a header instead.
         let mut api_key = options.api_key.clone();
-        if api_key.is_none() {
-            if let Some((k, v)) = parsed
+        if api_key.is_none()
+            && let Some((k, v)) = parsed
                 .query_pairs()
                 .find(|(k, _)| k == "api_key")
                 .map(|(k, v)| (k.into_owned(), v.into_owned()))
-            {
-                api_key = Some(v);
-                let remaining: Vec<(String, String)> = parsed
-                    .query_pairs()
-                    .filter(|(name, _)| name != &k)
-                    .map(|(a, b)| (a.into_owned(), b.into_owned()))
-                    .collect();
-                let mut q = parsed.query_pairs_mut();
-                q.clear();
-                for (a, b) in &remaining {
-                    q.append_pair(a, b);
-                }
-                drop(q);
-                if parsed.query() == Some("") {
-                    parsed.set_query(None);
-                }
+        {
+            api_key = Some(v);
+            let remaining: Vec<(String, String)> = parsed
+                .query_pairs()
+                .filter(|(name, _)| name != &k)
+                .map(|(a, b)| (a.into_owned(), b.into_owned()))
+                .collect();
+            let mut q = parsed.query_pairs_mut();
+            q.clear();
+            for (a, b) in &remaining {
+                q.append_pair(a, b);
+            }
+            drop(q);
+            if parsed.query() == Some("") {
+                parsed.set_query(None);
             }
         }
         if api_key.is_none() {
@@ -248,12 +247,12 @@ impl Context {
                     .map_err(|e| ClientError::Invalid(format!("invalid api key: {e}")))?,
             ));
         }
-        if let Some(auth) = self.auth().await {
-            if let Some(h) = auth.auth_header().await {
-                return Ok(Some(HeaderValue::from_str(&h).map_err(|e| {
-                    ClientError::Invalid(format!("invalid bearer: {e}"))
-                })?));
-            }
+        if let Some(auth) = self.auth().await
+            && let Some(h) = auth.auth_header().await
+        {
+            return Ok(Some(HeaderValue::from_str(&h).map_err(|e| {
+                ClientError::Invalid(format!("invalid bearer: {e}"))
+            })?));
         }
         Ok(None)
     }
@@ -320,10 +319,10 @@ impl Context {
     /// Send a GET with a caller-chosen Accept. Cache lookup keys by
     /// `(url, accept)`.
     pub async fn get_with_accept(&self, url: &Url, accept: &str) -> Result<Response> {
-        if let Some(cache) = self.cache() {
-            if let Some(cached) = cache.try_get(url, accept).await? {
-                return Ok(cached);
-            }
+        if let Some(cache) = self.cache()
+            && let Some(cached) = cache.try_get(url, accept).await?
+        {
+            return Ok(cached);
         }
         let mut req = self.request(Method::GET, url).await?;
         if let Some(cache) = self.cache() {
@@ -340,10 +339,10 @@ impl Context {
         let resp = handle_error(resp).await?;
         if resp.status().as_u16() == 304 {
             // Server says "your cached copy is still good".
-            if let Some(cache) = self.cache() {
-                if let Some(refreshed) = cache.revalidate_existing(url, accept, &resp).await? {
-                    return Ok(refreshed);
-                }
+            if let Some(cache) = self.cache()
+                && let Some(refreshed) = cache.revalidate_existing(url, accept, &resp).await?
+            {
+                return Ok(refreshed);
             }
             // No cache or no entry — surface a clearer error than a bare 304.
             return Err(ClientError::Invalid(
@@ -366,10 +365,10 @@ impl Context {
     }
 
     pub async fn get_bytes(&self, url: &Url, accept: &str) -> Result<bytes::Bytes> {
-        if let Some(cache) = self.cache() {
-            if let Some(cached) = cache.try_get(url, accept).await? {
-                return Ok(cached.bytes().await?);
-            }
+        if let Some(cache) = self.cache()
+            && let Some(cached) = cache.try_get(url, accept).await?
+        {
+            return Ok(cached.bytes().await?);
         }
         let mut req = self.request(Method::GET, url).await?;
         if let Some(cache) = self.cache() {
@@ -383,10 +382,10 @@ impl Context {
         self.maybe_capture_csrf(&resp).await;
         let resp = handle_error(resp).await?;
         if resp.status().as_u16() == 304 {
-            if let Some(cache) = self.cache() {
-                if let Some(refreshed) = cache.revalidate_existing(url, accept, &resp).await? {
-                    return Ok(refreshed.bytes().await?);
-                }
+            if let Some(cache) = self.cache()
+                && let Some(refreshed) = cache.revalidate_existing(url, accept, &resp).await?
+            {
+                return Ok(refreshed.bytes().await?);
             }
             return Err(ClientError::Invalid(
                 "server returned 304 but no cached entry exists".into(),

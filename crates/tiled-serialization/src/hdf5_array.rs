@@ -26,43 +26,42 @@ pub fn register_hdf5_serializer(reg: &SerializationRegistry) {
 }
 
 fn hdf5_serializer() -> SerializerFn {
-    Box::new(|data, meta| -> Result<Bytes, crate::registry::SerializeError> {
-        let itemsize = meta
-            .get("itemsize")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(8) as usize;
-        let kind = meta.get("kind").and_then(|v| v.as_str()).unwrap_or("f");
-        let shape: Vec<usize> = meta
-            .get("shape")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_u64().map(|n| n as usize))
-                    .collect()
-            })
-            .unwrap_or_default();
+    Box::new(
+        |data, meta| -> Result<Bytes, crate::registry::SerializeError> {
+            let itemsize = meta.get("itemsize").and_then(|v| v.as_u64()).unwrap_or(8) as usize;
+            let kind = meta.get("kind").and_then(|v| v.as_str()).unwrap_or("f");
+            let shape: Vec<usize> = meta
+                .get("shape")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_u64().map(|n| n as usize))
+                        .collect()
+                })
+                .unwrap_or_default();
 
-        // rust-hdf5 writes via filesystem; use a process-unique temp path.
-        let tmp = tempfile::Builder::new()
-            .prefix("tiled-h5-")
-            .suffix(".h5")
-            .tempfile()
-            .map_err(|e| format!("temp file: {e}"))?;
-        // Drop the NamedTempFile so HDF5 can open the path itself.
-        // `into_temp_path` keeps a TempPath that auto-deletes on drop.
-        let path = tmp.into_temp_path();
-        let path_str = path.to_path_buf();
+            // rust-hdf5 writes via filesystem; use a process-unique temp path.
+            let tmp = tempfile::Builder::new()
+                .prefix("tiled-h5-")
+                .suffix(".h5")
+                .tempfile()
+                .map_err(|e| format!("temp file: {e}"))?;
+            // Drop the NamedTempFile so HDF5 can open the path itself.
+            // `into_temp_path` keeps a TempPath that auto-deletes on drop.
+            let path = tmp.into_temp_path();
+            let path_str = path.to_path_buf();
 
-        write_dataset(&path_str, data, itemsize, kind, &shape)
-            .map_err(|e| format!("hdf5 write: {e}"))?;
+            write_dataset(&path_str, data, itemsize, kind, &shape)
+                .map_err(|e| format!("hdf5 write: {e}"))?;
 
-        let mut buf = Vec::new();
-        std::fs::File::open(&path_str)
-            .map_err(|e| format!("read back: {e}"))?
-            .read_to_end(&mut buf)
-            .map_err(|e| format!("read back: {e}"))?;
-        Ok(Bytes::from(buf))
-    })
+            let mut buf = Vec::new();
+            std::fs::File::open(&path_str)
+                .map_err(|e| format!("read back: {e}"))?
+                .read_to_end(&mut buf)
+                .map_err(|e| format!("read back: {e}"))?;
+            Ok(Bytes::from(buf))
+        },
+    )
 }
 
 fn write_dataset(
@@ -100,7 +99,7 @@ fn write_typed<T>(
 where
     T: rust_hdf5::types::H5Type + Copy,
 {
-    if data.len() % itemsize != 0 {
+    if !data.len().is_multiple_of(itemsize) {
         return Err(format!(
             "byte buffer length {} not aligned to itemsize {itemsize}",
             data.len()
@@ -120,18 +119,11 @@ where
         // SAFETY: we write `itemsize` bytes that match T's layout.
         unsafe {
             let mut value = std::mem::MaybeUninit::<T>::uninit();
-            std::ptr::copy_nonoverlapping(
-                buf.as_ptr(),
-                value.as_mut_ptr() as *mut u8,
-                chunk,
-            );
+            std::ptr::copy_nonoverlapping(buf.as_ptr(), value.as_mut_ptr() as *mut u8, chunk);
             typed.push(value.assume_init());
         }
     }
-    let dataset = file
-        .new_dataset::<T>()
-        .shape(shape)
-        .create("data")?;
+    let dataset = file.new_dataset::<T>().shape(shape).create("data")?;
     dataset.write_raw(&typed)?;
     Ok(())
 }

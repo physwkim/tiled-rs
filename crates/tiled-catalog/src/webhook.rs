@@ -32,7 +32,7 @@ impl Catalog {
         let events_json = req
             .events
             .as_ref()
-            .map(|v| serde_json::to_string(v))
+            .map(serde_json::to_string)
             .transpose()
             .map_err(|e| CatalogError::Validation(format!("encode events: {e}")))?;
         match self.pool() {
@@ -132,7 +132,10 @@ impl Catalog {
                     q = q.bind(id);
                 }
                 let rows = q.fetch_all(pool).await?;
-                let all = rows.iter().map(decode_webhook_sqlite).collect::<Result<Vec<_>>>()?;
+                let all = rows
+                    .iter()
+                    .map(decode_webhook_sqlite)
+                    .collect::<Result<Vec<_>>>()?;
                 Ok(all
                     .into_iter()
                     .filter(|w| webhook_matches_event(w, event_type))
@@ -148,7 +151,10 @@ impl Catalog {
                 .bind(candidate_node_ids)
                 .fetch_all(pool)
                 .await?;
-                let all = rows.iter().map(decode_webhook_pg).collect::<Result<Vec<_>>>()?;
+                let all = rows
+                    .iter()
+                    .map(decode_webhook_pg)
+                    .collect::<Result<Vec<_>>>()?;
                 Ok(all
                     .into_iter()
                     .filter(|w| webhook_matches_event(w, event_type))
@@ -365,7 +371,7 @@ fn parse_iso(value: &str) -> Result<chrono::DateTime<chrono::Utc>> {
 fn decode_events_text(text: Option<&str>) -> Result<Option<Vec<String>>> {
     match text {
         None => Ok(None),
-        Some(s) if s.is_empty() => Ok(None),
+        Some("") => Ok(None),
         Some(s) => serde_json::from_str(s)
             .map(Some)
             .map_err(|e| CatalogError::Validation(format!("decode events: {e}"))),
@@ -393,9 +399,8 @@ fn decode_webhook_pg(row: &sqlx::postgres::PgRow) -> Result<Webhook> {
     let events_value: Option<Value> = row.try_get("events")?;
     let events = match events_value {
         None => None,
-        Some(v) => serde_json::from_value(v).map_err(|e| {
-            CatalogError::Validation(format!("decode events: {e}"))
-        })?,
+        Some(v) => serde_json::from_value(v)
+            .map_err(|e| CatalogError::Validation(format!("decode events: {e}")))?,
     };
     Ok(Webhook {
         id: row.try_get("id")?,

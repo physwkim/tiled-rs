@@ -4,9 +4,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::body::Body;
-use axum::http::{Method, Request};
-use futures::{SinkExt, StreamExt};
+use futures::StreamExt;
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -21,9 +19,10 @@ async fn spawn_server() -> (String, tempfile::TempDir) {
     catalog.migrate().await.unwrap();
 
     let resolver: Arc<dyn tiled_catalog::adapter::LeafResolver> = Arc::new(UnresolvedLeaf);
-    let root_tree: Arc<dyn ContainerAdapter> = Arc::new(
-        tiled_catalog::CatalogAdapter::root(catalog.clone(), resolver),
-    );
+    let root_tree: Arc<dyn ContainerAdapter> = Arc::new(tiled_catalog::CatalogAdapter::root(
+        catalog.clone(),
+        resolver,
+    ));
     let registry = Arc::new(tiled_serialization::default_registry());
     let state = tiled_server::AppState {
         root_tree,

@@ -712,11 +712,8 @@ async fn test_metadata_handles_percent_encoded_slash_in_key() {
     let data: Vec<f64> = vec![1.0, 2.0, 3.0];
     let arr = ArrayAdapter::from_f64_1d(&data, serde_json::json!({}));
     mapping.insert("a/b".to_string(), AnyAdapter::Array(Box::new(arr)));
-    let root: Arc<dyn tiled_core::adapters::ContainerAdapter> = Arc::new(MapAdapter::new(
-        mapping,
-        serde_json::json!({}),
-        vec![],
-    ));
+    let root: Arc<dyn tiled_core::adapters::ContainerAdapter> =
+        Arc::new(MapAdapter::new(mapping, serde_json::json!({}), vec![]));
     let registry = Arc::new(tiled_serialization::default_registry());
     let state = tiled_server::AppState {
         root_tree: root,

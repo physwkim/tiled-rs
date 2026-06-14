@@ -129,8 +129,7 @@ impl AppState {
             return url.clone();
         }
 
-        let trust = self.trust_forwarded_headers
-            && self.peer_is_trusted(peer_ip);
+        let trust = self.trust_forwarded_headers && self.peer_is_trusted(peer_ip);
         let (host, scheme) = if trust {
             let h = headers
                 .get("x-forwarded-host")
@@ -159,7 +158,7 @@ impl AppState {
             (None, _) => true,
             // Empty list = "trust nobody".
             (Some(list), _) if list.is_empty() => false,
-            (Some(list), Some(ip)) => list.iter().any(|allowed| *allowed == ip),
+            (Some(list), Some(ip)) => list.contains(&ip),
             // Allow-list configured but we don't know the peer → don't trust.
             (Some(_), None) => false,
         }

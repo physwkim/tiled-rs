@@ -64,11 +64,7 @@ pub trait ArrayAdapterWrite: ArrayAdapterRead {
     /// store supports growth (zarr, ND-streaming) implement it; default
     /// errors out with a clear "not supported" so the route stays the
     /// same shape regardless of backend support.
-    fn append<'a>(
-        &'a self,
-        _data: DynNDArray,
-        _axis: usize,
-    ) -> BoxFuture<'a, Result<usize>> {
+    fn append<'a>(&'a self, _data: DynNDArray, _axis: usize) -> BoxFuture<'a, Result<usize>> {
         Box::pin(async move {
             Err(crate::error::TiledError::Validation(
                 "append is not supported by this adapter".into(),

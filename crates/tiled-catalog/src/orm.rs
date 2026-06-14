@@ -60,7 +60,6 @@ pub struct Revision {
     pub time_created: chrono::DateTime<chrono::Utc>,
 }
 
-
 // -------------------------- Webhooks (upstream tiled #1353) --------------------------
 
 /// One row of `webhooks` — a registered webhook listening for events on

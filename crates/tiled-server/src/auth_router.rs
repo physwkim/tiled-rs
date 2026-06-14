@@ -61,8 +61,8 @@ fn require_auth_db(
     Ok((db, issuer))
 }
 
-fn lookup_authenticator<'a>(
-    state: &'a AppState,
+fn lookup_authenticator(
+    state: &AppState,
     name: &str,
 ) -> Option<Arc<dyn tiled_auth::Authenticator>> {
     state

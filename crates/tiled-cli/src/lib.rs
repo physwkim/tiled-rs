@@ -11,6 +11,13 @@ use tiled_core::adapters::{AnyAdapter, ContainerAdapter};
 use tiled_core::queries::Query;
 use tiled_server::state::CorsOriginPolicy;
 
+// The `Serve` variant carries the full server configuration (~20 CLI flags),
+// so it is far larger than the tiny subcommand variants. That asymmetry is
+// harmless here: `Command` is parsed exactly once at startup and exactly one
+// instance ever exists, so the per-variant size has no runtime cost. Boxing
+// the payload would add indirection purely to satisfy a layout lint that does
+// not model a parse-once singleton.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 pub enum Command {
     /// Start the Tiled server
@@ -426,10 +433,11 @@ pub async fn run(command: Command) -> Result<()> {
 
             // Decide BEFORE the struct literal moves catalog_handle.
             let webhook_config_value = if catalog_handle.is_some() {
-                let mut wc = tiled_server::webhook_dispatch::WebhookConfig::default();
-                wc.allow_http = webhooks_allow_http;
-                wc.allow_private_addresses = webhooks_allow_private_addresses;
-                Some(wc)
+                Some(tiled_server::webhook_dispatch::WebhookConfig {
+                    allow_http: webhooks_allow_http,
+                    allow_private_addresses: webhooks_allow_private_addresses,
+                    ..Default::default()
+                })
             } else {
                 None
             };

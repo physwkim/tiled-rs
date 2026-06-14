@@ -48,23 +48,20 @@ impl CompositeClient {
     pub async fn flat_keys_mapping(&self) -> Result<HashMap<String, String>> {
         let mut out: HashMap<String, String> = HashMap::new();
         for (key, item) in self.get_contents().await? {
-            if item.attributes.structure_family == Some(StructureFamily::Table) {
-                if let Some(structure) = &item.attributes.structure {
-                    if let Some(cols) = structure.get("columns").and_then(|v| v.as_array()) {
-                        for col in cols {
-                            if let Some(name) = col.as_str() {
-                                if let Some(prev) =
-                                    out.insert(name.to_string(), format!("{key}/{name}"))
-                                {
-                                    return Err(ClientError::Invalid(format!(
-                                        "composite key collision on '{name}': existing='{prev}', new='{key}/{name}'"
-                                    )));
-                                }
-                            }
-                        }
-                        continue;
+            if item.attributes.structure_family == Some(StructureFamily::Table)
+                && let Some(structure) = &item.attributes.structure
+                && let Some(cols) = structure.get("columns").and_then(|v| v.as_array())
+            {
+                for col in cols {
+                    if let Some(name) = col.as_str()
+                        && let Some(prev) = out.insert(name.to_string(), format!("{key}/{name}"))
+                    {
+                        return Err(ClientError::Invalid(format!(
+                            "composite key collision on '{name}': existing='{prev}', new='{key}/{name}'"
+                        )));
                     }
                 }
+                continue;
             }
             if let Some(prev) = out.insert(key.clone(), key.clone()) {
                 return Err(ClientError::Invalid(format!(
@@ -224,7 +221,7 @@ impl CompositeClient {
                     let columns: Vec<String> = if let Some(vs) = variables {
                         tbl.columns()
                             .iter()
-                            .filter(|c| vs.iter().any(|v| *v == c.as_str()))
+                            .filter(|c| vs.contains(&c.as_str()))
                             .cloned()
                             .collect()
                     } else {
@@ -376,6 +373,10 @@ fn array_to_le_bytes(array: &dyn Array, dt: &ArrowDataType) -> Result<Vec<u8>> {
 /// you get when the key matches a column inside one of the container's child
 /// tables (`composite["temperature"]` where `temperature` is a column of
 /// `temperature_sensor` table).
+// Both variants are owned client handles held transiently while projecting a
+// composite view; this enum is never stored in bulk, so boxing the larger
+// variant would only add an allocation on the hot Node path.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum CompositePart {
     /// A real child of the underlying container.

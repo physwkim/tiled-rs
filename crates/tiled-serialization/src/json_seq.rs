@@ -29,24 +29,26 @@ pub fn register_json_seq_serializer(reg: &SerializationRegistry) {
 }
 
 fn json_seq_serializer() -> SerializerFn {
-    Box::new(|data, _meta| -> Result<Bytes, crate::registry::SerializeError> {
-        // The container handler hands us a JSON-encoded Vec<Value>. Walk
-        // it and re-emit each element with proper RS/LF framing.
-        let value: serde_json::Value =
-            serde_json::from_slice(data).map_err(|e| format!("decode input: {e}"))?;
-        let arr = value
-            .as_array()
-            .ok_or("json-seq input must be a JSON array")?;
-        let mut out = Vec::with_capacity(data.len() + arr.len() * 2);
-        for record in arr {
-            let serialised =
-                serde_json::to_vec(record).map_err(|e| format!("encode record: {e}"))?;
-            out.push(RS);
-            out.extend_from_slice(&serialised);
-            out.push(LF);
-        }
-        Ok(Bytes::from(out))
-    })
+    Box::new(
+        |data, _meta| -> Result<Bytes, crate::registry::SerializeError> {
+            // The container handler hands us a JSON-encoded Vec<Value>. Walk
+            // it and re-emit each element with proper RS/LF framing.
+            let value: serde_json::Value =
+                serde_json::from_slice(data).map_err(|e| format!("decode input: {e}"))?;
+            let arr = value
+                .as_array()
+                .ok_or("json-seq input must be a JSON array")?;
+            let mut out = Vec::with_capacity(data.len() + arr.len() * 2);
+            for record in arr {
+                let serialised =
+                    serde_json::to_vec(record).map_err(|e| format!("encode record: {e}"))?;
+                out.push(RS);
+                out.extend_from_slice(&serialised);
+                out.push(LF);
+            }
+            Ok(Bytes::from(out))
+        },
+    )
 }
 
 #[cfg(test)]

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
 
-use tiled_auth::{Principal, ScopeSet, Scope};
+use tiled_auth::{Principal, Scope, ScopeSet};
 
 use crate::error::ServerError;
 

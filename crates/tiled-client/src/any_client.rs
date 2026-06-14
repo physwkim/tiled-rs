@@ -60,10 +60,10 @@ impl AnyClient {
     /// Dispatch on `structure_family` to build the right client. If the
     /// context has a [`ClientResolver`] configured, it is consulted first.
     pub fn from_item(context: Context, item: Item, include_data_sources: bool) -> Result<Self> {
-        if let Some(resolver) = context.resolver() {
-            if let Some(custom) = resolver.resolve(&context, &item, include_data_sources) {
-                return Ok(Self::Custom(custom?));
-            }
+        if let Some(resolver) = context.resolver()
+            && let Some(custom) = resolver.resolve(&context, &item, include_data_sources)
+        {
+            return Ok(Self::Custom(custom?));
         }
         let family = item
             .attributes
@@ -121,6 +121,9 @@ impl AnyClient {
 
     /// Move out the inner custom client. Returns `Err` with the original
     /// `AnyClient` if the variant or downcast doesn't match.
+    // Mirrors `Arc::downcast`, which hands the original value back on failure;
+    // boxing the error would force every caller through a `*` deref for no gain.
+    #[allow(clippy::result_large_err)]
     pub fn downcast<T: Any + Send + Sync>(self) -> std::result::Result<Arc<T>, Self> {
         match self {
             Self::Custom(a) => match Arc::downcast::<T>(a) {

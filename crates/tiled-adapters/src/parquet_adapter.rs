@@ -27,18 +27,13 @@ pub struct ParquetAdapter {
 
 impl ParquetAdapter {
     pub fn from_path(path: PathBuf, metadata: serde_json::Value) -> Result<Self> {
-        let file = std::fs::File::open(&path).map_err(|e| {
-            TiledError::Internal(format!("open {}: {e}", path.display()))
-        })?;
+        let file = std::fs::File::open(&path)
+            .map_err(|e| TiledError::Internal(format!("open {}: {e}", path.display())))?;
         let builder = ParquetRecordBatchReaderBuilder::try_new(file)
             .map_err(|e| TiledError::Internal(format!("parquet builder: {e}")))?;
         let schema = builder.schema().clone();
         let npartitions = builder.metadata().num_row_groups().max(1);
-        let columns: Vec<String> = schema
-            .fields()
-            .iter()
-            .map(|f| f.name().clone())
-            .collect();
+        let columns: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
         let structure = TableStructure {
             arrow_schema: encode_schema(schema.as_ref()),
             npartitions,
@@ -55,9 +50,8 @@ impl ParquetAdapter {
     }
 
     fn read_partition_inner(&self, partition: Option<usize>) -> Result<Vec<RecordBatch>> {
-        let file = std::fs::File::open(&self.path).map_err(|e| {
-            TiledError::Internal(format!("open {}: {e}", self.path.display()))
-        })?;
+        let file = std::fs::File::open(&self.path)
+            .map_err(|e| TiledError::Internal(format!("open {}: {e}", self.path.display())))?;
         let mut builder = ParquetRecordBatchReaderBuilder::try_new(file)
             .map_err(|e| TiledError::Internal(format!("parquet builder: {e}")))?;
         if let Some(p) = partition {
@@ -74,9 +68,7 @@ impl ParquetAdapter {
             .map_err(|e| TiledError::Internal(format!("parquet build: {e}")))?;
         let mut batches = Vec::new();
         for b in reader {
-            batches.push(
-                b.map_err(|e| TiledError::Internal(format!("parquet read: {e}")))?,
-            );
+            batches.push(b.map_err(|e| TiledError::Internal(format!("parquet read: {e}")))?);
         }
         Ok(batches)
     }
@@ -157,7 +149,8 @@ fn project(
 
 fn encode_schema(schema: &arrow::datatypes::Schema) -> String {
     use base64::Engine;
-    let buf = arrow::ipc::convert::schema_to_fb(schema)
+    let buf = arrow::ipc::convert::IpcSchemaEncoder::new()
+        .schema_to_fb(schema)
         .finished_data()
         .to_vec();
     let b64 = base64::engine::general_purpose::STANDARD.encode(buf);

@@ -11,7 +11,10 @@
 use std::io::Cursor;
 
 use bytes::Bytes;
-use image::{ImageBuffer, Luma, codecs::png::PngEncoder, codecs::jpeg::JpegEncoder, ExtendedColorType, ImageEncoder};
+use image::{
+    ExtendedColorType, ImageBuffer, ImageEncoder, Luma, codecs::jpeg::JpegEncoder,
+    codecs::png::PngEncoder,
+};
 
 use tiled_core::media_type::mime;
 use tiled_core::structures::StructureFamily;
@@ -90,7 +93,11 @@ fn encode_image(
         ("u", 1) => data.to_vec(),
         ("u", 2) => downscale_u16(data),
         ("u", 4) => downscale_u32(data),
-        ("i", 1) => data.iter().map(|&b| b as i8 as i32 + 128).map(|v| v as u8).collect(),
+        ("i", 1) => data
+            .iter()
+            .map(|&b| b as i8 as i32 + 128)
+            .map(|v| v as u8)
+            .collect(),
         ("i", 2) => downscale_i16(data),
         ("f", 4) => normalize_f32(data),
         ("f", 8) => normalize_f64(data),
@@ -161,7 +168,7 @@ fn downscale_i16(data: &[u8]) -> Vec<u8> {
     data.chunks_exact(2)
         .map(|c| {
             let v = i16::from_le_bytes([c[0], c[1]]);
-            ((v.saturating_add(i16::MIN.unsigned_abs() as i16) as i32 / 257) as u8) as u8
+            (v.saturating_add(i16::MIN.unsigned_abs() as i16) as i32 / 257) as u8
         })
         .collect()
 }
@@ -194,7 +201,7 @@ fn normalize_floats(values: &[f32]) -> Vec<u8> {
             max = max.max(v);
         }
     }
-    if !min.is_finite() || !max.is_finite() || (max - min) < f32::EPSILON {
+    if !min.is_finite() || !max.is_finite() || (max - min).abs() < f32::EPSILON {
         return vec![0u8; values.len()];
     }
     values

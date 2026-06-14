@@ -188,13 +188,12 @@ async fn logout_submit(State(state): State<Arc<WebState>>, headers: HeaderMap) -
         state.auth_db.clone(),
         state.issuer.clone(),
         read_session_cookie(&headers),
-    ) {
-        if let Ok(claims) = issuer.verify_access(&jwt) {
-            // Revoke the specific session, not every session for the
-            // principal — the API's logout endpoint already supports
-            // logout-everywhere if the user wants it.
-            db.revoke_session(&claims.sid).await.ok();
-        }
+    ) && let Ok(claims) = issuer.verify_access(&jwt)
+    {
+        // Revoke the specific session, not every session for the
+        // principal — the API's logout endpoint already supports
+        // logout-everywhere if the user wants it.
+        db.revoke_session(&claims.sid).await.ok();
     }
     let cookie = clear_session_cookie(state.secure_cookies);
     let mut response = Redirect::temporary("/admin/login").into_response();

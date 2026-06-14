@@ -55,9 +55,7 @@ fn main() {
         wipe_and_copy(&dist, &dst).expect("copy dist -> assets/spa");
     } else {
         if spa_crate.exists() {
-            println!(
-                "cargo:warning=trunk not in PATH; falling back to assets/spa-placeholder/"
-            );
+            println!("cargo:warning=trunk not in PATH; falling back to assets/spa-placeholder/");
         }
         wipe_and_copy(&placeholder, &dst).expect("copy spa-placeholder -> assets/spa");
     }

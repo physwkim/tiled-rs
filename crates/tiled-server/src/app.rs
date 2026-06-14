@@ -26,11 +26,16 @@ pub fn build_app(state: AppState) -> Router {
     // the streaming bus's root channel so it sees every event without
     // touching request paths.
     if let (Some(cfg), Some(catalog)) = (state.webhook_config.as_ref(), state.catalog.as_ref()) {
-        let _ = crate::webhook_dispatch::spawn(
+        // `spawn` already drives the dispatcher on the runtime via `tokio::spawn`
+        // and hands back the `JoinHandle`. We intentionally detach it: the
+        // dispatcher lives for the lifetime of the process and is torn down when
+        // the runtime stops. Drop the handle explicitly (not `let _`) so the
+        // detach is deliberate rather than an accidentally-dropped future.
+        drop(crate::webhook_dispatch::spawn(
             catalog.clone(),
             state.streaming_bus.clone(),
             cfg.clone(),
-        );
+        ));
     }
 
     let cors = match &state.cors_policy {
@@ -64,10 +69,7 @@ pub fn build_app(state: AppState) -> Router {
             "/api/v1/auth/device/initiate",
             post(auth_router::device_initiate),
         )
-        .route(
-            "/api/v1/auth/device/token",
-            post(auth_router::device_token),
-        );
+        .route("/api/v1/auth/device/token", post(auth_router::device_token));
 
     // Authenticated auth endpoints — must run inside the auth middleware
     // so AuthContext is populated.
@@ -120,7 +122,10 @@ pub fn build_app(state: AppState) -> Router {
             get(router::array_full).patch(router::array_append),
         )
         .route("/api/v1/container/full/", get(router::container_full_root))
-        .route("/api/v1/container/full/{*path}", get(router::container_full))
+        .route(
+            "/api/v1/container/full/{*path}",
+            get(router::container_full),
+        )
         .route("/api/v1/array/full", post(router::array_full_post))
         .route("/api/v1/container/full", post(router::container_full_post))
         .route(
@@ -218,7 +223,9 @@ async fn correlation_id_middleware(
     };
 
     let mut request = request;
-    request.extensions_mut().insert(RequestId(request_id.clone()));
+    request
+        .extensions_mut()
+        .insert(RequestId(request_id.clone()));
     let mut response = next.run(request).await;
     if let Ok(value) = HeaderValue::from_str(&request_id) {
         response.headers_mut().insert(header_name, value);
@@ -307,30 +314,30 @@ pub async fn validate_bearer(state: &AppState, token: &str) -> Result<AuthContex
         .auth_db
         .as_ref()
         .ok_or_else(|| "server has no auth_db; bearer not supported".to_string())?;
-    if let Some(issuer) = state.issuer.as_ref() {
-        if let Ok(claims) = issuer.verify_access(token) {
-            let session = db
-                .lookup_session(&claims.sid)
-                .await
-                .map_err(|_| "session not found".to_string())?;
-            if session.revoked {
-                return Err("session revoked".into());
-            }
-            if session.expiration_time <= chrono::Utc::now() {
-                return Err("session expired".into());
-            }
-            db.touch_session(&claims.sid).await.ok();
-            let principal = db
-                .get_principal(session.principal_id)
-                .await
-                .map_err(|_| "principal lookup failed".to_string())?
-                .ok_or_else(|| "principal not found".to_string())?;
-            return Ok(AuthContext {
-                principal: Some(Arc::new(principal)),
-                scopes: claims.scopes.intersect(&session.scopes),
-                kind: AuthKind::Session,
-            });
+    if let Some(issuer) = state.issuer.as_ref()
+        && let Ok(claims) = issuer.verify_access(token)
+    {
+        let session = db
+            .lookup_session(&claims.sid)
+            .await
+            .map_err(|_| "session not found".to_string())?;
+        if session.revoked {
+            return Err("session revoked".into());
         }
+        if session.expiration_time <= chrono::Utc::now() {
+            return Err("session expired".into());
+        }
+        db.touch_session(&claims.sid).await.ok();
+        let principal = db
+            .get_principal(session.principal_id)
+            .await
+            .map_err(|_| "principal lookup failed".to_string())?
+            .ok_or_else(|| "principal not found".to_string())?;
+        return Ok(AuthContext {
+            principal: Some(Arc::new(principal)),
+            scopes: claims.scopes.intersect(&session.scopes),
+            kind: AuthKind::Session,
+        });
     }
     if let Some(validator) = state.external_oidc.as_ref() {
         let validated = validator
@@ -355,19 +362,19 @@ pub async fn validate_bearer(state: &AppState, token: &str) -> Result<AuthContex
 /// first, single-user CLI flag fallback. Same constant-time compare
 /// the middleware uses (R3 timing-attack fix).
 pub async fn validate_apikey(state: &AppState, key: &str) -> Result<AuthContext, String> {
-    if let Some(db) = state.auth_db.as_ref() {
-        if let Ok(record) = db.verify_api_key(key).await {
-            let principal = db
-                .get_principal(record.principal_id)
-                .await
-                .map_err(|_| "principal lookup failed".to_string())?
-                .ok_or_else(|| "principal vanished".to_string())?;
-            return Ok(AuthContext {
-                principal: Some(Arc::new(principal)),
-                scopes: record.scopes,
-                kind: AuthKind::ApiKey,
-            });
-        }
+    if let Some(db) = state.auth_db.as_ref()
+        && let Ok(record) = db.verify_api_key(key).await
+    {
+        let principal = db
+            .get_principal(record.principal_id)
+            .await
+            .map_err(|_| "principal lookup failed".to_string())?
+            .ok_or_else(|| "principal vanished".to_string())?;
+        return Ok(AuthContext {
+            principal: Some(Arc::new(principal)),
+            scopes: record.scopes,
+            kind: AuthKind::ApiKey,
+        });
     }
     if let Some(expected) = state.api_key.as_ref() {
         if expected.is_empty() {
@@ -406,18 +413,18 @@ async fn resolve_auth_inner(
     // ---- 2. Apikey (multi-user → single-user fallback) ----
     let api_key_value = extract_api_key(headers, query);
     if let Some(key) = api_key_value {
-        if let Some(db) = state.auth_db.as_ref() {
-            if let Ok(record) = db.verify_api_key(&key).await {
-                let principal = match db.get_principal(record.principal_id).await {
-                    Ok(Some(p)) => Arc::new(p),
-                    _ => return Err(unauthorized("principal vanished")),
-                };
-                return Ok(AuthContext {
-                    principal: Some(principal),
-                    scopes: record.scopes,
-                    kind: AuthKind::ApiKey,
-                });
-            }
+        if let Some(db) = state.auth_db.as_ref()
+            && let Ok(record) = db.verify_api_key(&key).await
+        {
+            let principal = match db.get_principal(record.principal_id).await {
+                Ok(Some(p)) => Arc::new(p),
+                _ => return Err(unauthorized("principal vanished")),
+            };
+            return Ok(AuthContext {
+                principal: Some(principal),
+                scopes: record.scopes,
+                kind: AuthKind::ApiKey,
+            });
         }
         if let Some(expected) = state.api_key.as_ref() {
             if expected.is_empty() {
@@ -436,38 +443,31 @@ async fn resolve_auth_inner(
     }
 
     // ---- 3. Proxied header ----
-    if state.trust_forwarded_headers {
-        if let (Some(prox), Some(db)) = (
-            state.proxied_header_auth.as_ref(),
-            state.auth_db.as_ref(),
-        ) {
-            if let Some(subject) = prox.extract(headers) {
-                let (principal, identity) = match db
-                    .ensure_principal(&subject.provider, &subject.sub)
-                    .await
-                {
-                    Ok(t) => t,
-                    Err(e) => {
-                        tracing::error!(target: "tiled.auth", "proxied principal: {e}");
-                        return Err(unauthorized("proxied principal lookup failed"));
-                    }
-                };
-                db.touch_identity_login(identity.id).await.ok();
-                return Ok(AuthContext {
-                    principal: Some(Arc::new(principal)),
-                    scopes: ScopeSet::full(),
-                    kind: AuthKind::Proxied,
-                });
+    if state.trust_forwarded_headers
+        && let (Some(prox), Some(db)) = (state.proxied_header_auth.as_ref(), state.auth_db.as_ref())
+        && let Some(subject) = prox.extract(headers)
+    {
+        let (principal, identity) = match db.ensure_principal(&subject.provider, &subject.sub).await
+        {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!(target: "tiled.auth", "proxied principal: {e}");
+                return Err(unauthorized("proxied principal lookup failed"));
             }
-        }
+        };
+        db.touch_identity_login(identity.id).await.ok();
+        return Ok(AuthContext {
+            principal: Some(Arc::new(principal)),
+            scopes: ScopeSet::full(),
+            kind: AuthKind::Proxied,
+        });
     }
 
     // ---- 4. Anonymous fallback ----
     // No auth backend configured at all: behaviour matches pre-multi-user
     // tiled-rs — full access. Operators that want to lock the server down
     // configure single-user `api_key` or wire the auth DB.
-    let no_auth_configured =
-        state.api_key.is_none() && state.auth_db.is_none();
+    let no_auth_configured = state.api_key.is_none() && state.auth_db.is_none();
     if no_auth_configured {
         return Ok(AuthContext {
             principal: None,

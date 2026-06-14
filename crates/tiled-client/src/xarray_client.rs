@@ -69,10 +69,10 @@ impl DatasetClient {
 
         for item in entries {
             let id = item.id.clone();
-            if let Some(vars) = variables {
-                if !vars.iter().any(|v| *v == id) {
-                    continue;
-                }
+            if let Some(vars) = variables
+                && !vars.iter().any(|v| *v == id)
+            {
+                continue;
             }
             let specs = item.attributes.specs.clone().unwrap_or_default();
             let any = AnyClient::from_item(self.inner.base().context().clone(), item, false)?;

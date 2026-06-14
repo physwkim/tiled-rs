@@ -20,9 +20,10 @@ async fn build_test_app() -> (axum::Router, tempfile::TempDir) {
     catalog.migrate().await.unwrap();
 
     let resolver: Arc<dyn tiled_catalog::adapter::LeafResolver> = Arc::new(UnresolvedLeaf);
-    let root_tree: Arc<dyn ContainerAdapter> = Arc::new(
-        tiled_catalog::CatalogAdapter::root(catalog.clone(), resolver),
-    );
+    let root_tree: Arc<dyn ContainerAdapter> = Arc::new(tiled_catalog::CatalogAdapter::root(
+        catalog.clone(),
+        resolver,
+    ));
     let registry = Arc::new(tiled_serialization::default_registry());
     let state = tiled_server::AppState {
         root_tree,
@@ -68,7 +69,9 @@ async fn json_request(
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
     let status = resp.status();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
     (status, v)
 }
@@ -81,7 +84,9 @@ async fn empty_request(app: &axum::Router, method: Method, uri: &str) -> (Status
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
     let status = resp.status();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
     (status, bytes.to_vec())
 }
 
@@ -168,8 +173,7 @@ async fn register_then_read_then_patch_then_delete() {
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
 
     // Empty the child first, THEN the container.
-    let (status, _) =
-        empty_request(&app, Method::DELETE, "/api/v1/metadata/expt/scan_1").await;
+    let (status, _) = empty_request(&app, Method::DELETE, "/api/v1/metadata/expt/scan_1").await;
     assert_eq!(status, StatusCode::NO_CONTENT);
     let (status, _) = empty_request(&app, Method::DELETE, "/api/v1/metadata/expt").await;
     assert_eq!(status, StatusCode::NO_CONTENT);
@@ -201,11 +205,7 @@ async fn search_pushes_filters_to_sql() {
     let (app, _dir) = build_test_app().await;
 
     // Seed three nodes with different metadata.
-    for (key, plan, count) in [
-        ("a", "count", 3),
-        ("b", "scan", 7),
-        ("c", "count", 12),
-    ] {
+    for (key, plan, count) in [("a", "count", 3), ("b", "scan", 7), ("c", "count", 12)] {
         let body = serde_json::json!({
             "key": key,
             "structure_family": "container",
@@ -254,5 +254,8 @@ async fn delete_root_rejected() {
     let (status, _) = empty_request(&app, Method::DELETE, "/api/v1/metadata/").await;
     // No `*path` segments → 404 from axum routing (no DELETE on the bare
     // collection prefix).
-    assert!(matches!(status, StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED));
+    assert!(matches!(
+        status,
+        StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
+    ));
 }

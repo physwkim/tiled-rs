@@ -151,8 +151,7 @@ impl AccessPolicy for TagBasedPolicy {
             .get(&principal.uuid)
             .cloned()
             .unwrap_or_default();
-        let visible = node_tags.is_empty()
-            || node_tags.iter().any(|t| granted.contains(t));
+        let visible = node_tags.is_empty() || node_tags.iter().any(|t| granted.contains(t));
         if visible {
             Decision {
                 scopes: session_scopes.intersect(&self.default_scopes),

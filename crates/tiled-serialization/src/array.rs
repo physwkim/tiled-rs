@@ -38,7 +38,11 @@ pub fn register_array_serializers(registry: &SerializationRegistry) {
             let shape: Vec<usize> = metadata
                 .get("shape")
                 .and_then(|v| v.as_array())
-                .map(|arr| arr.iter().filter_map(|v| v.as_u64().map(|n| n as usize)).collect())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_u64().map(|n| n as usize))
+                        .collect()
+                })
                 .unwrap_or_default();
 
             let format_value = |bytes: &[u8]| -> String {

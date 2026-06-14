@@ -348,7 +348,7 @@ impl Default for Settings {
         Self {
             adapters,
             mimetypes_by_ext: HashMap::new(),
-            key_from_filename: Box::new(|n| strip_suffixes(n)),
+            key_from_filename: Box::new(strip_suffixes),
             filter: Box::new(default_filter),
         }
     }

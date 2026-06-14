@@ -49,12 +49,10 @@ struct JwksDocument {
 struct Jwk {
     kid: Option<String>,
     kty: String,
-    alg: Option<String>,
     n: Option<String>,
     e: Option<String>,
     x: Option<String>,
     y: Option<String>,
-    crv: Option<String>,
     #[serde(rename = "use")]
     use_: Option<String>,
 }
@@ -127,9 +125,7 @@ impl ExternalOidcValidator {
             .providers
             .iter()
             .find(|p| p.issuer == issuer)
-            .ok_or_else(|| {
-                AuthError::Unauthorized(format!("unknown token issuer: {issuer}"))
-            })?;
+            .ok_or_else(|| AuthError::Unauthorized(format!("unknown token issuer: {issuer}")))?;
 
         let key = self.fetch_key(provider, &kid).await?;
         let mut validation = Validation::new(header.alg);
@@ -148,10 +144,7 @@ impl ExternalOidcValidator {
             .get(&provider.subject_claim)
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
-                AuthError::Unauthorized(format!(
-                    "token missing claim '{}'",
-                    provider.subject_claim
-                ))
+                AuthError::Unauthorized(format!("token missing claim '{}'", provider.subject_claim))
             })?
             .to_string();
         Ok(ValidatedToken {
@@ -162,12 +155,11 @@ impl ExternalOidcValidator {
     }
 
     async fn fetch_key(&self, provider: &OidcProvider, kid: &str) -> Result<DecodingKey> {
-        if let Some(cached) = self.cache.read().await.get(&provider.name) {
-            if cached.expires_at > Utc::now() {
-                if let Some(k) = cached.keys.get(kid) {
-                    return Ok(k.clone());
-                }
-            }
+        if let Some(cached) = self.cache.read().await.get(&provider.name)
+            && cached.expires_at > Utc::now()
+            && let Some(k) = cached.keys.get(kid)
+        {
+            return Ok(k.clone());
         }
         // Cache miss / expiry → re-fetch.
         let response = self
@@ -182,10 +174,10 @@ impl ExternalOidcValidator {
             .map_err(|e| AuthError::Validation(format!("decode jwks: {e}")))?;
         let mut by_kid = HashMap::new();
         for jwk in &jwks.keys {
-            if let Some(decoder) = jwk_to_decoding_key(jwk) {
-                if let Some(kid) = jwk.kid.clone() {
-                    by_kid.insert(kid, decoder);
-                }
+            if let Some(decoder) = jwk_to_decoding_key(jwk)
+                && let Some(kid) = jwk.kid.clone()
+            {
+                by_kid.insert(kid, decoder);
             }
         }
         let cached = CachedKeys {

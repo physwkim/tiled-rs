@@ -116,22 +116,22 @@ impl AuthDb {
     /// verification UI.
     pub async fn approve_device_code(&self, user_code: &str, principal_id: i64) -> Result<()> {
         let affected: u64 = match self.pool() {
-            AuthPool::Sqlite(pool) => sqlx::query(
-                "UPDATE device_codes SET principal_id = ? WHERE user_code = ?",
-            )
-            .bind(principal_id)
-            .bind(user_code)
-            .execute(pool)
-            .await?
-            .rows_affected(),
-            AuthPool::Postgres(pool) => sqlx::query(
-                "UPDATE device_codes SET principal_id = $1 WHERE user_code = $2",
-            )
-            .bind(principal_id)
-            .bind(user_code)
-            .execute(pool)
-            .await?
-            .rows_affected(),
+            AuthPool::Sqlite(pool) => {
+                sqlx::query("UPDATE device_codes SET principal_id = ? WHERE user_code = ?")
+                    .bind(principal_id)
+                    .bind(user_code)
+                    .execute(pool)
+                    .await?
+                    .rows_affected()
+            }
+            AuthPool::Postgres(pool) => {
+                sqlx::query("UPDATE device_codes SET principal_id = $1 WHERE user_code = $2")
+                    .bind(principal_id)
+                    .bind(user_code)
+                    .execute(pool)
+                    .await?
+                    .rows_affected()
+            }
         };
         if affected == 0 {
             return Err(AuthError::NotFound(format!("user_code {user_code}")));
@@ -248,7 +248,9 @@ fn device_from_sqlite(row: &sqlx::sqlite::SqliteRow) -> Result<DeviceCodeRecord>
         // Be explicit about the Option type — sqlx-sqlite's `try_get::<i64, _>`
         // returns 0 for SQL NULL on integer columns, so type inference via
         // the field type silently fills `Some(0)` for an unset principal.
-        principal_id: row.try_get::<Option<i64>, _>("principal_id").unwrap_or(None),
+        principal_id: row
+            .try_get::<Option<i64>, _>("principal_id")
+            .unwrap_or(None),
         expires_at: parse_dt_sqlite(row.get::<String, _>("expires_at"))?,
         interval_seconds: row.get("interval_seconds"),
         last_polled_at: row

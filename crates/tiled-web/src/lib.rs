@@ -93,10 +93,7 @@ pub fn build_router(state: WebState) -> Router {
             let body = settings_json.clone();
             async move {
                 (
-                    [(
-                        axum::http::header::CONTENT_TYPE,
-                        "application/json",
-                    )],
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
                     body,
                 )
             }

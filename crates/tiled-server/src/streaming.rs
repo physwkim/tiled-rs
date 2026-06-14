@@ -19,9 +19,8 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
-use axum::extract::{Query, State, WebSocketUpgrade, ws::Message, ws::WebSocket};
 use axum::extract::OriginalUri;
-use axum::response::IntoResponse;
+use axum::extract::{Query, State, WebSocketUpgrade, ws::Message, ws::WebSocket};
 use chrono::Utc;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
@@ -126,9 +125,9 @@ impl StreamingBus {
                 .or_insert_with(|| ChannelEntry {
                     sender: broadcast::channel(CHANNEL_CAPACITY).0,
                     sequence: AtomicU64::new(0),
-                    history: std::sync::Mutex::new(
-                        std::collections::VecDeque::with_capacity(HISTORY_CAPACITY),
-                    ),
+                    history: std::sync::Mutex::new(std::collections::VecDeque::with_capacity(
+                        HISTORY_CAPACITY,
+                    )),
                 });
             let seq = entry.sequence.fetch_add(1, Ordering::Relaxed) + 1;
             let env = UpdateEnvelope {
@@ -231,9 +230,7 @@ pub enum UpdateKind {
     /// Node (and descendants) were deleted.
     NodeDeleted,
     /// A new partition / block of data is available.
-    DataAppended {
-        partition: Option<usize>,
-    },
+    DataAppended { partition: Option<usize> },
 }
 
 #[derive(Debug, Deserialize)]
@@ -261,7 +258,11 @@ pub async fn ws_subscribe(
     // working.
     let header_auth = crate::app::resolve_header_auth(&state, &headers).await;
 
-    let prefix_starts = ["/api/v1/array/subscribe/", "/api/v1/container/subscribe/", "/api/v1/table/subscribe/"];
+    let prefix_starts = [
+        "/api/v1/array/subscribe/",
+        "/api/v1/container/subscribe/",
+        "/api/v1/table/subscribe/",
+    ];
     let path = uri.path();
     let segments: Vec<String> = prefix_starts
         .iter()
@@ -307,10 +308,7 @@ pub async fn ws_subscribe(
     }))
 }
 
-async fn build_schema_payload(
-    state: &AppState,
-    segments: &[String],
-) -> serde_json::Value {
+async fn build_schema_payload(state: &AppState, segments: &[String]) -> serde_json::Value {
     if let Some(ref catalog) = state.catalog {
         if segments.is_empty() {
             return serde_json::json!({
@@ -352,7 +350,9 @@ async fn build_schema_payload(
         }
     })
     .await
-    .unwrap_or_else(|_| serde_json::json!({"type": "subscription-error", "message": "blocking task failed"}))
+    .unwrap_or_else(
+        |_| serde_json::json!({"type": "subscription-error", "message": "blocking task failed"}),
+    )
 }
 
 async fn run_subscription(
@@ -372,8 +372,9 @@ async fn run_subscription(
     // non-browser clients usually arrive. Fall back to a first-message
     // handshake (tiled#1351) if the headers carried nothing usable.
     let auth_ctx = match header_auth {
-        Some(ctx) if !matches!(ctx.kind, AuthKind::Anonymous)
-            || (state.api_key.is_none() && state.auth_db.is_none()) =>
+        Some(ctx)
+            if !matches!(ctx.kind, AuthKind::Anonymous)
+                || (state.api_key.is_none() && state.auth_db.is_none()) =>
         {
             ctx
         }
@@ -381,9 +382,7 @@ async fn run_subscription(
             Ok(ctx) => ctx,
             Err(close_reason) => {
                 tracing::info!(target: "tiled.streaming", "ws auth failed: {close_reason}");
-                let _ = tx
-                    .send(Message::Text(close_reason.into()))
-                    .await;
+                let _ = tx.send(Message::Text(close_reason.into())).await;
                 let _ = tx.send(Message::Close(None)).await;
                 return;
             }
@@ -473,7 +472,6 @@ async fn handshake_auth(
     tx: &mut futures::stream::SplitSink<WebSocket, Message>,
     rx: &mut futures::stream::SplitStream<WebSocket>,
 ) -> Result<AuthContext, String> {
-    use futures::SinkExt;
     use tokio::time::Duration;
 
     // Anonymous mode: no auth backend at all → grant full scopes
@@ -488,21 +486,20 @@ async fn handshake_auth(
     }
     // Otherwise wait briefly for the client's first message — must be a
     // JSON object: {"type": "auth", "apikey"|"bearer": "..."}.
-    let first = match tokio::time::timeout(Duration::from_secs(10), futures::StreamExt::next(rx))
-        .await
-    {
-        Ok(Some(Ok(Message::Text(text)))) => text,
-        Ok(Some(Ok(Message::Binary(bytes)))) => match std::str::from_utf8(&bytes) {
-            Ok(s) => s.to_string().into(),
-            Err(_) => return Err("auth handshake: non-utf8 binary".into()),
-        },
-        Ok(Some(Ok(Message::Close(_)))) | Ok(None) => {
-            return Err("auth handshake: client closed".into());
-        }
-        Ok(Some(Err(e))) => return Err(format!("auth handshake: {e}")),
-        Ok(Some(Ok(_))) => return Err("auth handshake: unexpected frame type".into()),
-        Err(_) => return Err("auth handshake: timeout".into()),
-    };
+    let first =
+        match tokio::time::timeout(Duration::from_secs(10), futures::StreamExt::next(rx)).await {
+            Ok(Some(Ok(Message::Text(text)))) => text,
+            Ok(Some(Ok(Message::Binary(bytes)))) => match std::str::from_utf8(&bytes) {
+                Ok(s) => s.to_string().into(),
+                Err(_) => return Err("auth handshake: non-utf8 binary".into()),
+            },
+            Ok(Some(Ok(Message::Close(_)))) | Ok(None) => {
+                return Err("auth handshake: client closed".into());
+            }
+            Ok(Some(Err(e))) => return Err(format!("auth handshake: {e}")),
+            Ok(Some(Ok(_))) => return Err("auth handshake: unexpected frame type".into()),
+            Err(_) => return Err("auth handshake: timeout".into()),
+        };
     let parsed: serde_json::Value = match serde_json::from_str(&first) {
         Ok(v) => v,
         Err(e) => return Err(format!("auth handshake: invalid JSON: {e}")),

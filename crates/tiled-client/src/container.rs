@@ -74,10 +74,10 @@ impl ContainerClient {
     /// Number of children. Honors the inline `structure.contents` shortcut
     /// when the server has provided it.
     pub async fn len(&self) -> Result<usize> {
-        if let Some(structure) = self.base.item().attributes.structure.as_ref() {
-            if let Some(count) = structure.get("count").and_then(|v| v.as_u64()) {
-                return Ok(count as usize);
-            }
+        if let Some(structure) = self.base.item().attributes.structure.as_ref()
+            && let Some(count) = structure.get("count").and_then(|v| v.as_u64())
+        {
+            return Ok(count as usize);
         }
         // Fall back to a search with limit=0; meta.count is the total.
         let url = self.search_url(0, 0)?;
@@ -141,11 +141,11 @@ impl ContainerClient {
             .await?;
             let count = resp.data.len();
             all.extend(resp.data);
-            if let Some(want) = limit {
-                if all.len() >= want {
-                    all.truncate(want);
-                    break;
-                }
+            if let Some(want) = limit
+                && all.len() >= want
+            {
+                all.truncate(want);
+                break;
             }
             // Stop when the server indicates there is no next page or we got
             // less than a full page back.

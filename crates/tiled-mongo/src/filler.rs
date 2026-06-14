@@ -67,11 +67,7 @@ impl Filler {
     /// concatenating bytes of differing per-row sizes — including the
     /// scalar case where `expected_shape` is empty but the handler
     /// returned a non-empty shape.
-    pub fn fill_column(
-        &self,
-        datum_ids: &[String],
-        expected_shape: &[usize],
-    ) -> Result<Vec<u8>> {
+    pub fn fill_column(&self, datum_ids: &[String], expected_shape: &[usize]) -> Result<Vec<u8>> {
         let mut all_bytes = Vec::new();
         for datum_id in datum_ids {
             let (data, shape) = self.fill(datum_id)?;

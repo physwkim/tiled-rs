@@ -4,14 +4,14 @@ pub mod json_seq;
 pub mod registry;
 pub mod table;
 
-#[cfg(feature = "image")]
-pub mod image_array;
-#[cfg(feature = "parquet")]
-pub mod parquet_table;
 #[cfg(feature = "csv")]
 pub mod excel_table;
 #[cfg(feature = "hdf5")]
 pub mod hdf5_array;
+#[cfg(feature = "image")]
+pub mod image_array;
+#[cfg(feature = "parquet")]
+pub mod parquet_table;
 
 pub use registry::{SerializationRegistry, resolve_media_type};
 

@@ -7,10 +7,13 @@
 
 use std::path::PathBuf;
 
+#[cfg(feature = "tiff")]
 use bytes::Bytes;
 
 use tiled_core::adapters::{ArrayAdapterRead, BaseAdapter, BoxFuture};
-use tiled_core::dtype::{BuiltinDType, DType, DynNDArray, Endianness, Kind};
+use tiled_core::dtype::DynNDArray;
+#[cfg(feature = "tiff")]
+use tiled_core::dtype::{BuiltinDType, DType, Endianness, Kind};
 use tiled_core::error::{Result, TiledError};
 use tiled_core::ndslice::NDSlice;
 use tiled_core::structures::{ArrayStructure, Spec, StructureFamily};
@@ -87,6 +90,7 @@ impl ImageAdapter {
     }
 }
 
+#[cfg(feature = "tiff")]
 fn pixel_dtype(itemsize: usize) -> BuiltinDType {
     BuiltinDType::new(Endianness::Little, Kind::UnsignedInteger, itemsize)
 }

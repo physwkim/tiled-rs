@@ -79,20 +79,24 @@ impl AuthDb {
     pub async fn applied_migrations(&self) -> Result<Vec<String>> {
         match self.pool() {
             AuthPool::Sqlite(pool) => {
-                let rows = sqlx::query(
-                    "SELECT name FROM _tiled_auth_migrations ORDER BY applied_at",
-                )
-                .fetch_all(pool)
-                .await?;
-                Ok(rows.into_iter().map(|r| r.get::<String, _>("name")).collect())
+                let rows =
+                    sqlx::query("SELECT name FROM _tiled_auth_migrations ORDER BY applied_at")
+                        .fetch_all(pool)
+                        .await?;
+                Ok(rows
+                    .into_iter()
+                    .map(|r| r.get::<String, _>("name"))
+                    .collect())
             }
             AuthPool::Postgres(pool) => {
-                let rows = sqlx::query(
-                    "SELECT name FROM _tiled_auth_migrations ORDER BY applied_at",
-                )
-                .fetch_all(pool)
-                .await?;
-                Ok(rows.into_iter().map(|r| r.get::<String, _>("name")).collect())
+                let rows =
+                    sqlx::query("SELECT name FROM _tiled_auth_migrations ORDER BY applied_at")
+                        .fetch_all(pool)
+                        .await?;
+                Ok(rows
+                    .into_iter()
+                    .map(|r| r.get::<String, _>("name"))
+                    .collect())
             }
         }
     }

@@ -59,10 +59,9 @@ impl From<tiled_catalog::orm::Webhook> for WebhookResponse {
 }
 
 fn require_catalog(state: &AppState) -> Result<&tiled_catalog::db::Catalog, ServerError> {
-    state
-        .catalog
-        .as_ref()
-        .ok_or_else(|| ServerError::Validation("server has no catalog DB; webhooks not supported".into()))
+    state.catalog.as_ref().ok_or_else(|| {
+        ServerError::Validation("server has no catalog DB; webhooks not supported".into())
+    })
 }
 
 fn parse_path_segments(uri: &axum::http::Uri, prefix: &str) -> Vec<String> {
@@ -177,7 +176,8 @@ impl WebhookConfig {
         {
             return Err(ServerError::Validation(
                 "Webhook URL targets a private/reserved address \
-                 (set webhook.allow_private_addresses=true to override)".into(),
+                 (set webhook.allow_private_addresses=true to override)"
+                    .into(),
             ));
         }
         Ok(())

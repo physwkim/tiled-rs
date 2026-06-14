@@ -90,14 +90,8 @@ pub fn spawn(
                         Some(t) => t,
                         None => continue, // unknown event kind
                     };
-                    if let Err(e) = dispatch_event(
-                        &catalog,
-                        &client,
-                        &config,
-                        &env,
-                        event_type,
-                    )
-                    .await
+                    if let Err(e) =
+                        dispatch_event(&catalog, &client, &config, &env, event_type).await
                     {
                         tracing::warn!(target: "tiled.webhooks", "dispatch failed: {e}");
                     }
@@ -160,8 +154,16 @@ async fn dispatch_event(
         let event_id = event_id.clone();
         let event_type = event_type.to_string();
         tokio::spawn(async move {
-            if let Err(e) =
-                deliver(&catalog, &client, &config, &wh, &event_id, &event_type, &payload).await
+            if let Err(e) = deliver(
+                &catalog,
+                &client,
+                &config,
+                &wh,
+                &event_id,
+                &event_type,
+                &payload,
+            )
+            .await
             {
                 tracing::warn!(
                     target: "tiled.webhooks",
@@ -186,7 +188,7 @@ async fn collect_path_node_ids(catalog: &Catalog, path: &str) -> Result<Vec<i64>
         .collect();
     let mut ids = Vec::with_capacity(segments.len());
     for end in 1..=segments.len() {
-        if let Ok(Some(node)) = catalog.lookup(&segments[..end].to_vec()).await {
+        if let Ok(Some(node)) = catalog.lookup(&segments[..end]).await {
             ids.push(node.id);
         }
     }
@@ -207,11 +209,10 @@ async fn deliver(
         .await
         .map_err(|e| e.to_string())?;
 
-    let body_bytes =
-        serde_json::to_vec(payload).map_err(|e| format!("encode body: {e}"))?;
+    let body_bytes = serde_json::to_vec(payload).map_err(|e| format!("encode body: {e}"))?;
     let signature = wh.secret.as_deref().map(|secret| {
-        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
-            .expect("HMAC accepts any key length");
+        let mut mac =
+            Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
         mac.update(&body_bytes);
         let tag = mac.finalize().into_bytes();
         format!(

@@ -62,12 +62,11 @@ impl Catalog {
                 .execute(pool)
                 .await?;
                 for (name, sql) in SQLITE_MIGRATIONS {
-                    let already: Option<String> = sqlx::query_scalar(
-                        "SELECT name FROM _tiled_migrations WHERE name = ?",
-                    )
-                    .bind(*name)
-                    .fetch_optional(pool)
-                    .await?;
+                    let already: Option<String> =
+                        sqlx::query_scalar("SELECT name FROM _tiled_migrations WHERE name = ?")
+                            .bind(*name)
+                            .fetch_optional(pool)
+                            .await?;
                     if already.is_some() {
                         continue;
                     }
@@ -89,12 +88,11 @@ impl Catalog {
                 .execute(pool)
                 .await?;
                 for (name, sql) in POSTGRES_MIGRATIONS {
-                    let already: Option<String> = sqlx::query_scalar(
-                        "SELECT name FROM _tiled_migrations WHERE name = $1",
-                    )
-                    .bind(*name)
-                    .fetch_optional(pool)
-                    .await?;
+                    let already: Option<String> =
+                        sqlx::query_scalar("SELECT name FROM _tiled_migrations WHERE name = $1")
+                            .bind(*name)
+                            .fetch_optional(pool)
+                            .await?;
                     if already.is_some() {
                         continue;
                     }
@@ -115,20 +113,22 @@ impl Catalog {
     pub async fn applied_migrations(&self) -> Result<Vec<String>> {
         match self.pool() {
             DbPool::Sqlite(pool) => {
-                let rows = sqlx::query(
-                    "SELECT name FROM _tiled_migrations ORDER BY applied_at",
-                )
-                .fetch_all(pool)
-                .await?;
-                Ok(rows.into_iter().map(|r| r.get::<String, _>("name")).collect())
+                let rows = sqlx::query("SELECT name FROM _tiled_migrations ORDER BY applied_at")
+                    .fetch_all(pool)
+                    .await?;
+                Ok(rows
+                    .into_iter()
+                    .map(|r| r.get::<String, _>("name"))
+                    .collect())
             }
             DbPool::Postgres(pool) => {
-                let rows = sqlx::query(
-                    "SELECT name FROM _tiled_migrations ORDER BY applied_at",
-                )
-                .fetch_all(pool)
-                .await?;
-                Ok(rows.into_iter().map(|r| r.get::<String, _>("name")).collect())
+                let rows = sqlx::query("SELECT name FROM _tiled_migrations ORDER BY applied_at")
+                    .fetch_all(pool)
+                    .await?;
+                Ok(rows
+                    .into_iter()
+                    .map(|r| r.get::<String, _>("name"))
+                    .collect())
             }
         }
     }
@@ -137,10 +137,7 @@ impl Catalog {
 /// Split a multi-statement SQL string and execute each piece. SQLx doesn't
 /// run `CREATE TABLE; CREATE INDEX;` as one prepared statement, so we split
 /// on `;` while ignoring `;` inside string literals.
-async fn apply_multi_statement(
-    pool: &sqlx::Pool<sqlx::Sqlite>,
-    sql: &str,
-) -> Result<()> {
+async fn apply_multi_statement(pool: &sqlx::Pool<sqlx::Sqlite>, sql: &str) -> Result<()> {
     for stmt in split_statements(sql) {
         if stmt.trim().is_empty() {
             continue;
@@ -152,10 +149,7 @@ async fn apply_multi_statement(
     Ok(())
 }
 
-async fn apply_multi_statement_pg(
-    pool: &sqlx::Pool<sqlx::Postgres>,
-    sql: &str,
-) -> Result<()> {
+async fn apply_multi_statement_pg(pool: &sqlx::Pool<sqlx::Postgres>, sql: &str) -> Result<()> {
     for stmt in split_statements(sql) {
         if stmt.trim().is_empty() {
             continue;
