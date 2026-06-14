@@ -318,12 +318,10 @@ impl Query {
                     format!("{prefix}[include]"),
                     serde_json::to_string(&q.include).unwrap_or_default(),
                 ));
-                if !q.exclude.is_empty() {
-                    params.push((
-                        format!("{prefix}[exclude]"),
-                        serde_json::to_string(&q.exclude).unwrap_or_default(),
-                    ));
-                }
+                params.push((
+                    format!("{prefix}[exclude]"),
+                    serde_json::to_string(&q.exclude).unwrap_or_default(),
+                ));
             }
             Self::AccessBlobFilter(q) => {
                 if let Some(ref uid) = q.user_id {
@@ -782,6 +780,34 @@ mod tests {
                 assert_eq!(like.pattern, "Ni%");
             }
             _ => panic!("Expected Like"),
+        }
+    }
+
+    /// H3: SpecsQuery with empty exclude must always emit the exclude field.
+    /// Python SpecsQuery.encode() always returns both include and exclude
+    /// (queries.py:483-486). Python SpecsQuery.decode() requires both as keyword
+    /// args with no defaults (queries.py:490). Previously Rust omitted exclude
+    /// when empty, so the Python server would crash with a TypeError on any
+    /// SpecsQuery(exclude=[]) query from a Rust client.
+    #[test]
+    fn test_encode_decode_specs_empty_exclude() {
+        let q = Query::Specs(SpecsQuery {
+            include: vec!["foo".into()],
+            exclude: vec![],
+        });
+        let pairs = q.encode();
+        assert!(
+            pairs.iter().any(|(k, _)| k.contains("[exclude]")),
+            "exclude field must always be emitted"
+        );
+        let decoded = decode_query_filters(&pairs);
+        assert_eq!(decoded.len(), 1);
+        match &decoded[0] {
+            Query::Specs(s) => {
+                assert_eq!(s.include, vec!["foo"]);
+                assert!(s.exclude.is_empty());
+            }
+            _ => panic!("Expected Specs"),
         }
     }
 }
