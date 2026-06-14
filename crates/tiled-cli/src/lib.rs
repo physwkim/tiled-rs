@@ -26,8 +26,9 @@ pub enum Command {
         #[arg(short, long)]
         config: Option<String>,
 
-        /// Host to bind to
-        #[arg(long, default_value = "0.0.0.0")]
+        /// Host to bind to. Defaults to loopback; use 0.0.0.0 to expose on all
+        /// interfaces (explicit opt-in required).
+        #[arg(long, default_value = "127.0.0.1")]
         host: String,
 
         /// Port to bind to
@@ -214,6 +215,15 @@ fn redact_mongo_uri(uri: &str) -> String {
     format!("{scheme}://{user}:***@{host_and_rest}")
 }
 
+/// Generate a 64-character hex string from 32 cryptographically-random bytes.
+/// Mirrors Python's `secrets.token_hex(32)` used in `_serve.py`.
+fn generate_single_user_key() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// Build a demo MapAdapter with sample arrays for testing.
 fn build_demo_tree() -> MapAdapter {
     let mut mapping = IndexMap::new();
@@ -355,6 +365,31 @@ pub async fn run(command: Command) -> Result<()> {
                      either omit it for anonymous access or supply a non-empty key"
                 );
             }
+
+            // Warn early: explicit 0.0.0.0 bind with no operator-configured auth.
+            // auth_db_uri.is_some() means multi-user JWT mode; api_key.is_some()
+            // means single-user key mode. Neither set → server would be fully open
+            // to any network peer if an interface-wide bind is allowed.
+            if host == "0.0.0.0" && api_key.is_none() && auth_db_uri.is_none() {
+                tracing::warn!(
+                    "Binding 0.0.0.0 with no authentication configured. \
+                     The server is reachable on all network interfaces without \
+                     credentials. A single-user API key will be generated for \
+                     this session. Pass --api-key or restrict to --host 127.0.0.1."
+                );
+            }
+
+            // Single-user mode with no explicit key: mirror Python _serve.py
+            // (secrets.token_hex(32)). Generate once per process; the key is not
+            // persisted — restart produces a new key unless the operator exports it.
+            let api_key = if auth_db_uri.is_none() && api_key.is_none() {
+                let key = generate_single_user_key();
+                eprintln!("Auto-generated single-user API key: {key}");
+                eprintln!("Set TILED_SINGLE_USER_API_KEY={key} to reuse across restarts.\n");
+                Some(key)
+            } else {
+                api_key
+            };
 
             // Open the persistent catalog up-front (before the read tree) so
             // a misconfigured DB fails the start-up rather than the first
@@ -744,5 +779,52 @@ async fn find_principal_by_uuid(
             .await
             .map_err(|e| anyhow::anyhow!("lookup: {e}"))?
             .map(|r| r.get::<i64, _>("id"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct TestCli {
+        #[command(subcommand)]
+        command: Command,
+    }
+
+    #[test]
+    fn serve_default_host_is_loopback() {
+        let cli = TestCli::parse_from(["tiled", "serve", "--demo"]);
+        let Command::Serve { host, .. } = cli.command else {
+            panic!("expected Serve variant");
+        };
+        assert_eq!(host, "127.0.0.1");
+    }
+
+    #[test]
+    fn serve_explicit_host_0000_overrides_default() {
+        let cli = TestCli::parse_from(["tiled", "serve", "--host", "0.0.0.0", "--demo"]);
+        let Command::Serve { host, .. } = cli.command else {
+            panic!("expected Serve variant");
+        };
+        assert_eq!(host, "0.0.0.0");
+    }
+
+    #[test]
+    fn generated_key_is_64_hex_chars() {
+        let key = generate_single_user_key();
+        assert_eq!(key.len(), 64, "32 bytes → 64 hex chars");
+        assert!(
+            key.chars().all(|c| c.is_ascii_hexdigit()),
+            "must be lowercase hex; got: {key}"
+        );
+    }
+
+    #[test]
+    fn generated_keys_are_unique() {
+        let k1 = generate_single_user_key();
+        let k2 = generate_single_user_key();
+        assert_ne!(k1, k2, "consecutive generated keys must differ");
     }
 }

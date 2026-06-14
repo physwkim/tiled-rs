@@ -31,3 +31,4 @@ tiled-catalog = { workspace = true }
 tiled-auth = { workspace = true }
 chrono = { workspace = true }
 sqlx = { workspace = true }
+rand = "0.8"
