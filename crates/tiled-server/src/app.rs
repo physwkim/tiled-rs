@@ -350,8 +350,8 @@ pub async fn validate_bearer(state: &AppState, token: &str) -> Result<AuthContex
             .map_err(|e| format!("ensure principal: {e}"))?;
         db.touch_identity_login(identity.id).await.ok();
         return Ok(AuthContext {
-            principal: Some(Arc::new(principal)),
-            scopes: state.default_login_scopes.clone(),
+            principal: Some(Arc::new(principal.clone())),
+            scopes: mint_session_scopes(&principal, state),
             kind: AuthKind::Session,
         });
     }
@@ -457,8 +457,8 @@ async fn resolve_auth_inner(
         };
         db.touch_identity_login(identity.id).await.ok();
         return Ok(AuthContext {
-            principal: Some(Arc::new(principal)),
-            scopes: ScopeSet::full(),
+            principal: Some(Arc::new(principal.clone())),
+            scopes: mint_session_scopes(&principal, state),
             kind: AuthKind::Proxied,
         });
     }
@@ -476,6 +476,13 @@ async fn resolve_auth_inner(
         });
     }
     Err(unauthorized("authentication required"))
+}
+
+/// Derive session scopes for a principal using the same formula as
+/// `auth_router::login` and `device_token`: role-based scope cap
+/// intersected with the operator's `default_login_scopes`.
+fn mint_session_scopes(principal: &tiled_auth::Principal, state: &AppState) -> ScopeSet {
+    tiled_auth::ScopeSet::for_role(&principal.role).intersect(&state.default_login_scopes)
 }
 
 fn extract_api_key(headers: &axum::http::HeaderMap, query: &str) -> Option<String> {
