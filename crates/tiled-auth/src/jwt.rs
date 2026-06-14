@@ -29,6 +29,9 @@ pub struct AccessClaims {
     /// Scope strings the bearer is allowed to exercise.
     #[serde(default)]
     pub scopes: ScopeSet,
+    /// `"access"` — enforced by `verify_access` so a refresh token can't
+    /// be presented as an access token (symmetric with `RefreshClaims.typ`).
+    pub typ: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,6 +104,7 @@ impl Issuer {
             iat: now.timestamp(),
             exp: (now + self.access_ttl).timestamp(),
             scopes,
+            typ: "access".into(),
         };
         let token = encode(&Header::new(Algorithm::HS256), &claims, &self.encoding)?;
         Ok(token)
@@ -123,6 +127,9 @@ impl Issuer {
         let mut v = Validation::new(Algorithm::HS256);
         v.leeway = 5;
         let data = decode::<AccessClaims>(token, &self.decoding, &v)?;
+        if data.claims.typ != "access" {
+            return Err(AuthError::Unauthorized("not an access token".into()));
+        }
         Ok(data.claims)
     }
 
@@ -162,6 +169,17 @@ mod tests {
         // Presenting an access token as a refresh fails on `typ`.
         assert!(matches!(
             issuer.verify_refresh(&access).unwrap_err(),
+            AuthError::Jwt(_) | AuthError::Unauthorized(_)
+        ));
+    }
+
+    #[test]
+    fn access_token_typ_enforced() {
+        let issuer = Issuer::new(b"this-is-a-test-secret-32-bytes-long!!").unwrap();
+        let refresh = issuer.issue_refresh("p", "s").unwrap();
+        // Presenting a refresh token as an access token must fail on `typ`.
+        assert!(matches!(
+            issuer.verify_access(&refresh).unwrap_err(),
             AuthError::Jwt(_) | AuthError::Unauthorized(_)
         ));
     }
