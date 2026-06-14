@@ -146,23 +146,23 @@ impl TokenStore {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                let mut perms = std::fs::metadata(&tmp_path)
+                let mut perms = tokio::fs::metadata(&tmp_path)
+                    .await
                     .map_err(|e| ClientError::Invalid(format!("stat token tmp: {e}")))?
                     .permissions();
                 perms.set_mode(0o600);
-                std::fs::set_permissions(&tmp_path, perms)
+                tokio::fs::set_permissions(&tmp_path, perms)
+                    .await
                     .map_err(|e| ClientError::Invalid(format!("chmod token tmp: {e}")))?;
             }
-            tokio::fs::rename(&tmp_path, &final_path)
-                .await
-                .map_err(|e| {
-                    let _ = std::fs::remove_file(&tmp_path);
-                    ClientError::Invalid(format!(
-                        "rename {} → {}: {e}",
-                        tmp_path.display(),
-                        final_path.display()
-                    ))
-                })?;
+            if let Err(e) = tokio::fs::rename(&tmp_path, &final_path).await {
+                let _ = tokio::fs::remove_file(&tmp_path).await;
+                return Err(ClientError::Invalid(format!(
+                    "rename {} → {}: {e}",
+                    tmp_path.display(),
+                    final_path.display()
+                )));
+            }
         }
         self.cache.lock().await.insert(key.into(), value.into());
         Ok(())
