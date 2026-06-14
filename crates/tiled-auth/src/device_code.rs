@@ -114,27 +114,40 @@ impl AuthDb {
     /// Approve a pending device code by setting `principal_id`. The
     /// authenticated user calls this after typing the `user_code` into the
     /// verification UI.
+    ///
+    /// First-writer-wins: the WHERE clause requires `principal_id IS NULL`
+    /// (not yet approved) and `expires_at > now` (not expired), so a
+    /// concurrent or replayed approval returns `Conflict` — RFC 8628: a
+    /// granted code is immutable.
     pub async fn approve_device_code(&self, user_code: &str, principal_id: i64) -> Result<()> {
         let affected: u64 = match self.pool() {
             AuthPool::Sqlite(pool) => {
-                sqlx::query("UPDATE device_codes SET principal_id = ? WHERE user_code = ?")
-                    .bind(principal_id)
-                    .bind(user_code)
-                    .execute(pool)
-                    .await?
-                    .rows_affected()
+                let now_iso = Utc::now().to_rfc3339();
+                sqlx::query(
+                    "UPDATE device_codes SET principal_id = ?
+                       WHERE user_code = ? AND principal_id IS NULL AND expires_at > ?",
+                )
+                .bind(principal_id)
+                .bind(user_code)
+                .bind(&now_iso)
+                .execute(pool)
+                .await?
+                .rows_affected()
             }
-            AuthPool::Postgres(pool) => {
-                sqlx::query("UPDATE device_codes SET principal_id = $1 WHERE user_code = $2")
-                    .bind(principal_id)
-                    .bind(user_code)
-                    .execute(pool)
-                    .await?
-                    .rows_affected()
-            }
+            AuthPool::Postgres(pool) => sqlx::query(
+                "UPDATE device_codes SET principal_id = $1
+                       WHERE user_code = $2 AND principal_id IS NULL AND expires_at > now()",
+            )
+            .bind(principal_id)
+            .bind(user_code)
+            .execute(pool)
+            .await?
+            .rows_affected(),
         };
         if affected == 0 {
-            return Err(AuthError::NotFound(format!("user_code {user_code}")));
+            return Err(AuthError::Conflict(format!(
+                "device code not found, already approved, or expired: {user_code}"
+            )));
         }
         Ok(())
     }

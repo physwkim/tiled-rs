@@ -208,3 +208,49 @@ async fn device_code_flow() {
     let err = db.poll_device_code(&dc.device_code).await.unwrap_err();
     assert!(matches!(err, tiled_auth::AuthError::NotFound(_)));
 }
+
+#[tokio::test]
+async fn device_code_double_approve_rejected() {
+    let (db, _dir) = fresh_db().await;
+    let (p1, _) = db.ensure_principal("dummy", "alice").await.unwrap();
+    let (p2, _) = db.ensure_principal("dummy", "bob").await.unwrap();
+
+    let dc = db
+        .initiate_device_code(Duration::minutes(10), Duration::seconds(0))
+        .await
+        .unwrap();
+
+    // First approval succeeds (first-writer-wins).
+    db.approve_device_code(&dc.user_code, p1.id).await.unwrap();
+
+    // Second approval must fail — principal_id is no longer NULL.
+    let err = db
+        .approve_device_code(&dc.user_code, p2.id)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, tiled_auth::AuthError::Conflict(_)),
+        "expected Conflict, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn device_code_expired_approve_rejected() {
+    let (db, _dir) = fresh_db().await;
+    let (p, _) = db.ensure_principal("dummy", "alice").await.unwrap();
+
+    // Negative TTL → expires_at is already in the past.
+    let dc = db
+        .initiate_device_code(Duration::seconds(-10), Duration::seconds(0))
+        .await
+        .unwrap();
+
+    let err = db
+        .approve_device_code(&dc.user_code, p.id)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, tiled_auth::AuthError::Conflict(_)),
+        "expected Conflict for expired code, got {err:?}"
+    );
+}
