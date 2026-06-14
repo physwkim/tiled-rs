@@ -48,30 +48,6 @@ impl ParquetAdapter {
             specs: vec![Spec::new("parquet")],
         })
     }
-
-    fn read_partition_inner(&self, partition: Option<usize>) -> Result<Vec<RecordBatch>> {
-        let file = std::fs::File::open(&self.path)
-            .map_err(|e| TiledError::Internal(format!("open {}: {e}", self.path.display())))?;
-        let mut builder = ParquetRecordBatchReaderBuilder::try_new(file)
-            .map_err(|e| TiledError::Internal(format!("parquet builder: {e}")))?;
-        if let Some(p) = partition {
-            let n = builder.metadata().num_row_groups();
-            if p >= n {
-                return Err(TiledError::Validation(format!(
-                    "partition {p} out of range ({n} groups)"
-                )));
-            }
-            builder = builder.with_row_groups(vec![p]);
-        }
-        let reader = builder
-            .build()
-            .map_err(|e| TiledError::Internal(format!("parquet build: {e}")))?;
-        let mut batches = Vec::new();
-        for b in reader {
-            batches.push(b.map_err(|e| TiledError::Internal(format!("parquet read: {e}")))?);
-        }
-        Ok(batches)
-    }
 }
 
 impl BaseAdapter for ParquetAdapter {
@@ -91,9 +67,14 @@ impl TableAdapterRead for ParquetAdapter {
         &self.structure
     }
     fn read<'a>(&'a self, fields: Option<&'a [String]>) -> BoxFuture<'a, Result<ArrowTable>> {
+        let path = self.path.clone();
+        let schema = self.schema.clone();
+        let fields = fields.map(<[String]>::to_vec);
         Box::pin(async move {
-            let batches = self.read_partition_inner(None)?;
-            project(&self.schema, &batches, fields)
+            let batches = tokio::task::spawn_blocking(move || read_parquet_file(path, None))
+                .await
+                .map_err(|e| TiledError::Internal(format!("parquet spawn: {e}")))??;
+            project(&schema, &batches, fields.as_deref())
         })
     }
     fn read_partition<'a>(
@@ -101,11 +82,41 @@ impl TableAdapterRead for ParquetAdapter {
         partition: usize,
         fields: Option<&'a [String]>,
     ) -> BoxFuture<'a, Result<ArrowTable>> {
+        let path = self.path.clone();
+        let schema = self.schema.clone();
+        let fields = fields.map(<[String]>::to_vec);
         Box::pin(async move {
-            let batches = self.read_partition_inner(Some(partition))?;
-            project(&self.schema, &batches, fields)
+            let batches =
+                tokio::task::spawn_blocking(move || read_parquet_file(path, Some(partition)))
+                    .await
+                    .map_err(|e| TiledError::Internal(format!("parquet spawn: {e}")))??;
+            project(&schema, &batches, fields.as_deref())
         })
     }
+}
+
+fn read_parquet_file(path: PathBuf, partition: Option<usize>) -> Result<Vec<RecordBatch>> {
+    let file = std::fs::File::open(&path)
+        .map_err(|e| TiledError::Internal(format!("open {}: {e}", path.display())))?;
+    let mut builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        .map_err(|e| TiledError::Internal(format!("parquet builder: {e}")))?;
+    if let Some(p) = partition {
+        let n = builder.metadata().num_row_groups();
+        if p >= n {
+            return Err(TiledError::Validation(format!(
+                "partition {p} out of range ({n} groups)"
+            )));
+        }
+        builder = builder.with_row_groups(vec![p]);
+    }
+    let reader = builder
+        .build()
+        .map_err(|e| TiledError::Internal(format!("parquet build: {e}")))?;
+    let mut batches = Vec::new();
+    for b in reader {
+        batches.push(b.map_err(|e| TiledError::Internal(format!("parquet read: {e}")))?);
+    }
+    Ok(batches)
 }
 
 fn project(
