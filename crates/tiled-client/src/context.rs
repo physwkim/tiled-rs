@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::{Client, Method, RequestBuilder, Response};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use url::Url;
 
 use tiled_core::schemas::About;
@@ -46,6 +46,9 @@ pub(crate) struct ContextInner {
     pub(crate) server_info: tokio::sync::OnceCell<About>,
     /// CSRF cookie value, captured after the initial about fetch.
     pub(crate) csrf_token: RwLock<Option<String>>,
+    /// Serialises the token-refresh network call so concurrent 401s produce
+    /// exactly one refresh round-trip. Mirrors Python `_sync_lock`.
+    pub(crate) refresh_lock: Mutex<()>,
     /// Optional HTTP cache.
     pub(crate) cache: Option<Arc<HttpCache>>,
     /// Optional client resolver for spec-based dispatch.
@@ -177,6 +180,7 @@ impl Context {
                 auth: RwLock::new(None),
                 server_info: tokio::sync::OnceCell::new(),
                 csrf_token: RwLock::new(None),
+                refresh_lock: Mutex::new(()),
                 cache: options.cache,
                 resolver: options.resolver,
             }),
@@ -267,9 +271,16 @@ impl Context {
 
     /// Send a pre-built request, transparently refreshing OIDC tokens on 401.
     ///
-    /// On 401 we refresh the token and retry once. The retry replaces the
-    /// `Authorization` header (we operate on a built `Request`, not a builder
-    /// — `RequestBuilder::header` would *append* a duplicate Authorization).
+    /// On 401 the function implements the single-flight refresh pattern
+    /// (mirrors Python `sync_auth_flow` + `_sync_lock` in `tiled/client/auth.py`):
+    ///
+    /// 1. Extract the `Authorization` value from the failing request.
+    /// 2. Re-read the stored access token.  If it already differs from what
+    ///    was sent (another task refreshed concurrently), skip the network call.
+    /// 3. Otherwise acquire `refresh_lock` so only one task posts to the token
+    ///    endpoint.  Waiters re-check after the lock; if the lock-holder saved a
+    ///    new token they skip the call too.
+    /// 4. Retry the request with the now-current `Authorization` header.
     pub async fn send_with_auth(&self, req: RequestBuilder) -> Result<Response> {
         let req_clone = req.try_clone().ok_or_else(|| {
             ClientError::Invalid("request body not cloneable; cannot retry".into())
@@ -280,11 +291,40 @@ impl Context {
         }
         let auth = self.auth().await;
         let Some(a) = auth else {
+            // api_key or unauthenticated — nothing to refresh.
             return Ok(resp);
         };
-        a.refresh(&self.inner.http).await?;
 
-        // Build the original request, override Authorization in-place.
+        // What Authorization value was in the request that just 401'd?
+        let used_auth: Option<String> =
+            req.try_clone().and_then(|b| b.build().ok()).and_then(|r| {
+                r.headers()
+                    .get(reqwest::header::AUTHORIZATION)
+                    .and_then(|v| v.to_str().ok())
+                    .map(String::from)
+            });
+
+        // What does the token store hold right now?
+        let current_auth = a.auth_header().await;
+
+        if current_auth.as_deref() != used_auth.as_deref() {
+            // A concurrent task already refreshed; the new token is in the
+            // store.  Fall through and retry without a network round-trip.
+        } else {
+            // Token is still stale.  Acquire the per-context lock so only one
+            // task performs the network refresh.  Waiters re-check after the
+            // lock-holder saves new tokens and releases.
+            let _guard = self.inner.refresh_lock.lock().await;
+            let current_after_lock = a.auth_header().await;
+            if current_after_lock.as_deref() == used_auth.as_deref() {
+                // Still stale — we hold the lock; perform the refresh.
+                a.refresh(&self.inner.http).await?;
+            }
+            // else: another waiter refreshed while we waited for the lock.
+        }
+
+        // Retry the original request with the now-current auth header,
+        // replacing the stale one to avoid a duplicate Authorization header.
         let mut request = req
             .try_clone()
             .ok_or_else(|| ClientError::Invalid("request body not cloneable on retry".into()))?

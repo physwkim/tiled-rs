@@ -17,7 +17,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use tokio::net::TcpListener;
-use tokio::sync::Mutex;
+use tokio::sync::{Barrier, Mutex};
 
 use tiled_client::{Context, ContextOptions, HttpCache};
 
@@ -503,6 +503,124 @@ fn any_client_custom_clone_is_safe() {
     let cloned = custom.clone();
     let m: &Marker = cloned.as_custom().expect("downcast");
     assert_eq!(m.0, 42);
+}
+
+// ---------------------------------------------------------------------------
+// (10) Concurrent 401s: single-flight refresh — only ONE network refresh call
+//      even when N tasks all get 401 at the same time with the same stale token.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn concurrent_401s_single_refresh() {
+    const N: usize = 5;
+
+    #[derive(Default)]
+    struct ConcState {
+        refresh_count: AtomicU32,
+    }
+
+    let state: Arc<ConcState> = Arc::new(ConcState::default());
+
+    async fn handle_about_conc() -> impl IntoResponse {
+        let mut about = about_payload();
+        about["authentication"]["links"]["refresh_session"] = "auth/session/refresh".into();
+        ([(SET_COOKIE, "tiled_csrf=csrf-token; Path=/")], Json(about))
+    }
+
+    async fn handle_metadata_conc(headers: HeaderMap) -> impl IntoResponse {
+        let val = headers
+            .get(AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if val == "Bearer old-token" {
+            return (StatusCode::UNAUTHORIZED, "expired").into_response();
+        }
+        if val == "Bearer new-token" {
+            return Json(serde_json::json!({
+                "data": {
+                    "id": "",
+                    "attributes": {"ancestors": [], "structure_family": "container"},
+                    "links": {}
+                }
+            }))
+            .into_response();
+        }
+        (StatusCode::UNAUTHORIZED, "unknown token").into_response()
+    }
+
+    async fn handle_refresh_conc(
+        State(s): State<Arc<ConcState>>,
+        Json(_body): Json<serde_json::Value>,
+    ) -> impl IntoResponse {
+        let n = s.refresh_count.fetch_add(1, Ordering::SeqCst);
+        if n == 0 {
+            // First call: succeed and hand out a fresh token pair.
+            Json(serde_json::json!({
+                "access_token": "new-token",
+                "refresh_token": "new-refresh",
+            }))
+            .into_response()
+        } else {
+            // Subsequent calls: simulate a single-use (or already-rotated)
+            // refresh token by returning 401.  The buggy code (no lock) would
+            // clear the freshly-saved refresh token here, destroying the session.
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"detail": "refresh_token already used"})),
+            )
+                .into_response()
+        }
+    }
+
+    let app = Router::new()
+        .route("/api/v1/", get(handle_about_conc))
+        .route("/api/v1/metadata/", get(handle_metadata_conc))
+        .route("/api/v1/auth/session/refresh", post(handle_refresh_conc))
+        .with_state(state.clone());
+    let base = spawn(app).await;
+
+    let (ctx, _) = Context::from_uri(&base).unwrap();
+    ctx.server_info().await.unwrap();
+    ctx.configure_auth(
+        tiled_client::Tokens {
+            access_token: "old-token".into(),
+            refresh_token: "old-refresh".into(),
+            id_token: None,
+        },
+        false,
+    )
+    .await
+    .unwrap();
+
+    // A barrier ensures all N tasks call ctx.get() at the same instant so
+    // they all send "Bearer old-token" before any refresh can happen.
+    let barrier = Arc::new(Barrier::new(N));
+    let url = url::Url::parse(&format!("{base}/api/v1/metadata/")).unwrap();
+
+    let mut handles = Vec::new();
+    for _ in 0..N {
+        let ctx = ctx.clone();
+        let url = url.clone();
+        let barrier = barrier.clone();
+        handles.push(tokio::spawn(async move {
+            barrier.wait().await;
+            ctx.get(&url).await
+        }));
+    }
+
+    for h in handles {
+        h.await
+            .expect("task did not panic")
+            .expect("all concurrent requests must succeed");
+    }
+
+    // The single-flight lock must have serialised the refresh: exactly one
+    // network call to the token endpoint regardless of how many tasks raced.
+    assert_eq!(
+        state.refresh_count.load(Ordering::SeqCst),
+        1,
+        "expected exactly one refresh, got more — single-flight lock broken"
+    );
 }
 
 #[allow(dead_code)]
