@@ -295,12 +295,13 @@ pub async fn ws_subscribe(
         None => Vec::new(),
     };
     let state_for_handshake = state.clone();
+    let segments_for_ws = segments.to_vec();
     Ok(ws.on_upgrade(move |socket| {
         run_subscription(
             socket,
             state_for_handshake,
             bus,
-            path_str,
+            segments_for_ws,
             schema,
             replay,
             header_auth,
@@ -359,11 +360,12 @@ async fn run_subscription(
     socket: WebSocket,
     state: AppState,
     bus: StreamingBus,
-    path: String,
+    segments: Vec<String>,
     schema: serde_json::Value,
     replay: Vec<UpdateEnvelope>,
     header_auth: Option<AuthContext>,
 ) {
+    let path = segments.join("/");
     let (mut tx, mut rx) = futures::StreamExt::split(socket);
     use futures::SinkExt;
 
@@ -388,6 +390,31 @@ async fn run_subscription(
             }
         },
     };
+    // H4: when an access policy is configured, resolve per-node narrowing for
+    // the subscribed path.  Deny (SecureEntry 404-style: not found or access
+    // denied) if the narrowed scopes lose ReadMetadata.  Without a policy
+    // there is nothing to narrow — fall through to the plain scope check so
+    // subscriptions to non-existent paths are still allowed (they just
+    // receive no updates).
+    if !segments.is_empty()
+        && state.access_policy.is_some()
+        && crate::router::resolve_entry(
+            &state,
+            auth_ctx.clone(),
+            &segments,
+            tiled_auth::Scope::ReadMetadata,
+        )
+        .await
+        .is_err()
+    {
+        let _ = tx
+            .send(Message::Text(
+                "subscription denied: node not found or access denied".into(),
+            ))
+            .await;
+        let _ = tx.send(Message::Close(None)).await;
+        return;
+    }
     if !auth_ctx.scopes.contains(tiled_auth::Scope::ReadMetadata) {
         let _ = tx
             .send(Message::Text("forbidden: missing read:metadata".into()))

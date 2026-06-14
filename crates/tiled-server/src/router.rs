@@ -34,7 +34,7 @@ fn segments_from_uri(uri: &axum::http::Uri, prefix: &str) -> Vec<String> {
 /// metadata the node doesn't exist for you").
 /// 403 when the final narrowed context lacks `required_scope`.
 /// Returns the final narrowed [`AuthContext`].
-async fn resolve_entry(
+pub(crate) async fn resolve_entry(
     state: &AppState,
     auth: crate::AuthContext,
     segments: &[String],
