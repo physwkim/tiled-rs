@@ -452,6 +452,51 @@ pub async fn search(
 }
 
 // ---------------------------------------------------------------------------
+// Shared array response builder (used by array_block and array_full)
+// ---------------------------------------------------------------------------
+
+async fn build_array_response(
+    data: tiled_core::dtype::DynNDArray,
+    headers: &HeaderMap,
+    state: &AppState,
+) -> Result<axum::response::Response, ServerError> {
+    let accept = headers
+        .get("accept")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream");
+
+    let media_type = tiled_serialization::resolve_media_type(
+        accept,
+        tiled_core::structures::StructureFamily::Array,
+        &state.serialization_registry,
+    )
+    .unwrap_or_else(|| "application/octet-stream".to_string());
+
+    let body = if let Some(serializer) = state
+        .serialization_registry
+        .dispatch(tiled_core::structures::StructureFamily::Array, &media_type)
+    {
+        let ser_meta = serde_json::json!({
+            "itemsize": data.dtype.element_size(),
+            "kind": String::from(data.dtype.kind.to_numpy_char()),
+            "shape": data.shape,
+        });
+        // Serializers run CPU-bound encode work (and, for HDF5, blocking file
+        // I/O); offload off the async executor so a large export can't stall
+        // the runtime. `dispatch` returns an Arc<SerializerFn> (Send + 'static).
+        let payload = data.data;
+        tokio::task::spawn_blocking(move || serializer(&payload, &ser_meta))
+            .await
+            .map_err(|e| ServerError::Internal(format!("serialize task failed: {e}")))?
+            .map_err(|e| ServerError::Internal(e.to_string()))?
+    } else {
+        data.data
+    };
+
+    Ok(serve_with_range(headers, &media_type, body))
+}
+
+// ---------------------------------------------------------------------------
 // GET /api/v1/array/block/{*path}
 // ---------------------------------------------------------------------------
 
@@ -535,40 +580,7 @@ pub async fn array_block(
     .await
     .map_err(|e| ServerError::Internal(format!("blocking task failed: {e}")))??;
 
-    let accept = headers
-        .get("accept")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/octet-stream");
-
-    let media_type = tiled_serialization::resolve_media_type(
-        accept,
-        tiled_core::structures::StructureFamily::Array,
-        &state.serialization_registry,
-    )
-    .unwrap_or_else(|| "application/octet-stream".to_string());
-
-    let body = if let Some(serializer) = state
-        .serialization_registry
-        .dispatch(tiled_core::structures::StructureFamily::Array, &media_type)
-    {
-        let ser_meta = serde_json::json!({
-            "itemsize": data.dtype.element_size(),
-            "kind": String::from(data.dtype.kind.to_numpy_char()),
-            "shape": data.shape,
-        });
-        // Serializers run CPU-bound encode work (and, for HDF5, blocking file
-        // I/O); offload off the async executor so a large export can't stall
-        // the runtime. `dispatch` returns an Arc<SerializerFn> (Send + 'static).
-        let payload = data.data;
-        tokio::task::spawn_blocking(move || serializer(&payload, &ser_meta))
-            .await
-            .map_err(|e| ServerError::Internal(format!("serialize task failed: {e}")))?
-            .map_err(|e| ServerError::Internal(e.to_string()))?
-    } else {
-        data.data
-    };
-
-    Ok(serve_with_range(&headers, &media_type, body))
+    build_array_response(data, &headers, &state).await
 }
 
 /// Build a Response that honors `Range: bytes=...` when present
@@ -1328,28 +1340,46 @@ fn copy_chunk_into_result(
 // ---------------------------------------------------------------------------
 //
 // Returns the entire array with optional `?slice=...` numpy-style slicing.
-// For single-block adapters this is the natural read path. Multi-chunk
-// adapters currently return only block 0,0,...,0 — concat across blocks
-// is a follow-up. Mirrors upstream tiled's `/array/full/` endpoint, which
-// the SPA uses via `links.full`.
+// Calls ArrayAdapterRead::read, which assembles all chunks. Mirrors upstream
+// tiled's `/array/full/` endpoint, which the SPA uses via `links.full`.
 pub async fn array_full(
-    state: State<AppState>,
+    State(state): State<AppState>,
     OriginalUri(uri): OriginalUri,
-    Query(mut params): Query<HashMap<String, String>>,
+    Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
     auth: crate::AuthContext,
 ) -> Result<impl IntoResponse, ServerError> {
-    // Translate /array/full/<p> → /array/block/<p> with implicit
-    // block=0,0,...,0. The block handler already does the right thing
-    // when the param is absent.
-    let path = uri
-        .path()
-        .replacen("/api/v1/array/full/", "/api/v1/array/block/", 1);
-    let new_uri: axum::http::Uri = path
-        .parse()
-        .map_err(|e| ServerError::Internal(format!("malformed /array/full/ URI: {e}")))?;
-    params.remove("block");
-    array_block(state, OriginalUri(new_uri), Query(params), headers, auth).await
+    auth.require(tiled_auth::Scope::ReadData)?;
+    let segments = segments_from_uri(&uri, "/api/v1/array/full/");
+    let _ = resolve_entry(&state, auth.clone(), &segments, tiled_auth::Scope::ReadData).await?;
+
+    let slice_str = params
+        .get("slice")
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+    let handle = tokio::runtime::Handle::current();
+    let state_c = state.clone();
+    let segs = segments.clone();
+    let data = tokio::task::spawn_blocking(
+        move || -> Result<tiled_core::dtype::DynNDArray, ServerError> {
+            let adapter = core::walk_tree(state_c.root_tree.as_ref(), &segs)?;
+            let array_adapter = adapter.as_array().ok_or_else(|| {
+                ServerError::Validation(format!("'{}' is not an array", segs.join("/")))
+            })?;
+            let slice = match slice_str.as_str() {
+                "" => tiled_core::ndslice::NDSlice::empty(),
+                s => tiled_core::ndslice::NDSlice::from_numpy_str(s)
+                    .map_err(|e| ServerError::Validation(format!("Invalid slice '{s}': {e}")))?,
+            };
+            handle
+                .block_on(array_adapter.read(&slice))
+                .map_err(ServerError::from)
+        },
+    )
+    .await
+    .map_err(|e| ServerError::Internal(format!("blocking task failed: {e}")))??;
+
+    build_array_response(data, &headers, &state).await
 }
 
 // ---------------------------------------------------------------------------
