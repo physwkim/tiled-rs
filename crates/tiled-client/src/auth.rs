@@ -70,13 +70,14 @@ impl std::fmt::Debug for TokenStore {
 }
 
 impl TokenStore {
-    pub fn new(dir: Option<PathBuf>) -> Result<Self> {
+    pub async fn new(dir: Option<PathBuf>) -> Result<Self> {
         if let Some(d) = dir.as_ref() {
-            std::fs::create_dir_all(d).map_err(|e| {
+            tokio::fs::create_dir_all(d).await.map_err(|e| {
                 ClientError::Invalid(format!("token directory {}: {e}", d.display()))
             })?;
             // Mirror `_check_writable_token_directory`.
-            let meta = std::fs::metadata(d)
+            let meta = tokio::fs::metadata(d)
+                .await
                 .map_err(|e| ClientError::Invalid(format!("token directory metadata: {e}")))?;
             if meta.permissions().readonly() {
                 return Err(ClientError::Invalid(format!(
@@ -228,13 +229,13 @@ pub struct TiledAuthInner {
 }
 
 impl TiledAuth {
-    pub fn new(
+    pub async fn new(
         refresh_url: Url,
         csrf_token: impl Into<String>,
         token_directory: Option<PathBuf>,
         client_id: Option<String>,
     ) -> Result<Self> {
-        let tokens = TokenStore::new(token_directory)?;
+        let tokens = TokenStore::new(token_directory).await?;
         Ok(Self {
             inner: Arc::new(TiledAuthInner {
                 refresh_url,
@@ -746,7 +747,9 @@ mod tests {
     #[tokio::test]
     async fn token_store_roundtrip_on_disk() {
         let dir = tempfile::tempdir().unwrap();
-        let s = TokenStore::new(Some(dir.path().to_path_buf())).unwrap();
+        let s = TokenStore::new(Some(dir.path().to_path_buf()))
+            .await
+            .unwrap();
         s.set("refresh_token", "xyz").await.unwrap();
         let path = dir.path().join("refresh_token");
         assert!(path.exists());
@@ -754,7 +757,9 @@ mod tests {
         assert_eq!(body, "xyz");
 
         // Reload via fresh instance.
-        let s2 = TokenStore::new(Some(dir.path().to_path_buf())).unwrap();
+        let s2 = TokenStore::new(Some(dir.path().to_path_buf()))
+            .await
+            .unwrap();
         assert_eq!(
             s2.get("refresh_token", false).await.unwrap(),
             Some("xyz".into())

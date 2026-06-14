@@ -584,7 +584,7 @@ impl Context {
             .map(String::from);
 
         let auth = if let Some(dir) = token_dir {
-            TiledAuth::new(refresh_url, csrf, Some(dir), client_id)?
+            TiledAuth::new(refresh_url, csrf, Some(dir), client_id).await?
         } else {
             TiledAuth::in_memory(refresh_url, csrf, client_id)
         };
@@ -618,7 +618,7 @@ impl Context {
             .and_then(|l| l.get("client_id"))
             .and_then(|v| v.as_str())
             .map(String::from);
-        let auth = TiledAuth::new(refresh_url, csrf, Some(dir), client_id)?;
+        let auth = TiledAuth::new(refresh_url, csrf, Some(dir), client_id).await?;
         // Probe with whoami; success means tokens are valid.
         self.set_auth(Some(auth)).await?;
         match self.whoami().await {
