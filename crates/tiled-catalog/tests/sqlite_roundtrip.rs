@@ -1,7 +1,7 @@
 //! SQLite round-trip — open in-memory, migrate, write, read.
 
 use serde_json::json;
-use tiled_core::queries::{Like, Query, SpecsQuery};
+use tiled_core::queries::{Eq, In, Like, NotEq, NotIn, Query, SpecsQuery};
 
 use tiled_catalog::data_source::{AssetSpec, DataSourceSpec};
 use tiled_catalog::{Catalog, RegisterRequest};
@@ -308,4 +308,120 @@ async fn search_specs_include_and_exclude() {
     );
     let keys: Vec<&str> = nodes3.iter().map(|n| n.key.as_str()).collect();
     assert!(!keys.contains(&"xas_run"), "xas_run must be excluded");
+}
+
+/// H1: Eq/NotEq/In/NotIn on NUMERIC metadata fields must match under SQLite.
+///
+/// SQLite's `json_extract` returns the native storage class (INTEGER for JSON
+/// integers). Binding the filter value as TEXT ('5') produces a no-match
+/// because SQLite's no-affinity rules never coerce INTEGER to TEXT. This test
+/// fails on the old code (all return 0 rows) and passes after the fix.
+#[tokio::test]
+async fn search_numeric_eq_in_notin_sqlite() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("sqlite://{}", dir.path().join("catalog.db").display());
+    let cat = Catalog::connect(&uri).await.unwrap();
+    cat.migrate().await.unwrap();
+
+    // Three nodes with integer metadata fields.
+    for (key, scan_id, count) in [("run_1", 1i64, 10i64), ("run_2", 2, 20), ("run_3", 3, 10)] {
+        cat.create_node(
+            None,
+            vec![],
+            RegisterRequest {
+                key: key.into(),
+                structure_family: "container".into(),
+                metadata: json!({"scan_id": scan_id, "count": count}),
+                specs: json!([]),
+                access_blob: json!({}),
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    // Eq: scan_id == 2 → only run_2
+    let (nodes, total) = cat
+        .search_children(
+            None,
+            &[Query::Eq(Eq {
+                key: "scan_id".into(),
+                value: json!(2),
+            })],
+            0,
+            100,
+        )
+        .await
+        .unwrap();
+    assert_eq!(total, 1, "Eq(scan_id=2) must match exactly 1 node");
+    assert_eq!(nodes[0].key, "run_2", "matched node must be run_2");
+
+    // NotEq: scan_id != 2 → run_1 and run_3
+    let (_, total_neq) = cat
+        .search_children(
+            None,
+            &[Query::NotEq(NotEq {
+                key: "scan_id".into(),
+                value: json!(2),
+            })],
+            0,
+            100,
+        )
+        .await
+        .unwrap();
+    assert_eq!(total_neq, 2, "NotEq(scan_id=2) must match 2 nodes");
+
+    // In: scan_id in [1, 3] → run_1 and run_3
+    let (nodes_in, total_in) = cat
+        .search_children(
+            None,
+            &[Query::In(In {
+                key: "scan_id".into(),
+                value: vec![json!(1), json!(3)],
+            })],
+            0,
+            100,
+        )
+        .await
+        .unwrap();
+    assert_eq!(total_in, 2, "In(scan_id=[1,3]) must match 2 nodes");
+    let in_keys: Vec<&str> = nodes_in.iter().map(|n| n.key.as_str()).collect();
+    assert!(in_keys.contains(&"run_1") && in_keys.contains(&"run_3"));
+
+    // NotIn: scan_id not in [1, 2] → only run_3
+    let (nodes_nin, total_nin) = cat
+        .search_children(
+            None,
+            &[Query::NotIn(NotIn {
+                key: "scan_id".into(),
+                value: vec![json!(1), json!(2)],
+            })],
+            0,
+            100,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        total_nin, 1,
+        "NotIn(scan_id=[1,2]) must match exactly 1 node"
+    );
+    assert_eq!(nodes_nin[0].key, "run_3");
+
+    // Eq on a shared integer value: count == 10 → run_1 and run_3
+    let (_, total_count) = cat
+        .search_children(
+            None,
+            &[Query::Eq(Eq {
+                key: "count".into(),
+                value: json!(10),
+            })],
+            0,
+            100,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        total_count, 2,
+        "Eq(count=10) must match 2 nodes (run_1 + run_3)"
+    );
 }

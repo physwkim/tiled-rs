@@ -110,19 +110,17 @@ impl WhereBuilder {
     fn push_eq(&mut self, key: &str, value: &Value) {
         let lhs = self.dialect.json_text("metadata", key);
         let p = self.dialect.placeholder(self.bindings.len());
-        let rendered = render_value_as_text(value);
         self.pieces.push(format!("{lhs} = {p}"));
-        self.bindings.push(Bind::Text(rendered));
+        self.bindings.push(value_to_bind(value));
     }
 
     fn push_neq(&mut self, key: &str, value: &Value) {
         let lhs = self.dialect.json_text("metadata", key);
         let p = self.dialect.placeholder(self.bindings.len());
-        let rendered = render_value_as_text(value);
         // Treat NULL as "not equal" too — without `IS DISTINCT FROM`/COALESCE,
         // a JSON key that's missing would otherwise drop out of the result.
         self.pieces.push(format!("({lhs} IS NULL OR {lhs} != {p})"));
-        self.bindings.push(Bind::Text(rendered));
+        self.bindings.push(value_to_bind(value));
     }
 
     fn push_key_present(&mut self, key: &str, exists: bool) {
@@ -194,7 +192,7 @@ impl WhereBuilder {
         for v in values {
             let p = self.dialect.placeholder(self.bindings.len());
             placeholders.push(p);
-            self.bindings.push(Bind::Text(render_value_as_text(v)));
+            self.bindings.push(value_to_bind(v));
         }
         self.pieces
             .push(format!("{lhs} IN ({})", placeholders.join(", ")));
@@ -212,7 +210,7 @@ impl WhereBuilder {
         for v in values {
             let p = self.dialect.placeholder(self.bindings.len());
             placeholders.push(p);
-            self.bindings.push(Bind::Text(render_value_as_text(v)));
+            self.bindings.push(value_to_bind(v));
         }
         self.pieces.push(format!(
             "({lhs} IS NULL OR {lhs} NOT IN ({}))",
@@ -446,6 +444,28 @@ fn render_value_as_text(v: &Value) -> String {
         Value::Bool(b) => b.to_string(),
         other => other.to_string(),
     }
+}
+
+/// Produce a type-aware `Bind` for a JSON value so SQLite compares
+/// `json_extract` results by storage class rather than text coercion.
+///
+/// SQLite's `json_extract` returns the *native* storage class (INTEGER for
+/// JSON integers and booleans, REAL for JSON floats, TEXT for strings).
+/// A `Bind::Text` binding never matches an INTEGER/REAL value under SQLite's
+/// no-affinity comparison rules — `json_extract('{"x":5}','$.x') = '5'` is
+/// FALSE.  Postgres is unaffected because `->>` always returns TEXT.
+fn value_to_bind(v: &Value) -> Bind {
+    if let Some(i) = v.as_i64() {
+        return Bind::Int(i);
+    }
+    if let Some(f) = v.as_f64() {
+        return Bind::Real(f);
+    }
+    if let Some(b) = v.as_bool() {
+        // SQLite stores JSON booleans as INTEGER 1/0 via json_extract.
+        return Bind::Int(if b { 1 } else { 0 });
+    }
+    Bind::Text(render_value_as_text(v))
 }
 
 impl Catalog {
@@ -757,6 +777,91 @@ mod tests {
         let offset_p = format!("${}", where_binds.len() + 3);
         assert_eq!(limit_p, "$4");
         assert_eq!(offset_p, "$5");
+    }
+
+    // H1: value_to_bind produces type-aware binds so SQLite json_extract
+    // comparisons match by storage class, not text coercion.
+    #[test]
+    fn value_to_bind_integer_yields_int() {
+        assert!(matches!(value_to_bind(&json!(42)), Bind::Int(42)));
+    }
+
+    #[test]
+    fn value_to_bind_float_yields_real() {
+        let b = value_to_bind(&json!(2.5));
+        assert!(matches!(b, Bind::Real(f) if (f - 2.5).abs() < 1e-10));
+    }
+
+    #[test]
+    fn value_to_bind_bool_yields_int() {
+        assert!(matches!(value_to_bind(&json!(true)), Bind::Int(1)));
+        assert!(matches!(value_to_bind(&json!(false)), Bind::Int(0)));
+    }
+
+    #[test]
+    fn value_to_bind_string_yields_text() {
+        assert!(matches!(value_to_bind(&json!("hello")), Bind::Text(s) if s == "hello"));
+    }
+
+    #[test]
+    fn push_eq_numeric_binds_int_not_text() {
+        let mut b = WhereBuilder::new(Dialect::Sqlite);
+        b.push_eq("count", &json!(5));
+        let (_, binds) = b.finish();
+        assert_eq!(binds.len(), 1);
+        assert!(
+            matches!(&binds[0], Bind::Int(5)),
+            "push_eq with integer must bind Bind::Int, got: {:?}",
+            binds[0]
+        );
+    }
+
+    #[test]
+    fn push_neq_numeric_binds_int_not_text() {
+        let mut b = WhereBuilder::new(Dialect::Sqlite);
+        b.push_neq("count", &json!(5));
+        let (_, binds) = b.finish();
+        assert!(
+            matches!(&binds[0], Bind::Int(5)),
+            "push_neq with integer must bind Bind::Int, got: {:?}",
+            binds[0]
+        );
+    }
+
+    #[test]
+    fn push_in_numeric_binds_int_not_text() {
+        let q = Query::In(tiled_core::queries::In {
+            key: "scan_id".into(),
+            value: vec![json!(1), json!(2), json!(3)],
+        });
+        let mut b = WhereBuilder::new(Dialect::Sqlite);
+        b.push_in("scan_id", &[json!(1), json!(2), json!(3)]);
+        let (_, binds) = b.finish();
+        assert_eq!(binds.len(), 3);
+        for bind in &binds {
+            assert!(
+                matches!(bind, Bind::Int(_)),
+                "push_in integers must all bind as Bind::Int, got: {:?}",
+                bind
+            );
+        }
+        // suppress unused variable warning
+        let _ = q;
+    }
+
+    #[test]
+    fn push_not_in_numeric_binds_int_not_text() {
+        let mut b = WhereBuilder::new(Dialect::Sqlite);
+        b.push_not_in("scan_id", &[json!(10), json!(20)]);
+        let (_, binds) = b.finish();
+        assert_eq!(binds.len(), 2);
+        for bind in &binds {
+            assert!(
+                matches!(bind, Bind::Int(_)),
+                "push_not_in integers must all bind as Bind::Int, got: {:?}",
+                bind
+            );
+        }
     }
 
     // H2: Like SQL generation
