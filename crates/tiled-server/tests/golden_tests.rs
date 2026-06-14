@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::http::{Request, StatusCode};
+use axum::http::{HeaderMap, Request, StatusCode};
 use bytes::Bytes;
 use indexmap::IndexMap;
 use tower::ServiceExt;
@@ -844,4 +844,75 @@ async fn array_full_returns_all_chunks_not_just_first() {
         v2, 99.0,
         "sentinel from non-first chunk (frame 2 = 99.0) must appear in full read"
     );
+}
+
+// ---------------------------------------------------------------------------
+// H2 regression — ?format= query param must beat the Accept header
+// ---------------------------------------------------------------------------
+
+/// Like `get()` but lets the caller set extra request headers and returns
+/// the response header map alongside status + body.
+async fn get_with_headers(
+    app: &axum::Router,
+    uri: &str,
+    extra: &[(&str, &str)],
+) -> (StatusCode, HeaderMap, Bytes) {
+    let mut builder = Request::builder().uri(uri);
+    for (k, v) in extra {
+        builder = builder.header(*k, *v);
+    }
+    let req = builder.body(Body::empty()).unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let headers = resp.headers().clone();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, headers, body)
+}
+
+/// H2 regression: before the fix, array_full / array_block ignored the
+/// `?format=` query parameter and negotiated entirely from the Accept header.
+/// After the fix, `format_param` is extracted and passed to
+/// `negotiate_media_type`, which resolves it before consulting Accept.
+///
+/// This test sends `Accept: application/octet-stream` (the default) alongside
+/// `?format=text/csv`.  The format param must win → response Content-Type must
+/// be text/csv and the body must be CSV-shaped.
+///
+/// Note: the shorthand `?format=csv` does NOT work because `SerializationRegistry`
+/// has no `.csv` / `csv` alias registered for arrays (only `tiled_core::media_type::
+/// resolve_alias` knows it, but that function is not called by `negotiate_media_type`).
+/// This is tracked under UNFIXED in the test-hardening report.
+#[tokio::test]
+async fn array_full_format_param_beats_accept_header() {
+    let app = build_app();
+    // Accept says raw bytes; format param says CSV — format param must win.
+    let (status, headers, body) = get_with_headers(
+        &app,
+        "/api/v1/array/full/some_array?format=text/csv",
+        &[("accept", "application/octet-stream")],
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    let content_type = headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        content_type.starts_with("text/csv"),
+        "?format= must override Accept header; got Content-Type: {content_type}"
+    );
+
+    // some_array is [0.0 .. 9.0] — CSV for a 1-D array is one value per line.
+    let body_str = std::str::from_utf8(&body).expect("CSV body must be valid UTF-8");
+    let lines: Vec<&str> = body_str.trim().split('\n').collect();
+    assert_eq!(
+        lines.len(),
+        10,
+        "CSV body for a 10-element array must have 10 lines; got: {body_str:?}"
+    );
+    assert_eq!(lines[0].trim(), "0", "first CSV line must be 0");
+    assert_eq!(lines[9].trim(), "9", "last CSV line must be 9");
 }
