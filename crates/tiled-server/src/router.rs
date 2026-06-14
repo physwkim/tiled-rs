@@ -333,6 +333,15 @@ pub async fn search(
         .collect();
     let mut queries = tiled_core::queries::decode_query_filters(&filter_params);
 
+    // Per-ancestor auth gate on the parent container path.
+    // Returns 404 (not 403) when any ancestor's per-node policy drops
+    // ReadMetadata — same behaviour as the metadata read gate.
+    let auth = if !segments.is_empty() {
+        resolve_entry(&state, auth, &segments, tiled_auth::Scope::ReadMetadata).await?
+    } else {
+        auth
+    };
+
     // Inject the access-policy list filter so the SQL/in-memory path
     // only returns nodes the principal is permitted to see.
     if let Some(ref policy) = state.access_policy {
@@ -1616,6 +1625,13 @@ pub async fn register(
     .to_string();
 
     if let Some(ref catalog) = state.catalog {
+        // Per-ancestor auth gate on the parent container path.
+        let auth = if !segments.is_empty() {
+            resolve_entry(&state, auth, &segments, tiled_auth::Scope::CreateNode).await?
+        } else {
+            auth
+        };
+
         // Resolve parent_id by walking the segments. Empty segments → root.
         let parent_id = if segments.is_empty() {
             None
