@@ -3,8 +3,7 @@
 use chrono::{Duration, Utc};
 
 use tiled_auth::{
-    AuthDb, ApiKeyCreate, DummyAuthenticator, Issuer, Scope, ScopeSet,
-    Authenticator,
+    ApiKeyCreate, AuthDb, Authenticator, DummyAuthenticator, Issuer, Scope, ScopeSet,
 };
 
 async fn fresh_db() -> (AuthDb, tempfile::TempDir) {
@@ -18,7 +17,10 @@ async fn fresh_db() -> (AuthDb, tempfile::TempDir) {
 #[tokio::test]
 async fn migrate_and_principal_lifecycle() {
     let (db, _dir) = fresh_db().await;
-    assert_eq!(db.applied_migrations().await.unwrap(), vec!["0001_initial".to_string()]);
+    assert_eq!(
+        db.applied_migrations().await.unwrap(),
+        vec!["0001_initial".to_string()]
+    );
 
     let (p, ident) = db.ensure_principal("dummy", "alice").await.unwrap();
     assert!(p.id > 0);
@@ -57,10 +59,41 @@ async fn api_key_create_verify_revoke() {
     let err = db.verify_api_key("000000000").await.unwrap_err();
     assert!(matches!(err, tiled_auth::AuthError::Unauthorized(_)));
 
-    // Revoke + verify again should fail.
-    db.revoke_api_key(&material.record.first_eight).await.unwrap();
+    // Revoke scoped to owner succeeds.
+    db.revoke_api_key(&material.record.first_eight, Some(p.id))
+        .await
+        .unwrap();
     let err = db.verify_api_key(&material.secret).await.unwrap_err();
     assert!(matches!(err, tiled_auth::AuthError::Unauthorized(_)));
+}
+
+#[tokio::test]
+async fn revoke_api_key_cross_principal_rejected() {
+    let (db, _dir) = fresh_db().await;
+    let (alice, _) = db.ensure_principal("dummy", "alice").await.unwrap();
+    let (bob, _) = db.ensure_principal("dummy", "bob").await.unwrap();
+
+    let material = db
+        .create_api_key(ApiKeyCreate {
+            principal_id: alice.id,
+            note: None,
+            scopes: ScopeSet::default(),
+            expiration_time: None,
+        })
+        .await
+        .unwrap();
+
+    // Bob cannot revoke Alice's key by first_eight.
+    let err = db
+        .revoke_api_key(&material.record.first_eight, Some(bob.id))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, tiled_auth::AuthError::NotFound(_)));
+
+    // Admin bypass (None) can delete any key.
+    db.revoke_api_key(&material.record.first_eight, None)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

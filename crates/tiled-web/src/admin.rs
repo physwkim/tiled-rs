@@ -3,11 +3,11 @@
 use std::sync::Arc;
 
 use askama::Template;
+use axum::Router;
 use axum::extract::{Form, Path, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
-use axum::Router;
 use chrono::{Duration, Utc};
 use serde::Deserialize;
 use sqlx::Row;
@@ -17,9 +17,7 @@ use tiled_auth::{
 };
 
 use crate::WebState;
-use crate::cookie::{
-    build_session_cookie, clear_session_cookie, read_session_cookie,
-};
+use crate::cookie::{build_session_cookie, clear_session_cookie, read_session_cookie};
 
 pub fn admin_router(state: WebState) -> Router {
     Router::new()
@@ -129,10 +127,7 @@ struct LoginForm {
     password: String,
 }
 
-async fn login_submit(
-    State(state): State<Arc<WebState>>,
-    Form(form): Form<LoginForm>,
-) -> Response {
+async fn login_submit(State(state): State<Arc<WebState>>, Form(form): Form<LoginForm>) -> Response {
     let Some(db) = state.auth_db.clone() else {
         return error_login("auth DB not configured on this server");
     };
@@ -160,10 +155,7 @@ async fn login_submit(
     // Dispatch through the same code path the API exposes by looking
     // up the principal directly. Treat the supplied `username` as the
     // identity sub.
-    let (principal, identity) = match db
-        .ensure_principal(&form.provider, &form.username)
-        .await
-    {
+    let (principal, identity) = match db.ensure_principal(&form.provider, &form.username).await {
         Ok(p) => p,
         Err(e) => return error_login(&format!("auth failed: {e}")),
     };
@@ -222,10 +214,7 @@ fn error_login(msg: &str) -> Response {
 // API keys
 // ---------------------------------------------------------------------------
 
-async fn api_keys_page(
-    State(state): State<Arc<WebState>>,
-    headers: HeaderMap,
-) -> Response {
+async fn api_keys_page(State(state): State<Arc<WebState>>, headers: HeaderMap) -> Response {
     let session = match resolve_session(&state, &headers).await {
         Ok(s) => s,
         Err(redir) => return redir,
@@ -258,11 +247,11 @@ async fn api_keys_create(
         )
         .await;
     };
-    if !session.scopes.contains(Scope::ApiKeyCreate) {
+    if !session.scopes.contains(Scope::CreateApiKeys) {
         return render_api_keys(
             &state,
             &session,
-            Some("missing scope: apikeys:create".into()),
+            Some("missing scope: create:apikeys".into()),
             None,
         )
         .await;
@@ -344,11 +333,11 @@ async fn api_keys_revoke(
         )
         .await;
     };
-    if !session.scopes.contains(Scope::ApiKeyRevoke) {
+    if !session.scopes.contains(Scope::RevokeApiKeys) {
         return render_api_keys(
             &state,
             &session,
-            Some("missing scope: apikeys:revoke".into()),
+            Some("missing scope: revoke:apikeys".into()),
             None,
         )
         .await;
@@ -358,8 +347,8 @@ async fn api_keys_revoke(
         .list_api_keys(Some(session.principal.id))
         .await
         .unwrap_or_default();
-    let allowed = owned.iter().any(|k| k.first_eight == first_eight)
-        || session.scopes.contains(Scope::Admin);
+    let is_admin = session.scopes.contains(Scope::AdminApiKeys);
+    let allowed = owned.iter().any(|k| k.first_eight == first_eight) || is_admin;
     if !allowed {
         return render_api_keys(
             &state,
@@ -369,7 +358,12 @@ async fn api_keys_revoke(
         )
         .await;
     }
-    if let Err(e) = db.revoke_api_key(&first_eight).await {
+    let caller_id = if is_admin {
+        None
+    } else {
+        Some(session.principal.id)
+    };
+    if let Err(e) = db.revoke_api_key(&first_eight, caller_id).await {
         return render_api_keys(&state, &session, Some(format!("revoke: {e}")), None).await;
     }
     render_api_keys(
@@ -441,10 +435,7 @@ async fn render_api_keys(
 // Sessions
 // ---------------------------------------------------------------------------
 
-async fn sessions_page(
-    State(state): State<Arc<WebState>>,
-    headers: HeaderMap,
-) -> Response {
+async fn sessions_page(State(state): State<Arc<WebState>>, headers: HeaderMap) -> Response {
     let session = match resolve_session(&state, &headers).await {
         Ok(s) => s,
         Err(redir) => return redir,
@@ -466,10 +457,7 @@ async fn sessions_page(
     })
 }
 
-async fn sessions_revoke_all(
-    State(state): State<Arc<WebState>>,
-    headers: HeaderMap,
-) -> Response {
+async fn sessions_revoke_all(State(state): State<Arc<WebState>>, headers: HeaderMap) -> Response {
     let session = match resolve_session(&state, &headers).await {
         Ok(s) => s,
         Err(redir) => return redir,
@@ -478,9 +466,10 @@ async fn sessions_revoke_all(
         let _ = db.revoke_all_sessions(session.principal.id).await;
     }
     let mut response = Redirect::temporary("/admin/login").into_response();
-    response
-        .headers_mut()
-        .insert(header::SET_COOKIE, clear_session_cookie(state.secure_cookies));
+    response.headers_mut().insert(
+        header::SET_COOKIE,
+        clear_session_cookie(state.secure_cookies),
+    );
     response
 }
 
@@ -542,10 +531,7 @@ async fn list_sessions_for_principal(db: &AuthDb, principal_id: i64) -> Vec<Sess
 // Streaming
 // ---------------------------------------------------------------------------
 
-async fn streaming_page(
-    State(state): State<Arc<WebState>>,
-    headers: HeaderMap,
-) -> Response {
+async fn streaming_page(State(state): State<Arc<WebState>>, headers: HeaderMap) -> Response {
     let _session = match resolve_session(&state, &headers).await {
         Ok(s) => s,
         Err(redir) => return redir,

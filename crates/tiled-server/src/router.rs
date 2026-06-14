@@ -1339,8 +1339,9 @@ pub async fn register(
     auth: crate::AuthContext,
     Json(req): Json<tiled_core::schemas::PostMetadataRequest>,
 ) -> Result<impl IntoResponse, ServerError> {
-    auth.require(tiled_auth::Scope::Register)
-        .or_else(|_| auth.require(tiled_auth::Scope::WriteMetadata))?;
+    auth.require(tiled_auth::Scope::WriteMetadata)?;
+    auth.require(tiled_auth::Scope::CreateNode)?;
+    auth.require(tiled_auth::Scope::Register)?;
     let segments = segments_from_uri(&uri, "/api/v1/register/");
     let path = segments.join("/");
     // Prefer the top-level `key` (Python tiled wire format, used by cirrus),

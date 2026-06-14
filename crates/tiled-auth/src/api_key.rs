@@ -158,34 +158,70 @@ impl AuthDb {
         }
     }
 
-    /// Revoke (delete) an API key matching `first_eight`. Returns the row
-    /// that was removed for log/audit purposes.
-    pub async fn revoke_api_key(&self, first_eight: &str) -> Result<ApiKeyRecord> {
+    /// Revoke (delete) an API key matching `first_eight`.
+    ///
+    /// `principal_id = Some(pid)` scopes the DELETE to keys owned by `pid`
+    /// (normal-user path). `principal_id = None` is the admin bypass: deletes
+    /// any key with the given prefix regardless of owner (matches Python's
+    /// `admin:apikeys` path).
+    ///
+    /// Returns the row that was removed for log/audit purposes.
+    pub async fn revoke_api_key(
+        &self,
+        first_eight: &str,
+        principal_id: Option<i64>,
+    ) -> Result<ApiKeyRecord> {
         match self.pool() {
             AuthPool::Sqlite(pool) => {
-                let row = sqlx::query(
-                    "DELETE FROM api_keys WHERE first_eight = ?
-                     RETURNING id, principal_id, first_eight, note, scopes,
-                               expiration_time, time_created, latest_activity",
-                )
-                .bind(first_eight)
-                .fetch_optional(pool)
-                .await?
-                .ok_or_else(|| {
+                let row = if let Some(pid) = principal_id {
+                    sqlx::query(
+                        "DELETE FROM api_keys
+                         WHERE first_eight = ? AND principal_id = ?
+                         RETURNING id, principal_id, first_eight, note, scopes,
+                                   expiration_time, time_created, latest_activity",
+                    )
+                    .bind(first_eight)
+                    .bind(pid)
+                    .fetch_optional(pool)
+                    .await?
+                } else {
+                    sqlx::query(
+                        "DELETE FROM api_keys WHERE first_eight = ?
+                         RETURNING id, principal_id, first_eight, note, scopes,
+                                   expiration_time, time_created, latest_activity",
+                    )
+                    .bind(first_eight)
+                    .fetch_optional(pool)
+                    .await?
+                };
+                let row = row.ok_or_else(|| {
                     AuthError::NotFound(format!("api key with prefix {first_eight}"))
                 })?;
                 api_key_from_sqlite(&row)
             }
             AuthPool::Postgres(pool) => {
-                let row = sqlx::query(
-                    "DELETE FROM api_keys WHERE first_eight = $1
-                     RETURNING id, principal_id, first_eight, note, scopes,
-                               expiration_time, time_created, latest_activity",
-                )
-                .bind(first_eight)
-                .fetch_optional(pool)
-                .await?
-                .ok_or_else(|| {
+                let row = if let Some(pid) = principal_id {
+                    sqlx::query(
+                        "DELETE FROM api_keys
+                         WHERE first_eight = $1 AND principal_id = $2
+                         RETURNING id, principal_id, first_eight, note, scopes,
+                                   expiration_time, time_created, latest_activity",
+                    )
+                    .bind(first_eight)
+                    .bind(pid)
+                    .fetch_optional(pool)
+                    .await?
+                } else {
+                    sqlx::query(
+                        "DELETE FROM api_keys WHERE first_eight = $1
+                         RETURNING id, principal_id, first_eight, note, scopes,
+                                   expiration_time, time_created, latest_activity",
+                    )
+                    .bind(first_eight)
+                    .fetch_optional(pool)
+                    .await?
+                };
+                let row = row.ok_or_else(|| {
                     AuthError::NotFound(format!("api key with prefix {first_eight}"))
                 })?;
                 api_key_from_postgres(&row)
@@ -250,10 +286,10 @@ impl AuthDb {
                 .verify_password(secret.as_bytes(), &parsed)
                 .is_ok()
             {
-                if let Some(exp) = rec.expiration_time {
-                    if exp <= chrono::Utc::now() {
-                        return Err(AuthError::Expired);
-                    }
+                if let Some(exp) = rec.expiration_time
+                    && exp <= chrono::Utc::now()
+                {
+                    return Err(AuthError::Expired);
                 }
                 self.touch_api_key(rec.id).await.ok();
                 return Ok(rec);

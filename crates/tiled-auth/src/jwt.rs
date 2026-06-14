@@ -62,19 +62,13 @@ impl std::fmt::Debug for Issuer {
 }
 
 impl Issuer {
-    /// `secret` is HMAC-SHA256 keying material. Length should be ≥ 32 bytes
-    /// so a brute-force on the secret is infeasible.
+    /// `secret` is HMAC-SHA256 keying material.
     pub fn new(secret: &[u8]) -> Result<Self> {
-        if secret.len() < 16 {
-            return Err(AuthError::Validation(
-                "JWT secret must be at least 16 bytes".into(),
-            ));
-        }
         Ok(Self {
             encoding: EncodingKey::from_secret(secret),
             decoding: DecodingKey::from_secret(secret),
             access_ttl: Duration::minutes(15),
-            refresh_ttl: Duration::days(30),
+            refresh_ttl: Duration::days(7),
         })
     }
 
@@ -154,9 +148,7 @@ mod tests {
     #[test]
     fn refresh_token_typ_enforced() {
         let issuer = Issuer::new(b"this-is-a-test-secret-32-bytes-long!!").unwrap();
-        let access = issuer
-            .issue_access("p", "s", ScopeSet::default())
-            .unwrap();
+        let access = issuer.issue_access("p", "s", ScopeSet::default()).unwrap();
         // Presenting an access token as a refresh fails on `typ`.
         assert!(matches!(
             issuer.verify_refresh(&access).unwrap_err(),
