@@ -699,9 +699,11 @@ pub async fn watch(
     // Initial walk.
     register(&node, &path, &prefix, &settings, true).await?;
 
-    let (tx, mut rx) = mpsc::unbounded_channel::<notify::Result<notify::Event>>();
+    let (tx, mut rx) = mpsc::channel::<notify::Result<notify::Event>>(64);
     let mut watcher = notify::recommended_watcher(move |res| {
-        let _ = tx.send(res);
+        // Drop events when the channel is full — the debounce re-walks
+        // the tree on the next window so no event is load-bearing.
+        let _ = tx.try_send(res);
     })
     .map_err(|e| ClientError::Invalid(format!("create watcher: {e}")))?;
     watcher
