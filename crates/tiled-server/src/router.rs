@@ -700,6 +700,14 @@ pub async fn array_append(
 ) -> Result<impl IntoResponse, ServerError> {
     auth.require(tiled_auth::Scope::WriteData)?;
     let segments = segments_from_uri(&uri, "/api/v1/array/full/");
+    // H2: per-node policy check (matches every other data handler).
+    let _ = resolve_entry(
+        &state,
+        auth.clone(),
+        &segments,
+        tiled_auth::Scope::WriteData,
+    )
+    .await?;
 
     let append_along: usize = params
         .get("append_along")
