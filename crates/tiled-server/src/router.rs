@@ -1420,7 +1420,7 @@ pub async fn register(
                     structure_family: structure_family.clone(),
                     metadata: req.metadata.clone(),
                     specs: serde_json::to_value(&req.specs).unwrap_or_default(),
-                    access_blob: serde_json::Value::Object(Default::default()),
+                    access_blob: creator_access_blob(auth.principal.as_deref()),
                 },
             )
             .await
@@ -1500,6 +1500,16 @@ pub async fn register(
         access_blob: None,
     };
     Ok((axum::http::StatusCode::CREATED, Json(resp)))
+}
+
+/// Default access_blob for a newly registered node: owned by the creating
+/// principal so the creator can always manage their own node. Anonymous
+/// creates get an empty blob (untagged = world-readable with PassthroughPolicy).
+fn creator_access_blob(principal: Option<&tiled_auth::Principal>) -> serde_json::Value {
+    match principal {
+        Some(p) => serde_json::json!({"user": p.uuid}),
+        None => serde_json::Value::Object(Default::default()),
+    }
 }
 
 fn ds_family_str(f: tiled_core::structures::StructureFamily) -> &'static str {
