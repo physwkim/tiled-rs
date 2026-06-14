@@ -215,6 +215,15 @@ fn redact_mongo_uri(uri: &str) -> String {
     format!("{scheme}://{user}:***@{host_and_rest}")
 }
 
+/// Generate a 64-character hex string from 32 cryptographically-random bytes.
+/// Mirrors Python's `secrets.token_hex(32)` used in `_serve.py`.
+fn generate_single_user_key() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// Build a demo MapAdapter with sample arrays for testing.
 fn build_demo_tree() -> MapAdapter {
     let mut mapping = IndexMap::new();
@@ -369,6 +378,18 @@ pub async fn run(command: Command) -> Result<()> {
                      this session. Pass --api-key or restrict to --host 127.0.0.1."
                 );
             }
+
+            // Single-user mode with no explicit key: mirror Python _serve.py
+            // (secrets.token_hex(32)). Generate once per process; the key is not
+            // persisted — restart produces a new key unless the operator exports it.
+            let api_key = if auth_db_uri.is_none() && api_key.is_none() {
+                let key = generate_single_user_key();
+                eprintln!("Auto-generated single-user API key: {key}");
+                eprintln!("Set TILED_SINGLE_USER_API_KEY={key} to reuse across restarts.\n");
+                Some(key)
+            } else {
+                api_key
+            };
 
             // Open the persistent catalog up-front (before the read tree) so
             // a misconfigured DB fails the start-up rather than the first
@@ -788,5 +809,22 @@ mod tests {
             panic!("expected Serve variant");
         };
         assert_eq!(host, "0.0.0.0");
+    }
+
+    #[test]
+    fn generated_key_is_64_hex_chars() {
+        let key = generate_single_user_key();
+        assert_eq!(key.len(), 64, "32 bytes → 64 hex chars");
+        assert!(
+            key.chars().all(|c| c.is_ascii_hexdigit()),
+            "must be lowercase hex; got: {key}"
+        );
+    }
+
+    #[test]
+    fn generated_keys_are_unique() {
+        let k1 = generate_single_user_key();
+        let k2 = generate_single_user_key();
+        assert_ne!(k1, k2, "consecutive generated keys must differ");
     }
 }
