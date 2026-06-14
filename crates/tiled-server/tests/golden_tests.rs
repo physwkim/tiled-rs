@@ -10,7 +10,7 @@ use bytes::Bytes;
 use indexmap::IndexMap;
 use tower::ServiceExt;
 
-use tiled_adapters::{ArrayAdapter, MapAdapter};
+use tiled_adapters::{ArrayAdapter, MapAdapter, NpyFrameOpener, SequenceAdapter};
 use tiled_core::adapters::AnyAdapter;
 use tiled_core::queries::Query;
 
@@ -748,4 +748,100 @@ async fn test_metadata_handles_percent_encoded_slash_in_key() {
     let data = &body["data"];
     assert_eq!(data["id"], "a/b");
     assert_eq!(data["attributes"]["structure_family"], "array");
+}
+
+// ---------------------------------------------------------------------------
+// H1 regression — array_full must read ALL chunks, not just chunk 0
+// ---------------------------------------------------------------------------
+
+/// Write a minimal NPY v1.0 file containing exactly one f64 value in a
+/// (1, 1) shaped array.  Matches the format used in sequence_adapter tests.
+fn write_npy_1x1(path: &std::path::Path, value: f64) {
+    use std::io::Write;
+    let header_str = "{'descr': '<f8', 'fortran_order': False, 'shape': (1, 1), }";
+    let mut header = header_str.as_bytes().to_vec();
+    // Pad so that (10 + header.len()) % 64 == 0 (NPY spec alignment).
+    while (10 + header.len()) % 64 != 63 {
+        header.push(b' ');
+    }
+    header.push(b'\n');
+    let mut f = std::fs::File::create(path).unwrap();
+    f.write_all(b"\x93NUMPY").unwrap();
+    f.write_all(&[1, 0]).unwrap();
+    f.write_all(&(header.len() as u16).to_le_bytes()).unwrap();
+    f.write_all(&header).unwrap();
+    f.write_all(&value.to_le_bytes()).unwrap();
+}
+
+/// H1 regression: before the fix, array_full rewired to array_block with
+/// block=[0,0,...] and silently returned only the first chunk.  After the
+/// fix, array_full calls ArrayAdapterRead::read() which concatenates all
+/// chunks.  SequenceAdapter (one chunk per file) exercises this: three files
+/// are stacked along axis 0; only the non-first-chunk sentinel (99.0 in
+/// frame 2) proves that all chunks were read.
+#[tokio::test]
+async fn array_full_returns_all_chunks_not_just_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths: Vec<std::path::PathBuf> = (0..3)
+        .map(|i| dir.path().join(format!("f{i}.npy")))
+        .collect();
+    // Frame 0 = 1.0, Frame 1 = 2.0, Frame 2 = sentinel 99.0.
+    write_npy_1x1(&paths[0], 1.0);
+    write_npy_1x1(&paths[1], 2.0);
+    write_npy_1x1(&paths[2], 99.0);
+
+    let seq = SequenceAdapter::from_paths(paths, Arc::new(NpyFrameOpener), serde_json::json!({}))
+        .unwrap();
+
+    let mut mapping = IndexMap::new();
+    mapping.insert("seq_array".to_string(), AnyAdapter::Array(Arc::new(seq)));
+    let root_tree: Arc<dyn tiled_core::adapters::ContainerAdapter> =
+        Arc::new(MapAdapter::new(mapping, serde_json::json!({}), vec![]));
+    let registry = Arc::new(tiled_serialization::default_registry());
+    let state = tiled_server::AppState {
+        root_tree,
+        serialization_registry: registry,
+        query_names: vec![],
+        base_url: Some("http://localhost:8000".to_string()),
+        cors_policy: tiled_server::state::CorsOriginPolicy::Permissive,
+        trust_forwarded_headers: false,
+        api_key: None,
+        catalog: None,
+        auth_db: None,
+        issuer: None,
+        authenticators: vec![],
+        proxied_header_auth: None,
+        external_oidc: None,
+        forwarded_allow_ips: None,
+        max_request_body_bytes: 10 * 1024 * 1024,
+        streaming_bus: tiled_server::streaming::StreamingBus::new(),
+        access_policy: None,
+        default_login_scopes: tiled_auth::ScopeSet::full(),
+        enable_web: true,
+        web_assets_dir: None,
+        spec_views: Vec::new(),
+        webhook_config: None,
+    };
+    let app = tiled_server::build_app(state);
+
+    let (status, body) = get(&app, "/api/v1/array/full/seq_array").await;
+    assert_eq!(status, 200);
+
+    // 3 frames × shape(1,1) × 8 bytes/f64 = 24 bytes total.
+    assert_eq!(
+        body.len(),
+        24,
+        "full read must return all 3 chunks (24 bytes), not just chunk 0 (8 bytes)"
+    );
+
+    // Frame 0 sanity check.
+    let v0 = f64::from_le_bytes(body[0..8].try_into().unwrap());
+    assert_eq!(v0, 1.0, "frame 0 must be 1.0");
+
+    // Non-first-chunk sentinel: frame 2 must be present.
+    let v2 = f64::from_le_bytes(body[16..24].try_into().unwrap());
+    assert_eq!(
+        v2, 99.0,
+        "sentinel from non-first chunk (frame 2 = 99.0) must appear in full read"
+    );
 }
