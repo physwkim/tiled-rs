@@ -442,7 +442,14 @@ pub async fn array_block(
             "kind": String::from(data.dtype.kind.to_numpy_char()),
             "shape": data.shape,
         });
-        serializer(&data.data, &ser_meta).map_err(|e| ServerError::Internal(e.to_string()))?
+        // Serializers run CPU-bound encode work (and, for HDF5, blocking file
+        // I/O); offload off the async executor so a large export can't stall
+        // the runtime. `dispatch` returns an Arc<SerializerFn> (Send + 'static).
+        let payload = data.data;
+        tokio::task::spawn_blocking(move || serializer(&payload, &ser_meta))
+            .await
+            .map_err(|e| ServerError::Internal(format!("serialize task failed: {e}")))?
+            .map_err(|e| ServerError::Internal(e.to_string()))?
     } else {
         data.data
     };
@@ -828,7 +835,11 @@ pub async fn container_full(
         &media_type,
     ) {
         let meta = serde_json::json!({"path": path});
-        serializer(&body_json, &meta).map_err(|e| ServerError::Internal(e.to_string()))?
+        // Offload the (CPU-bound) container serializer off the async executor.
+        tokio::task::spawn_blocking(move || serializer(&body_json, &meta))
+            .await
+            .map_err(|e| ServerError::Internal(format!("serialize task failed: {e}")))?
+            .map_err(|e| ServerError::Internal(e.to_string()))?
     } else {
         return Err(ServerError::Validation(format!(
             "no container serializer for {media_type}"
@@ -856,25 +867,32 @@ async fn export_container_as_zip(
     let mut entries: Vec<(String, Vec<u8>)> = Vec::new();
     collect_zip_entries(container, "", base_path, &mut entries).await?;
 
-    use std::io::{Cursor, Write};
-    use zip::write::SimpleFileOptions;
-    let mut buf = Vec::new();
-    {
-        let mut writer = zip::ZipWriter::new(Cursor::new(&mut buf));
-        let opts =
-            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
-        for (name, bytes) in entries {
+    // Deflate compression of the whole subtree is CPU-bound; run it on a
+    // blocking thread so it doesn't stall the async runtime.
+    let buf = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, ServerError> {
+        use std::io::{Cursor, Write};
+        use zip::write::SimpleFileOptions;
+        let mut buf = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(Cursor::new(&mut buf));
+            let opts =
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+            for (name, bytes) in entries {
+                writer
+                    .start_file(&name, opts)
+                    .map_err(|e| ServerError::Internal(format!("zip: {e}")))?;
+                writer
+                    .write_all(&bytes)
+                    .map_err(|e| ServerError::Internal(format!("zip write: {e}")))?;
+            }
             writer
-                .start_file(&name, opts)
-                .map_err(|e| ServerError::Internal(format!("zip: {e}")))?;
-            writer
-                .write_all(&bytes)
-                .map_err(|e| ServerError::Internal(format!("zip write: {e}")))?;
+                .finish()
+                .map_err(|e| ServerError::Internal(format!("zip finalize: {e}")))?;
         }
-        writer
-            .finish()
-            .map_err(|e| ServerError::Internal(format!("zip finalize: {e}")))?;
-    }
+        Ok(buf)
+    })
+    .await
+    .map_err(|e| ServerError::Internal(format!("zip task failed: {e}")))??;
     Ok(bytes::Bytes::from(buf))
 }
 
