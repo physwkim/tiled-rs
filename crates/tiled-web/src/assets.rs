@@ -39,25 +39,25 @@ pub fn spa_router_with(dir: Option<PathBuf>) -> Router {
 }
 
 async fn serve_index(State(state): State<Arc<AssetsState>>) -> Response {
-    serve_path(&state, "index.html")
+    serve_path(&state, "index.html").await
 }
 
 async fn serve_static(State(state): State<Arc<AssetsState>>, Path(file): Path<String>) -> Response {
-    serve_path(&state, &file)
+    serve_path(&state, &file).await
 }
 
-fn serve_path(state: &AssetsState, path: &str) -> Response {
+async fn serve_path(state: &AssetsState, path: &str) -> Response {
     // Prefer disk first when an assets_dir is configured — operators
     // typically swap in the real bluesky/tiled WebUI bundle this way.
     if let Some(dir) = &state.dir {
         let candidate = dir.join(path);
-        if let Ok(bytes) = std::fs::read(&candidate) {
+        if let Ok(bytes) = tokio::fs::read(&candidate).await {
             return ok_response(path, bytes);
         }
         // index.html fallback inside disk dir for SPA routes.
         let fallback = dir.join("index.html");
         if path != "index.html"
-            && let Ok(bytes) = std::fs::read(&fallback)
+            && let Ok(bytes) = tokio::fs::read(&fallback).await
         {
             return ok_response("index.html", bytes);
         }
