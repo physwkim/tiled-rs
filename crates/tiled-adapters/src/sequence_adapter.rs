@@ -164,28 +164,6 @@ impl SequenceAdapter {
     fn frame_size_bytes(&self) -> usize {
         self.inner_shape.iter().product::<usize>() * self.dtype.element_size()
     }
-
-    /// Convert a multi-D outer block index (one entry per outer axis)
-    /// into the flat frame index. Row-major (C-order).
-    fn outer_block_to_frame(&self, outer_block: &[usize]) -> Result<usize> {
-        if outer_block.len() != self.outer_shape.len() {
-            return Err(TiledError::Validation(format!(
-                "expected {} outer block indices, got {}",
-                self.outer_shape.len(),
-                outer_block.len()
-            )));
-        }
-        let mut idx = 0usize;
-        for (axis, (&i, &d)) in outer_block.iter().zip(self.outer_shape.iter()).enumerate() {
-            if i >= d {
-                return Err(TiledError::Validation(format!(
-                    "outer block index {i} out of range on axis {axis} (extent {d})"
-                )));
-            }
-            idx = idx * d + i;
-        }
-        Ok(idx)
-    }
 }
 
 impl BaseAdapter for SequenceAdapter {
@@ -206,25 +184,30 @@ impl ArrayAdapterRead for SequenceAdapter {
     }
 
     fn read<'a>(&'a self, _slice: &'a NDSlice) -> BoxFuture<'a, Result<DynNDArray>> {
+        let frame_bytes = self.frame_size_bytes();
+        let paths = self.paths.clone();
+        let opener = self.opener.clone();
+        let inner_shape = self.inner_shape.clone();
+        let dtype = self.dtype.clone();
+        let full_shape = self.structure.shape.clone();
         Box::pin(async move {
-            let frame_bytes = self.frame_size_bytes();
-            let mut buf = BytesMut::with_capacity(frame_bytes * self.paths.len());
-            for (i, path) in self.paths.iter().enumerate() {
-                let frame = self.opener.open(path.clone(), i)?;
+            let mut buf = BytesMut::with_capacity(frame_bytes * paths.len());
+            for (i, path) in paths.iter().enumerate() {
+                let op = opener.clone();
+                let p = path.clone();
+                let frame = tokio::task::spawn_blocking(move || op.open(p, i))
+                    .await
+                    .map_err(|e| TiledError::Internal(format!("sequence frame spawn: {e}")))??;
                 let dyn_arr = frame.read(&NDSlice::empty()).await?;
-                if dyn_arr.shape != self.inner_shape {
+                if dyn_arr.shape != inner_shape {
                     return Err(TiledError::Validation(format!(
                         "frame {i} has shape {:?}, expected {:?}",
-                        dyn_arr.shape, self.inner_shape
+                        dyn_arr.shape, inner_shape
                     )));
                 }
                 buf.extend_from_slice(&dyn_arr.data);
             }
-            Ok(DynNDArray::new(
-                buf.freeze(),
-                self.dtype.clone(),
-                self.structure.shape.clone(),
-            ))
+            Ok(DynNDArray::new(buf.freeze(), dtype, full_shape))
         })
     }
 
@@ -233,17 +216,41 @@ impl ArrayAdapterRead for SequenceAdapter {
         block: &'a [usize],
         _slice: &'a NDSlice,
     ) -> BoxFuture<'a, Result<DynNDArray>> {
+        let block = block.to_vec();
+        let n_shape_dims = self.structure.shape.len();
+        let outer_shape = self.outer_shape.clone();
+        let paths = self.paths.clone();
+        let opener = self.opener.clone();
+        let inner_shape = self.inner_shape.clone();
+        let dtype = self.dtype.clone();
         Box::pin(async move {
-            if block.len() != self.structure.shape.len() {
+            if block.len() != n_shape_dims {
                 return Err(TiledError::Validation(format!(
-                    "expected {} block indices, got {}",
-                    self.structure.shape.len(),
+                    "expected {n_shape_dims} block indices, got {}",
                     block.len()
                 )));
             }
-            let outer_dims = self.outer_shape.len();
+            let outer_dims = outer_shape.len();
             let outer_block = &block[..outer_dims];
-            let frame_idx = self.outer_block_to_frame(outer_block)?;
+
+            // Compute flat frame index from multi-D outer block.
+            if outer_block.len() != outer_shape.len() {
+                return Err(TiledError::Validation(format!(
+                    "expected {} outer block indices, got {}",
+                    outer_shape.len(),
+                    outer_block.len()
+                )));
+            }
+            let mut frame_idx = 0usize;
+            for (axis, (&i, &d)) in outer_block.iter().zip(outer_shape.iter()).enumerate() {
+                if i >= d {
+                    return Err(TiledError::Validation(format!(
+                        "outer block index {i} out of range on axis {axis} (extent {d})"
+                    )));
+                }
+                frame_idx = frame_idx * d + i;
+            }
+
             for (axis, &b) in block.iter().enumerate().skip(outer_dims) {
                 if b != 0 {
                     return Err(TiledError::Validation(format!(
@@ -251,23 +258,20 @@ impl ArrayAdapterRead for SequenceAdapter {
                     )));
                 }
             }
-            let frame = self.opener.open(self.paths[frame_idx].clone(), frame_idx)?;
+            let path = paths[frame_idx].clone();
+            let frame = tokio::task::spawn_blocking(move || opener.open(path, frame_idx))
+                .await
+                .map_err(|e| TiledError::Internal(format!("sequence frame spawn: {e}")))??;
             let dyn_arr = frame.read(&NDSlice::empty()).await?;
-            if dyn_arr.shape != self.inner_shape {
+            if dyn_arr.shape != inner_shape {
                 return Err(TiledError::Validation(format!(
                     "frame {frame_idx} has shape {:?}, expected {:?}",
-                    dyn_arr.shape, self.inner_shape
+                    dyn_arr.shape, inner_shape
                 )));
             }
-            // The block is a single frame so its shape is
-            // `[1, 1, ...] × inner_shape` — one for each outer axis.
             let mut block_shape = vec![1usize; outer_dims];
-            block_shape.extend_from_slice(&self.inner_shape);
-            Ok(DynNDArray::new(
-                dyn_arr.data,
-                self.dtype.clone(),
-                block_shape,
-            ))
+            block_shape.extend_from_slice(&inner_shape);
+            Ok(DynNDArray::new(dyn_arr.data, dtype, block_shape))
         })
     }
 }
