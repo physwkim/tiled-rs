@@ -307,7 +307,10 @@ impl Query {
             }
             Self::Like(q) => {
                 params.push((format!("{prefix}[key]"), q.key.clone()));
-                params.push((format!("{prefix}[pattern]"), q.pattern.clone()));
+                params.push((
+                    format!("{prefix}[pattern]"),
+                    serde_json::to_string(&q.pattern).unwrap_or_default(),
+                ));
             }
             Self::Specs(q) => {
                 params.push((
@@ -455,7 +458,7 @@ fn decode_single_query(name: &str, fields: &HashMap<String, String>) -> Option<Q
         }
         "like" => {
             let key = fields.get("key")?.clone();
-            let pattern = fields.get("pattern")?.clone();
+            let pattern: String = serde_json::from_str(fields.get("pattern")?).ok()?;
             Some(Query::Like(Like { key, pattern }))
         }
         "specs" => {
@@ -697,5 +700,35 @@ mod tests {
             .collect();
         ops.sort_by_key(|o| o.to_string());
         assert_eq!(ops, vec![Operator::Gt, Operator::Lt]);
+    }
+
+    /// H1: Like.pattern must be JSON-encoded (json.dumps parity with queries.py:441-442).
+    /// Previously emitted raw — a pattern like `Ni%` would round-trip only by
+    /// accident; the Python server's decode calls json.loads so it expects quotes.
+    #[test]
+    fn test_encode_decode_like_pattern() {
+        let q = Query::Like(Like {
+            key: "sample".into(),
+            pattern: "Ni%".into(),
+        });
+        let pairs = q.encode();
+        let pattern_val = pairs
+            .iter()
+            .find(|(k, _)| k.contains("[pattern]"))
+            .map(|(_, v)| v.as_str())
+            .expect("pattern field must be present");
+        assert_eq!(
+            pattern_val, "\"Ni%\"",
+            "pattern must be JSON-quoted (json.dumps parity)"
+        );
+        let decoded = decode_query_filters(&pairs);
+        assert_eq!(decoded.len(), 1);
+        match &decoded[0] {
+            Query::Like(like) => {
+                assert_eq!(like.key, "sample");
+                assert_eq!(like.pattern, "Ni%");
+            }
+            _ => panic!("Expected Like"),
+        }
     }
 }
