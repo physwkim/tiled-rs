@@ -30,9 +30,8 @@ pub struct TiffAdapter {
 
 impl TiffAdapter {
     pub fn from_path(path: PathBuf, metadata: serde_json::Value) -> Result<Self> {
-        let file = std::fs::File::open(&path).map_err(|e| {
-            TiledError::Internal(format!("open {}: {e}", path.display()))
-        })?;
+        let file = std::fs::File::open(&path)
+            .map_err(|e| TiledError::Internal(format!("open {}: {e}", path.display())))?;
         let mut decoder = tiff::decoder::Decoder::new(file)
             .map_err(|e| TiledError::Internal(format!("tiff open: {e}")))?;
         let (w, h) = decoder
@@ -60,27 +59,42 @@ impl TiffAdapter {
         // than uniformly coercing to u16 (which loses precision for f32
         // micrographs and overflows for u32 thermal sensors).
         let (bytes, dtype): (Vec<u8>, BuiltinDType) = match result {
-            tiff::decoder::DecodingResult::U8(v) => {
-                (v, BuiltinDType::new(Endianness::Little, Kind::UnsignedInteger, 1))
-            }
+            tiff::decoder::DecodingResult::U8(v) => (
+                v,
+                BuiltinDType::new(Endianness::Little, Kind::UnsignedInteger, 1),
+            ),
             tiff::decoder::DecodingResult::U16(v) => {
                 let mut buf = Vec::with_capacity(v.len() * 2);
-                for s in &v { buf.extend_from_slice(&s.to_le_bytes()); }
-                (buf, BuiltinDType::new(Endianness::Little, Kind::UnsignedInteger, 2))
+                for s in &v {
+                    buf.extend_from_slice(&s.to_le_bytes());
+                }
+                (
+                    buf,
+                    BuiltinDType::new(Endianness::Little, Kind::UnsignedInteger, 2),
+                )
             }
             tiff::decoder::DecodingResult::U32(v) => {
                 let mut buf = Vec::with_capacity(v.len() * 4);
-                for s in &v { buf.extend_from_slice(&s.to_le_bytes()); }
-                (buf, BuiltinDType::new(Endianness::Little, Kind::UnsignedInteger, 4))
+                for s in &v {
+                    buf.extend_from_slice(&s.to_le_bytes());
+                }
+                (
+                    buf,
+                    BuiltinDType::new(Endianness::Little, Kind::UnsignedInteger, 4),
+                )
             }
             tiff::decoder::DecodingResult::F32(v) => {
                 let mut buf = Vec::with_capacity(v.len() * 4);
-                for s in &v { buf.extend_from_slice(&s.to_le_bytes()); }
+                for s in &v {
+                    buf.extend_from_slice(&s.to_le_bytes());
+                }
                 (buf, BuiltinDType::new(Endianness::Little, Kind::Float, 4))
             }
             tiff::decoder::DecodingResult::F64(v) => {
                 let mut buf = Vec::with_capacity(v.len() * 8);
-                for s in &v { buf.extend_from_slice(&s.to_le_bytes()); }
+                for s in &v {
+                    buf.extend_from_slice(&s.to_le_bytes());
+                }
                 (buf, BuiltinDType::new(Endianness::Little, Kind::Float, 8))
             }
             other => {
@@ -128,13 +142,13 @@ impl ArrayAdapterRead for TiffAdapter {
     fn structure(&self) -> &ArrayStructure {
         &self.structure
     }
-    fn read<'a>(&'a self, _slice: &'a NDSlice) -> BoxFuture<'a, Result<DynNDArray>> {
-        Box::pin(async move { Ok(self.array.clone()) })
+    fn read<'a>(&'a self, slice: &'a NDSlice) -> BoxFuture<'a, Result<DynNDArray>> {
+        Box::pin(async move { self.array.apply_slice(slice) })
     }
     fn read_block<'a>(
         &'a self,
         block: &'a [usize],
-        _slice: &'a NDSlice,
+        slice: &'a NDSlice,
     ) -> BoxFuture<'a, Result<DynNDArray>> {
         Box::pin(async move {
             for (axis, &b) in block.iter().enumerate() {
@@ -144,7 +158,57 @@ impl ArrayAdapterRead for TiffAdapter {
                     )));
                 }
             }
-            Ok(self.array.clone())
+            self.array.apply_slice(slice)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+    use tiled_core::ndslice::NDSlice;
+
+    /// Build a minimal grayscale u8 TIFF with w=4, h=3, values 0..11.
+    fn make_tiff_3x4_gray8() -> Vec<u8> {
+        let mut buf = Vec::new();
+        {
+            let cursor = Cursor::new(&mut buf);
+            let mut encoder = tiff::encoder::TiffEncoder::new(cursor).unwrap();
+            let data: Vec<u8> = (0..12u8).collect();
+            encoder
+                .write_image::<tiff::encoder::colortype::Gray8>(4, 3, &data)
+                .unwrap();
+        }
+        buf
+    }
+
+    #[tokio::test]
+    async fn read_with_slice_returns_subarray() {
+        let tiff_bytes = make_tiff_3x4_gray8();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), &tiff_bytes).unwrap();
+        let adapter =
+            TiffAdapter::from_path(tmp.path().to_path_buf(), serde_json::json!({})).unwrap();
+        // arr shape is [H=3, W=4] for grayscale
+        // arr[1:3, 1:3] → rows 1-2, cols 1-2 → [5,6,9,10]
+        let slice = NDSlice::from_numpy_str("1:3,1:3").unwrap();
+        let result = adapter.read(&slice).await.unwrap();
+        assert_eq!(result.shape, vec![2, 2]);
+        assert_eq!(&result.data[..], &[5u8, 6, 9, 10]);
+    }
+
+    #[tokio::test]
+    async fn read_block_with_slice_returns_subarray() {
+        let tiff_bytes = make_tiff_3x4_gray8();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), &tiff_bytes).unwrap();
+        let adapter =
+            TiffAdapter::from_path(tmp.path().to_path_buf(), serde_json::json!({})).unwrap();
+        // arr[0, :] → row 0 = [0,1,2,3]
+        let slice = NDSlice::from_numpy_str("0,:").unwrap();
+        let result = adapter.read_block(&[0, 0], &slice).await.unwrap();
+        assert_eq!(result.shape, vec![4]);
+        assert_eq!(&result.data[..], &[0u8, 1, 2, 3]);
     }
 }

@@ -89,8 +89,8 @@ impl ZarrAdapter {
             start.push(offset as u64);
             shape_inner.push(chunks[b] as u64);
         }
-        Ok(ArraySubset::new_with_start_shape(start, shape_inner)
-            .map_err(|e| TiledError::Validation(format!("zarr subset: {e}")))?)
+        ArraySubset::new_with_start_shape(start, shape_inner)
+            .map_err(|e| TiledError::Validation(format!("zarr subset: {e}")))
     }
 }
 
@@ -111,20 +111,20 @@ impl ArrayAdapterRead for ZarrAdapter {
         &self.structure
     }
 
-    fn read<'a>(&'a self, _slice: &'a NDSlice) -> BoxFuture<'a, Result<DynNDArray>> {
+    fn read<'a>(&'a self, slice: &'a NDSlice) -> BoxFuture<'a, Result<DynNDArray>> {
         Box::pin(async move {
-            let subset_shape: Vec<u64> =
-                self.structure.shape.iter().map(|&d| d as u64).collect();
+            let subset_shape: Vec<u64> = self.structure.shape.iter().map(|&d| d as u64).collect();
             let subset = ArraySubset::new_with_shape(subset_shape);
             let bytes = self
                 .array
                 .retrieve_array_subset(&subset)
                 .map_err(|e| TiledError::Internal(format!("zarr retrieve: {e}")))?;
-            Ok(DynNDArray::new(
+            let full = DynNDArray::new(
                 bytes_from_array_bytes(bytes)?,
                 self.dtype.clone(),
                 self.structure.shape.clone(),
-            ))
+            );
+            full.apply_slice(slice)
         })
     }
 

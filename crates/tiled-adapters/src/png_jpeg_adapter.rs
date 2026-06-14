@@ -28,9 +28,8 @@ impl ImageAdapter {
     pub fn from_path(path: PathBuf, metadata: serde_json::Value) -> Result<Self> {
         #[cfg(feature = "tiff")]
         {
-            let img = ::image::open(&path).map_err(|e| {
-                TiledError::Internal(format!("decode {}: {e}", path.display()))
-            })?;
+            let img = ::image::open(&path)
+                .map_err(|e| TiledError::Internal(format!("decode {}: {e}", path.display())))?;
             Self::from_dynamic(img, metadata)
         }
         #[cfg(not(feature = "tiff"))]
@@ -44,10 +43,7 @@ impl ImageAdapter {
     }
 
     #[cfg(feature = "tiff")]
-    pub fn from_dynamic(
-        img: ::image::DynamicImage,
-        metadata: serde_json::Value,
-    ) -> Result<Self> {
+    pub fn from_dynamic(img: ::image::DynamicImage, metadata: serde_json::Value) -> Result<Self> {
         use ::image::{ColorType, GenericImageView};
         let (w, h) = img.dimensions();
         let (raw, dtype, channels) = match img.color() {
@@ -55,26 +51,14 @@ impl ImageAdapter {
             ColorType::La8 => (img.to_luma_alpha8().into_raw(), pixel_dtype(1), 2),
             ColorType::Rgb8 => (img.to_rgb8().into_raw(), pixel_dtype(1), 3),
             ColorType::Rgba8 => (img.to_rgba8().into_raw(), pixel_dtype(1), 4),
-            ColorType::L16 => (
-                u16_to_le(&img.to_luma16().into_raw()),
-                pixel_dtype(2),
-                1,
-            ),
+            ColorType::L16 => (u16_to_le(&img.to_luma16().into_raw()), pixel_dtype(2), 1),
             ColorType::La16 => (
                 u16_to_le(&img.to_luma_alpha16().into_raw()),
                 pixel_dtype(2),
                 2,
             ),
-            ColorType::Rgb16 => (
-                u16_to_le(&img.to_rgb16().into_raw()),
-                pixel_dtype(2),
-                3,
-            ),
-            ColorType::Rgba16 => (
-                u16_to_le(&img.to_rgba16().into_raw()),
-                pixel_dtype(2),
-                4,
-            ),
+            ColorType::Rgb16 => (u16_to_le(&img.to_rgb16().into_raw()), pixel_dtype(2), 3),
+            ColorType::Rgba16 => (u16_to_le(&img.to_rgba16().into_raw()), pixel_dtype(2), 4),
             other => {
                 return Err(TiledError::Validation(format!(
                     "unsupported image color type: {other:?}"
@@ -132,13 +116,13 @@ impl ArrayAdapterRead for ImageAdapter {
     fn structure(&self) -> &ArrayStructure {
         &self.structure
     }
-    fn read<'a>(&'a self, _slice: &'a NDSlice) -> BoxFuture<'a, Result<DynNDArray>> {
-        Box::pin(async move { Ok(self.array.clone()) })
+    fn read<'a>(&'a self, slice: &'a NDSlice) -> BoxFuture<'a, Result<DynNDArray>> {
+        Box::pin(async move { self.array.apply_slice(slice) })
     }
     fn read_block<'a>(
         &'a self,
         block: &'a [usize],
-        _slice: &'a NDSlice,
+        slice: &'a NDSlice,
     ) -> BoxFuture<'a, Result<DynNDArray>> {
         Box::pin(async move {
             for (axis, &b) in block.iter().enumerate() {
@@ -148,7 +132,7 @@ impl ArrayAdapterRead for ImageAdapter {
                     )));
                 }
             }
-            Ok(self.array.clone())
+            self.array.apply_slice(slice)
         })
     }
 }

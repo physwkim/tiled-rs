@@ -25,9 +25,8 @@ pub struct NpyAdapter {
 impl NpyAdapter {
     /// Open a `.npy` file at `path` and parse the header.
     pub fn from_path(path: PathBuf, metadata: serde_json::Value) -> Result<Self> {
-        let raw = std::fs::read(&path).map_err(|e| {
-            TiledError::Internal(format!("read {}: {e}", path.display()))
-        })?;
+        let raw = std::fs::read(&path)
+            .map_err(|e| TiledError::Internal(format!("read {}: {e}", path.display())))?;
         Self::from_bytes(&raw, metadata)
     }
 
@@ -101,13 +100,13 @@ impl ArrayAdapterRead for NpyAdapter {
     fn structure(&self) -> &ArrayStructure {
         &self.structure
     }
-    fn read<'a>(&'a self, _slice: &'a NDSlice) -> BoxFuture<'a, Result<DynNDArray>> {
-        Box::pin(async move { Ok(self.array.clone()) })
+    fn read<'a>(&'a self, slice: &'a NDSlice) -> BoxFuture<'a, Result<DynNDArray>> {
+        Box::pin(async move { self.array.apply_slice(slice) })
     }
     fn read_block<'a>(
         &'a self,
         block: &'a [usize],
-        _slice: &'a NDSlice,
+        slice: &'a NDSlice,
     ) -> BoxFuture<'a, Result<DynNDArray>> {
         Box::pin(async move {
             // NPY adapter exposes a single chunk per dim, so any non-zero
@@ -119,7 +118,7 @@ impl ArrayAdapterRead for NpyAdapter {
                     )));
                 }
             }
-            Ok(self.array.clone())
+            self.array.apply_slice(slice)
         })
     }
 }
@@ -146,9 +145,10 @@ fn parse_header(header: &str) -> Result<(BuiltinDType, Vec<usize>, bool)> {
         if t.is_empty() {
             continue;
         }
-        shape.push(t.parse::<usize>().map_err(|_| {
-            TiledError::Validation(format!("bad shape element: {t}"))
-        })?);
+        shape.push(
+            t.parse::<usize>()
+                .map_err(|_| TiledError::Validation(format!("bad shape element: {t}")))?,
+        );
     }
 
     let fortran = pick(header, "'fortran_order':")
@@ -230,12 +230,58 @@ fn parse_descr(descr: &str) -> Result<BuiltinDType> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tiled_core::ndslice::NDSlice;
+
+    /// Build a v1 `.npy` file for a 3×4 little-endian f64 array.
+    /// Values: arr[i][j] = (i * 4 + j) as f64  →  0.0 … 11.0.
+    fn make_npy_3x4_f64() -> Vec<u8> {
+        let header = b"{'descr': '<f8', 'fortran_order': False, 'shape': (3, 4), }\n";
+        let mut raw = Vec::new();
+        raw.extend_from_slice(b"\x93NUMPY");
+        raw.push(1); // major
+        raw.push(0); // minor
+        raw.extend_from_slice(&(header.len() as u16).to_le_bytes());
+        raw.extend_from_slice(header);
+        for v in 0..12u64 {
+            raw.extend_from_slice(&(v as f64).to_le_bytes());
+        }
+        raw
+    }
+
+    #[tokio::test]
+    async fn read_with_slice_returns_subarray() {
+        let adapter = NpyAdapter::from_bytes(&make_npy_3x4_f64(), serde_json::json!({})).unwrap();
+        // arr[1:3, 1:3] → rows 1-2, cols 1-2 → [[5,6],[9,10]]
+        let slice = NDSlice::from_numpy_str("1:3,1:3").unwrap();
+        let result = adapter.read(&slice).await.unwrap();
+        assert_eq!(result.shape, vec![2, 2]);
+        let floats: Vec<f64> = result
+            .data
+            .chunks_exact(8)
+            .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(floats, vec![5.0, 6.0, 9.0, 10.0]);
+    }
+
+    #[tokio::test]
+    async fn read_block_with_slice_returns_subarray() {
+        let adapter = NpyAdapter::from_bytes(&make_npy_3x4_f64(), serde_json::json!({})).unwrap();
+        // Block [0, 0] is the only block; slice arr[0, :] → row 0 = [0,1,2,3]
+        let slice = NDSlice::from_numpy_str("0,:").unwrap();
+        let result = adapter.read_block(&[0, 0], &slice).await.unwrap();
+        assert_eq!(result.shape, vec![4]);
+        let floats: Vec<f64> = result
+            .data
+            .chunks_exact(8)
+            .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(floats, vec![0.0, 1.0, 2.0, 3.0]);
+    }
 
     #[test]
     fn parse_simple_2d() {
         let (dtype, shape, fortran) =
-            parse_header("{'descr': '<f8', 'fortran_order': False, 'shape': (3, 4), }")
-                .unwrap();
+            parse_header("{'descr': '<f8', 'fortran_order': False, 'shape': (3, 4), }").unwrap();
         assert_eq!(shape, vec![3, 4]);
         assert!(!fortran);
         assert_eq!(dtype.element_size(), 8);

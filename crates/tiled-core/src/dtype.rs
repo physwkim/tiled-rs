@@ -379,6 +379,206 @@ impl DynNDArray {
     pub fn nbytes(&self) -> usize {
         self.len() * self.dtype.element_size()
     }
+
+    /// Apply an NDSlice to this array, materialising the result.
+    ///
+    /// Equivalent to `arr[slice]` in numpy — supports `Index` (reduces ndim),
+    /// `Slice` with start / stop / step (including negative indices and steps),
+    /// and `Ellipsis`.
+    pub fn apply_slice(&self, slice: &crate::ndslice::NDSlice) -> Result<Self> {
+        use crate::ndslice::SliceDim;
+
+        if slice.is_empty() {
+            return Ok(self.clone());
+        }
+
+        let ndim = self.ndim();
+        let esz = self.dtype.element_size();
+
+        // Expand ellipsis, then pad missing trailing dims with full slices.
+        let mut dims = expand_slice_dims(slice, ndim)?;
+        while dims.len() < ndim {
+            dims.push(SliceDim::full());
+        }
+        if dims.len() != ndim {
+            return Err(TiledError::InvalidSlice(format!(
+                "slice has {} dims but array has {} dims",
+                dims.len(),
+                ndim
+            )));
+        }
+
+        // Per-axis plan: source start index, element count, step, drop flag.
+        let mut src_starts: Vec<isize> = Vec::with_capacity(ndim);
+        let mut counts: Vec<usize> = Vec::with_capacity(ndim);
+        let mut steps: Vec<isize> = Vec::with_capacity(ndim);
+        let mut drop_axes: Vec<bool> = Vec::with_capacity(ndim);
+
+        for (axis, dim) in dims.iter().enumerate() {
+            let len = self.shape[axis] as isize;
+            match dim {
+                SliceDim::Index(i) => {
+                    let ni = if *i < 0 { i + len } else { *i };
+                    if ni < 0 || ni >= len {
+                        return Err(TiledError::InvalidSlice(format!(
+                            "index {i} out of bounds for axis {axis} (len {len})"
+                        )));
+                    }
+                    src_starts.push(ni);
+                    counts.push(1);
+                    steps.push(1);
+                    drop_axes.push(true);
+                }
+                SliceDim::Slice { start, stop, step } => {
+                    let step = step.unwrap_or(1);
+                    if step == 0 {
+                        return Err(TiledError::InvalidSlice("slice step cannot be zero".into()));
+                    }
+                    // Mirrors Python's slice.indices(length) semantics.
+                    let (start_n, stop_n): (isize, isize) = if step > 0 {
+                        let s = match start {
+                            None => 0,
+                            Some(v) => {
+                                if *v < 0 {
+                                    (*v + len).max(0)
+                                } else {
+                                    (*v).min(len)
+                                }
+                            }
+                        };
+                        let t = match stop {
+                            None => len,
+                            Some(v) => {
+                                if *v < 0 {
+                                    (*v + len).max(0)
+                                } else {
+                                    (*v).min(len)
+                                }
+                            }
+                        };
+                        (s, t)
+                    } else {
+                        // step < 0: default stop is sentinel -1 ("before index 0")
+                        let s = match start {
+                            None => len - 1,
+                            Some(v) => {
+                                if *v < 0 {
+                                    (*v + len).max(-1)
+                                } else {
+                                    (*v).min(len - 1)
+                                }
+                            }
+                        };
+                        let t = match stop {
+                            None => -1,
+                            Some(v) => {
+                                if *v < 0 {
+                                    (*v + len).max(-1)
+                                } else {
+                                    (*v).min(len - 1)
+                                }
+                            }
+                        };
+                        (s, t)
+                    };
+                    let count: usize = if step > 0 {
+                        ((stop_n - start_n + step - 1).max(0) / step) as usize
+                    } else {
+                        ((start_n - stop_n - step - 1).max(0) / (-step)) as usize
+                    };
+                    src_starts.push(start_n);
+                    counts.push(count);
+                    steps.push(step);
+                    drop_axes.push(false);
+                }
+                SliceDim::Ellipsis => unreachable!("expanded above"),
+            }
+        }
+
+        // Output shape: exclude Index-collapsed axes.
+        let out_shape: Vec<usize> = counts
+            .iter()
+            .zip(&drop_axes)
+            .filter_map(|(c, drop)| if *drop { None } else { Some(*c) })
+            .collect();
+
+        let n_out: usize = out_shape.iter().product();
+        if n_out == 0 || esz == 0 {
+            return Ok(Self::new(
+                bytes::Bytes::new(),
+                self.dtype.clone(),
+                out_shape,
+            ));
+        }
+
+        // Materialise output. self.strides holds byte strides (C-contiguous
+        // by construction for all adapters, but we honour them generically).
+        let total: usize = counts.iter().product();
+        let mut out = Vec::with_capacity(total * esz);
+        let mut cur = vec![0usize; ndim];
+
+        for _ in 0..total {
+            let mut byte_off: isize = 0;
+            for ax in 0..ndim {
+                let src_ax: isize = src_starts[ax] + cur[ax] as isize * steps[ax];
+                byte_off += src_ax * self.strides[ax];
+            }
+            let bo = byte_off as usize;
+            out.extend_from_slice(&self.data[bo..bo + esz]);
+
+            // Advance multi-index in row-major order over counts.
+            for ax in (0..ndim).rev() {
+                cur[ax] += 1;
+                if cur[ax] < counts[ax] {
+                    break;
+                }
+                cur[ax] = 0;
+            }
+        }
+
+        Ok(Self::new(
+            bytes::Bytes::from(out),
+            self.dtype.clone(),
+            out_shape,
+        ))
+    }
+}
+
+/// Expand an NDSlice to an explicit per-axis list, replacing Ellipsis with
+/// full slices to fill `ndim` dimensions.
+fn expand_slice_dims(
+    slice: &crate::ndslice::NDSlice,
+    ndim: usize,
+) -> Result<Vec<crate::ndslice::SliceDim>> {
+    use crate::ndslice::SliceDim;
+    let n_ellipsis = slice
+        .0
+        .iter()
+        .filter(|d| matches!(d, SliceDim::Ellipsis))
+        .count();
+    if n_ellipsis > 1 {
+        return Err(TiledError::InvalidSlice(
+            "more than one ellipsis in slice".into(),
+        ));
+    }
+    let non_ellipsis = slice.0.len() - n_ellipsis;
+    if non_ellipsis > ndim {
+        return Err(TiledError::InvalidSlice(format!(
+            "slice has more non-ellipsis dims ({non_ellipsis}) than array ndim ({ndim})"
+        )));
+    }
+    let fill = ndim - non_ellipsis;
+    let mut out = Vec::with_capacity(ndim);
+    for d in &slice.0 {
+        if matches!(d, SliceDim::Ellipsis) {
+            for _ in 0..fill {
+                out.push(SliceDim::full());
+            }
+        } else {
+            out.push(d.clone());
+        }
+    }
+    Ok(out)
 }
 
 /// Compute C-contiguous strides for a given shape and element size.
@@ -505,5 +705,101 @@ mod tests {
         assert_eq!(c_strides(&[3, 4, 5], 8), vec![160, 40, 8]);
         assert_eq!(c_strides(&[10], 4), vec![4]);
         assert_eq!(c_strides(&[], 8), Vec::<isize>::new());
+    }
+
+    fn make_u8_array(shape: Vec<usize>) -> DynNDArray {
+        let n: usize = shape.iter().product();
+        let data: Vec<u8> = (0..n as u8).collect();
+        DynNDArray::new(
+            bytes::Bytes::from(data),
+            BuiltinDType::new(Endianness::NotApplicable, Kind::UnsignedInteger, 1),
+            shape,
+        )
+    }
+
+    #[test]
+    fn apply_slice_empty_is_identity() {
+        use crate::ndslice::NDSlice;
+        let arr = make_u8_array(vec![3, 4]);
+        let result = arr.apply_slice(&NDSlice::empty()).unwrap();
+        assert_eq!(result.shape, vec![3, 4]);
+        assert_eq!(&result.data[..], &arr.data[..]);
+    }
+
+    #[test]
+    fn apply_slice_range() {
+        use crate::ndslice::NDSlice;
+        // arr[1:3, 1:3] on 3x4 → rows 1-2, cols 1-2 → [5,6,9,10]
+        let arr = make_u8_array(vec![3, 4]);
+        let slice = NDSlice::from_numpy_str("1:3,1:3").unwrap();
+        let result = arr.apply_slice(&slice).unwrap();
+        assert_eq!(result.shape, vec![2, 2]);
+        assert_eq!(&result.data[..], &[5u8, 6, 9, 10]);
+    }
+
+    #[test]
+    fn apply_slice_index_reduces_dim() {
+        use crate::ndslice::NDSlice;
+        // arr[1, :] on 3x4 → row 1 = [4,5,6,7]
+        let arr = make_u8_array(vec![3, 4]);
+        let slice = NDSlice::from_numpy_str("1,:").unwrap();
+        let result = arr.apply_slice(&slice).unwrap();
+        assert_eq!(result.shape, vec![4]);
+        assert_eq!(&result.data[..], &[4u8, 5, 6, 7]);
+    }
+
+    #[test]
+    fn apply_slice_step() {
+        use crate::ndslice::NDSlice;
+        // arr[::2, ::2] on 3x4 → every-other row/col → [[0,2],[8,10]]
+        let arr = make_u8_array(vec![3, 4]);
+        let slice = NDSlice::from_numpy_str("::2,::2").unwrap();
+        let result = arr.apply_slice(&slice).unwrap();
+        assert_eq!(result.shape, vec![2, 2]);
+        assert_eq!(&result.data[..], &[0u8, 2, 8, 10]);
+    }
+
+    #[test]
+    fn apply_slice_negative_index() {
+        use crate::ndslice::NDSlice;
+        // arr[-1, :] on 3x4 → last row = [8,9,10,11]
+        let arr = make_u8_array(vec![3, 4]);
+        let slice = NDSlice::from_numpy_str("-1,:").unwrap();
+        let result = arr.apply_slice(&slice).unwrap();
+        assert_eq!(result.shape, vec![4]);
+        assert_eq!(&result.data[..], &[8u8, 9, 10, 11]);
+    }
+
+    #[test]
+    fn apply_slice_reverse() {
+        use crate::ndslice::NDSlice;
+        // arr[::-1, :] on 3x4 → reversed rows → [8,9,10,11,4,5,6,7,0,1,2,3]
+        let arr = make_u8_array(vec![3, 4]);
+        let slice = NDSlice::from_numpy_str("::-1,:").unwrap();
+        let result = arr.apply_slice(&slice).unwrap();
+        assert_eq!(result.shape, vec![3, 4]);
+        assert_eq!(&result.data[..], &[8u8, 9, 10, 11, 4, 5, 6, 7, 0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn apply_slice_ellipsis() {
+        use crate::ndslice::NDSlice;
+        // arr[..., 0] on 3x4 → first col of each row = [0,4,8]
+        let arr = make_u8_array(vec![3, 4]);
+        let slice = NDSlice::from_numpy_str("...,0").unwrap();
+        let result = arr.apply_slice(&slice).unwrap();
+        assert_eq!(result.shape, vec![3]);
+        assert_eq!(&result.data[..], &[0u8, 4, 8]);
+    }
+
+    #[test]
+    fn apply_slice_empty_result() {
+        use crate::ndslice::NDSlice;
+        // arr[5:3, :] on 3x4 → inverted range → empty
+        let arr = make_u8_array(vec![3, 4]);
+        let slice = NDSlice::from_numpy_str("5:3,:").unwrap();
+        let result = arr.apply_slice(&slice).unwrap();
+        assert_eq!(result.shape, vec![0, 4]);
+        assert_eq!(result.data.len(), 0);
     }
 }
