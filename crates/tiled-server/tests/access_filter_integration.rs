@@ -183,6 +183,115 @@ async fn search_respects_tag_based_access_policy() {
     assert_eq!(keys.len(), 2, "alice sees exactly 2 nodes, got: {keys:?}");
 }
 
+async fn patch_status(app: &axum::Router, uri: &str, bearer: Option<&str>) -> StatusCode {
+    let mut builder = Request::builder()
+        .method(Method::PATCH)
+        .uri(uri)
+        .header("content-type", "application/octet-stream");
+    if let Some(b) = bearer {
+        builder = builder.header("authorization", b);
+    }
+    let req = builder.body(Body::empty()).unwrap();
+    app.clone().oneshot(req).await.unwrap().status()
+}
+
+/// Verify: PATCH /array/full on a tag-restricted node returns 404 for a
+/// principal that is not granted the required tag (F1 regression).
+///
+/// F1 wired array_append through resolve_entry(WriteData). resolve_entry_catalog
+/// calls narrow_for_node per path segment; TagBasedPolicy returns empty scopes for
+/// a principal with no matching tag grant. The narrowed auth then fails the
+/// ReadMetadata check → ServerError::NotFound → HTTP 404.
+/// The array adapter is never reached — UnresolvedLeaf would produce a different
+/// error code if it were instantiated, so the 404 assertion proves the adapter
+/// is bypassed entirely.
+#[tokio::test]
+async fn array_append_denied_by_tag_policy_returns_404() {
+    let dir = tempfile::tempdir().unwrap();
+    let cat_uri = format!("sqlite://{}", dir.path().join("catalog.db").display());
+    let auth_uri = format!("sqlite://{}", dir.path().join("auth.db").display());
+
+    let catalog = Catalog::connect(&cat_uri).await.unwrap();
+    catalog.migrate().await.unwrap();
+
+    let auth_db = AuthDb::connect(&auth_uri).await.unwrap();
+    auth_db.migrate().await.unwrap();
+
+    // Create alice in auth_db so DummyAuthenticator can authenticate her.
+    // No tag grant is added to the policy, so the "restricted" node is invisible to her.
+    auth_db.ensure_principal("dummy", "alice").await.unwrap();
+
+    catalog
+        .create_node(
+            None,
+            vec![],
+            RegisterRequest {
+                key: "restricted_array".to_string(),
+                structure_family: "array".to_string(),
+                metadata: json!({}),
+                specs: json!([]),
+                access_blob: json!({"tags": ["restricted"]}),
+            },
+        )
+        .await
+        .unwrap();
+
+    // TagBasedPolicy with NO grants → principal_decision for alice returns empty
+    // scopes for any node tagged "restricted".
+    let policy = TagBasedPolicy::new(ScopeSet::full());
+    let access_policy: Arc<dyn tiled_access::AccessPolicy> = Arc::new(policy);
+
+    let resolver: Arc<dyn tiled_catalog::adapter::LeafResolver> =
+        Arc::new(tiled_catalog::adapter::UnresolvedLeaf);
+    let root_tree: Arc<dyn ContainerAdapter> = Arc::new(tiled_catalog::CatalogAdapter::root(
+        catalog.clone(),
+        resolver,
+    ));
+    let registry = Arc::new(tiled_serialization::default_registry());
+    let issuer = Issuer::new(b"this-is-a-test-secret-32-bytes-long!!").unwrap();
+    let mut dummy = DummyAuthenticator::new("dummy");
+    dummy.add_user("alice", "wonderland").unwrap();
+
+    let state = tiled_server::AppState {
+        root_tree,
+        serialization_registry: registry,
+        query_names: Query::all_query_names()
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        base_url: Some("http://localhost:8000".into()),
+        cors_policy: tiled_server::state::CorsOriginPolicy::Permissive,
+        trust_forwarded_headers: false,
+        api_key: None,
+        catalog: Some(catalog),
+        auth_db: Some(auth_db),
+        issuer: Some(issuer),
+        authenticators: vec![Arc::new(dummy)],
+        proxied_header_auth: None,
+        external_oidc: None,
+        forwarded_allow_ips: None,
+        max_request_body_bytes: 10 * 1024 * 1024,
+        streaming_bus: tiled_server::streaming::StreamingBus::new(),
+        access_policy: Some(access_policy),
+        default_login_scopes: tiled_auth::ScopeSet::full(),
+        enable_web: true,
+        web_assets_dir: None,
+        spec_views: Vec::new(),
+        webhook_config: None,
+    };
+    let app = tiled_server::build_app(state);
+
+    let token = login(&app, "alice", "wonderland").await;
+    let bearer = format!("Bearer {token}");
+
+    let status = patch_status(&app, "/api/v1/array/full/restricted_array", Some(&bearer)).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "PATCH to a tag-restricted node must return 404 before the adapter is reached"
+    );
+}
+
 /// Anonymous search: only untagged (public) nodes are visible.
 ///
 /// Uses no auth backend (api_key=None, auth_db=None) so the middleware falls
