@@ -8,6 +8,7 @@
 //! The SQL syntax differs between SQLite and Postgres for JSON access:
 //! - SQLite uses `json_extract(metadata, '$.key')`.
 //! - Postgres uses `metadata ->> 'key'` (text) / `metadata -> 'key'` (json).
+//!
 //! Each `to_sql_*` method picks the right shape.
 
 use serde_json::Value;
@@ -266,6 +267,89 @@ impl WhereBuilder {
         }
     }
 
+    /// `Like(key, pattern)` — SQL LIKE on the text value of `metadata.key`.
+    /// The caller supplies the pattern verbatim (with `%` / `_` wildcards);
+    /// no escaping is applied — mirrors Python `attr.like(query.pattern)`.
+    fn push_like(&mut self, key: &str, pattern: &str) {
+        let lhs = self.dialect.json_text("metadata", key);
+        let p = self.dialect.placeholder(self.bindings.len());
+        self.pieces.push(format!("{lhs} LIKE {p}"));
+        self.bindings.push(Bind::Text(pattern.to_string()));
+    }
+
+    /// `Regex(key, pattern, case_sensitive)` — regex match on `metadata.key`.
+    ///
+    /// Postgres: `~` (case-sensitive) or `~*` (case-insensitive).
+    /// SQLite: no native regex operator; the condition is a no-op (passes all
+    /// rows through). A future port could register a custom function via sqlx.
+    fn push_regex(&mut self, key: &str, pattern: &str, case_sensitive: bool) {
+        match self.dialect {
+            Dialect::Postgres => {
+                let lhs = self.dialect.json_text("metadata", key);
+                let op = if case_sensitive { "~" } else { "~*" };
+                let p = self.dialect.placeholder(self.bindings.len());
+                self.pieces.push(format!("{lhs} {op} {p}"));
+                self.bindings.push(Bind::Text(pattern.to_string()));
+            }
+            Dialect::Sqlite => {
+                // SQLite has no native regex operator; leave as no-op.
+            }
+        }
+    }
+
+    /// `Specs(include, exclude)` — filter by the `specs` JSONB/text column.
+    ///
+    /// Mirrors Python `catalog/adapter.py::specs()`:
+    /// - SQLite: one `LIKE '%{"name":"<n>",%'` per name (Python's approach;
+    ///   note this misses specs serialised without extra fields after "name").
+    /// - Postgres: `specs @> '[{"name":"<n>"}]'::jsonb` containment.
+    fn push_specs(&mut self, include: &[String], exclude: &[String]) {
+        match self.dialect {
+            Dialect::Sqlite => {
+                for name in include {
+                    let escaped = escape_like_meta(name);
+                    let p = self.dialect.placeholder(self.bindings.len());
+                    self.pieces.push(format!("specs LIKE {p} ESCAPE '\\'"));
+                    // Pattern: %{"name":"<escaped>",% — mirrors Python
+                    self.bindings
+                        .push(Bind::Text(format!("%{{\"name\":\"{escaped}\",%")));
+                }
+                for name in exclude {
+                    let escaped = escape_like_meta(name);
+                    let p = self.dialect.placeholder(self.bindings.len());
+                    self.pieces
+                        .push(format!("NOT (specs LIKE {p} ESCAPE '\\')"));
+                    self.bindings
+                        .push(Bind::Text(format!("%{{\"name\":\"{escaped}\",%")));
+                }
+            }
+            Dialect::Postgres => {
+                if !include.is_empty() {
+                    let arr: Vec<serde_json::Value> = include
+                        .iter()
+                        .map(|n| serde_json::json!({"name": n}))
+                        .collect();
+                    let p = self.dialect.placeholder(self.bindings.len());
+                    self.pieces.push(format!("specs @> {p}::jsonb"));
+                    self.bindings.push(Bind::Text(
+                        serde_json::to_string(&arr).expect("json serialization"),
+                    ));
+                }
+                if !exclude.is_empty() {
+                    let arr: Vec<serde_json::Value> = exclude
+                        .iter()
+                        .map(|n| serde_json::json!({"name": n}))
+                        .collect();
+                    let p = self.dialect.placeholder(self.bindings.len());
+                    self.pieces.push(format!("NOT (specs @> {p}::jsonb)"));
+                    self.bindings.push(Bind::Text(
+                        serde_json::to_string(&arr).expect("json serialization"),
+                    ));
+                }
+            }
+        }
+    }
+
     fn finish(self) -> (String, Vec<Bind>) {
         if self.pieces.is_empty() {
             ("TRUE".into(), self.bindings)
@@ -273,6 +357,14 @@ impl WhereBuilder {
             (self.pieces.join(" AND "), self.bindings)
         }
     }
+}
+
+/// Escape LIKE metacharacters (`\`, `%`, `_`) in a string that will be
+/// embedded inside a LIKE pattern bound with `ESCAPE '\'`.
+fn escape_like_meta(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
 }
 
 fn render_value_as_text(v: &Value) -> String {
@@ -323,8 +415,11 @@ impl Catalog {
                 Query::In(in_q) => builder.push_in(&in_q.key, &in_q.value),
                 Query::NotIn(nin) => builder.push_not_in(&nin.key, &nin.value),
                 Query::Contains(c) => builder.push_contains(&c.key, &c.value),
-                Query::Like(_) | Query::Regex(_) | Query::Specs(_) | Query::AccessBlobFilter(_) => {
-                }
+                Query::Like(l) => builder.push_like(&l.key, &l.pattern),
+                Query::Regex(r) => builder.push_regex(&r.key, &r.pattern, r.case_sensitive),
+                Query::Specs(s) => builder.push_specs(&s.include, &s.exclude),
+                // AccessBlobFilter depends on the access-engine layer; deferred.
+                Query::AccessBlobFilter(_) => {}
             }
         }
         let (where_clause, bindings) = builder.finish();
@@ -591,5 +686,96 @@ mod tests {
         let offset_p = format!("${}", where_binds.len() + 3);
         assert_eq!(limit_p, "$4");
         assert_eq!(offset_p, "$5");
+    }
+
+    // H2: Like SQL generation
+    #[test]
+    fn like_sqlite_generates_like_clause() {
+        let mut b = WhereBuilder::new(Dialect::Sqlite);
+        b.push_like("sample", "Cu%");
+        let (sql, binds) = b.finish();
+        assert!(
+            sql.contains("json_extract(metadata, '$.sample') LIKE ?"),
+            "SQLite Like must use json_extract + LIKE ?, got: {sql}"
+        );
+        assert_eq!(binds.len(), 1);
+        assert!(matches!(&binds[0], Bind::Text(s) if s == "Cu%"));
+    }
+
+    #[test]
+    fn like_postgres_generates_like_clause() {
+        let mut b = WhereBuilder::new(Dialect::Postgres);
+        b.push_like("sample", "Cu%");
+        let (sql, binds) = b.finish();
+        assert!(
+            sql.contains("(metadata ->> 'sample') LIKE $1"),
+            "Postgres Like must use ->> + LIKE $1, got: {sql}"
+        );
+        assert_eq!(binds.len(), 1);
+        assert!(matches!(&binds[0], Bind::Text(s) if s == "Cu%"));
+    }
+
+    // H2: Specs SQL generation
+    #[test]
+    fn specs_sqlite_include_generates_like_pattern() {
+        let mut b = WhereBuilder::new(Dialect::Sqlite);
+        b.push_specs(&["XAS".to_string()], &[]);
+        let (sql, binds) = b.finish();
+        assert!(
+            sql.contains("specs LIKE ? ESCAPE '\\'"),
+            "SQLite Specs include must use LIKE with ESCAPE, got: {sql}"
+        );
+        assert_eq!(binds.len(), 1);
+        assert!(
+            matches!(&binds[0], Bind::Text(s) if s.contains(r#""name":"XAS""#)),
+            "Bound pattern must contain the spec name, got: {:?}",
+            binds[0]
+        );
+    }
+
+    #[test]
+    fn specs_sqlite_exclude_generates_not_like() {
+        let mut b = WhereBuilder::new(Dialect::Sqlite);
+        b.push_specs(&[], &["BadSpec".to_string()]);
+        let (sql, binds) = b.finish();
+        assert!(
+            sql.contains("NOT (specs LIKE ? ESCAPE '\\')"),
+            "SQLite Specs exclude must use NOT (LIKE), got: {sql}"
+        );
+        assert_eq!(binds.len(), 1);
+        assert!(matches!(&binds[0], Bind::Text(s) if s.contains(r#""name":"BadSpec""#)));
+    }
+
+    #[test]
+    fn specs_postgres_include_generates_containment() {
+        let mut b = WhereBuilder::new(Dialect::Postgres);
+        b.push_specs(&["XAS".to_string(), "NXdata".to_string()], &[]);
+        let (sql, binds) = b.finish();
+        assert!(
+            sql.contains("specs @> $1::jsonb"),
+            "Postgres Specs include must use @> containment, got: {sql}"
+        );
+        assert_eq!(binds.len(), 1);
+        let pattern = match &binds[0] {
+            Bind::Text(s) => s.clone(),
+            _ => panic!("expected Text bind"),
+        };
+        assert!(
+            pattern.contains(r#""name":"XAS""#) && pattern.contains(r#""name":"NXdata""#),
+            "Bound JSON must list all include specs, got: {pattern}"
+        );
+    }
+
+    #[test]
+    fn specs_postgres_exclude_generates_not_containment() {
+        let mut b = WhereBuilder::new(Dialect::Postgres);
+        b.push_specs(&[], &["BadSpec".to_string()]);
+        let (sql, binds) = b.finish();
+        assert!(
+            sql.contains("NOT (specs @> $1::jsonb)"),
+            "Postgres Specs exclude must use NOT (@>), got: {sql}"
+        );
+        assert_eq!(binds.len(), 1);
+        assert!(matches!(&binds[0], Bind::Text(s) if s.contains(r#""name":"BadSpec""#)));
     }
 }

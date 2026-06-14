@@ -1,9 +1,10 @@
 //! SQLite round-trip — open in-memory, migrate, write, read.
 
 use serde_json::json;
+use tiled_core::queries::{Like, Query, SpecsQuery};
 
-use tiled_catalog::{Catalog, RegisterRequest};
 use tiled_catalog::data_source::{AssetSpec, DataSourceSpec};
+use tiled_catalog::{Catalog, RegisterRequest};
 
 #[tokio::test]
 async fn migrate_create_lookup_delete() {
@@ -112,7 +113,12 @@ async fn migrate_create_lookup_delete() {
 
     // Delete cascades.
     cat.delete_node(container.id).await.unwrap();
-    assert!(cat.lookup(&["experiment_a".into()]).await.unwrap().is_none());
+    assert!(
+        cat.lookup(&["experiment_a".into()])
+            .await
+            .unwrap()
+            .is_none()
+    );
     let assets_after = cat.list_assets(ds.id).await.unwrap();
     assert_eq!(assets_after.len(), 0);
 }
@@ -157,4 +163,149 @@ async fn duplicate_key_at_same_level_rejected() {
     cat.create_node(None, vec![], req()).await.unwrap();
     let err = cat.create_node(None, vec![], req()).await.unwrap_err();
     assert!(matches!(err, tiled_catalog::CatalogError::Conflict(_)));
+}
+
+/// H2: Like returns only the matching subset, not the whole container.
+#[tokio::test]
+async fn search_like_filters_correct_subset() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("sqlite://{}", dir.path().join("catalog.db").display());
+    let cat = Catalog::connect(&uri).await.unwrap();
+    cat.migrate().await.unwrap();
+
+    for (key, material) in [("cu_run", "Cu"), ("ni_run", "Ni"), ("fe_run", "Fe")] {
+        cat.create_node(
+            None,
+            vec![],
+            RegisterRequest {
+                key: key.into(),
+                structure_family: "container".into(),
+                metadata: json!({"material": material}),
+                specs: json!([]),
+                access_blob: json!({}),
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    // LIKE "Cu" — exact match (no wildcards in pattern)
+    let (nodes, total) = cat
+        .search_children(
+            None,
+            &[Query::Like(Like {
+                key: "material".into(),
+                pattern: "Cu".into(),
+            })],
+            0,
+            100,
+        )
+        .await
+        .unwrap();
+    assert_eq!(total, 1, "Like 'Cu' should match exactly 1 node");
+    assert_eq!(nodes[0].key, "cu_run");
+
+    // LIKE "N%" — prefix wildcard
+    let (nodes2, total2) = cat
+        .search_children(
+            None,
+            &[Query::Like(Like {
+                key: "material".into(),
+                pattern: "N%".into(),
+            })],
+            0,
+            100,
+        )
+        .await
+        .unwrap();
+    assert_eq!(total2, 1, "Like 'N%' should match exactly 1 node");
+    assert_eq!(nodes2[0].key, "ni_run");
+}
+
+/// H2: Specs(include) returns only nodes whose specs column contains every
+/// listed spec name. Specs(exclude) excludes them.
+#[tokio::test]
+async fn search_specs_include_and_exclude() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("sqlite://{}", dir.path().join("catalog.db").display());
+    let cat = Catalog::connect(&uri).await.unwrap();
+    cat.migrate().await.unwrap();
+
+    // "xas_run" has BlueskyRun + XAS; "nd_run" has BlueskyRun + NXdata; "bare" has none.
+    for (key, specs) in [
+        (
+            "xas_run",
+            json!([{"name": "BlueskyRun", "version": "1"}, {"name": "XAS", "version": "1"}]),
+        ),
+        (
+            "nd_run",
+            json!([{"name": "BlueskyRun", "version": "1"}, {"name": "NXdata", "version": "1"}]),
+        ),
+        ("bare", json!([])),
+    ] {
+        cat.create_node(
+            None,
+            vec![],
+            RegisterRequest {
+                key: key.into(),
+                structure_family: "container".into(),
+                metadata: json!({}),
+                specs,
+                access_blob: json!({}),
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    // include=["XAS"] → only xas_run
+    let (nodes, total) = cat
+        .search_children(
+            None,
+            &[Query::Specs(SpecsQuery {
+                include: vec!["XAS".into()],
+                exclude: vec![],
+            })],
+            0,
+            100,
+        )
+        .await
+        .unwrap();
+    assert_eq!(total, 1, "include=[XAS] should match 1 node");
+    assert_eq!(nodes[0].key, "xas_run");
+
+    // include=["BlueskyRun"] → both xas_run and nd_run
+    let (_nodes2, total2) = cat
+        .search_children(
+            None,
+            &[Query::Specs(SpecsQuery {
+                include: vec!["BlueskyRun".into()],
+                exclude: vec![],
+            })],
+            0,
+            100,
+        )
+        .await
+        .unwrap();
+    assert_eq!(total2, 2, "include=[BlueskyRun] should match 2 nodes");
+
+    // exclude=["XAS"] → nd_run and bare (everything without XAS)
+    let (nodes3, total3) = cat
+        .search_children(
+            None,
+            &[Query::Specs(SpecsQuery {
+                include: vec![],
+                exclude: vec!["XAS".into()],
+            })],
+            0,
+            100,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        total3, 2,
+        "exclude=[XAS] should match 2 nodes (nd_run + bare)"
+    );
+    let keys: Vec<&str> = nodes3.iter().map(|n| n.key.as_str()).collect();
+    assert!(!keys.contains(&"xas_run"), "xas_run must be excluded");
 }
