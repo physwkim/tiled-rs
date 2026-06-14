@@ -74,7 +74,7 @@ impl Issuer {
             encoding: EncodingKey::from_secret(secret),
             decoding: DecodingKey::from_secret(secret),
             access_ttl: Duration::minutes(15),
-            refresh_ttl: Duration::days(30),
+            refresh_ttl: Duration::days(7),
         })
     }
 
@@ -154,9 +154,7 @@ mod tests {
     #[test]
     fn refresh_token_typ_enforced() {
         let issuer = Issuer::new(b"this-is-a-test-secret-32-bytes-long!!").unwrap();
-        let access = issuer
-            .issue_access("p", "s", ScopeSet::default())
-            .unwrap();
+        let access = issuer.issue_access("p", "s", ScopeSet::default()).unwrap();
         // Presenting an access token as a refresh fails on `typ`.
         assert!(matches!(
             issuer.verify_refresh(&access).unwrap_err(),
