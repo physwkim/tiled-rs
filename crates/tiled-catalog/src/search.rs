@@ -8,6 +8,7 @@
 //! The SQL syntax differs between SQLite and Postgres for JSON access:
 //! - SQLite uses `json_extract(metadata, '$.key')`.
 //! - Postgres uses `metadata ->> 'key'` (text) / `metadata -> 'key'` (json).
+//!
 //! Each `to_sql_*` method picks the right shape.
 
 use serde_json::Value;
@@ -120,8 +121,7 @@ impl WhereBuilder {
         let rendered = render_value_as_text(value);
         // Treat NULL as "not equal" too — without `IS DISTINCT FROM`/COALESCE,
         // a JSON key that's missing would otherwise drop out of the result.
-        self.pieces
-            .push(format!("({lhs} IS NULL OR {lhs} != {p})"));
+        self.pieces.push(format!("({lhs} IS NULL OR {lhs} != {p})"));
         self.bindings.push(Bind::Text(rendered));
     }
 
@@ -214,8 +214,10 @@ impl WhereBuilder {
             placeholders.push(p);
             self.bindings.push(Bind::Text(render_value_as_text(v)));
         }
-        self.pieces
-            .push(format!("({lhs} IS NULL OR {lhs} NOT IN ({}))", placeholders.join(", ")));
+        self.pieces.push(format!(
+            "({lhs} IS NULL OR {lhs} NOT IN ({}))",
+            placeholders.join(", ")
+        ));
     }
 
     /// `Contains(key, value)` — substring match on the text rendering
@@ -231,9 +233,11 @@ impl WhereBuilder {
             other => render_value_as_text(other),
         };
         // Escape SQL LIKE metacharacters in the user-supplied needle.
-        let escaped = needle.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
-        self.pieces
-            .push(format!("{lhs} LIKE {p} ESCAPE '\\'"));
+        let escaped = needle
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        self.pieces.push(format!("{lhs} LIKE {p} ESCAPE '\\'"));
         self.bindings.push(Bind::Text(format!("%{escaped}%")));
     }
 
@@ -253,12 +257,96 @@ impl WhereBuilder {
                 .push(format!("CAST({lhs} AS REAL) {op_sql} {p}"));
             self.bindings.push(Bind::Real(n));
         } else if let Some(i) = value.as_i64() {
-            self.pieces.push(format!("CAST({lhs} AS INTEGER) {op_sql} {p}"));
+            self.pieces
+                .push(format!("CAST({lhs} AS INTEGER) {op_sql} {p}"));
             self.bindings.push(Bind::Int(i));
         } else {
             let rendered = render_value_as_text(value);
             self.pieces.push(format!("{lhs} {op_sql} {p}"));
             self.bindings.push(Bind::Text(rendered));
+        }
+    }
+
+    /// `Like(key, pattern)` — SQL LIKE on the text value of `metadata.key`.
+    /// The caller supplies the pattern verbatim (with `%` / `_` wildcards);
+    /// no escaping is applied — mirrors Python `attr.like(query.pattern)`.
+    fn push_like(&mut self, key: &str, pattern: &str) {
+        let lhs = self.dialect.json_text("metadata", key);
+        let p = self.dialect.placeholder(self.bindings.len());
+        self.pieces.push(format!("{lhs} LIKE {p}"));
+        self.bindings.push(Bind::Text(pattern.to_string()));
+    }
+
+    /// `Regex(key, pattern, case_sensitive)` — regex match on `metadata.key`.
+    ///
+    /// Postgres: `~` (case-sensitive) or `~*` (case-insensitive).
+    /// SQLite: no native regex operator; the condition is a no-op (passes all
+    /// rows through). A future port could register a custom function via sqlx.
+    fn push_regex(&mut self, key: &str, pattern: &str, case_sensitive: bool) {
+        match self.dialect {
+            Dialect::Postgres => {
+                let lhs = self.dialect.json_text("metadata", key);
+                let op = if case_sensitive { "~" } else { "~*" };
+                let p = self.dialect.placeholder(self.bindings.len());
+                self.pieces.push(format!("{lhs} {op} {p}"));
+                self.bindings.push(Bind::Text(pattern.to_string()));
+            }
+            Dialect::Sqlite => {
+                // SQLite has no native regex operator; leave as no-op.
+            }
+        }
+    }
+
+    /// `Specs(include, exclude)` — filter by the `specs` JSONB/text column.
+    ///
+    /// Mirrors Python `catalog/adapter.py::specs()`:
+    /// - SQLite: one `LIKE '%{"name":"<n>",%'` per name (Python's approach;
+    ///   note this misses specs serialised without extra fields after "name").
+    /// - Postgres: `specs @> '[{"name":"<n>"}]'::jsonb` containment.
+    fn push_specs(&mut self, include: &[String], exclude: &[String]) {
+        match self.dialect {
+            Dialect::Sqlite => {
+                for name in include {
+                    let escaped = escape_like_meta(name);
+                    let p = self.dialect.placeholder(self.bindings.len());
+                    self.pieces.push(format!("specs LIKE {p} ESCAPE '\\'"));
+                    // Pattern: %{"name":"<escaped>",% — mirrors Python
+                    self.bindings
+                        .push(Bind::Text(format!("%{{\"name\":\"{escaped}\",%")));
+                }
+                for name in exclude {
+                    let escaped = escape_like_meta(name);
+                    let p = self.dialect.placeholder(self.bindings.len());
+                    self.pieces
+                        .push(format!("NOT (specs LIKE {p} ESCAPE '\\')"));
+                    self.bindings
+                        .push(Bind::Text(format!("%{{\"name\":\"{escaped}\",%")));
+                }
+            }
+            Dialect::Postgres => {
+                if !include.is_empty() {
+                    let arr: Vec<serde_json::Value> = include
+                        .iter()
+                        .map(|n| serde_json::json!({"name": n}))
+                        .collect();
+                    let p = self.dialect.placeholder(self.bindings.len());
+                    self.pieces.push(format!("specs @> {p}::jsonb"));
+                    self.bindings.push(Bind::Text(
+                        serde_json::to_string(&arr).expect("json serialization"),
+                    ));
+                }
+                if !exclude.is_empty() {
+                    let arr: Vec<serde_json::Value> = exclude
+                        .iter()
+                        .map(|n| serde_json::json!({"name": n}))
+                        .collect();
+                    let p = self.dialect.placeholder(self.bindings.len());
+                    self.pieces.push(format!("NOT (specs @> {p}::jsonb)"));
+                    self.bindings.push(Bind::Text(
+                        serde_json::to_string(&arr).expect("json serialization"),
+                    ));
+                }
+            }
         }
     }
 
@@ -269,6 +357,14 @@ impl WhereBuilder {
             (self.pieces.join(" AND "), self.bindings)
         }
     }
+}
+
+/// Escape LIKE metacharacters (`\`, `%`, `_`) in a string that will be
+/// embedded inside a LIKE pattern bound with `ESCAPE '\'`.
+fn escape_like_meta(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
 }
 
 fn render_value_as_text(v: &Value) -> String {
@@ -319,10 +415,11 @@ impl Catalog {
                 Query::In(in_q) => builder.push_in(&in_q.key, &in_q.value),
                 Query::NotIn(nin) => builder.push_not_in(&nin.key, &nin.value),
                 Query::Contains(c) => builder.push_contains(&c.key, &c.value),
-                Query::Like(_)
-                | Query::Regex(_)
-                | Query::Specs(_)
-                | Query::AccessBlobFilter(_) => {}
+                Query::Like(l) => builder.push_like(&l.key, &l.pattern),
+                Query::Regex(r) => builder.push_regex(&r.key, &r.pattern, r.case_sensitive),
+                Query::Specs(s) => builder.push_specs(&s.include, &s.exclude),
+                // AccessBlobFilter depends on the access-engine layer; deferred.
+                Query::AccessBlobFilter(_) => {}
             }
         }
         let (where_clause, bindings) = builder.finish();
@@ -347,9 +444,8 @@ impl Catalog {
 
         match self.pool() {
             DbPool::Sqlite(pool) => {
-                let count_sql = format!(
-                    "SELECT COUNT(*) FROM nodes WHERE {parent_clause} AND {where_clause}"
-                );
+                let count_sql =
+                    format!("SELECT COUNT(*) FROM nodes WHERE {parent_clause} AND {where_clause}");
                 let mut count_q = sqlx::query_scalar::<_, i64>(&count_sql);
                 if parent_id.is_some() {
                     count_q = count_q.bind(parent_id);
@@ -379,16 +475,23 @@ impl Catalog {
                 Ok((nodes?, total))
             }
             DbPool::Postgres(pool) => {
-                let limit_p = format!("${}", bindings.len() + if parent_id.is_some() { 2 } else { 1 });
-                let offset_p = format!("${}", bindings.len() + if parent_id.is_some() { 3 } else { 2 });
-                let count_sql = format!(
-                    "SELECT COUNT(*) FROM nodes WHERE {parent_clause} AND {where_clause}"
+                let limit_p = format!(
+                    "${}",
+                    bindings.len() + if parent_id.is_some() { 2 } else { 1 }
                 );
+                let offset_p = format!(
+                    "${}",
+                    bindings.len() + if parent_id.is_some() { 3 } else { 2 }
+                );
+                let count_sql =
+                    format!("SELECT COUNT(*) FROM nodes WHERE {parent_clause} AND {where_clause}");
+                // Bind WHERE params first ($1..$N), then parent_id ($N+1), matching
+                // the placeholder numbering emitted by parent_clause above.
                 let mut count_q = sqlx::query_scalar::<_, i64>(&count_sql);
+                count_q = bind_all_postgres(count_q, &bindings);
                 if parent_id.is_some() {
                     count_q = count_q.bind(parent_id);
                 }
-                count_q = bind_all_postgres(count_q, &bindings);
                 let total: i64 = count_q.fetch_one(pool).await?;
 
                 let select_sql = format!(
@@ -398,15 +501,15 @@ impl Catalog {
                        ORDER BY id LIMIT {limit_p} OFFSET {offset_p}"
                 );
                 let mut q = sqlx::query(&select_sql);
-                if parent_id.is_some() {
-                    q = q.bind(parent_id);
-                }
                 for b in &bindings {
                     q = match b {
                         Bind::Text(s) => q.bind(s.clone()),
                         Bind::Int(i) => q.bind(*i),
                         Bind::Real(f) => q.bind(*f),
                     };
+                }
+                if parent_id.is_some() {
+                    q = q.bind(parent_id);
                 }
                 let rows = q.bind(limit).bind(offset).fetch_all(pool).await?;
                 let nodes: Result<Vec<Node>> = rows.iter().map(node_from_postgres_row).collect();
@@ -453,9 +556,7 @@ fn node_from_sqlite_row(row: &sqlx::sqlite::SqliteRow) -> Result<Node> {
                 chrono::NaiveDateTime::parse_from_str(&s, "%Y-%m-%dT%H:%M:%S%.fZ")
                     .map(|n| n.and_utc())
             })
-            .map_err(|e| {
-                crate::error::CatalogError::Validation(format!("bad timestamp {s}: {e}"))
-            })
+            .map_err(|e| crate::error::CatalogError::Validation(format!("bad timestamp {s}: {e}")))
     };
     Ok(Node {
         id: row.get("id"),
@@ -512,7 +613,10 @@ mod tests {
 
     #[test]
     fn in_empty_list_yields_false() {
-        let q = Query::In(tiled_core::queries::In { key: "color".into(), value: vec![] });
+        let q = Query::In(tiled_core::queries::In {
+            key: "color".into(),
+            value: vec![],
+        });
         let (sql, n) = build(Dialect::Sqlite, &[q]);
         assert!(sql.contains("FALSE"));
         assert_eq!(n, 0);
@@ -520,7 +624,10 @@ mod tests {
 
     #[test]
     fn notin_empty_list_yields_true() {
-        let q = Query::NotIn(tiled_core::queries::NotIn { key: "color".into(), value: vec![] });
+        let q = Query::NotIn(tiled_core::queries::NotIn {
+            key: "color".into(),
+            value: vec![],
+        });
         let (sql, n) = build(Dialect::Sqlite, &[q]);
         assert!(sql.contains("TRUE"));
         assert_eq!(n, 0);
@@ -557,5 +664,118 @@ mod tests {
         let (sql, _) = build(Dialect::Sqlite, &[q]);
         // Generated SQL contains a single-backslash ESCAPE clause.
         assert!(sql.contains("LIKE ? ESCAPE '\\'"));
+    }
+
+    // H1: Verify that Postgres placeholder numbering is consistent with the
+    // bind order fix (WHERE bindings $1..$N, parent_id $N+1, limit $N+2,
+    // offset $N+3).
+    #[test]
+    fn postgres_parent_placeholder_after_where_bindings() {
+        let mut b = WhereBuilder::new(Dialect::Postgres);
+        b.push_eq("color", &json!("red")); // emits $1
+        b.push_eq("material", &json!("Cu")); // emits $2
+        let (where_sql, where_binds) = b.finish();
+        // WHERE clause must reference $1 and $2 (0-indexed: positions 0 and 1)
+        assert!(where_sql.contains("$1"), "first WHERE bind must be $1");
+        assert!(where_sql.contains("$2"), "second WHERE bind must be $2");
+        // parent_id placeholder = N+1 = 3
+        let parent_placeholder = format!("${}", where_binds.len() + 1);
+        assert_eq!(parent_placeholder, "$3");
+        // limit placeholder = N+2 = 4, offset = N+3 = 5
+        let limit_p = format!("${}", where_binds.len() + 2);
+        let offset_p = format!("${}", where_binds.len() + 3);
+        assert_eq!(limit_p, "$4");
+        assert_eq!(offset_p, "$5");
+    }
+
+    // H2: Like SQL generation
+    #[test]
+    fn like_sqlite_generates_like_clause() {
+        let mut b = WhereBuilder::new(Dialect::Sqlite);
+        b.push_like("sample", "Cu%");
+        let (sql, binds) = b.finish();
+        assert!(
+            sql.contains("json_extract(metadata, '$.sample') LIKE ?"),
+            "SQLite Like must use json_extract + LIKE ?, got: {sql}"
+        );
+        assert_eq!(binds.len(), 1);
+        assert!(matches!(&binds[0], Bind::Text(s) if s == "Cu%"));
+    }
+
+    #[test]
+    fn like_postgres_generates_like_clause() {
+        let mut b = WhereBuilder::new(Dialect::Postgres);
+        b.push_like("sample", "Cu%");
+        let (sql, binds) = b.finish();
+        assert!(
+            sql.contains("(metadata ->> 'sample') LIKE $1"),
+            "Postgres Like must use ->> + LIKE $1, got: {sql}"
+        );
+        assert_eq!(binds.len(), 1);
+        assert!(matches!(&binds[0], Bind::Text(s) if s == "Cu%"));
+    }
+
+    // H2: Specs SQL generation
+    #[test]
+    fn specs_sqlite_include_generates_like_pattern() {
+        let mut b = WhereBuilder::new(Dialect::Sqlite);
+        b.push_specs(&["XAS".to_string()], &[]);
+        let (sql, binds) = b.finish();
+        assert!(
+            sql.contains("specs LIKE ? ESCAPE '\\'"),
+            "SQLite Specs include must use LIKE with ESCAPE, got: {sql}"
+        );
+        assert_eq!(binds.len(), 1);
+        assert!(
+            matches!(&binds[0], Bind::Text(s) if s.contains(r#""name":"XAS""#)),
+            "Bound pattern must contain the spec name, got: {:?}",
+            binds[0]
+        );
+    }
+
+    #[test]
+    fn specs_sqlite_exclude_generates_not_like() {
+        let mut b = WhereBuilder::new(Dialect::Sqlite);
+        b.push_specs(&[], &["BadSpec".to_string()]);
+        let (sql, binds) = b.finish();
+        assert!(
+            sql.contains("NOT (specs LIKE ? ESCAPE '\\')"),
+            "SQLite Specs exclude must use NOT (LIKE), got: {sql}"
+        );
+        assert_eq!(binds.len(), 1);
+        assert!(matches!(&binds[0], Bind::Text(s) if s.contains(r#""name":"BadSpec""#)));
+    }
+
+    #[test]
+    fn specs_postgres_include_generates_containment() {
+        let mut b = WhereBuilder::new(Dialect::Postgres);
+        b.push_specs(&["XAS".to_string(), "NXdata".to_string()], &[]);
+        let (sql, binds) = b.finish();
+        assert!(
+            sql.contains("specs @> $1::jsonb"),
+            "Postgres Specs include must use @> containment, got: {sql}"
+        );
+        assert_eq!(binds.len(), 1);
+        let pattern = match &binds[0] {
+            Bind::Text(s) => s.clone(),
+            _ => panic!("expected Text bind"),
+        };
+        assert!(
+            pattern.contains(r#""name":"XAS""#) && pattern.contains(r#""name":"NXdata""#),
+            "Bound JSON must list all include specs, got: {pattern}"
+        );
+    }
+
+    #[test]
+    fn specs_postgres_exclude_generates_not_containment() {
+        let mut b = WhereBuilder::new(Dialect::Postgres);
+        b.push_specs(&[], &["BadSpec".to_string()]);
+        let (sql, binds) = b.finish();
+        assert!(
+            sql.contains("NOT (specs @> $1::jsonb)"),
+            "Postgres Specs exclude must use NOT (@>), got: {sql}"
+        );
+        assert_eq!(binds.len(), 1);
+        assert!(matches!(&binds[0], Bind::Text(s) if s.contains(r#""name":"BadSpec""#)));
     }
 }
