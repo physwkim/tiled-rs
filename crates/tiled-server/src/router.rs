@@ -457,6 +457,7 @@ pub async fn search(
 
 async fn build_array_response(
     data: tiled_core::dtype::DynNDArray,
+    format_param: Option<&str>,
     headers: &HeaderMap,
     state: &AppState,
 ) -> Result<axum::response::Response, ServerError> {
@@ -465,7 +466,8 @@ async fn build_array_response(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/octet-stream");
 
-    let media_type = tiled_serialization::resolve_media_type(
+    let media_type = tiled_serialization::negotiate_media_type(
+        format_param,
         accept,
         tiled_core::structures::StructureFamily::Array,
         &state.serialization_registry,
@@ -523,6 +525,7 @@ pub async fn array_block(
         .get("slice")
         .map(|s| s.to_string())
         .unwrap_or_default();
+    let format_str = params.get("format").map(|s| s.to_string());
     let handle = tokio::runtime::Handle::current();
     let state_c = state.clone();
     let segs = segments.clone();
@@ -580,7 +583,7 @@ pub async fn array_block(
     .await
     .map_err(|e| ServerError::Internal(format!("blocking task failed: {e}")))??;
 
-    build_array_response(data, &headers, &state).await
+    build_array_response(data, format_str.as_deref(), &headers, &state).await
 }
 
 /// Build a Response that honors `Range: bytes=...` when present
@@ -859,9 +862,16 @@ pub async fn container_full_post(
     let uri: axum::http::Uri = format!("/api/v1/container/full/{path}")
         .parse()
         .map_err(|e| ServerError::Internal(format!("rebuild URI: {e}")))?;
-    container_full(state, OriginalUri(uri), BaseUrl(base_url), headers, auth)
-        .await
-        .map(IntoResponse::into_response)
+    container_full(
+        state,
+        OriginalUri(uri),
+        BaseUrl(base_url),
+        Query(req.to_query_params()),
+        headers,
+        auth,
+    )
+    .await
+    .map(IntoResponse::into_response)
 }
 
 // ---------------------------------------------------------------------------
@@ -878,6 +888,7 @@ pub async fn container_full_post(
 pub async fn container_full_root(
     state: State<AppState>,
     base_url: BaseUrl,
+    Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
     auth: crate::AuthContext,
 ) -> Result<axum::response::Response, ServerError> {
@@ -885,6 +896,7 @@ pub async fn container_full_root(
         state,
         OriginalUri("/api/v1/container/full/".parse().expect("static URI")),
         base_url,
+        Query(params),
         headers,
         auth,
     )
@@ -896,6 +908,7 @@ pub async fn container_full(
     State(state): State<AppState>,
     OriginalUri(uri): OriginalUri,
     BaseUrl(base_url): BaseUrl,
+    Query(params): Query<HashMap<String, String>>,
     headers: HeaderMap,
     auth: crate::AuthContext,
 ) -> Result<impl IntoResponse, ServerError> {
@@ -910,6 +923,15 @@ pub async fn container_full(
         .get("accept")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/json");
+    let format_str = params.get("format").map(|s| s.to_string());
+    // Resolve effective media type once: format param beats Accept header.
+    let media_type = tiled_serialization::negotiate_media_type(
+        format_str.as_deref(),
+        accept,
+        tiled_core::structures::StructureFamily::Container,
+        &state.serialization_registry,
+    )
+    .unwrap_or_else(|| "text/html".to_string());
     let path = segments.join("/");
 
     // H3: compute access filter once (async) so it can be pushed into the
@@ -933,7 +955,7 @@ pub async fn container_full(
 
     // Deep-export branch (upstream tiled #660): build the zip entirely
     // inside one spawn_blocking using Handle::block_on for async reads.
-    if accept.contains("application/zip") {
+    if media_type == "application/zip" {
         let handle = tokio::runtime::Handle::current();
         let bytes = tokio::task::spawn_blocking(move || -> Result<bytes::Bytes, ServerError> {
             let container: &dyn ContainerAdapter = if segs.is_empty() {
@@ -1018,13 +1040,6 @@ pub async fn container_full(
     })
     .await
     .map_err(|e| ServerError::Internal(format!("blocking task failed: {e}")))??;
-
-    let media_type = tiled_serialization::resolve_media_type(
-        accept,
-        tiled_core::structures::StructureFamily::Container,
-        &state.serialization_registry,
-    )
-    .unwrap_or_else(|| "text/html".to_string());
 
     let body = if let Some(serializer) = state.serialization_registry.dispatch(
         tiled_core::structures::StructureFamily::Container,
@@ -1357,6 +1372,7 @@ pub async fn array_full(
         .get("slice")
         .map(|s| s.to_string())
         .unwrap_or_default();
+    let format_str = params.get("format").map(|s| s.to_string());
     let handle = tokio::runtime::Handle::current();
     let state_c = state.clone();
     let segs = segments.clone();
@@ -1379,7 +1395,7 @@ pub async fn array_full(
     .await
     .map_err(|e| ServerError::Internal(format!("blocking task failed: {e}")))??;
 
-    build_array_response(data, &headers, &state).await
+    build_array_response(data, format_str.as_deref(), &headers, &state).await
 }
 
 // ---------------------------------------------------------------------------

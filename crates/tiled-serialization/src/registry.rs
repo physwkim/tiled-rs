@@ -123,6 +123,38 @@ impl Default for SerializationRegistry {
     }
 }
 
+/// Resolve the appropriate media type, honoring an explicit `?format=` query
+/// param before falling back to the Accept header.
+///
+/// Tries `format_param` as a registered alias (with and without a leading
+/// dot so bare extensions like `"png"` and dotted forms like `".png"` both
+/// work), then as a verbatim media-type string (e.g. `"image/png"`). Falls
+/// back to [`resolve_media_type`] when no match is found.
+pub fn negotiate_media_type(
+    format_param: Option<&str>,
+    accept: &str,
+    family: StructureFamily,
+    registry: &SerializationRegistry,
+) -> Option<String> {
+    if let Some(fmt) = format_param {
+        if let Some(mt) = registry.resolve_alias(fmt) {
+            return Some(mt);
+        }
+        if !fmt.starts_with('.')
+            && let Some(mt) = registry.resolve_alias(&format!(".{fmt}"))
+        {
+            return Some(mt);
+        }
+        if fmt.contains('/') {
+            let available = registry.media_types(family);
+            if available.iter().any(|m| m == fmt) {
+                return Some(fmt.to_string());
+            }
+        }
+    }
+    resolve_media_type(accept, family, registry)
+}
+
 /// Resolve the appropriate media type from an Accept header.
 pub fn resolve_media_type(
     accept: &str,

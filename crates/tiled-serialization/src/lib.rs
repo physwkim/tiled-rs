@@ -13,7 +13,7 @@ pub mod image_array;
 #[cfg(feature = "parquet")]
 pub mod parquet_table;
 
-pub use registry::{SerializationRegistry, resolve_media_type};
+pub use registry::{SerializationRegistry, negotiate_media_type, resolve_media_type};
 
 /// Create a registry with all built-in serializers registered.
 pub fn default_registry() -> SerializationRegistry {

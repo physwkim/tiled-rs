@@ -16,6 +16,10 @@ pub const TEXT_HTML: &str = "text/html";
 pub fn register_html_serializer(reg: &SerializationRegistry) {
     reg.register(StructureFamily::Container, TEXT_HTML, html_serializer());
     reg.register_alias(".html", TEXT_HTML);
+    // application/zip for containers is handled inline in the router (no
+    // registered serializer), but registering the alias lets negotiate_media_type
+    // resolve ?format=zip and ?format=.zip to the right media type.
+    reg.register_alias(".zip", "application/zip");
 }
 
 fn html_serializer() -> SerializerFn {
