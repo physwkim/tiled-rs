@@ -301,9 +301,10 @@ impl Query {
             }
             Self::KeyPresent(q) => {
                 params.push((format!("{prefix}[key]"), q.key.clone()));
-                if !q.exists {
-                    params.push((format!("{prefix}[exists]"), "false".into()));
-                }
+                params.push((
+                    format!("{prefix}[exists]"),
+                    serde_json::to_string(&q.exists).unwrap_or_default(),
+                ));
             }
             Self::Like(q) => {
                 params.push((format!("{prefix}[key]"), q.key.clone()));
@@ -453,7 +454,13 @@ fn decode_single_query(name: &str, fields: &HashMap<String, String>) -> Option<Q
         }
         "keypresent" => {
             let key = fields.get("key")?.clone();
-            let exists = fields.get("exists").map(|v| v != "false").unwrap_or(true);
+            let exists = fields
+                .get("exists")
+                .map(|v| {
+                    // Accept JSON "true"/"false" (Rust encode) and Python "True"/"False".
+                    serde_json::from_str::<bool>(v).unwrap_or_else(|_| v.to_lowercase() != "false")
+                })
+                .unwrap_or(true);
             Some(Query::KeyPresent(KeyPresent { key, exists }))
         }
         "like" => {
@@ -700,6 +707,52 @@ mod tests {
             .collect();
         ops.sort_by_key(|o| o.to_string());
         assert_eq!(ops, vec![Operator::Gt, Operator::Lt]);
+    }
+
+    /// H2: KeyPresent with exists=true must always emit the exists field.
+    /// Python KeyPresent.encode() always returns {"key":…, "exists": self.exists}
+    /// (queries.py:402). Python decode() requires exists as a keyword arg (:406).
+    /// Previously Rust omitted exists when true, so the Python server would crash
+    /// with a TypeError when decoding a `KeyPresent(exists=true)` query.
+    #[test]
+    fn test_encode_decode_keypresent_exists_true() {
+        let q = Query::KeyPresent(KeyPresent {
+            key: "x".into(),
+            exists: true,
+        });
+        let pairs = q.encode();
+        assert!(
+            pairs.iter().any(|(k, _)| k.contains("[exists]")),
+            "exists field must be emitted even when true"
+        );
+        let decoded = decode_query_filters(&pairs);
+        assert_eq!(decoded.len(), 1);
+        match &decoded[0] {
+            Query::KeyPresent(kp) => {
+                assert_eq!(kp.key, "x");
+                assert!(kp.exists);
+            }
+            _ => panic!("Expected KeyPresent"),
+        }
+    }
+
+    /// H2: KeyPresent with exists=false must also round-trip.
+    #[test]
+    fn test_encode_decode_keypresent_exists_false() {
+        let q = Query::KeyPresent(KeyPresent {
+            key: "sample.name".into(),
+            exists: false,
+        });
+        let pairs = q.encode();
+        let decoded = decode_query_filters(&pairs);
+        assert_eq!(decoded.len(), 1);
+        match &decoded[0] {
+            Query::KeyPresent(kp) => {
+                assert_eq!(kp.key, "sample.name");
+                assert!(!kp.exists);
+            }
+            _ => panic!("Expected KeyPresent"),
+        }
     }
 
     /// H1: Like.pattern must be JSON-encoded (json.dumps parity with queries.py:441-442).
