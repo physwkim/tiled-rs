@@ -120,8 +120,7 @@ impl WhereBuilder {
         let rendered = render_value_as_text(value);
         // Treat NULL as "not equal" too — without `IS DISTINCT FROM`/COALESCE,
         // a JSON key that's missing would otherwise drop out of the result.
-        self.pieces
-            .push(format!("({lhs} IS NULL OR {lhs} != {p})"));
+        self.pieces.push(format!("({lhs} IS NULL OR {lhs} != {p})"));
         self.bindings.push(Bind::Text(rendered));
     }
 
@@ -214,8 +213,10 @@ impl WhereBuilder {
             placeholders.push(p);
             self.bindings.push(Bind::Text(render_value_as_text(v)));
         }
-        self.pieces
-            .push(format!("({lhs} IS NULL OR {lhs} NOT IN ({}))", placeholders.join(", ")));
+        self.pieces.push(format!(
+            "({lhs} IS NULL OR {lhs} NOT IN ({}))",
+            placeholders.join(", ")
+        ));
     }
 
     /// `Contains(key, value)` — substring match on the text rendering
@@ -231,9 +232,11 @@ impl WhereBuilder {
             other => render_value_as_text(other),
         };
         // Escape SQL LIKE metacharacters in the user-supplied needle.
-        let escaped = needle.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
-        self.pieces
-            .push(format!("{lhs} LIKE {p} ESCAPE '\\'"));
+        let escaped = needle
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        self.pieces.push(format!("{lhs} LIKE {p} ESCAPE '\\'"));
         self.bindings.push(Bind::Text(format!("%{escaped}%")));
     }
 
@@ -253,7 +256,8 @@ impl WhereBuilder {
                 .push(format!("CAST({lhs} AS REAL) {op_sql} {p}"));
             self.bindings.push(Bind::Real(n));
         } else if let Some(i) = value.as_i64() {
-            self.pieces.push(format!("CAST({lhs} AS INTEGER) {op_sql} {p}"));
+            self.pieces
+                .push(format!("CAST({lhs} AS INTEGER) {op_sql} {p}"));
             self.bindings.push(Bind::Int(i));
         } else {
             let rendered = render_value_as_text(value);
@@ -319,10 +323,8 @@ impl Catalog {
                 Query::In(in_q) => builder.push_in(&in_q.key, &in_q.value),
                 Query::NotIn(nin) => builder.push_not_in(&nin.key, &nin.value),
                 Query::Contains(c) => builder.push_contains(&c.key, &c.value),
-                Query::Like(_)
-                | Query::Regex(_)
-                | Query::Specs(_)
-                | Query::AccessBlobFilter(_) => {}
+                Query::Like(_) | Query::Regex(_) | Query::Specs(_) | Query::AccessBlobFilter(_) => {
+                }
             }
         }
         let (where_clause, bindings) = builder.finish();
@@ -347,9 +349,8 @@ impl Catalog {
 
         match self.pool() {
             DbPool::Sqlite(pool) => {
-                let count_sql = format!(
-                    "SELECT COUNT(*) FROM nodes WHERE {parent_clause} AND {where_clause}"
-                );
+                let count_sql =
+                    format!("SELECT COUNT(*) FROM nodes WHERE {parent_clause} AND {where_clause}");
                 let mut count_q = sqlx::query_scalar::<_, i64>(&count_sql);
                 if parent_id.is_some() {
                     count_q = count_q.bind(parent_id);
@@ -379,16 +380,23 @@ impl Catalog {
                 Ok((nodes?, total))
             }
             DbPool::Postgres(pool) => {
-                let limit_p = format!("${}", bindings.len() + if parent_id.is_some() { 2 } else { 1 });
-                let offset_p = format!("${}", bindings.len() + if parent_id.is_some() { 3 } else { 2 });
-                let count_sql = format!(
-                    "SELECT COUNT(*) FROM nodes WHERE {parent_clause} AND {where_clause}"
+                let limit_p = format!(
+                    "${}",
+                    bindings.len() + if parent_id.is_some() { 2 } else { 1 }
                 );
+                let offset_p = format!(
+                    "${}",
+                    bindings.len() + if parent_id.is_some() { 3 } else { 2 }
+                );
+                let count_sql =
+                    format!("SELECT COUNT(*) FROM nodes WHERE {parent_clause} AND {where_clause}");
+                // Bind WHERE params first ($1..$N), then parent_id ($N+1), matching
+                // the placeholder numbering emitted by parent_clause above.
                 let mut count_q = sqlx::query_scalar::<_, i64>(&count_sql);
+                count_q = bind_all_postgres(count_q, &bindings);
                 if parent_id.is_some() {
                     count_q = count_q.bind(parent_id);
                 }
-                count_q = bind_all_postgres(count_q, &bindings);
                 let total: i64 = count_q.fetch_one(pool).await?;
 
                 let select_sql = format!(
@@ -398,15 +406,15 @@ impl Catalog {
                        ORDER BY id LIMIT {limit_p} OFFSET {offset_p}"
                 );
                 let mut q = sqlx::query(&select_sql);
-                if parent_id.is_some() {
-                    q = q.bind(parent_id);
-                }
                 for b in &bindings {
                     q = match b {
                         Bind::Text(s) => q.bind(s.clone()),
                         Bind::Int(i) => q.bind(*i),
                         Bind::Real(f) => q.bind(*f),
                     };
+                }
+                if parent_id.is_some() {
+                    q = q.bind(parent_id);
                 }
                 let rows = q.bind(limit).bind(offset).fetch_all(pool).await?;
                 let nodes: Result<Vec<Node>> = rows.iter().map(node_from_postgres_row).collect();
@@ -453,9 +461,7 @@ fn node_from_sqlite_row(row: &sqlx::sqlite::SqliteRow) -> Result<Node> {
                 chrono::NaiveDateTime::parse_from_str(&s, "%Y-%m-%dT%H:%M:%S%.fZ")
                     .map(|n| n.and_utc())
             })
-            .map_err(|e| {
-                crate::error::CatalogError::Validation(format!("bad timestamp {s}: {e}"))
-            })
+            .map_err(|e| crate::error::CatalogError::Validation(format!("bad timestamp {s}: {e}")))
     };
     Ok(Node {
         id: row.get("id"),
@@ -512,7 +518,10 @@ mod tests {
 
     #[test]
     fn in_empty_list_yields_false() {
-        let q = Query::In(tiled_core::queries::In { key: "color".into(), value: vec![] });
+        let q = Query::In(tiled_core::queries::In {
+            key: "color".into(),
+            value: vec![],
+        });
         let (sql, n) = build(Dialect::Sqlite, &[q]);
         assert!(sql.contains("FALSE"));
         assert_eq!(n, 0);
@@ -520,7 +529,10 @@ mod tests {
 
     #[test]
     fn notin_empty_list_yields_true() {
-        let q = Query::NotIn(tiled_core::queries::NotIn { key: "color".into(), value: vec![] });
+        let q = Query::NotIn(tiled_core::queries::NotIn {
+            key: "color".into(),
+            value: vec![],
+        });
         let (sql, n) = build(Dialect::Sqlite, &[q]);
         assert!(sql.contains("TRUE"));
         assert_eq!(n, 0);
@@ -557,5 +569,27 @@ mod tests {
         let (sql, _) = build(Dialect::Sqlite, &[q]);
         // Generated SQL contains a single-backslash ESCAPE clause.
         assert!(sql.contains("LIKE ? ESCAPE '\\'"));
+    }
+
+    // H1: Verify that Postgres placeholder numbering is consistent with the
+    // bind order fix (WHERE bindings $1..$N, parent_id $N+1, limit $N+2,
+    // offset $N+3).
+    #[test]
+    fn postgres_parent_placeholder_after_where_bindings() {
+        let mut b = WhereBuilder::new(Dialect::Postgres);
+        b.push_eq("color", &json!("red")); // emits $1
+        b.push_eq("material", &json!("Cu")); // emits $2
+        let (where_sql, where_binds) = b.finish();
+        // WHERE clause must reference $1 and $2 (0-indexed: positions 0 and 1)
+        assert!(where_sql.contains("$1"), "first WHERE bind must be $1");
+        assert!(where_sql.contains("$2"), "second WHERE bind must be $2");
+        // parent_id placeholder = N+1 = 3
+        let parent_placeholder = format!("${}", where_binds.len() + 1);
+        assert_eq!(parent_placeholder, "$3");
+        // limit placeholder = N+2 = 4, offset = N+3 = 5
+        let limit_p = format!("${}", where_binds.len() + 2);
+        let offset_p = format!("${}", where_binds.len() + 3);
+        assert_eq!(limit_p, "$4");
+        assert_eq!(offset_p, "$5");
     }
 }
