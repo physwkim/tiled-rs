@@ -1772,7 +1772,6 @@ pub async fn patch_metadata(
     auth: crate::AuthContext,
     Json(req): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, ServerError> {
-    auth.require(tiled_auth::Scope::WriteMetadata)?;
     // Optional `?drop_revision=true` (upstream tiled #972). When set,
     // the previous (metadata, specs, access_blob) is discarded instead
     // of pushed onto the revisions table — useful for high-frequency
@@ -1790,27 +1789,14 @@ pub async fn patch_metadata(
             "cannot PATCH the catalog root".into(),
         ));
     }
+    // Per-ancestor auth gate: narrows at every prefix and requires
+    // WriteMetadata on the narrowed set — same invariant as the read gate.
+    resolve_entry(&state, auth, &segments, tiled_auth::Scope::WriteMetadata).await?;
     let node = catalog
         .lookup(&segments)
         .await
         .map_err(map_catalog_err)?
         .ok_or_else(|| ServerError::NotFound(format!("'{}' not found", segments.join("/"))))?;
-    // Per-node AccessPolicy decision (tiled#287). When a policy is
-    // wired, this narrows the session's scopes by what the policy says
-    // about THIS node (e.g. tag-based). The require() check that
-    // follows uses the narrowed set, so policy denials surface as 403.
-    let auth = auth
-        .narrow_for_node(
-            state.access_policy.as_deref(),
-            tiled_access::NodeContext {
-                path: &segments,
-                structure_family: &node.structure_family,
-                metadata: &node.metadata,
-                access_blob: &node.access_blob,
-            },
-        )
-        .await;
-    auth.require(tiled_auth::Scope::WriteMetadata)?;
 
     // Content-Type-driven dispatch (upstream tiled #688):
     //
@@ -1927,8 +1913,6 @@ pub async fn put_data_source(
     auth: crate::AuthContext,
     Json(req): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, ServerError> {
-    auth.require(tiled_auth::Scope::WriteData)
-        .or_else(|_| auth.require(tiled_auth::Scope::WriteMetadata))?;
     let segments = segments_from_uri(&uri, "/api/v1/data_source/");
     let catalog = state.catalog.as_ref().ok_or_else(|| {
         ServerError::Validation("server has no catalog DB; PUT not supported".into())
@@ -1938,25 +1922,15 @@ pub async fn put_data_source(
             "PUT /data_source requires a node path".into(),
         ));
     }
+    // Per-ancestor auth gate (compound scope: WriteData or WriteMetadata).
+    let auth = resolve_entry_catalog(&state, auth, &segments).await?;
+    auth.require(tiled_auth::Scope::WriteData)
+        .or_else(|_| auth.require(tiled_auth::Scope::WriteMetadata))?;
     let node = catalog
         .lookup(&segments)
         .await
         .map_err(map_catalog_err)?
         .ok_or_else(|| ServerError::NotFound(format!("'{}' not found", segments.join("/"))))?;
-    // H2: per-node policy check, mirroring patch_metadata / delete_metadata.
-    let auth = auth
-        .narrow_for_node(
-            state.access_policy.as_deref(),
-            tiled_access::NodeContext {
-                path: &segments,
-                structure_family: &node.structure_family,
-                metadata: &node.metadata,
-                access_blob: &node.access_blob,
-            },
-        )
-        .await;
-    auth.require(tiled_auth::Scope::WriteData)
-        .or_else(|_| auth.require(tiled_auth::Scope::WriteMetadata))?;
     let body = req
         .get("data_source")
         .ok_or_else(|| ServerError::Validation("body missing 'data_source'".into()))?;
@@ -2008,7 +1982,6 @@ pub async fn delete_metadata(
     OriginalUri(uri): OriginalUri,
     auth: crate::AuthContext,
 ) -> Result<impl IntoResponse, ServerError> {
-    auth.require(tiled_auth::Scope::DeleteNode)?;
     let segments = segments_from_uri(&uri, "/api/v1/metadata/");
     let catalog = state.catalog.as_ref().ok_or_else(|| {
         ServerError::Validation("server has no catalog DB; DELETE not supported".into())
@@ -2018,23 +1991,14 @@ pub async fn delete_metadata(
             "cannot DELETE the catalog root".into(),
         ));
     }
+    // Per-ancestor auth gate: narrows at every prefix and requires
+    // DeleteNode on the narrowed set — same invariant as the read gate.
+    resolve_entry(&state, auth, &segments, tiled_auth::Scope::DeleteNode).await?;
     let node = catalog
         .lookup(&segments)
         .await
         .map_err(map_catalog_err)?
         .ok_or_else(|| ServerError::NotFound(format!("'{}' not found", segments.join("/"))))?;
-    let auth = auth
-        .narrow_for_node(
-            state.access_policy.as_deref(),
-            tiled_access::NodeContext {
-                path: &segments,
-                structure_family: &node.structure_family,
-                metadata: &node.metadata,
-                access_blob: &node.access_blob,
-            },
-        )
-        .await;
-    auth.require(tiled_auth::Scope::DeleteNode)?;
     // Reject deletion of a non-empty container (upstream tiled #503).
     // Cascading FK delete *would* succeed, but silently dropping a
     // subtree is the kind of thing that needs explicit `rm -rf`
