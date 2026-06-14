@@ -399,33 +399,54 @@ pub async fn search(
             .map_err(map_catalog_err)?;
         let logical_path = segments.join("/");
         let path_trimmed = logical_path.trim_matches('/');
-        let entries: Vec<tiled_core::schemas::Resource> = rows
-            .into_iter()
-            .map(|node| {
-                let family = parse_structure_family(&node.structure_family)
-                    .unwrap_or(tiled_core::structures::StructureFamily::Container);
-                let child_path = if path_trimmed.is_empty() {
-                    node.key.clone()
-                } else {
-                    format!("{path_trimmed}/{}", node.key)
-                };
-                let links = tiled_core::links::links_for_node(family, &base_url, &child_path);
-                tiled_core::schemas::Resource {
-                    id: node.key,
-                    attributes: tiled_core::schemas::NodeAttributes {
-                        ancestors: node.ancestors,
-                        structure_family: Some(family),
-                        specs: serde_json::from_value(node.specs).unwrap_or_default(),
-                        metadata: Some(node.metadata),
-                        structure: None,
-                        access_blob: Some(node.access_blob),
-                        sorting: None,
-                        data_sources: None,
-                    },
-                    links,
-                }
-            })
-            .collect();
+        // Populate structure per node, matching catalog_metadata_resource:
+        // containers get a child-count NodeStructure; leaves get the
+        // data_source.structure from their first data source.
+        let mut entries = Vec::with_capacity(rows.len());
+        for node in rows {
+            let family = parse_structure_family(&node.structure_family)
+                .unwrap_or(tiled_core::structures::StructureFamily::Container);
+            let child_path = if path_trimmed.is_empty() {
+                node.key.clone()
+            } else {
+                format!("{path_trimmed}/{}", node.key)
+            };
+            let links = tiled_core::links::links_for_node(family, &base_url, &child_path);
+            let structure = if matches!(family, tiled_core::structures::StructureFamily::Container)
+            {
+                let count = catalog
+                    .count_children(Some(node.id))
+                    .await
+                    .map_err(map_catalog_err)?;
+                Some(
+                    serde_json::to_value(&tiled_core::schemas::NodeStructure {
+                        contents: None,
+                        count: count as usize,
+                    })
+                    .unwrap_or_default(),
+                )
+            } else {
+                let ds_rows = catalog
+                    .list_data_sources(node.id)
+                    .await
+                    .map_err(map_catalog_err)?;
+                ds_rows.first().map(|ds| ds.structure.clone())
+            };
+            entries.push(tiled_core::schemas::Resource {
+                id: node.key,
+                attributes: tiled_core::schemas::NodeAttributes {
+                    ancestors: node.ancestors,
+                    structure_family: Some(family),
+                    specs: serde_json::from_value(node.specs).unwrap_or_default(),
+                    metadata: Some(node.metadata),
+                    structure,
+                    access_blob: Some(node.access_blob),
+                    sorting: None,
+                    data_sources: None,
+                },
+                links,
+            });
+        }
         let pagination = tiled_core::links::pagination_links(
             &base_url,
             "search",
