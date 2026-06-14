@@ -1,4 +1,4 @@
-mod config;
+pub mod config;
 
 use std::sync::Arc;
 
@@ -467,12 +467,18 @@ pub async fn run(command: Command) -> Result<()> {
             let trust_forwarded_headers = trust_proxy || proxied_auth_header;
 
             // Decide BEFORE the struct literal moves auth_db_handle / catalog_handle.
-            let access_policy_value: Option<Arc<dyn tiled_access::AccessPolicy>> =
-                if auth_db_handle.is_some() {
-                    Some(Arc::new(tiled_access::PassthroughPolicy))
-                } else {
-                    None
-                };
+            // An explicit `access_control:` config selects and constructs a real
+            // policy (e.g. TagBasedPolicy); absent it, fall back to the previous
+            // default — PassthroughPolicy when an auth DB is configured, no
+            // policy otherwise (backward compatible).
+            let access_policy_value: Option<Arc<dyn tiled_access::AccessPolicy>> = match file_config
+                .as_ref()
+                .and_then(|c| c.access_control.as_ref())
+            {
+                Some(ac) => Some(ac.build()?),
+                None if auth_db_handle.is_some() => Some(Arc::new(tiled_access::PassthroughPolicy)),
+                None => None,
+            };
             let webhook_config_value = if catalog_handle.is_some() {
                 Some(tiled_server::webhook_dispatch::WebhookConfig {
                     allow_http: webhooks_allow_http,

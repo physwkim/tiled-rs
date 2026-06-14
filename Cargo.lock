@@ -5062,6 +5062,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sqlx",
+ "tempfile",
  "tiled-access",
  "tiled-adapters",
  "tiled-auth",
@@ -5072,6 +5073,7 @@ dependencies = [
  "tiled-server",
  "tiled-web",
  "tokio",
+ "tower",
  "tracing",
  "tracing-subscriber",
 ]
