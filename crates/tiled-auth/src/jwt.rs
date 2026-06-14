@@ -64,6 +64,16 @@ impl std::fmt::Debug for Issuer {
 impl Issuer {
     /// `secret` is HMAC-SHA256 keying material.
     pub fn new(secret: &[u8]) -> Result<Self> {
+        // HMAC-SHA256 keying material must be at least 32 bytes (256 bits) —
+        // the SHA-256 block/output width. Python tiled defaults to
+        // secrets.token_hex(32); we reject weaker keys outright rather than
+        // silently accept a brute-forceable secret.
+        if secret.len() < 32 {
+            return Err(AuthError::Validation(format!(
+                "JWT secret must be at least 32 bytes, got {}",
+                secret.len()
+            )));
+        }
         Ok(Self {
             encoding: EncodingKey::from_secret(secret),
             decoding: DecodingKey::from_secret(secret),
