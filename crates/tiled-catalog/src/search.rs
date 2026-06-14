@@ -350,6 +350,61 @@ impl WhereBuilder {
         }
     }
 
+    /// `AccessBlobFilter(user_id, tags)` — match nodes whose `access_blob`
+    /// grants access to the requesting principal. Mirrors Python catalog
+    /// `access_blob_filter` (adapter.py:2048-2079):
+    ///
+    /// - Both empty → `FALSE` (no rows; matches Python `false()` branch).
+    /// - Tags present → EXISTS subquery over `access_blob.tags`.
+    /// - user_id present → `access_blob.user` text equality.
+    /// - Both → OR of the two conditions.
+    fn push_access_blob_filter(&mut self, filter: &tiled_core::queries::AccessBlobFilter) {
+        if filter.user_id.is_none() && filter.tags.is_empty() {
+            self.pieces.push("1 = 0".into());
+            return;
+        }
+        let mut conds: Vec<String> = Vec::new();
+        if !filter.tags.is_empty() {
+            // Bind tags first, then compose the IN-list with their placeholder positions.
+            let start = self.bindings.len();
+            for tag in &filter.tags {
+                self.bindings.push(Bind::Text(tag.clone()));
+            }
+            let tag_phs: Vec<String> = (start..self.bindings.len())
+                .map(|i| self.dialect.placeholder(i))
+                .collect();
+            match self.dialect {
+                Dialect::Sqlite => conds.push(format!(
+                    "EXISTS (SELECT 1 FROM json_each(json_extract(access_blob, '$.tags')) \
+                     WHERE value IN ({}))",
+                    tag_phs.join(", ")
+                )),
+                Dialect::Postgres => conds.push(format!(
+                    "EXISTS (SELECT 1 FROM jsonb_array_elements_text(access_blob->'tags') _t \
+                     WHERE _t IN ({}))",
+                    tag_phs.join(", ")
+                )),
+            }
+        }
+        if let Some(ref uid) = filter.user_id {
+            let p = self.dialect.placeholder(self.bindings.len());
+            self.bindings.push(Bind::Text(uid.clone()));
+            match self.dialect {
+                Dialect::Sqlite => {
+                    conds.push(format!("json_extract(access_blob, '$.user') = {p}"));
+                }
+                Dialect::Postgres => {
+                    conds.push(format!("access_blob->>'user' = {p}"));
+                }
+            }
+        }
+        if conds.len() == 1 {
+            self.pieces.push(conds.remove(0));
+        } else {
+            self.pieces.push(format!("({})", conds.join(" OR ")));
+        }
+    }
+
     fn finish(self) -> (String, Vec<Bind>) {
         if self.pieces.is_empty() {
             ("TRUE".into(), self.bindings)
@@ -418,8 +473,7 @@ impl Catalog {
                 Query::Like(l) => builder.push_like(&l.key, &l.pattern),
                 Query::Regex(r) => builder.push_regex(&r.key, &r.pattern, r.case_sensitive),
                 Query::Specs(s) => builder.push_specs(&s.include, &s.exclude),
-                // AccessBlobFilter depends on the access-engine layer; deferred.
-                Query::AccessBlobFilter(_) => {}
+                Query::AccessBlobFilter(f) => builder.push_access_blob_filter(f),
             }
         }
         let (where_clause, bindings) = builder.finish();
@@ -777,5 +831,123 @@ mod tests {
         );
         assert_eq!(binds.len(), 1);
         assert!(matches!(&binds[0], Bind::Text(s) if s.contains(r#""name":"BadSpec""#)));
+    }
+
+    // AccessBlobFilter SQL generation tests.
+
+    #[test]
+    fn access_blob_filter_empty_yields_false() {
+        use tiled_core::queries::AccessBlobFilter;
+        let f = AccessBlobFilter {
+            user_id: None,
+            tags: vec![],
+        };
+        let mut b = WhereBuilder::new(Dialect::Sqlite);
+        b.push_access_blob_filter(&f);
+        let (sql, binds) = b.finish();
+        assert!(
+            sql.contains("1 = 0"),
+            "empty filter must yield FALSE, got: {sql}"
+        );
+        assert_eq!(binds.len(), 0);
+    }
+
+    #[test]
+    fn access_blob_filter_tags_only_sqlite() {
+        use tiled_core::queries::AccessBlobFilter;
+        let f = AccessBlobFilter {
+            user_id: None,
+            tags: vec!["alpha".into(), "beta".into()],
+        };
+        let mut b = WhereBuilder::new(Dialect::Sqlite);
+        b.push_access_blob_filter(&f);
+        let (sql, binds) = b.finish();
+        assert!(
+            sql.contains("json_each(json_extract(access_blob, '$.tags'))"),
+            "SQLite tags filter must use json_each, got: {sql}"
+        );
+        assert!(sql.contains("IN (?, ?)"), "must bind two tags, got: {sql}");
+        assert_eq!(binds.len(), 2);
+        assert!(matches!(&binds[0], Bind::Text(s) if s == "alpha"));
+        assert!(matches!(&binds[1], Bind::Text(s) if s == "beta"));
+    }
+
+    #[test]
+    fn access_blob_filter_user_only_sqlite() {
+        use tiled_core::queries::AccessBlobFilter;
+        let f = AccessBlobFilter {
+            user_id: Some("bill".into()),
+            tags: vec![],
+        };
+        let mut b = WhereBuilder::new(Dialect::Sqlite);
+        b.push_access_blob_filter(&f);
+        let (sql, binds) = b.finish();
+        assert!(
+            sql.contains("json_extract(access_blob, '$.user') = ?"),
+            "SQLite user filter must use json_extract, got: {sql}"
+        );
+        assert_eq!(binds.len(), 1);
+        assert!(matches!(&binds[0], Bind::Text(s) if s == "bill"));
+    }
+
+    #[test]
+    fn access_blob_filter_both_user_and_tags_sqlite() {
+        use tiled_core::queries::AccessBlobFilter;
+        let f = AccessBlobFilter {
+            user_id: Some("alice".into()),
+            tags: vec!["pub".into()],
+        };
+        let mut b = WhereBuilder::new(Dialect::Sqlite);
+        b.push_access_blob_filter(&f);
+        let (sql, binds) = b.finish();
+        // Must be an OR of two conditions wrapped in parens.
+        assert!(sql.contains(" OR "), "user+tags must be ORed, got: {sql}");
+        assert!(
+            sql.starts_with('(') && sql.ends_with(')'),
+            "must be wrapped, got: {sql}"
+        );
+        assert_eq!(binds.len(), 2, "one bind per tag + one for user");
+        assert!(matches!(&binds[0], Bind::Text(s) if s == "pub"));
+        assert!(matches!(&binds[1], Bind::Text(s) if s == "alice"));
+    }
+
+    #[test]
+    fn access_blob_filter_tags_only_postgres() {
+        use tiled_core::queries::AccessBlobFilter;
+        let f = AccessBlobFilter {
+            user_id: None,
+            tags: vec!["grp1".into()],
+        };
+        let mut b = WhereBuilder::new(Dialect::Postgres);
+        b.push_access_blob_filter(&f);
+        let (sql, binds) = b.finish();
+        assert!(
+            sql.contains("jsonb_array_elements_text(access_blob->'tags')"),
+            "Postgres tags filter must use jsonb_array_elements_text, got: {sql}"
+        );
+        assert!(
+            sql.contains("IN ($1)"),
+            "must bind one tag as $1, got: {sql}"
+        );
+        assert_eq!(binds.len(), 1);
+        assert!(matches!(&binds[0], Bind::Text(s) if s == "grp1"));
+    }
+
+    #[test]
+    fn access_blob_filter_user_only_postgres() {
+        use tiled_core::queries::AccessBlobFilter;
+        let f = AccessBlobFilter {
+            user_id: Some("bob".into()),
+            tags: vec![],
+        };
+        let mut b = WhereBuilder::new(Dialect::Postgres);
+        b.push_access_blob_filter(&f);
+        let (sql, binds) = b.finish();
+        assert!(
+            sql.contains("access_blob->>'user' = $1"),
+            "Postgres user filter must use ->>, got: {sql}"
+        );
+        assert_eq!(binds.len(), 1);
+        assert!(matches!(&binds[0], Bind::Text(s) if s == "bob"));
     }
 }
