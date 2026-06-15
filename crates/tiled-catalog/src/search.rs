@@ -504,6 +504,7 @@ impl Catalog {
                         tiled_core::structures::StructureFamily::Table => "table",
                         tiled_core::structures::StructureFamily::Sparse => "sparse",
                         tiled_core::structures::StructureFamily::Awkward => "awkward",
+                        tiled_core::structures::StructureFamily::Ragged => "ragged",
                     };
                     builder.push_structure_family(s);
                 }

@@ -12,15 +12,20 @@ use crate::error::{Result, TiledError};
 // StructureFamily
 // ---------------------------------------------------------------------------
 
-/// The five families of data structures that Tiled supports.
+/// The six families of data structures that Tiled supports.
 ///
-/// Maps to Python `StructureFamily(str, enum.Enum)`.
+/// Maps to Python `StructureFamily(str, enum.Enum)`
+/// (`tiled/structures/core.py:18-24`). `ragged` was added upstream in
+/// feature #1104; without it here, deserializing a node whose
+/// `structure_family == "ragged"` is a hard serde error, which breaks a
+/// whole container listing on a single ragged child.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StructureFamily {
     Array,
     Awkward,
     Container,
+    Ragged,
     Sparse,
     Table,
 }
@@ -31,6 +36,7 @@ impl std::fmt::Display for StructureFamily {
             Self::Array => write!(f, "array"),
             Self::Awkward => write!(f, "awkward"),
             Self::Container => write!(f, "container"),
+            Self::Ragged => write!(f, "ragged"),
             Self::Sparse => write!(f, "sparse"),
             Self::Table => write!(f, "table"),
         }
@@ -45,6 +51,7 @@ impl std::str::FromStr for StructureFamily {
             "array" => Ok(Self::Array),
             "awkward" => Ok(Self::Awkward),
             "container" => Ok(Self::Container),
+            "ragged" => Ok(Self::Ragged),
             "sparse" => Ok(Self::Sparse),
             "table" => Ok(Self::Table),
             _ => Err(TiledError::Validation(format!(
@@ -359,6 +366,46 @@ impl AwkwardStructure {
 }
 
 // ---------------------------------------------------------------------------
+// RaggedStructure
+// ---------------------------------------------------------------------------
+
+/// Describes the structure of a ragged array (variable-length trailing rows).
+///
+/// Maps to Python `RaggedStructure` dataclass (`tiled/structures/ragged.py`).
+/// The first dimension is always a known integer; variable-length dimensions
+/// are encoded as `None` in `shape` and `chunks`.
+///
+/// This is the family/structure representation only — it makes a `ragged` node
+/// representable, serializable, and non-breaking in listings. The full ragged
+/// read/write adapter (feature #1104) is intentionally not ported here.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RaggedStructure {
+    /// Serializable representation of the array's data type.
+    pub data_type: DType,
+    /// Overall shape; the first entry is a known integer, variable dimensions
+    /// are `None`.
+    pub shape: Vec<Option<usize>>,
+    /// Total number of elements in the array.
+    pub size: usize,
+    /// Dask-like chunks; the first entry is a known integer partitioning,
+    /// variable dimensions are `None`.
+    pub chunks: Vec<Option<Vec<usize>>>,
+    /// Optional dimension names, e.g. `["time", "x"]`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dims: Option<Vec<String>>,
+    /// Whether the array is resizable along any dimension.
+    #[serde(default)]
+    pub resizable: Resizable,
+}
+
+impl RaggedStructure {
+    pub fn from_json(value: &serde_json::Value) -> Result<Self> {
+        serde_json::from_value(value.clone())
+            .map_err(|e| TiledError::Validation(format!("Cannot parse RaggedStructure: {e}")))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ContainerStructure
 // ---------------------------------------------------------------------------
 
@@ -409,9 +456,14 @@ pub struct NodeStructure {
 ///
 /// Uses `#[serde(untagged)]` because in the wire format, `structure_family` and `structure`
 /// are separate sibling fields on `NodeAttributes`, not nested.
+///
+/// `Ragged` is listed first: `RaggedStructure` is the only variant with a
+/// required `size` field, so a ragged structure matches it while every other
+/// (size-less) structure falls through to its own variant.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum AnyStructure {
+    Ragged(RaggedStructure),
     Array(ArrayStructure),
     Table(TableStructure),
     Sparse(SparseStructure),
@@ -429,6 +481,7 @@ mod tests {
             StructureFamily::Array,
             StructureFamily::Awkward,
             StructureFamily::Container,
+            StructureFamily::Ragged,
             StructureFamily::Sparse,
             StructureFamily::Table,
         ] {
@@ -436,6 +489,75 @@ mod tests {
             let parsed: StructureFamily = s.parse().unwrap();
             assert_eq!(sf, parsed);
         }
+    }
+
+    #[test]
+    fn test_structure_family_ragged_serde() {
+        // A node whose structure_family is "ragged" must deserialize, not error.
+        let parsed: StructureFamily = serde_json::from_str("\"ragged\"").unwrap();
+        assert_eq!(parsed, StructureFamily::Ragged);
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), "\"ragged\"");
+        assert_eq!(
+            "ragged".parse::<StructureFamily>().unwrap(),
+            StructureFamily::Ragged
+        );
+    }
+
+    fn ragged_json() -> serde_json::Value {
+        serde_json::json!({
+            "data_type": {"endianness": "little", "kind": "f", "itemsize": 8},
+            "shape": [3, null],
+            "size": 7,
+            "chunks": [[3], null],
+            "dims": null,
+            "resizable": false
+        })
+    }
+
+    #[test]
+    fn test_ragged_structure_from_json() {
+        let s = RaggedStructure::from_json(&ragged_json()).unwrap();
+        assert_eq!(s.shape, vec![Some(3), None]);
+        assert_eq!(s.size, 7);
+        assert_eq!(s.chunks, vec![Some(vec![3]), None]);
+        assert_eq!(s.dims, None);
+        // Round-trips back out without losing the variable (null) dimensions.
+        let back: RaggedStructure =
+            serde_json::from_value(serde_json::to_value(&s).unwrap()).unwrap();
+        assert_eq!(back, s);
+    }
+
+    #[test]
+    fn test_any_structure_picks_ragged() {
+        // A ragged structure (has required `size`) must deserialize as Ragged,
+        // not be mislabeled Array/Sparse by the untagged enum.
+        let any: AnyStructure = serde_json::from_value(ragged_json()).unwrap();
+        assert!(matches!(any, AnyStructure::Ragged(_)));
+
+        // A fully-fixed ragged structure (no null dims) still has `size`, so it
+        // must NOT be stolen by the Array variant which lacks that field.
+        let fixed = serde_json::json!({
+            "data_type": {"endianness": "little", "kind": "f", "itemsize": 8},
+            "shape": [3, 2],
+            "size": 6,
+            "chunks": [[3], [2]],
+            "dims": null,
+            "resizable": false
+        });
+        let any: AnyStructure = serde_json::from_value(fixed).unwrap();
+        assert!(matches!(any, AnyStructure::Ragged(_)));
+
+        // An array structure (no `size`) must still deserialize as Array,
+        // i.e. adding Ragged-first did not capture array payloads.
+        let array = serde_json::json!({
+            "data_type": {"endianness": "little", "kind": "f", "itemsize": 8},
+            "chunks": [[100], [100]],
+            "shape": [100, 100],
+            "dims": null,
+            "resizable": false
+        });
+        let any: AnyStructure = serde_json::from_value(array).unwrap();
+        assert!(matches!(any, AnyStructure::Array(_)));
     }
 
     #[test]

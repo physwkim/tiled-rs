@@ -2063,6 +2063,7 @@ pub async fn register(
         tiled_core::structures::StructureFamily::Table => "table",
         tiled_core::structures::StructureFamily::Sparse => "sparse",
         tiled_core::structures::StructureFamily::Awkward => "awkward",
+        tiled_core::structures::StructureFamily::Ragged => "ragged",
     }
     .to_string();
 
@@ -2197,6 +2198,7 @@ fn ds_family_str(f: tiled_core::structures::StructureFamily) -> &'static str {
         SF::Table => "table",
         SF::Sparse => "sparse",
         SF::Awkward => "awkward",
+        SF::Ragged => "ragged",
     }
 }
 

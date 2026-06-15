@@ -9,8 +9,8 @@
 
 use tiled_core::schemas::{NodeAttributes, Resource};
 use tiled_core::structures::{
-    ArrayStructure, AwkwardStructure, ContainerStructure, SparseStructure, Spec, StructureFamily,
-    TableStructure,
+    ArrayStructure, AwkwardStructure, ContainerStructure, RaggedStructure, SparseStructure, Spec,
+    StructureFamily, TableStructure,
 };
 
 use crate::context::Context;
@@ -28,6 +28,7 @@ pub enum ParsedStructure {
     Table(TableStructure),
     Sparse(SparseStructure),
     Awkward(AwkwardStructure),
+    Ragged(RaggedStructure),
 }
 
 impl ParsedStructure {
@@ -76,6 +77,15 @@ impl ParsedStructure {
                     .ok_or_else(|| ClientError::Invalid("awkward missing structure".into()))?;
                 Ok(Self::Awkward(AwkwardStructure::from_json(s).map_err(
                     |e| ClientError::Invalid(format!("invalid awkward structure: {e}")),
+                )?))
+            }
+            StructureFamily::Ragged => {
+                let s = attrs
+                    .structure
+                    .as_ref()
+                    .ok_or_else(|| ClientError::Invalid("ragged missing structure".into()))?;
+                Ok(Self::Ragged(RaggedStructure::from_json(s).map_err(
+                    |e| ClientError::Invalid(format!("invalid ragged structure: {e}")),
                 )?))
             }
         }

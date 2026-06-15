@@ -46,6 +46,15 @@ pub fn links_for_node(family: StructureFamily, base_url: &str, path: &str) -> No
                 .extra
                 .insert("block".into(), format!("{base}/api/v1/array/block/{p}"));
         }
+        StructureFamily::Ragged => {
+            // Mirrors Python `links_for_ragged` (tiled/links.py:40-45): a ragged
+            // node exposes `full` and `block`, like an array but on the
+            // `/ragged/` route.
+            links.full = Some(format!("{base}/api/v1/ragged/full/{p}"));
+            links
+                .extra
+                .insert("block".into(), format!("{base}/api/v1/ragged/block/{p}"));
+        }
         StructureFamily::Table => {
             links.full = Some(format!("{base}/api/v1/table/full/{p}"));
             links.extra.insert(

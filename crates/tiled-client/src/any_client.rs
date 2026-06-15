@@ -16,6 +16,7 @@ use crate::container::ContainerClient;
 use crate::context::Context;
 use crate::dataframe::TableClient;
 use crate::error::{ClientError, Result};
+use crate::ragged::RaggedClient;
 use crate::sparse::SparseClient;
 
 /// User hook for substituting custom client types based on `Spec`s the node
@@ -52,6 +53,7 @@ pub enum AnyClient {
     Table(TableClient),
     Sparse(SparseClient),
     Awkward(AwkwardClient),
+    Ragged(RaggedClient),
     /// Custom client emitted by a [`ClientResolver`].
     Custom(Arc<dyn Any + Send + Sync>),
 }
@@ -95,6 +97,11 @@ impl AnyClient {
                 item,
                 include_data_sources,
             )?)),
+            StructureFamily::Ragged => Ok(Self::Ragged(RaggedClient::from_item(
+                context,
+                item,
+                include_data_sources,
+            )?)),
         }
     }
 
@@ -105,6 +112,7 @@ impl AnyClient {
             Self::Table(_) => StructureFamily::Table,
             Self::Sparse(_) => StructureFamily::Sparse,
             Self::Awkward(_) => StructureFamily::Awkward,
+            Self::Ragged(_) => StructureFamily::Ragged,
             // A custom client has no canonical family on the wire — a resolver
             // chose its own type. We default to Container for repr purposes.
             Self::Custom(_) => StructureFamily::Container,
@@ -165,6 +173,13 @@ impl AnyClient {
     pub fn as_awkward(&self) -> Option<&AwkwardClient> {
         match self {
             Self::Awkward(a) => Some(a),
+            _ => None,
+        }
+    }
+
+    pub fn as_ragged(&self) -> Option<&RaggedClient> {
+        match self {
+            Self::Ragged(r) => Some(r),
             _ => None,
         }
     }
