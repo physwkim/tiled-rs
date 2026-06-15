@@ -16,8 +16,9 @@
 
 use std::sync::Arc;
 
-use tiled_core::adapters::{AnyAdapter, BaseAdapter, BoxFuture, ContainerAdapter};
+use tiled_core::adapters::{AnyAdapter, BaseAdapter, BoxFuture, ContainerAdapter, SearchEntry};
 use tiled_core::queries::{Query, UnsupportedQuery};
+use tiled_core::schemas::{NodeStructure, SortDirection};
 use tiled_core::structures::{ContainerStructure, Spec, StructureFamily};
 
 use crate::db::Catalog;
@@ -198,6 +199,64 @@ impl ContainerAdapter for CatalogAdapter {
                 offset += got as i64;
             }
             Ok(matched)
+        })
+    }
+
+    /// Push the whole listing down to SQL: `search_children` evaluates every
+    /// query variant the database supports, applies `ORDER BY`, and returns
+    /// just the `[offset, offset+limit)` page plus the total match count. Each
+    /// row becomes a [`SearchEntry`] built from its `Node` columns — a
+    /// container's structure is a child count (`count_children`), a leaf's is
+    /// its first `data_source.structure` — so no (possibly file-backed) leaf
+    /// adapter is resolved merely to list it. `access_blob` is carried through
+    /// from the row. This is the authoritative search evaluator; it supports
+    /// strictly more variants than the in-memory `search` screening above.
+    fn search_page<'a>(
+        &'a self,
+        queries: &'a [Query],
+        sorting: &'a [(String, SortDirection)],
+        offset: usize,
+        limit: usize,
+    ) -> BoxFuture<'a, tiled_core::error::Result<(Vec<SearchEntry>, usize)>> {
+        Box::pin(async move {
+            let (rows, total) = self
+                .catalog
+                .search_children(self.node_id, queries, sorting, offset as i64, limit as i64)
+                .await?;
+            let mut entries = Vec::with_capacity(rows.len());
+            for node in rows {
+                // A row with an unrecognised family defaults to Container
+                // (a never-stored case; parity with the prior search path).
+                let family = node
+                    .structure_family
+                    .parse::<StructureFamily>()
+                    .unwrap_or(StructureFamily::Container);
+                let structure = if matches!(family, StructureFamily::Container) {
+                    let count = self.catalog.count_children(Some(node.id)).await?;
+                    Some(
+                        serde_json::to_value(NodeStructure {
+                            contents: None,
+                            count: count as usize,
+                        })
+                        .expect("NodeStructure is always serializable"),
+                    )
+                } else {
+                    let ds_rows = self.catalog.list_data_sources(node.id).await?;
+                    ds_rows.first().map(|ds| ds.structure.clone())
+                };
+                entries.push(SearchEntry {
+                    key: node.key,
+                    structure_family: family,
+                    // Specs are stored as `[{name, version}]`; mirror the
+                    // metadata endpoint's `from_value` decode (not the lenient
+                    // `parse_specs`) so a search row matches its metadata row.
+                    specs: serde_json::from_value(node.specs).unwrap_or_default(),
+                    metadata: node.metadata,
+                    structure,
+                    access_blob: Some(node.access_blob),
+                });
+            }
+            Ok((entries, total as usize))
         })
     }
 }

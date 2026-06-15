@@ -13,6 +13,7 @@ use std::sync::Arc;
 use crate::dtype::{ArrowTable, DynNDArray};
 use crate::error::Result;
 use crate::ndslice::NDSlice;
+use crate::schemas::SortDirection;
 use crate::structures::{
     ArrayStructure, AwkwardStructure, ContainerStructure, SparseStructure, Spec, StructureFamily,
     TableStructure,
@@ -142,6 +143,29 @@ pub trait AwkwardAdapterWrite: AwkwardAdapterRead {
 // Container (async — IO-backed: SQL catalog, MongoDB, etc.)
 // ---------------------------------------------------------------------------
 
+/// One row of a paginated container listing/search result.
+///
+/// A neutral data carrier (NOT the server `Resource` wire type) so the
+/// `tiled-server` schema never leaks into the adapter layer. It holds exactly
+/// the per-child attributes a listing needs, sourced WITHOUT resolving a
+/// (possibly file-backed) leaf adapter: the SQL catalog fills these from its
+/// `Node` row + `data_source.structure`, while in-memory adapters read them
+/// off the child adapter itself. `ancestors`/`links`/`sorting` are derived by
+/// the server from the path, so they are intentionally absent here.
+#[derive(Debug, Clone)]
+pub struct SearchEntry {
+    pub key: String,
+    pub structure_family: StructureFamily,
+    pub metadata: serde_json::Value,
+    pub specs: Vec<Spec>,
+    /// The node's structure JSON (array/table shape, or a container's child
+    /// count). `None` when the structure is unknown/not applicable.
+    pub structure: Option<serde_json::Value>,
+    /// Access-control blob carried through from the backing store. `None` for
+    /// adapters that do not track per-node access (in-memory trees).
+    pub access_blob: Option<serde_json::Value>,
+}
+
 /// A container node: a directory-like level whose children are looked up by
 /// key. Every method is async because the only non-trivial implementors are
 /// IO-backed (the SQL catalog awaits sqlx; the Mongo adapters offload the
@@ -181,6 +205,53 @@ pub trait ContainerAdapter: BaseAdapter {
         _queries: &'a [crate::queries::Query],
     ) -> BoxFuture<'a, Result<Vec<String>>> {
         Box::pin(async move { self.keys().await })
+    }
+
+    /// Paginated search: return the `[offset, offset+limit)` window of
+    /// children matching `queries` (sorted by `sorting`) as [`SearchEntry`]
+    /// rows, plus the **total** match count (not the page size). This is the
+    /// single listing primitive the server's search endpoint drives — both
+    /// the catalog and in-memory trees flow through it, so there is no
+    /// separate "direct SQL" path.
+    ///
+    /// The default impl is the in-memory one: it runs [`search`](Self::search)
+    /// (which enforces the adapter's query-support matrix → HTTP 400 on an
+    /// unevaluable variant), pages the matched keys, and builds each row from
+    /// the child adapter. `sorting` is ignored here — an in-memory tree
+    /// preserves insertion order. The SQL catalog overrides this to push
+    /// filter + sort + LIMIT/OFFSET down to the database and to carry each
+    /// node's `access_blob` and `data_source` structure without resolving the
+    /// leaf adapter.
+    fn search_page<'a>(
+        &'a self,
+        queries: &'a [crate::queries::Query],
+        _sorting: &'a [(String, SortDirection)],
+        offset: usize,
+        limit: usize,
+    ) -> BoxFuture<'a, Result<(Vec<SearchEntry>, usize)>> {
+        Box::pin(async move {
+            let matched = self.search(queries).await?;
+            let total = matched.len();
+            let mut entries = Vec::new();
+            for key in matched.into_iter().skip(offset).take(limit) {
+                // A key that vanished between `search` and `get` (concurrent
+                // delete) is skipped; a `get` that errors propagates rather
+                // than silently dropping the entry.
+                let Some(adapter) = self.get(&key).await? else {
+                    continue;
+                };
+                let structure = adapter.structure_json().await?;
+                entries.push(SearchEntry {
+                    key,
+                    structure_family: adapter.structure_family(),
+                    metadata: adapter.metadata().clone(),
+                    specs: adapter.specs().to_vec(),
+                    structure,
+                    access_blob: None,
+                });
+            }
+            Ok((entries, total))
+        })
     }
 }
 

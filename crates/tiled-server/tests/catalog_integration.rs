@@ -537,6 +537,59 @@ async fn search_pushes_filters_to_sql() {
     assert_eq!(ids, vec!["b", "c"]);
 }
 
+/// catalog-M4 Commit 2: searching a NESTED container resolves the parent via
+/// the async tree walk (one `CatalogAdapter` per hop) and runs `search_page`
+/// against that child's `node_id`. The old direct-SQL branch resolved the
+/// parent with a single `lookup`; this confirms the unified trait path queries
+/// the right subtree (and only that subtree), with the SQL filter applied.
+#[tokio::test]
+async fn search_within_nested_container_pushes_filter_to_sql() {
+    let (app, _dir) = build_test_app().await;
+
+    // Root container `expt` with two child containers carrying distinct
+    // metadata, plus a sibling at root that must NOT appear in the subtree
+    // search.
+    let register = |path: &str, key: &str, plan: &str| {
+        let body = serde_json::json!({
+            "key": key,
+            "structure_family": "container",
+            "metadata": {"plan_name": plan},
+            "specs": [],
+            "data_sources": [],
+        });
+        (path.to_string(), body)
+    };
+    for (path, body) in [
+        register("/api/v1/register/", "expt", "root"),
+        register("/api/v1/register/expt", "scan_1", "count"),
+        register("/api/v1/register/expt", "scan_2", "scan"),
+        register("/api/v1/register/", "other", "count"),
+    ] {
+        let (status, b) = json_request(&app, Method::POST, &path, body).await;
+        assert_eq!(status, StatusCode::CREATED, "register {path}: {b}");
+    }
+
+    // Search WITHIN expt for plan_name == "count": only expt/scan_1 matches.
+    // The root-level `other` (also plan_name=count) must be excluded because
+    // the walk scopes the search to the `expt` subtree.
+    let url = "/api/v1/search/expt?\
+        filter[eq][condition][key]=plan_name&\
+        filter[eq][condition][value]=%22count%22";
+    let (status, body) = json_request(&app, Method::GET, url, serde_json::Value::Null).await;
+    assert_eq!(status, StatusCode::OK, "nested search: {body}");
+    let ids: Vec<&str> = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["scan_1"]);
+    assert_eq!(body["meta"]["count"], 1);
+    // Container children advertise the default child sort (parity with the
+    // metadata endpoint) — the old catalog search branch left this null.
+    assert!(body["data"][0]["attributes"]["sorting"].is_array());
+}
+
 #[tokio::test]
 async fn delete_root_rejected() {
     let (app, _dir) = build_test_app().await;

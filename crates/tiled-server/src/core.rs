@@ -2,11 +2,12 @@
 //!
 //! Corresponds to `tiled/server/core.py` — `construct_resource`, `construct_entries_response`.
 
-use tiled_core::adapters::{AnyAdapter, ContainerAdapter};
+use tiled_core::adapters::{AnyAdapter, ContainerAdapter, SearchEntry};
 use tiled_core::links;
 use tiled_core::schemas::{
-    ContainerMeta, NodeAttributes, NodeStructure, Resource, Response, SortingItem,
+    ContainerMeta, NodeAttributes, NodeStructure, Resource, Response, SortDirection, SortingItem,
 };
+use tiled_core::structures::StructureFamily;
 
 use crate::error::ServerError;
 
@@ -152,6 +153,13 @@ pub async fn construct_root_resource(
 }
 
 /// Construct a paginated entries response for a container.
+///
+/// The single listing path for both catalog (SQL pushdown) and in-memory
+/// trees: the adapter's [`search_page`](ContainerAdapter::search_page) applies
+/// the filters, sort and `[offset, offset+limit)` window and returns the page
+/// of [`SearchEntry`] rows plus the **total** match count. An unsupported
+/// query variant surfaces as `ServerError::UnsupportedQuery` (HTTP 400),
+/// matching Python tiled's `UnsupportedQueryType`.
 pub async fn construct_entries_response(
     container: &dyn ContainerAdapter,
     path: &str,
@@ -159,41 +167,61 @@ pub async fn construct_entries_response(
     offset: usize,
     limit: usize,
     queries: &[tiled_core::queries::Query],
+    sorting: &[(String, SortDirection)],
 ) -> Result<Response<Vec<Resource>>, ServerError> {
-    // Apply search filters to get matching keys, then paginate. An unsupported
-    // query variant surfaces as ServerError::UnsupportedQuery (HTTP 400),
-    // matching Python tiled's UnsupportedQueryType handling.
-    let matched_keys = container.search(queries).await?;
-    let count = matched_keys.len();
+    let (entries, total) = container
+        .search_page(queries, sorting, offset, limit)
+        .await?;
     let path_trimmed = path.trim_matches('/');
 
-    // Lazily resolve only the page's keys (one `get` each). A key that
-    // vanished between `search` and `get` (concurrent delete) is skipped; a
-    // `get` that errors propagates rather than silently dropping the entry.
-    let mut entries: Vec<Resource> = Vec::new();
-    for key in matched_keys.iter().skip(offset).take(limit) {
-        let Some(adapter) = container.get(key).await? else {
-            continue;
-        };
+    let mut resources: Vec<Resource> = Vec::with_capacity(entries.len());
+    for entry in entries {
         let child_path = if path_trimmed.is_empty() {
-            key.clone()
+            entry.key.clone()
         } else {
-            format!("{path_trimmed}/{key}")
+            format!("{path_trimmed}/{}", entry.key)
         };
-        entries.push(construct_resource(&adapter, key, &child_path, base_url).await?);
+        resources.push(resource_from_entry(entry, &child_path, base_url));
     }
 
-    let pagination = links::pagination_links(base_url, "search", path, offset, limit, count);
+    let pagination = links::pagination_links(base_url, "search", path, offset, limit, total);
 
     Ok(Response {
-        data: Some(entries),
+        data: Some(resources),
         error: None,
         links: Some(
             serde_json::to_value(&pagination).expect("PaginationLinks is always serializable"),
         ),
         meta: Some(
-            serde_json::to_value(&ContainerMeta { count })
+            serde_json::to_value(&ContainerMeta { count: total })
                 .expect("ContainerMeta is always serializable"),
         ),
     })
+}
+
+/// Build one listing `Resource` from a neutral [`SearchEntry`] row. The
+/// `ancestors`, per-child `sorting` and `links` are derived here from the
+/// path + structure family so they are uniform across the catalog and
+/// in-memory adapters: a container advertises the default child sort (matching
+/// the metadata endpoint), a leaf carries none.
+fn resource_from_entry(entry: SearchEntry, child_path: &str, base_url: &str) -> Resource {
+    let family = entry.structure_family;
+    let sorting = match family {
+        StructureFamily::Container => Some(default_sorting()),
+        _ => None,
+    };
+    Resource {
+        id: entry.key,
+        attributes: NodeAttributes {
+            ancestors: ancestors_from_path(child_path),
+            structure_family: Some(family),
+            specs: Some(entry.specs),
+            metadata: Some(entry.metadata),
+            structure: entry.structure,
+            access_blob: entry.access_blob,
+            sorting,
+            data_sources: None,
+        },
+        links: links::links_for_node(family, base_url, child_path),
+    }
 }

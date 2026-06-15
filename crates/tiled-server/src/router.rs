@@ -388,134 +388,37 @@ pub async fn search(
         }
     }
 
-    if let Some(ref catalog) = state.catalog {
-        // Push filters down to SQL — avoids materialising every child in
-        // memory, and (more importantly) avoids the CatalogAdapter cache
-        // which would otherwise return stale rows after a write.
-        let parent_id = if segments.is_empty() {
-            None
-        } else {
-            let parent = catalog
-                .lookup(&segments)
-                .await
-                .map_err(map_catalog_err)?
-                .ok_or_else(|| {
-                    ServerError::NotFound(format!("'{}' not found", segments.join("/")))
-                })?;
-            if parent.structure_family != "container" {
-                return Err(ServerError::Validation(format!(
-                    "'{}' is not a container",
-                    segments.join("/")
-                )));
-            }
-            Some(parent.id)
-        };
-
-        let (rows, total) = catalog
-            .search_children(parent_id, &queries, &sorting, offset as i64, limit as i64)
-            .await
-            .map_err(map_catalog_err)?;
-        let logical_path = segments.join("/");
-        let path_trimmed = logical_path.trim_matches('/');
-        // Populate structure per node, matching catalog_metadata_resource:
-        // containers get a child-count NodeStructure; leaves get the
-        // data_source.structure from their first data source.
-        let mut entries = Vec::with_capacity(rows.len());
-        for node in rows {
-            let family = parse_structure_family(&node.structure_family)
-                .unwrap_or(tiled_core::structures::StructureFamily::Container);
-            let child_path = if path_trimmed.is_empty() {
-                node.key.clone()
-            } else {
-                format!("{path_trimmed}/{}", node.key)
-            };
-            let links = tiled_core::links::links_for_node(family, &base_url, &child_path);
-            let structure = if matches!(family, tiled_core::structures::StructureFamily::Container)
-            {
-                let count = catalog
-                    .count_children(Some(node.id))
-                    .await
-                    .map_err(map_catalog_err)?;
-                Some(
-                    serde_json::to_value(&tiled_core::schemas::NodeStructure {
-                        contents: None,
-                        count: count as usize,
-                    })
-                    .unwrap_or_default(),
-                )
-            } else {
-                let ds_rows = catalog
-                    .list_data_sources(node.id)
-                    .await
-                    .map_err(map_catalog_err)?;
-                ds_rows.first().map(|ds| ds.structure.clone())
-            };
-            entries.push(tiled_core::schemas::Resource {
-                id: node.key,
-                attributes: tiled_core::schemas::NodeAttributes {
-                    ancestors: node.ancestors,
-                    structure_family: Some(family),
-                    specs: serde_json::from_value(node.specs).unwrap_or_default(),
-                    metadata: Some(node.metadata),
-                    structure,
-                    access_blob: Some(node.access_blob),
-                    sorting: None,
-                    data_sources: None,
-                },
-                links,
-            });
-        }
-        let pagination = tiled_core::links::pagination_links(
-            &base_url,
-            "search",
-            &logical_path,
-            offset,
-            limit,
-            total as usize,
-        );
-        return Ok(Json(tiled_core::schemas::Response {
-            data: Some(entries),
-            error: None,
-            links: Some(serde_json::to_value(&pagination).unwrap_or_default()),
-            meta: Some(
-                serde_json::to_value(tiled_core::schemas::ContainerMeta {
-                    count: total as usize,
-                })
-                .unwrap_or_default(),
-            ),
-        }));
-    }
-
-    // Walk + paginate on the executor: the async container.search() / .get()
-    // resolve through the adapter (a blocking backend offloads internally).
+    // One listing path for both backends. Resolve the container (root, or via
+    // the async tree walk) and let its `search_page` apply the filters, sort
+    // and `[offset, offset+limit)` window: SQL pushdown for the catalog,
+    // in-memory screening for the rest. The catalog used to take a separate
+    // direct-SQL branch here; routing both through the trait deletes that
+    // divergence, so the catalog's full SQL query matrix
+    // (`Comparison`/`In`/`Regex`/…) now reaches every search instead of only
+    // the in-memory subset. A non-container target is rejected via the same
+    // `as_container` gate the leaf endpoints use (the walk resolves it first,
+    // consistent with the rest of the post-M4 read path).
     let logical_path = segments.join("/");
-    let resp = if segments.is_empty() {
-        // construct_entries_response returns Result<_, ServerError>; an
-        // unsupported query variant propagates as HTTP 400.
-        core::construct_entries_response(
-            state.root_tree.as_ref(),
-            &logical_path,
-            &base_url,
-            offset,
-            limit,
-            &queries,
-        )
-        .await?
+    let walked;
+    let container: &dyn ContainerAdapter = if segments.is_empty() {
+        state.root_tree.as_ref()
     } else {
-        let adapter = core::walk_tree(state.root_tree.as_ref(), &segments).await?;
-        let container = adapter.as_container().ok_or_else(|| {
+        walked = core::walk_tree(state.root_tree.as_ref(), &segments).await?;
+        walked.as_container().ok_or_else(|| {
             ServerError::WrongType(format!("'{}' is not a container", segments.join("/")))
-        })?;
-        core::construct_entries_response(
-            container,
-            &logical_path,
-            &base_url,
-            offset,
-            limit,
-            &queries,
-        )
-        .await?
+        })?
     };
+    // An unsupported query variant propagates as HTTP 400.
+    let resp = core::construct_entries_response(
+        container,
+        &logical_path,
+        &base_url,
+        offset,
+        limit,
+        &queries,
+        &sorting,
+    )
+    .await?;
     Ok(Json(resp))
 }
 
