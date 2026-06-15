@@ -9,12 +9,12 @@ use std::sync::Arc;
 use indexmap::IndexMap;
 use mongodb::bson::{Document, doc};
 use mongodb::sync::Database;
-use tokio::sync::OnceCell;
 
 use tiled_core::adapters::{AnyAdapter, BaseAdapter, BoxFuture, ContainerAdapter};
 use tiled_core::queries::{Query, UnsupportedQuery};
 use tiled_core::structures::{ContainerStructure, Spec, StructureFamily};
 
+use crate::cache::{DEFAULT_TTL, TtlCache};
 use crate::run::BlueskyRunAdapter;
 
 /// Top-level catalog: lists all BlueskyRuns in a MongoDB database.
@@ -22,11 +22,12 @@ pub struct MongoCatalog {
     db: Database,
     metadata: serde_json::Value,
     specs: Vec<Spec>,
-    /// Cached mapping of uid → BlueskyRunAdapter, populated once on first
-    /// access. An async [`OnceCell`] (not `OnceLock`) so the population can
-    /// run the synchronous MongoDB driver on `spawn_blocking` and `.await`
-    /// the result without blocking the executor.
-    runs: OnceCell<IndexMap<String, AnyAdapter>>,
+    /// Cached mapping of uid → BlueskyRunAdapter. A [`TtlCache`] (not a
+    /// permanent `OnceCell`) so runs ingested into MongoDB after the first
+    /// listing become visible once the TTL elapses, without a server restart
+    /// (Mongo/M1). The population runs the synchronous MongoDB driver on
+    /// `spawn_blocking` and is `.await`ed so the executor is never blocked.
+    runs: TtlCache<IndexMap<String, AnyAdapter>>,
 }
 
 impl MongoCatalog {
@@ -36,7 +37,7 @@ impl MongoCatalog {
             db,
             metadata,
             specs: vec![Spec::with_version("CatalogOfBlueskyRuns", "1")],
-            runs: OnceCell::new(),
+            runs: TtlCache::new(DEFAULT_TTL),
         }
     }
 
@@ -58,15 +59,17 @@ impl MongoCatalog {
         Ok(Self::new(db, serde_json::json!({})))
     }
 
-    /// Load the run mapping once, offloading the synchronous MongoDB driver
-    /// to `spawn_blocking` so the executor is never blocked. Subsequent calls
-    /// return the cached map. A failed *load task* (panic/join error) surfaces
-    /// as `Err`; per-document query/decode failures are logged inside the
-    /// blocking loader (it returns a possibly-empty map, mirroring the prior
-    /// behaviour) so a transient hiccup does not poison the cache forever.
-    async fn runs(&self) -> tiled_core::error::Result<&IndexMap<String, AnyAdapter>> {
+    /// Load the run mapping, offloading the synchronous MongoDB driver to
+    /// `spawn_blocking` so the executor is never blocked. The result is cached
+    /// for [`DEFAULT_TTL`]; calls within that window return the cached map,
+    /// calls past it reload (so newly-ingested runs appear without a restart —
+    /// Mongo/M1). A failed *load task* (panic/join error) surfaces as `Err` and
+    /// is not cached; per-document query/decode failures are logged inside the
+    /// blocking loader, which returns a possibly-empty map (mirroring the prior
+    /// behaviour) — that empty map is cached only until the TTL, then retried.
+    async fn runs(&self) -> tiled_core::error::Result<Arc<IndexMap<String, AnyAdapter>>> {
         self.runs
-            .get_or_try_init(|| async {
+            .get_or_refresh(|| async {
                 let db = self.db.clone();
                 tokio::task::spawn_blocking(move || load_runs_blocking(&db))
                     .await

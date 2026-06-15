@@ -8,6 +8,7 @@
 
 pub mod array_col;
 pub mod bson_ext;
+mod cache;
 pub mod catalog;
 pub mod filler;
 pub mod handler;

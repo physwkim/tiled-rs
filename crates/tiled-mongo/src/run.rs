@@ -7,11 +7,11 @@ use std::sync::Arc;
 use indexmap::IndexMap;
 use mongodb::bson::{Document, doc};
 use mongodb::sync::Database;
-use tokio::sync::OnceCell;
 
 use tiled_core::adapters::{AnyAdapter, BaseAdapter, BoxFuture, ContainerAdapter};
 use tiled_core::structures::{ContainerStructure, Spec, StructureFamily};
 
+use crate::cache::{DEFAULT_TTL, TtlCache};
 use crate::filler::Filler;
 use crate::handler::HandlerRegistry;
 use crate::stream::EventStreamAdapter;
@@ -24,9 +24,12 @@ pub struct BlueskyRunAdapter {
     metadata: serde_json::Value,
     specs: Vec<Spec>,
     handler_registry: Arc<HandlerRegistry>,
-    /// Cached stream mapping, populated once via `spawn_blocking` (the sync
-    /// MongoDB driver) and awaited through an async [`OnceCell`].
-    streams: OnceCell<IndexMap<String, AnyAdapter>>,
+    /// Cached stream mapping, populated via `spawn_blocking` (the sync MongoDB
+    /// driver). A [`TtlCache`] (not a permanent `OnceCell`) so streams whose
+    /// `event_descriptor`s are written to an in-progress run after the first
+    /// access become visible once the TTL elapses, without a restart
+    /// (Mongo/M1).
+    streams: TtlCache<IndexMap<String, AnyAdapter>>,
 }
 
 impl BlueskyRunAdapter {
@@ -70,7 +73,7 @@ impl BlueskyRunAdapter {
             metadata,
             specs: vec![Spec::with_version("BlueskyRun", "1")],
             handler_registry,
-            streams: OnceCell::new(),
+            streams: TtlCache::new(DEFAULT_TTL),
         }
     }
 
@@ -78,12 +81,14 @@ impl BlueskyRunAdapter {
         self.start_doc.get_str("uid").unwrap_or_default()
     }
 
-    /// Load the stream mapping once, offloading the synchronous MongoDB
-    /// driver to `spawn_blocking`. A failed *load task* surfaces as `Err`;
-    /// per-document failures are logged inside the blocking loader.
-    async fn streams(&self) -> tiled_core::error::Result<&IndexMap<String, AnyAdapter>> {
+    /// Load the stream mapping, offloading the synchronous MongoDB driver to
+    /// `spawn_blocking`. The result is cached for [`DEFAULT_TTL`]; calls past
+    /// the window reload so streams added to an in-progress run appear without
+    /// a restart (Mongo/M1). A failed *load task* surfaces as `Err` and is not
+    /// cached; per-document failures are logged inside the blocking loader.
+    async fn streams(&self) -> tiled_core::error::Result<Arc<IndexMap<String, AnyAdapter>>> {
         self.streams
-            .get_or_try_init(|| async {
+            .get_or_refresh(|| async {
                 let db = self.db.clone();
                 let uid = self.uid().to_string();
                 let stop_doc = self.stop_doc.clone();
