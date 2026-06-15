@@ -913,3 +913,184 @@ async fn array_full_format_param_beats_accept_header() {
     assert_eq!(lines[0].trim(), "0", "first CSV line must be 0");
     assert_eq!(lines[9].trim(), "9", "last CSV line must be 9");
 }
+
+// ---------------------------------------------------------------------------
+// /table/full — read the whole table (all partitions) with optional column
+// projection and format negotiation. Mirrors the upstream `table_full`
+// endpoint (router.py:1296). Uses a CSV-backed single-partition table.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "csv-adapter")]
+fn build_table_app(csv_path: std::path::PathBuf) -> axum::Router {
+    let csv = tiled_adapters::CsvAdapter::from_path(csv_path, serde_json::json!({"kind": "demo"}))
+        .expect("build CsvAdapter");
+    let mut mapping = IndexMap::new();
+    mapping.insert("some_table".to_string(), AnyAdapter::Table(Arc::new(csv)));
+    let root: Arc<dyn tiled_core::adapters::ContainerAdapter> =
+        Arc::new(MapAdapter::new(mapping, serde_json::json!({}), vec![]));
+    let registry = Arc::new(tiled_serialization::default_registry());
+    let state = tiled_server::AppState {
+        root_tree: root,
+        serialization_registry: registry,
+        query_names: vec![],
+        base_url: Some("http://localhost:8000".to_string()),
+        cors_policy: tiled_server::state::CorsOriginPolicy::Permissive,
+        trust_forwarded_headers: false,
+        api_key: None,
+        catalog: None,
+        auth_db: None,
+        issuer: None,
+        authenticators: vec![],
+        proxied_header_auth: None,
+        external_oidc: None,
+        forwarded_allow_ips: None,
+        max_request_body_bytes: 10 * 1024 * 1024,
+        streaming_bus: tiled_server::streaming::StreamingBus::new(),
+        access_policy: None,
+        default_login_scopes: tiled_auth::ScopeSet::full(),
+        enable_web: true,
+        web_assets_dir: None,
+        spec_views: Vec::new(),
+        webhook_config: None,
+    };
+    tiled_server::build_app(state)
+}
+
+/// Decode an Arrow IPC file body into (column names, total row count).
+#[cfg(feature = "csv-adapter")]
+fn decode_arrow(body: &Bytes) -> (Vec<String>, usize) {
+    let cursor = std::io::Cursor::new(body.to_vec());
+    let reader = arrow::ipc::reader::FileReader::try_new(cursor, None)
+        .expect("response body must be valid Arrow IPC");
+    let cols: Vec<String> = reader
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect();
+    let rows: usize = reader.map(|b| b.expect("arrow batch").num_rows()).sum();
+    (cols, rows)
+}
+
+/// POST a JSON body and return (status, body bytes).
+#[cfg(feature = "csv-adapter")]
+async fn post_json(app: &axum::Router, uri: &str, body: serde_json::Value) -> (StatusCode, Bytes) {
+    let req = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, bytes)
+}
+
+#[cfg(feature = "csv-adapter")]
+#[tokio::test]
+async fn test_table_full_endpoint() {
+    use std::io::Write;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.csv");
+    let mut f = std::fs::File::create(&path).unwrap();
+    writeln!(f, "x,y").unwrap();
+    writeln!(f, "1,10").unwrap();
+    writeln!(f, "2,20").unwrap();
+    writeln!(f, "3,30").unwrap();
+    f.flush().unwrap();
+
+    let app = build_table_app(path);
+
+    // (1) Full read → Arrow IPC, all 3 rows, both columns.
+    let (status, headers, body) =
+        get_with_headers(&app, "/api/v1/table/full/some_table", &[]).await;
+    assert_eq!(status, 200);
+    let ct = headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        ct.contains("arrow"),
+        "default Content-Type must be Arrow IPC; got {ct}"
+    );
+    let (cols, rows) = decode_arrow(&body);
+    assert_eq!(cols, vec!["x", "y"], "full read returns every column");
+    assert_eq!(rows, 3, "full read returns every row across all partitions");
+
+    // (2) ?column= projection (GET).
+    let (status, _, body) =
+        get_with_headers(&app, "/api/v1/table/full/some_table?column=y", &[]).await;
+    assert_eq!(status, 200);
+    let (cols, rows) = decode_arrow(&body);
+    assert_eq!(cols, vec!["y"], "?column=y projects to column y only");
+    assert_eq!(rows, 3);
+
+    // (3) deprecated ?field= alias also projects.
+    let (status, _, body) =
+        get_with_headers(&app, "/api/v1/table/full/some_table?field=x", &[]).await;
+    assert_eq!(status, 200);
+    let (cols, _) = decode_arrow(&body);
+    assert_eq!(cols, vec!["x"], "deprecated ?field=x projects to column x");
+
+    // (4) POST long-request form: columns carried in the JSON body.
+    let (status, body) = post_json(
+        &app,
+        "/api/v1/table/full",
+        serde_json::json!({"path": "some_table", "columns": ["y"]}),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let (cols, rows) = decode_arrow(&body);
+    assert_eq!(cols, vec!["y"], "POST columns body projects to column y");
+    assert_eq!(rows, 3);
+
+    // (5) POST with no columns reads the whole table.
+    let (status, body) = post_json(
+        &app,
+        "/api/v1/table/full",
+        serde_json::json!({"path": "some_table"}),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let (cols, rows) = decode_arrow(&body);
+    assert_eq!(cols, vec!["x", "y"]);
+    assert_eq!(rows, 3);
+
+    // (6) ?format= is honored by the endpoint's negotiation. parquet is a
+    // registered Table serializer, so the output changes shape — proving the
+    // format param flows through (not silently ignored).
+    if cfg!(feature = "parquet-serializer") {
+        let (status, headers, body) =
+            get_with_headers(&app, "/api/v1/table/full/some_table?format=parquet", &[]).await;
+        assert_eq!(status, 200);
+        let ct = headers
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            ct.contains("parquet"),
+            "?format=parquet must negotiate parquet; got {ct}"
+        );
+        assert_eq!(&body[..4], b"PAR1", "parquet file magic");
+    }
+
+    // ?format=csv is accepted (200). The Rust port has not registered a Table
+    // text/csv serializer (only Arrow IPC / parquet / xlsx), so csv negotiation
+    // falls back to Arrow IPC — identical to `table_partition`.
+    let (status, headers, body) =
+        get_with_headers(&app, "/api/v1/table/full/some_table?format=csv", &[]).await;
+    assert_eq!(status, 200);
+    let ct = headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        ct.contains("arrow"),
+        "no Table csv serializer in the port → csv falls back to Arrow IPC; got {ct}"
+    );
+    let (cols, _) = decode_arrow(&body);
+    assert_eq!(cols, vec!["x", "y"]);
+}

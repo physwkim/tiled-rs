@@ -549,6 +549,64 @@ async fn build_array_response(
     Ok(serve_with_range(headers, &media_type, body))
 }
 
+// Shared by `table_partition` and `table_full`: encode an already-read
+// `ArrowTable` to Arrow IPC and route it through the serialization registry so
+// format negotiation applies (e.g. csv/parquet re-encode the IPC bytes).
+async fn build_table_response(
+    table: tiled_core::dtype::ArrowTable,
+    format_param: Option<&str>,
+    headers: &HeaderMap,
+    state: &AppState,
+) -> Result<axum::response::Response, ServerError> {
+    let accept = headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let media_type = tiled_serialization::negotiate_media_type(
+        format_param,
+        accept,
+        tiled_core::structures::StructureFamily::Table,
+        &state.serialization_registry,
+    )
+    .unwrap_or_else(|| tiled_core::media_type::mime::ARROW_FILE.to_string());
+
+    // Arrow IPC encode is CPU-bound with no inner async — offload it.
+    let ipc_bytes = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, ServerError> {
+        let mut buf = Vec::new();
+        {
+            let mut writer = arrow::ipc::writer::FileWriter::try_new(&mut buf, &table.schema)
+                .map_err(|e| ServerError::Internal(format!("Arrow IPC write error: {e}")))?;
+            for batch in &table.batches {
+                writer
+                    .write(batch)
+                    .map_err(|e| ServerError::Internal(format!("Arrow IPC write error: {e}")))?;
+            }
+            writer
+                .finish()
+                .map_err(|e| ServerError::Internal(format!("Arrow IPC write error: {e}")))?;
+        }
+        Ok(buf)
+    })
+    .await
+    .map_err(|e| ServerError::Internal(format!("blocking task failed: {e}")))??;
+
+    // Route the Arrow IPC bytes through the serialization registry so
+    // format negotiation applies (e.g., parquet re-encodes the IPC bytes).
+    let body = if let Some(serializer) = state
+        .serialization_registry
+        .dispatch(tiled_core::structures::StructureFamily::Table, &media_type)
+    {
+        tokio::task::spawn_blocking(move || serializer(&ipc_bytes, &serde_json::Value::Null))
+            .await
+            .map_err(|e| ServerError::Internal(format!("serialize task failed: {e}")))?
+            .map_err(|e| ServerError::Internal(e.to_string()))?
+    } else {
+        bytes::Bytes::from(ipc_bytes)
+    };
+
+    Ok(serve_with_range(headers, &media_type, body))
+}
+
 // ---------------------------------------------------------------------------
 // GET /api/v1/array/block/{*path}
 // ---------------------------------------------------------------------------
@@ -1531,18 +1589,6 @@ pub async fn table_partition(
         .iter()
         .find(|(k, _)| k == "format")
         .map(|(_, v)| v.clone());
-    let accept = headers
-        .get(axum::http::header::ACCEPT)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-    let media_type = tiled_serialization::negotiate_media_type(
-        format_param.as_deref(),
-        &accept,
-        tiled_core::structures::StructureFamily::Table,
-        &state.serialization_registry,
-    )
-    .unwrap_or_else(|| tiled_core::media_type::mime::ARROW_FILE.to_string());
 
     // Separate the three concerns: the tree walk needs a blocking thread
     // (adapters may call Handle::block_on internally) and hands back an owned
@@ -1569,41 +1615,122 @@ pub async fn table_partition(
         .await
         .map_err(ServerError::from)?;
 
-    // Arrow IPC encode is CPU-bound with no inner async — offload it.
-    let ipc_bytes = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, ServerError> {
-        let mut buf = Vec::new();
-        {
-            let mut writer = arrow::ipc::writer::FileWriter::try_new(&mut buf, &table.schema)
-                .map_err(|e| ServerError::Internal(format!("Arrow IPC write error: {e}")))?;
-            for batch in &table.batches {
-                writer
-                    .write(batch)
-                    .map_err(|e| ServerError::Internal(format!("Arrow IPC write error: {e}")))?;
-            }
-            writer
-                .finish()
-                .map_err(|e| ServerError::Internal(format!("Arrow IPC write error: {e}")))?;
-        }
-        Ok(buf)
-    })
-    .await
-    .map_err(|e| ServerError::Internal(format!("blocking task failed: {e}")))??;
+    build_table_response(table, format_param.as_deref(), &headers, &state).await
+}
 
-    // Route the Arrow IPC bytes through the serialization registry so
-    // format negotiation applies (e.g., parquet re-encodes the IPC bytes).
-    let body = if let Some(serializer) = state
-        .serialization_registry
-        .dispatch(tiled_core::structures::StructureFamily::Table, &media_type)
-    {
-        tokio::task::spawn_blocking(move || serializer(&ipc_bytes, &serde_json::Value::Null))
-            .await
-            .map_err(|e| ServerError::Internal(format!("serialize task failed: {e}")))?
-            .map_err(|e| ServerError::Internal(e.to_string()))?
+// ---------------------------------------------------------------------------
+// GET /api/v1/table/full/{*path}
+// ---------------------------------------------------------------------------
+//
+// Upstream router.py:1215 `get_table_full` / 1296 `table_full`. Reads the
+// WHOLE table (all partitions) via `read`, with optional column projection,
+// then serializes exactly like `table_partition`.
+
+pub async fn table_full(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+    // Vec<(K,V)> preserves repeated keys so ?column=A&column=B all survive.
+    Query(params): Query<Vec<(String, String)>>,
+    headers: HeaderMap,
+    auth: crate::AuthContext,
+) -> Result<impl IntoResponse, ServerError> {
+    auth.require(tiled_auth::Scope::ReadData)?;
+    let segments = segments_from_uri(&uri, "/api/v1/table/full/");
+    // H2: per-node policy check.
+    let _ = resolve_entry(&state, auth.clone(), &segments, tiled_auth::Scope::ReadData).await?;
+
+    // Collect column projection: `column` (preferred) + `field` (deprecated alias).
+    // Both may be repeated: ?column=A&column=B selects columns A and B.
+    // Upstream router.py:1058-1059 accepts both keys.
+    let columns: Vec<String> = params
+        .iter()
+        .filter(|(k, _)| k == "column" || k == "field")
+        .map(|(_, v)| v.clone())
+        .collect();
+    let fields: Option<Vec<String>> = if columns.is_empty() {
+        None
     } else {
-        bytes::Bytes::from(ipc_bytes)
+        Some(columns)
     };
 
-    Ok(serve_with_range(&headers, &media_type, body))
+    let format_param = params
+        .iter()
+        .find(|(k, _)| k == "format")
+        .map(|(_, v)| v.clone());
+
+    // The tree walk needs a blocking thread (adapters may call
+    // `Handle::block_on` internally), so resolve the leaf there and hand back an
+    // owned `Arc` clone. The read itself is a `Send` future that offloads its
+    // own blocking, so it is awaited on the executor below (see `table_partition`).
+    let state_c = state.clone();
+    let segs = segments.clone();
+    let table_adapter: Arc<dyn tiled_core::adapters::TableAdapterRead> =
+        tokio::task::spawn_blocking(
+            move || -> Result<Arc<dyn tiled_core::adapters::TableAdapterRead>, ServerError> {
+                let adapter = core::walk_tree(state_c.root_tree.as_ref(), &segs)?;
+                adapter.as_table_arc().ok_or_else(|| {
+                    ServerError::Validation(format!("'{}' is not a table", segs.join("/")))
+                })
+            },
+        )
+        .await
+        .map_err(|e| ServerError::Internal(format!("blocking task failed: {e}")))??;
+
+    let table = table_adapter
+        .read(fields.as_deref())
+        .await
+        .map_err(ServerError::from)?;
+
+    build_table_response(table, format_param.as_deref(), &headers, &state).await
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/v1/table/full — long-URL workaround for the GET counterpart
+// ---------------------------------------------------------------------------
+//
+// Mirrors upstream `post_table_full` (router.py:1258). Applies when the
+// column projection list grows long enough to bump into the practical URL
+// length cap. Body shape (Rust port convention, path in body like
+// `array_full_post`): `{path, columns?, format?}`.
+
+#[derive(Debug, Deserialize)]
+pub struct TableFullRequest {
+    /// Forward-slash-separated tree path. Empty string = root.
+    #[serde(default)]
+    pub path: String,
+    /// Column projection. `column` is accepted as an alias (the GET query key).
+    #[serde(default, alias = "column")]
+    pub columns: Option<Vec<String>>,
+    #[serde(default)]
+    pub format: Option<String>,
+}
+
+pub async fn table_full_post(
+    state: State<AppState>,
+    headers: HeaderMap,
+    auth: crate::AuthContext,
+    Json(req): Json<TableFullRequest>,
+) -> Result<axum::response::Response, ServerError> {
+    let path = req.path.trim_start_matches('/');
+    let uri: axum::http::Uri = format!("/api/v1/table/full/{path}")
+        .parse()
+        .map_err(|e| ServerError::Internal(format!("rebuild URI: {e}")))?;
+
+    // Rebuild the query-param list `table_full` expects, preserving each
+    // projected column as its own `column=` entry.
+    let mut query: Vec<(String, String)> = Vec::new();
+    if let Some(cols) = &req.columns {
+        for c in cols {
+            query.push(("column".to_string(), c.clone()));
+        }
+    }
+    if let Some(f) = &req.format {
+        query.push(("format".to_string(), f.clone()));
+    }
+
+    table_full(state, OriginalUri(uri), Query(query), headers, auth)
+        .await
+        .map(IntoResponse::into_response)
 }
 
 // ---------------------------------------------------------------------------

@@ -132,6 +132,8 @@ pub fn build_app(state: AppState) -> Router {
             "/api/v1/table/partition/{*path}",
             get(router::table_partition),
         )
+        .route("/api/v1/table/full/{*path}", get(router::table_full))
+        .route("/api/v1/table/full", post(router::table_full_post))
         .route("/api/v1/register/", post(router::register_root))
         .route("/api/v1/register/{*path}", post(router::register))
         .route("/api/v1/metadata/{*path}", patch(router::patch_metadata))
