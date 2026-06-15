@@ -149,6 +149,12 @@ pub enum Command {
         #[command(subcommand)]
         command: ApiKeyCommand,
     },
+
+    /// Auth database administration
+    Admin {
+        #[command(subcommand)]
+        command: AdminCommand,
+    },
 }
 
 #[derive(Subcommand)]
@@ -197,6 +203,30 @@ pub enum ApiKeyCommand {
         #[arg(long, env = "TILED_AUTH_DB_URI")]
         auth_db_uri: String,
         first_eight: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum AdminCommand {
+    /// Initialize the auth database schema. DB-direct; mirrors Python
+    /// `tiled admin initialize-database` (_admin.py:16).
+    InitializeDatabase {
+        /// Auth DB URI (e.g. sqlite:///var/lib/tiled-auth.db).
+        #[arg(env = "TILED_AUTH_DB_URI")]
+        uri: String,
+    },
+    /// Create a service principal. DB-direct (no server required); mirrors
+    /// Python `tiled admin create-service-principal` (_admin.py:201).
+    /// For REST-based creation (requires a running server with admin
+    /// credentials), use the server's POST /api/v1/auth/principal endpoint.
+    CreateServicePrincipal {
+        /// Auth DB URI (e.g. sqlite:///var/lib/tiled-auth.db).
+        #[arg(long, env = "TILED_AUTH_DB_URI")]
+        auth_db_uri: String,
+        /// Role to assign. Defaults to "user"; use "admin" for an admin
+        /// service account.
+        #[arg(long, default_value = "user")]
+        role: String,
     },
 }
 
@@ -778,6 +808,34 @@ pub async fn run(command: Command) -> Result<()> {
                     "revoked api key {} (id={})",
                     removed.first_eight, removed.id
                 );
+                Ok(())
+            }
+        },
+        Command::Admin { command } => match command {
+            AdminCommand::InitializeDatabase { uri } => {
+                let db = tiled_auth::AuthDb::connect(&uri)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("auth db connect: {e}"))?;
+                db.migrate()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("auth migrate: {e}"))?;
+                eprintln!("Database initialized.");
+                Ok(())
+            }
+            AdminCommand::CreateServicePrincipal { auth_db_uri, role } => {
+                let db = tiled_auth::AuthDb::connect(&auth_db_uri)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("auth db: {e}"))?;
+                db.migrate()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("auth migrate: {e}"))?;
+                let principal = db
+                    .create_service_principal(&role)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("create service principal: {e}"))?;
+                println!("uuid: {}", principal.uuid);
+                println!("type: {}", principal.r#type);
+                println!("role: {}", principal.role);
                 Ok(())
             }
         },
