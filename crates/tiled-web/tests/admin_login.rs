@@ -8,6 +8,12 @@ use axum::http::{Method, Request, StatusCode};
 use tower::ServiceExt;
 
 async fn build_test_router() -> (axum::Router, tempfile::TempDir, tiled_auth::Issuer) {
+    build_test_router_with(false).await
+}
+
+async fn build_test_router_with(
+    trust_forwarded_proto: bool,
+) -> (axum::Router, tempfile::TempDir, tiled_auth::Issuer) {
     let dir = tempfile::tempdir().unwrap();
     let auth_uri = format!("sqlite://{}", dir.path().join("auth.db").display());
     let auth_db = tiled_auth::AuthDb::connect(&auth_uri).await.unwrap();
@@ -24,12 +30,38 @@ async fn build_test_router() -> (axum::Router, tempfile::TempDir, tiled_auth::Is
         default_login_scopes: tiled_auth::ScopeSet::full(),
         login_provider: "dummy".into(),
         channel_count_fn: Arc::new(|| 0),
-        secure_cookies: false,
+        trust_forwarded_proto,
         assets_dir: None,
         spec_views: Vec::new(),
         authenticator: Some(Arc::new(dummy)),
     };
     (tiled_web::build_router(state), dir, issuer)
+}
+
+/// Whether a Set-Cookie header carries the `Secure` attribute.
+fn cookie_is_secure(resp: &axum::response::Response) -> bool {
+    resp.headers()
+        .get("set-cookie")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|s| s.contains("; Secure"))
+}
+
+async fn post_login_with_proto(
+    app: &axum::Router,
+    forwarded_proto: Option<&str>,
+) -> axum::response::Response {
+    let body = "provider=dummy&username=alice&password=s3cret";
+    let mut req = Request::builder()
+        .method(Method::POST)
+        .uri("/admin/login")
+        .header("content-type", "application/x-www-form-urlencoded");
+    if let Some(proto) = forwarded_proto {
+        req = req.header("x-forwarded-proto", proto);
+    }
+    app.clone()
+        .oneshot(req.body(Body::from(body)).unwrap())
+        .await
+        .unwrap()
 }
 
 /// Extract the `tiled_session` JWT from a Set-Cookie response header.
@@ -84,6 +116,43 @@ async fn correct_password_issues_session_cookie() {
     assert!(
         resp.headers().get("set-cookie").is_some(),
         "session cookie must be set on successful authentication"
+    );
+}
+
+#[tokio::test]
+async fn secure_cookie_set_only_for_forwarded_https() {
+    // Behind a trusted proxy (trust_forwarded_proto = true), the session
+    // cookie gets `Secure` iff the proxy reports X-Forwarded-Proto: https.
+    let (app, _dir, _issuer) = build_test_router_with(true).await;
+
+    let https = post_login_with_proto(&app, Some("https")).await;
+    assert!(
+        cookie_is_secure(&https),
+        "X-Forwarded-Proto: https must produce a Secure cookie"
+    );
+
+    let http = post_login_with_proto(&app, Some("http")).await;
+    assert!(
+        !cookie_is_secure(&http),
+        "X-Forwarded-Proto: http must NOT produce a Secure cookie"
+    );
+
+    let none = post_login_with_proto(&app, None).await;
+    assert!(
+        !cookie_is_secure(&none),
+        "absent X-Forwarded-Proto must NOT produce a Secure cookie"
+    );
+}
+
+#[tokio::test]
+async fn secure_cookie_never_set_without_trusted_proxy() {
+    // With no trusted proxy (trust_forwarded_proto = false), a spoofed
+    // X-Forwarded-Proto: https must NOT flip the cookie to Secure.
+    let (app, _dir, _issuer) = build_test_router_with(false).await;
+    let resp = post_login_with_proto(&app, Some("https")).await;
+    assert!(
+        !cookie_is_secure(&resp),
+        "untrusted X-Forwarded-Proto must be ignored for the Secure flag"
     );
 }
 

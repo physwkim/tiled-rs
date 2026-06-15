@@ -149,7 +149,11 @@ struct LoginForm {
     password: String,
 }
 
-async fn login_submit(State(state): State<Arc<WebState>>, Form(form): Form<LoginForm>) -> Response {
+async fn login_submit(
+    State(state): State<Arc<WebState>>,
+    headers: HeaderMap,
+    Form(form): Form<LoginForm>,
+) -> Response {
     let Some(db) = state.auth_db.clone() else {
         return error_login("auth DB not configured on this server");
     };
@@ -204,7 +208,7 @@ async fn login_submit(State(state): State<Arc<WebState>>, Form(form): Form<Login
     let cookie = build_session_cookie(
         &access_token,
         issuer.access_ttl.num_seconds(),
-        state.secure_cookies,
+        cookie_is_secure(&state, &headers),
     );
     let mut response = Redirect::temporary("/admin/api-keys").into_response();
     response.headers_mut().insert(header::SET_COOKIE, cookie);
@@ -223,10 +227,23 @@ async fn logout_submit(State(state): State<Arc<WebState>>, headers: HeaderMap) -
         // logout-everywhere if the user wants it.
         db.revoke_session(&claims.sid).await.ok();
     }
-    let cookie = clear_session_cookie(state.secure_cookies);
+    let cookie = clear_session_cookie(cookie_is_secure(&state, &headers));
     let mut response = Redirect::temporary("/admin/login").into_response();
     response.headers_mut().insert(header::SET_COOKIE, cookie);
     response
+}
+
+/// Decide the session cookie's `Secure` flag for this request. The server
+/// never terminates TLS, so the only HTTPS signal is a fronting proxy's
+/// `X-Forwarded-Proto` header — honored only when the host trusts forwarded
+/// headers (`trust_forwarded_proto`). A plain-HTTP request (or one with no
+/// trusted proxy) yields `false`, so the admin login still works over HTTP.
+fn cookie_is_secure(state: &WebState, headers: &HeaderMap) -> bool {
+    state.trust_forwarded_proto
+        && headers
+            .get("x-forwarded-proto")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|s| s.eq_ignore_ascii_case("https"))
 }
 
 fn error_login(msg: &str) -> Response {
@@ -541,7 +558,7 @@ async fn sessions_revoke_all(State(state): State<Arc<WebState>>, headers: Header
     let mut response = Redirect::temporary("/admin/login").into_response();
     response.headers_mut().insert(
         header::SET_COOKIE,
-        clear_session_cookie(state.secure_cookies),
+        clear_session_cookie(cookie_is_secure(&state, &headers)),
     );
     response
 }

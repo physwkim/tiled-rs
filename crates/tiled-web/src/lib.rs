@@ -45,10 +45,16 @@ pub struct WebState {
     pub login_provider: String,
     /// Closure that reports the current StreamingBus channel count.
     pub channel_count_fn: Arc<dyn Fn() -> usize + Send + Sync>,
-    /// Set Secure on the session cookie. Off for plain-HTTP demos; on
-    /// once the deployment serves HTTPS (or sits behind a TLS proxy
-    /// with `--trust-proxy`).
-    pub secure_cookies: bool,
+    /// Whether this server may honor a fronting proxy's `X-Forwarded-Proto`
+    /// header to decide the session cookie's `Secure` flag. Set by the host
+    /// from `trust_forwarded_headers ∩ peer-trust` — i.e. true only when the
+    /// server is configured to trust a proxy's forwarded headers. The
+    /// `Secure` flag is then decided per-request: set when (and only when)
+    /// the trusted proxy reports `X-Forwarded-Proto: https`. The server
+    /// never terminates TLS itself, so the forwarded header is the only
+    /// HTTPS signal available; a plain-HTTP demo (no trusted proxy) never
+    /// sets `Secure`, so the admin login still works over HTTP.
+    pub trust_forwarded_proto: bool,
     /// Optional directory the SPA assets are served from on disk. When
     /// `None`, the compiled-in placeholder bundle is used. Operators
     /// drop the prebuilt bluesky/tiled WebUI bundle here to swap the
@@ -82,7 +88,7 @@ impl std::fmt::Debug for WebState {
             .field("auth_db", &self.auth_db.as_ref().map(|_| "<set>"))
             .field("issuer", &self.issuer.as_ref().map(|_| "<set>"))
             .field("login_provider", &self.login_provider)
-            .field("secure_cookies", &self.secure_cookies)
+            .field("trust_forwarded_proto", &self.trust_forwarded_proto)
             .field(
                 "authenticator",
                 &self.authenticator.as_ref().map(|_| "<set>"),
@@ -135,7 +141,7 @@ mod tests {
             default_login_scopes: ScopeSet::default(),
             login_provider: login_provider.into(),
             channel_count_fn: Arc::new(|| 0),
-            secure_cookies: false,
+            trust_forwarded_proto: false,
             assets_dir: None,
             spec_views: Vec::new(),
             authenticator: None,

@@ -187,7 +187,12 @@ pub fn build_app(state: AppState) -> Router {
                 default_login_scopes: state.default_login_scopes.clone(),
                 login_provider: "dummy".into(),
                 channel_count_fn: std::sync::Arc::new(move || bus.channel_count()),
-                secure_cookies: state.trust_forwarded_headers,
+                // Honor X-Forwarded-Proto for the cookie Secure flag only when
+                // we trust a fronting proxy's forwarded headers. peer_ip is not
+                // plumbed here (no ConnectInfo), so peer_is_trusted(None) folds
+                // to "no allow-list configured", consistent with how
+                // resolve_base_url treats forwarded headers.
+                trust_forwarded_proto: state.trust_forwarded_headers && state.peer_is_trusted(None),
                 assets_dir: state.web_assets_dir.clone(),
                 spec_views: state
                     .spec_views
