@@ -36,7 +36,9 @@ pub enum DeviceStatus {
 }
 
 const DEVICE_CODE_BYTES: usize = 32;
-const USER_CODE_LEN: usize = 8;
+/// Length of the canonical (no-dash) `user_code`. Displayed as
+/// `XXXXXXXX-XXXXXXXX` via [`format_user_code`].
+const USER_CODE_LEN: usize = 16;
 
 impl AuthDb {
     pub async fn initiate_device_code(
@@ -120,6 +122,12 @@ impl AuthDb {
     /// concurrent or replayed approval returns `Conflict` — RFC 8628: a
     /// granted code is immutable.
     pub async fn approve_device_code(&self, user_code: &str, principal_id: i64) -> Result<()> {
+        // Normalize the user-entered code to the canonical stored form so a
+        // user who types the displayed (dashed) code in lowercase, or omits
+        // the dash, still matches. Python parity: authentication.py:1045
+        // (`user_code.upper().replace("-", "").strip()`).
+        let user_code = normalize_user_code(user_code);
+        let user_code = user_code.as_str();
         let affected: u64 = match self.pool() {
             AuthPool::Sqlite(pool) => {
                 let now_iso = Utc::now().to_rfc3339();
@@ -237,19 +245,39 @@ fn random_hex(bytes: usize) -> String {
 }
 
 /// User-friendly code: uppercase alphanumeric, no `0/O/1/I/L` to avoid
-/// transcription mistakes. Format: `XXXX-XXXX`.
-fn random_user_code(half_len: usize) -> String {
+/// transcription mistakes. Generated in canonical form — uppercase, no
+/// separators — so the stored value matches a normalized lookup. The
+/// dashed `XXXXXXXX-XXXXXXXX` form is produced only for display by
+/// [`format_user_code`].
+fn random_user_code(len: usize) -> String {
     const ALPHABET: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
     let mut rng = rand::thread_rng();
-    let mut left = String::with_capacity(half_len);
-    let mut right = String::with_capacity(half_len);
-    for s in [&mut left, &mut right] {
-        for _ in 0..half_len {
-            let i = rng.gen_range(0..ALPHABET.len());
-            s.push(ALPHABET[i] as char);
-        }
+    let mut s = String::with_capacity(len);
+    for _ in 0..len {
+        let i = rng.gen_range(0..ALPHABET.len());
+        s.push(ALPHABET[i] as char);
     }
-    format!("{left}-{right}")
+    s
+}
+
+/// Format a canonical `user_code` for display by inserting a single dash at
+/// the midpoint (e.g. `ABCDEFGH-JKMNPQRS`). Purely cosmetic — the dash and
+/// case are stripped again at the approval boundary by
+/// [`normalize_user_code`]. The code is ASCII, so midpoint byte-slicing is
+/// safe.
+pub fn format_user_code(code: &str) -> String {
+    let mid = code.len() / 2;
+    if mid == 0 || mid >= code.len() {
+        return code.to_string();
+    }
+    format!("{}-{}", &code[..mid], &code[mid..])
+}
+
+/// Normalize a user-entered code to its canonical stored form: uppercase,
+/// dashes removed, surrounding whitespace trimmed. Mirrors Python's
+/// `user_code.upper().replace("-", "").strip()` (authentication.py:1045).
+fn normalize_user_code(input: &str) -> String {
+    input.to_uppercase().replace('-', "").trim().to_string()
 }
 
 fn device_from_sqlite(row: &sqlx::sqlite::SqliteRow) -> Result<DeviceCodeRecord> {
@@ -283,4 +311,38 @@ fn device_from_postgres(row: &sqlx::postgres::PgRow) -> Result<DeviceCodeRecord>
         interval_seconds: row.get("interval_seconds"),
         last_polled_at: row.try_get("last_polled_at").ok(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_user_code_matches_python() {
+        // upper().replace("-", "").strip()
+        assert_eq!(normalize_user_code("abcd-efgh"), "ABCDEFGH");
+        assert_eq!(normalize_user_code("  ab-cd  "), "ABCD");
+        assert_eq!(normalize_user_code("ABCDEFGH"), "ABCDEFGH");
+        assert_eq!(normalize_user_code("ab-cd-ef-gh"), "ABCDEFGH");
+    }
+
+    #[test]
+    fn format_user_code_inserts_midpoint_dash() {
+        assert_eq!(format_user_code("ABCDEFGH"), "ABCD-EFGH");
+        assert_eq!(format_user_code("ABCDEFGHJKMNPQRS"), "ABCDEFGH-JKMNPQRS");
+        // Degenerate lengths are returned unchanged.
+        assert_eq!(format_user_code(""), "");
+        assert_eq!(format_user_code("A"), "A");
+    }
+
+    #[test]
+    fn generated_code_is_canonical_and_display_roundtrips() {
+        let code = random_user_code(USER_CODE_LEN);
+        assert_eq!(code.len(), USER_CODE_LEN, "stored code is canonical length");
+        assert!(!code.contains('-'), "stored code has no separators");
+        assert_eq!(code, code.to_uppercase(), "stored code is uppercase");
+        // The displayed (dashed) form normalizes back to the stored value,
+        // so a user typing what they see always matches the lookup.
+        assert_eq!(normalize_user_code(&format_user_code(&code)), code);
+    }
 }

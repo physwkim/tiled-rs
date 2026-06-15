@@ -187,7 +187,9 @@ async fn device_code_flow() {
         .initiate_device_code(Duration::minutes(10), Duration::seconds(0))
         .await
         .unwrap();
-    assert_eq!(dc.user_code.len(), 17); // XXXXXXXX-XXXXXXXX (USER_CODE_LEN=8)
+    // Stored code is canonical (no dash, uppercase); display adds the dash.
+    assert_eq!(dc.user_code.len(), 16);
+    assert!(!dc.user_code.contains('-'));
     assert!(dc.principal_id.is_none());
 
     // First poll: pending.
@@ -205,6 +207,31 @@ async fn device_code_flow() {
     // After grant, the row is consumed; next poll fails to find it.
     let err = db.poll_device_code(&dc.device_code).await.unwrap_err();
     assert!(matches!(err, tiled_auth::AuthError::NotFound(_)));
+}
+
+/// Finding 5: a user who types the *displayed* code (dashed) in lowercase,
+/// with surrounding whitespace, must still approve — the stored code is
+/// canonical and the lookup normalizes the input (Python parity).
+#[tokio::test]
+async fn device_code_approve_normalizes_typed_input() {
+    let (db, _dir) = fresh_db().await;
+    let (p, _) = db.ensure_principal("dummy", "alice").await.unwrap();
+
+    let dc = db
+        .initiate_device_code(Duration::minutes(10), Duration::seconds(0))
+        .await
+        .unwrap();
+
+    // What the user sees (dashed), as they might mistype it.
+    let displayed = tiled_auth::device_code::format_user_code(&dc.user_code);
+    let typed = format!("  {}  ", displayed.to_lowercase());
+
+    db.approve_device_code(&typed, p.id).await.unwrap();
+    let st = db.poll_device_code(&dc.device_code).await.unwrap();
+    assert!(
+        matches!(st, tiled_auth::device_code::DeviceStatus::Granted(pid) if pid == p.id),
+        "normalized approval must grant the device code"
+    );
 }
 
 #[tokio::test]

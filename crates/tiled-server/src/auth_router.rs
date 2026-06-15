@@ -224,7 +224,9 @@ pub async fn device_initiate(
     let base = state.resolve_base_url(&headers);
     let resp = DeviceCodeInitiateResponse {
         device_code: dc.device_code,
-        user_code: dc.user_code,
+        // Display the canonical code in its dashed `XXXXXXXX-XXXXXXXX` form;
+        // the approval boundary normalizes case/dashes back out.
+        user_code: tiled_auth::device_code::format_user_code(&dc.user_code),
         verification_uri: format!("{}/api/v1/auth/device/approve", base.trim_end_matches('/')),
         interval: dc.interval_seconds.into(),
         expires_in: 15 * 60,
