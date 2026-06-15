@@ -132,6 +132,45 @@ fn build_app_dynamic(trust_forwarded: bool) -> axum::Router {
     tiled_server::build_app(state)
 }
 
+/// Build the app with a CORS AllowList containing exactly `origin`, so the
+/// preflight path (which only emits CORS headers for an allowed origin) is
+/// exercised. Used by the server-L6 regression test.
+fn build_app_with_cors_origin(origin: &str) -> axum::Router {
+    let root_tree: Arc<dyn tiled_core::adapters::ContainerAdapter> = Arc::new(build_test_tree());
+    let registry = Arc::new(tiled_serialization::default_registry());
+
+    let state = tiled_server::AppState {
+        root_tree,
+        serialization_registry: registry,
+        query_names: Query::all_query_names()
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        base_url: None,
+        cors_policy: tiled_server::state::CorsOriginPolicy::AllowList(vec![origin.to_string()]),
+        trust_forwarded_headers: false,
+        api_key: None,
+        catalog: None,
+        auth_db: None,
+        issuer: None,
+        authenticators: vec![],
+        proxied_header_auth: None,
+        external_oidc: None,
+        forwarded_allow_ips: None,
+        max_request_body_bytes: 10 * 1024 * 1024,
+        response_bytesize_limit: 300_000_000,
+        streaming_bus: tiled_server::streaming::StreamingBus::new(),
+        access_policy: None,
+        default_login_scopes: tiled_auth::ScopeSet::full(),
+        enable_web: true,
+        web_assets_dir: None,
+        spec_views: Vec::new(),
+        webhook_config: None,
+    };
+
+    tiled_server::build_app(state)
+}
+
 /// Send a GET request through the app in-process and return (status, body bytes).
 async fn get(app: &axum::Router, uri: &str) -> (StatusCode, Bytes) {
     let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
@@ -1503,4 +1542,39 @@ async fn array_route_on_a_missing_path_still_returns_404() {
     let app = build_app();
     let (status, _) = get(&app, "/api/v1/array/full/does_not_exist").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// server-L6: the CORS AllowList preflight must advertise PATCH. The data API
+// exposes PATCH routes (array_append at /array/full, patch_metadata at
+// /metadata), so a browser preflight for a PATCH request must succeed. Before
+// the fix, allow_methods omitted PATCH and the preflight's
+// Access-Control-Allow-Methods header excluded it, so browsers blocked every
+// cross-origin PATCH.
+#[tokio::test]
+async fn cors_preflight_advertises_patch_in_allow_methods() {
+    let app = build_app_with_cors_origin("http://example.com");
+    let req = Request::builder()
+        .method("OPTIONS")
+        .uri("/api/v1/metadata/some_array")
+        .header("origin", "http://example.com")
+        .header("access-control-request-method", "PATCH")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+
+    // tower_http short-circuits the preflight with 200 and echoes the
+    // configured method list in Access-Control-Allow-Methods.
+    assert_eq!(resp.status(), StatusCode::OK);
+    let allow_methods = resp
+        .headers()
+        .get("access-control-allow-methods")
+        .expect("preflight must carry Access-Control-Allow-Methods for an allowed origin")
+        .to_str()
+        .unwrap()
+        .to_ascii_uppercase();
+    assert!(
+        allow_methods.contains("PATCH"),
+        "CORS preflight must advertise PATCH (array_append + patch_metadata are PATCH routes); \
+         got Access-Control-Allow-Methods: {allow_methods}"
+    );
 }
