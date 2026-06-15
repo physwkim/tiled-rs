@@ -367,14 +367,21 @@ impl Query {
                 ));
             }
             Self::AccessBlobFilter(q) => {
+                // Python `AccessBlobFilter.encode` (tiled/queries.py:543-547)
+                // emits `tags` as a RAW list — unlike SpecsQuery it does NOT
+                // `json.dumps` — and the client appends each element as its own
+                // repeated param (tiled/client/container.py:1327-1335). The
+                // server's `decode` is keyword-only with no default
+                // (queries.py:550), so an absent `tags` is a 500. Mirror that:
+                // always emit `tags` as a raw repeated list, never gated on
+                // emptiness and never json-stringified into one param. `user_id`
+                // is dropped only when None, matching the client's
+                // `if value is not None`.
                 if let Some(ref uid) = q.user_id {
                     params.push((format!("{prefix}[user_id]"), uid.clone()));
                 }
-                if !q.tags.is_empty() {
-                    params.push((
-                        format!("{prefix}[tags]"),
-                        serde_json::to_string(&q.tags).unwrap_or_default(),
-                    ));
+                for tag in &q.tags {
+                    params.push((format!("{prefix}[tags]"), tag.clone()));
                 }
             }
             Self::StructureFamily(q) => {
@@ -543,9 +550,15 @@ fn decode_single_query(name: &str, fields: &HashMap<String, String>) -> Option<Q
         }
         "access_blob_filter" => {
             let user_id = fields.get("user_id").cloned();
+            // `tags` is a raw repeated list on the wire (see `Query::encode`,
+            // matching Python's raw-list encode). `decode_query_filters`'
+            // positional zip yields one tag value per query instance — the same
+            // shape Python's server produces (apply_search positional zip,
+            // tiled/server/core.py:163-169) — so wrap it as the single-element
+            // list our `Vec<String>` models, rather than json-parsing one param.
             let tags: Vec<String> = fields
                 .get("tags")
-                .and_then(|s| serde_json::from_str(s).ok())
+                .map(|s| vec![s.clone()])
                 .unwrap_or_default();
             Some(Query::AccessBlobFilter(AccessBlobFilter {
                 user_id,
@@ -879,6 +892,54 @@ mod tests {
                 assert!(s.exclude.is_empty());
             }
             _ => panic!("Expected Specs"),
+        }
+    }
+
+    /// F-N: AccessBlobFilter.tags must be emitted as a RAW repeated list, never
+    /// json-stringified into one param and never gated on emptiness. Python
+    /// `encode` (queries.py:543-547) returns the raw list (unlike SpecsQuery's
+    /// json.dumps); the client appends each element as its own param; the
+    /// server's `decode` requires the field (queries.py:550 → 500 if absent).
+    #[test]
+    fn test_encode_access_blob_filter_tags_raw_repeated() {
+        let q = Query::AccessBlobFilter(AccessBlobFilter {
+            user_id: Some("bill".into()),
+            tags: vec!["tag_for_bill".into(), "useful_data".into()],
+            include_untagged: false,
+        });
+        let pairs = q.encode();
+        let tag_vals: Vec<&str> = pairs
+            .iter()
+            .filter(|(k, _)| k.contains("[tags]"))
+            .map(|(_, v)| v.as_str())
+            .collect();
+        // One raw param per tag — NOT a single json-stringified list.
+        assert_eq!(tag_vals, vec!["tag_for_bill", "useful_data"]);
+        assert!(
+            !tag_vals.iter().any(|v| v.contains('[') || v.contains('"')),
+            "tags must be raw values, not json-stringified"
+        );
+    }
+
+    /// F-N: a single-tag AccessBlobFilter round-trips faithfully through the
+    /// raw-repeated wire format (the multi-tag case degrades via the positional
+    /// zip exactly as Python's server does — a shared upstream limitation).
+    #[test]
+    fn test_encode_decode_access_blob_filter_single_tag_roundtrip() {
+        let q = Query::AccessBlobFilter(AccessBlobFilter {
+            user_id: Some("amanda".into()),
+            tags: vec!["amanda_only".into()],
+            include_untagged: false,
+        });
+        let pairs = q.encode();
+        let decoded = decode_query_filters(&pairs);
+        assert_eq!(decoded.len(), 1);
+        match &decoded[0] {
+            Query::AccessBlobFilter(f) => {
+                assert_eq!(f.user_id.as_deref(), Some("amanda"));
+                assert_eq!(f.tags, vec!["amanda_only"]);
+            }
+            _ => panic!("Expected AccessBlobFilter"),
         }
     }
 }
