@@ -505,6 +505,111 @@ async fn anonymous_search_shows_only_public_nodes() {
     assert_eq!(keys.len(), 1, "anon sees exactly 1 node, got: {keys:?}");
 }
 
+/// A node tagged with the literal "public" tag is world-readable: anonymous
+/// must both LIST it (search) and READ it (direct metadata GET), consistently.
+/// A node tagged "secret" stays hidden on both surfaces. Mirrors Python
+/// is_tag_public for the built-in public_tag (access_policies.py:354-356).
+#[tokio::test]
+async fn public_tagged_node_is_listable_and_readable_by_anonymous() {
+    let dir = tempfile::tempdir().unwrap();
+    let cat_uri = format!("sqlite://{}", dir.path().join("catalog.db").display());
+
+    let catalog = Catalog::connect(&cat_uri).await.unwrap();
+    catalog.migrate().await.unwrap();
+
+    let make_node = |key: &str, access_blob: serde_json::Value| RegisterRequest {
+        key: key.to_string(),
+        structure_family: "container".to_string(),
+        metadata: json!({}),
+        specs: json!([]),
+        access_blob,
+    };
+    catalog
+        .create_node(
+            None,
+            vec![],
+            make_node("public_tag_node", json!({"tags": ["public"]})),
+        )
+        .await
+        .unwrap();
+    catalog
+        .create_node(
+            None,
+            vec![],
+            make_node("secret_node", json!({"tags": ["secret"]})),
+        )
+        .await
+        .unwrap();
+
+    let policy = TagBasedPolicy::new(ScopeSet::full());
+    let access_policy: Arc<dyn tiled_access::AccessPolicy> = Arc::new(policy);
+
+    let resolver: Arc<dyn tiled_catalog::adapter::LeafResolver> =
+        Arc::new(tiled_catalog::adapter::UnresolvedLeaf);
+    let root_tree: Arc<dyn ContainerAdapter> = Arc::new(tiled_catalog::CatalogAdapter::root(
+        catalog.clone(),
+        resolver,
+    ));
+    let registry = Arc::new(tiled_serialization::default_registry());
+
+    let state = tiled_server::AppState {
+        root_tree,
+        serialization_registry: registry,
+        query_names: Query::all_query_names()
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        base_url: Some("http://localhost:8000".into()),
+        cors_policy: tiled_server::state::CorsOriginPolicy::Permissive,
+        trust_forwarded_headers: false,
+        api_key: None,
+        catalog: Some(catalog),
+        auth_db: None,
+        issuer: None,
+        authenticators: vec![],
+        proxied_header_auth: None,
+        external_oidc: None,
+        forwarded_allow_ips: None,
+        max_request_body_bytes: 10 * 1024 * 1024,
+        response_bytesize_limit: 300_000_000,
+        streaming_bus: tiled_server::streaming::StreamingBus::new(),
+        access_policy: Some(access_policy),
+        default_login_scopes: tiled_auth::ScopeSet::full(),
+        enable_web: true,
+        web_assets_dir: None,
+        spec_views: Vec::new(),
+        webhook_config: None,
+    };
+    let app = tiled_server::build_app(state);
+
+    // List surface: anonymous search sees the public-tagged node, not secret.
+    let (status, body) = search_json(&app, None).await;
+    assert_eq!(status, StatusCode::OK, "anon search failed: {body}");
+    let keys = result_keys(&body);
+    assert!(
+        keys.contains(&"public_tag_node".to_string()),
+        "anon must list the public-tagged node, got: {keys:?}"
+    );
+    assert!(
+        !keys.contains(&"secret_node".to_string()),
+        "anon must NOT list the secret node, got: {keys:?}"
+    );
+
+    // Read surface: anonymous can read the public-tagged node, not the secret.
+    let pub_status = get_status(&app, "/api/v1/metadata/public_tag_node", None).await;
+    assert_eq!(
+        pub_status,
+        StatusCode::OK,
+        "anon must read the public-tagged node"
+    );
+    let sec_status = get_status(&app, "/api/v1/metadata/secret_node", None).await;
+    assert_eq!(
+        sec_status,
+        StatusCode::NOT_FOUND,
+        "anon must NOT read the secret node"
+    );
+}
+
 /// Regression (CRITICAL fail-open leak): a user-owned node `{"user": id}` has
 /// no `tags` key. The untagged-public arm must NOT treat it as world-readable,
 /// so anonymous /search must NOT return another user's owned node.
