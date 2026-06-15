@@ -246,7 +246,13 @@ pub struct SparseStructure {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data_type: Option<DType>,
     /// Data type of coordinate indices (default: uint64 little-endian).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// When the wire omits this field, default to uint64-LE so the derived
+    /// `Deserialize` matches both the manual `from_json` and Python's
+    /// `COOStructure.from_json` (sparse.py) instead of leaving it `None`.
+    #[serde(
+        default = "default_coord_data_type",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub coord_data_type: Option<BuiltinDType>,
     /// Optional dimension names.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -275,6 +281,16 @@ impl Default for SparseStructure {
             layout: SparseLayout::COO,
         }
     }
+}
+
+/// serde default for [`SparseStructure::coord_data_type`]: uint64
+/// little-endian, matching Python's `COOStructure.from_json` default.
+fn default_coord_data_type() -> Option<BuiltinDType> {
+    Some(BuiltinDType::new(
+        Endianness::Little,
+        Kind::UnsignedInteger,
+        8,
+    ))
 }
 
 impl SparseStructure {
@@ -627,6 +643,24 @@ mod tests {
         assert_eq!(s.layout, SparseLayout::COO);
         // Default coord_data_type should be uint64 little-endian
         let ct = s.coord_data_type.unwrap();
+        assert_eq!(ct.kind, crate::dtype::Kind::UnsignedInteger);
+        assert_eq!(ct.itemsize, 8);
+    }
+
+    #[test]
+    fn sparse_structure_serde_defaults_coord_data_type() {
+        // The derived Deserialize path (not just the manual from_json) must
+        // default coord_data_type to uint64-LE when the wire omits it,
+        // matching Python COOStructure.from_json.
+        let json = serde_json::json!({
+            "chunks": [[10], [10]],
+            "shape": [10, 10],
+        });
+        let s: SparseStructure = serde_json::from_value(json).unwrap();
+        let ct = s
+            .coord_data_type
+            .expect("absent coord_data_type must default to uint64-LE, not None");
+        assert_eq!(ct.endianness, crate::dtype::Endianness::Little);
         assert_eq!(ct.kind, crate::dtype::Kind::UnsignedInteger);
         assert_eq!(ct.itemsize, 8);
     }
