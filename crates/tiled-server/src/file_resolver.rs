@@ -16,61 +16,91 @@ use tiled_catalog::error::CatalogError;
 use tiled_catalog::orm::Node;
 use tiled_core::adapters::{AnyAdapter, BoxFuture};
 
-/// Resolver that decodes file:// URIs and dispatches to the right
-/// `tiled-adapters` implementation. When `allowed_data_dirs` is non-empty
-/// only paths whose canonicalised location lives under one of those
-/// directories are accepted; everything else fails with a
-/// `Validation` error so a registered `file:///etc/passwd` can't be
-/// served back as a CSV. An empty list means "no restriction" (for tests /
-/// trusted single-user deployments); constructing one that way through
-/// [`new`](Self::new) or [`Default`] logs a `warn!` so the unrestricted
-/// state is never silent — see [`unrestricted`](Self::unrestricted) for the
-/// explicit, un-warned opt-in.
+/// Resolver that decodes `file://` URIs and dispatches to the right
+/// `tiled-adapters` implementation.
+///
+/// Reads are **deny-by-default**, matching Python tiled
+/// (`catalog/adapter.py` refuses to serve an asset outside the readable
+/// storage area): a [`Restricted`](ReadScope::Restricted) resolver serves a
+/// `file:` path only when its canonicalised location lives under one of the
+/// configured directories, and an empty directory list serves nothing — so
+/// a registered `file:///etc/passwd` is refused unless an operator has
+/// explicitly allowed that location. Serving every path requires the
+/// explicit [`unrestricted`](Self::unrestricted) opt-out.
 pub struct FileLeafResolver {
-    allowed_data_dirs: Vec<PathBuf>,
+    scope: ReadScope,
+}
+
+/// What a [`FileLeafResolver`] may read off disk.
+///
+/// Modelling the scope as a sum type removes the old dual meaning of an
+/// empty `Vec<PathBuf>` (was it "no restriction" or "deny everything"?):
+/// [`Unrestricted`](ReadScope::Unrestricted) is the explicit opt-out, and
+/// `Restricted([])` is the safe deny-all default.
+#[derive(Clone)]
+enum ReadScope {
+    /// Serve any `file:` path with no containment check. The explicit,
+    /// audited opt-out — never a default.
+    Unrestricted,
+    /// Serve only `file:` paths under one of these directories. An empty
+    /// list serves nothing (deny-by-default).
+    Restricted(Vec<PathBuf>),
 }
 
 impl FileLeafResolver {
-    /// Construct a resolver restricted to `allowed_data_dirs`.
+    /// Construct a resolver restricted to `allowed_data_dirs`
+    /// (deny-by-default).
     ///
-    /// An **empty** list means "no restriction" — every `file:` path a
-    /// registered `data_uri` points at is served. That is convenient for a
-    /// trusted single-user deployment but unsafe once untrusted writers can
-    /// register nodes (N2), so an empty list is logged as a `warn!` at
-    /// construction: the dangerous state is no longer silent. Callers that
-    /// *intend* no restriction should use [`FileLeafResolver::unrestricted`],
-    /// which is the explicit, un-warned opt-in.
+    /// An **empty** list serves no files at all — every file-backed read is
+    /// refused until at least one directory is configured — so it is logged
+    /// as a `warn!`: the misconfiguration is not silent. For a deliberately
+    /// unrestricted server use [`FileLeafResolver::unrestricted`].
     pub fn new(allowed_data_dirs: Vec<PathBuf>) -> Self {
         if allowed_data_dirs.is_empty() {
             tracing::warn!(
-                "FileLeafResolver has no allowed-data-dir restriction: the server will \
-                 serve any local file referenced by a registered data_uri. Pass \
-                 --allowed-data-dir (repeatable) to confine reads to specific directories."
+                "FileLeafResolver has no allowed-data-dir: file-backed reads will be \
+                 refused. Pass --allowed-data-dir (repeatable) to allow specific \
+                 directories, or --allow-unrestricted-reads to serve any path."
             );
         }
-        Self { allowed_data_dirs }
+        Self {
+            scope: ReadScope::Restricted(allowed_data_dirs),
+        }
     }
 
-    /// Explicit, un-warned constructor for a deliberately unrestricted
-    /// resolver (tests, trusted single-user deployments). Unlike
-    /// [`FileLeafResolver::new`] with an empty list, this does not log a
-    /// warning, because the lack of restriction is the caller's stated
-    /// intent rather than a forgotten `--allowed-data-dir`.
+    /// Explicit opt-out: serve any `file:` path with no containment check.
+    ///
+    /// Reachable only by deliberate choice (the CLI's
+    /// `--allow-unrestricted-reads`, or tests). Logged as a `warn!` because
+    /// an unrestricted server will serve any local file a registered
+    /// `data_uri` points at.
     pub fn unrestricted() -> Self {
+        tracing::warn!(
+            "FileLeafResolver is unrestricted: the server will serve any local file \
+             referenced by a registered data_uri, with no path containment."
+        );
         Self {
-            allowed_data_dirs: Vec::new(),
+            scope: ReadScope::Unrestricted,
         }
     }
 }
 
-/// Allow-list check, run on the blocking pool (it calls `canonicalize`, a
-/// filesystem stat). An empty allow-list means "no restriction".
-fn check_allowed(
-    allowed_data_dirs: &[PathBuf],
-    path: &Path,
-) -> std::result::Result<(), CatalogError> {
+/// Containment check, run on the blocking pool (`canonicalize` is a
+/// filesystem stat). Deny-by-default: an
+/// [`Unrestricted`](ReadScope::Unrestricted) scope permits everything, a
+/// [`Restricted`](ReadScope::Restricted) scope permits only paths under one
+/// of its directories, and an empty `Restricted` list permits nothing.
+fn check_allowed(scope: &ReadScope, path: &Path) -> std::result::Result<(), CatalogError> {
+    let allowed_data_dirs = match scope {
+        ReadScope::Unrestricted => return Ok(()),
+        ReadScope::Restricted(dirs) => dirs,
+    };
     if allowed_data_dirs.is_empty() {
-        return Ok(());
+        return Err(CatalogError::Validation(format!(
+            "refusing to read {}: no allowed-data-dir configured (pass --allowed-data-dir, \
+             or --allow-unrestricted-reads to disable the check)",
+            path.display()
+        )));
     }
     // Resolve symlinks before comparing so a malicious symlink inside
     // an allowed dir can't escape.
@@ -90,10 +120,10 @@ fn check_allowed(
 }
 
 impl Default for FileLeafResolver {
-    /// The implicit default is unrestricted, but — unlike
-    /// [`FileLeafResolver::unrestricted`] — routes through
-    /// [`new`](FileLeafResolver::new) so a defaulted (i.e. unconsidered)
-    /// resolver still warns that reads are not path-restricted.
+    /// The default is the safe deny-all: an empty
+    /// [`Restricted`](ReadScope::Restricted) scope that serves no files until
+    /// directories are configured. Routes through
+    /// [`new`](FileLeafResolver::new) so the empty-list warning fires.
     fn default() -> Self {
         Self::new(Vec::new())
     }
@@ -119,7 +149,7 @@ impl LeafResolver for FileLeafResolver {
                 CatalogError::Validation(format!("data_source {} has no assets", ds.id))
             })?;
             let path = uri_to_path(&asset.data_uri)?;
-            let allowed = self.allowed_data_dirs.clone();
+            let scope = self.scope.clone();
             let mimetype = ds.mimetype.clone();
             let parameters = ds.parameters.clone();
             let metadata = node.metadata.clone();
@@ -128,7 +158,7 @@ impl LeafResolver for FileLeafResolver {
             // filesystem work — offload to the blocking pool so the async
             // `get` that awaits this never parks the executor.
             tokio::task::spawn_blocking(move || {
-                check_allowed(&allowed, &path)?;
+                check_allowed(&scope, &path)?;
                 build_leaf_adapter(&mimetype, path, &parameters, metadata)
             })
             .await
@@ -300,15 +330,23 @@ mod tests {
     }
 
     #[test]
-    fn empty_allow_list_permits_any_path() {
-        // N2: an empty allow-list is "no restriction" (now warned at
-        // construction). The gate short-circuits without touching the
-        // filesystem, so a non-existent path is still permitted.
-        assert!(check_allowed(&[], Path::new("/etc/passwd")).is_ok());
+    fn empty_restricted_scope_denies_all() {
+        // N2 deny-by-default: an empty allow-list serves nothing. The gate
+        // refuses before touching the filesystem, so even a non-existent
+        // path is rejected rather than permitted.
+        assert!(
+            check_allowed(&ReadScope::Restricted(Vec::new()), Path::new("/etc/passwd")).is_err()
+        );
     }
 
     #[test]
-    fn non_empty_allow_list_contains_reads() {
+    fn unrestricted_scope_permits_any_path() {
+        // The explicit opt-out serves everything, no filesystem check.
+        assert!(check_allowed(&ReadScope::Unrestricted, Path::new("/etc/passwd")).is_ok());
+    }
+
+    #[test]
+    fn restricted_scope_contains_reads() {
         let inside = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         let inside_file = inside.path().join("data.csv");
@@ -316,30 +354,31 @@ mod tests {
         std::fs::write(&inside_file, b"x").unwrap();
         std::fs::write(&outside_file, b"x").unwrap();
 
-        let allowed = vec![inside.path().to_path_buf()];
-        assert!(check_allowed(&allowed, &inside_file).is_ok());
-        assert!(check_allowed(&allowed, &outside_file).is_err());
+        let scope = ReadScope::Restricted(vec![inside.path().to_path_buf()]);
+        assert!(check_allowed(&scope, &inside_file).is_ok());
+        assert!(check_allowed(&scope, &outside_file).is_err());
     }
 
     #[test]
-    fn permissive_constructors_leave_allow_list_empty() {
-        // new([]), unrestricted(), and default() differ only in whether they
-        // warn; all three leave reads unrestricted (the non-breaking N2
-        // contract). new([dir]) stores the restriction.
-        assert!(
-            FileLeafResolver::new(Vec::new())
-                .allowed_data_dirs
-                .is_empty()
-        );
-        assert!(
-            FileLeafResolver::unrestricted()
-                .allowed_data_dirs
-                .is_empty()
-        );
-        assert!(FileLeafResolver::default().allowed_data_dirs.is_empty());
-        assert_eq!(
-            FileLeafResolver::new(vec![PathBuf::from("/data")]).allowed_data_dirs,
-            vec![PathBuf::from("/data")]
-        );
+    fn constructors_map_to_expected_scope() {
+        // new([]) and default() are deny-all (Restricted empty); only the
+        // explicit unrestricted() opts out of containment. new([dir])
+        // restricts to the dir.
+        assert!(matches!(
+            FileLeafResolver::new(Vec::new()).scope,
+            ReadScope::Restricted(ref d) if d.is_empty()
+        ));
+        assert!(matches!(
+            FileLeafResolver::default().scope,
+            ReadScope::Restricted(ref d) if d.is_empty()
+        ));
+        assert!(matches!(
+            FileLeafResolver::unrestricted().scope,
+            ReadScope::Unrestricted
+        ));
+        assert!(matches!(
+            FileLeafResolver::new(vec![PathBuf::from("/data")]).scope,
+            ReadScope::Restricted(ref d) if d == &[PathBuf::from("/data")]
+        ));
     }
 }

@@ -97,13 +97,19 @@ pub enum Command {
         #[arg(long)]
         proxied_auth_header: bool,
 
-        /// Restrict the FileLeafResolver to data files under these
-        /// directories (repeatable). Without this flag the server will
-        /// serve any local file referenced by a registered data_uri,
-        /// which is fine for trusted single-user deployments but unsafe
-        /// once authenticated writers exist.
+        /// Restrict file-backed reads to data files under these directories
+        /// (repeatable). Reads are deny-by-default: without this flag (and
+        /// without `--allow-unrestricted-reads`) the server refuses to serve
+        /// any local file referenced by a registered data_uri.
         #[arg(long = "allowed-data-dir")]
         allowed_data_dirs: Vec<std::path::PathBuf>,
+
+        /// Disable path containment entirely: serve any local file a
+        /// registered data_uri points at. The explicit opt-out for trusted
+        /// single-user deployments — unsafe once untrusted writers can
+        /// register nodes. Overrides `--allowed-data-dir`.
+        #[arg(long)]
+        allow_unrestricted_reads: bool,
 
         /// Disable the bundled WebUI shell. The API still works; only
         /// the `/`, `/static/*`, and `/admin/*` browser surface goes
@@ -335,6 +341,7 @@ pub async fn run(command: Command) -> Result<()> {
             auth_provider_name,
             proxied_auth_header,
             allowed_data_dirs,
+            allow_unrestricted_reads,
             no_web,
             web_assets_dir,
             webhooks_allow_http,
@@ -424,12 +431,17 @@ pub async fn run(command: Command) -> Result<()> {
             } else if let Some(ref cat) = catalog_handle {
                 // Wire the file-format adapters so leaves backed by
                 // CSV / NPY / TIFF / HDF5 / PNG / JPEG / Parquet
-                // resolve to the right adapter. The allow-list is
-                // empty by default — set --allowed-data-dir to lock
-                // server reads down to specific directories.
-                let resolver: Arc<dyn tiled_catalog::adapter::LeafResolver> = Arc::new(
-                    tiled_server::file_resolver::FileLeafResolver::new(allowed_data_dirs.clone()),
-                );
+                // resolve to the right adapter. Reads are deny-by-default:
+                // set --allowed-data-dir to allow specific directories, or
+                // --allow-unrestricted-reads to disable containment.
+                use tiled_server::file_resolver::FileLeafResolver;
+                let file_resolver = if allow_unrestricted_reads {
+                    FileLeafResolver::unrestricted()
+                } else {
+                    FileLeafResolver::new(allowed_data_dirs.clone())
+                };
+                let resolver: Arc<dyn tiled_catalog::adapter::LeafResolver> =
+                    Arc::new(file_resolver);
                 Arc::new(tiled_catalog::CatalogAdapter::root(cat.clone(), resolver))
             } else if demo {
                 tracing::info!("Starting with demo dataset");
