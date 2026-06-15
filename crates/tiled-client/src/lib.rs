@@ -33,6 +33,7 @@ pub mod dataframe;
 pub mod dataset;
 pub mod error;
 pub mod profiles;
+pub mod queries;
 pub mod ragged;
 pub mod register;
 pub mod sparse;
