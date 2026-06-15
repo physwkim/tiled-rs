@@ -97,28 +97,13 @@ impl EventStreamTable {
         }
     }
 
-    fn read_batches(&self, fields: Option<&[String]>) -> Result<Vec<RecordBatch>> {
-        if self.descriptors.is_empty() || self.cutoff_seq_num <= 1 {
-            return Ok(vec![]);
-        }
-        let descriptor_uids: Vec<String> = self
-            .descriptors
-            .iter()
-            .filter_map(|d| d.get_str("uid").ok().map(String::from))
-            .collect();
-
-        let collection = self.db.collection::<Document>("event");
-        let cursor = collection
-            .find(doc! {
-                "descriptor": { "$in": &descriptor_uids },
-                "seq_num": { "$lt": self.cutoff_seq_num as i64 },
-            })
-            .sort(doc! { "seq_num": 1 })
-            .run()
-            .map_err(|e| TiledError::Internal(format!("event find: {e}")))?;
-
-        // Determine which schema fields to materialise.
-        let target_schema = match fields {
+    /// Returns the projected schema together with the batches so callers do
+    /// not need to recompute it.  Field-name validation happens here — an
+    /// unknown name in `fields` errors even for empty results.
+    fn read_batches(&self, fields: Option<&[String]>) -> Result<(SchemaRef, Vec<RecordBatch>)> {
+        // Compute the target schema first so that unknown-field errors are
+        // surfaced even when the result is empty.
+        let target_schema: SchemaRef = match fields {
             None => self.schema.clone(),
             Some(names) => {
                 let indices: Vec<usize> = names
@@ -140,6 +125,25 @@ impl EventStreamTable {
                 )
             }
         };
+
+        if self.descriptors.is_empty() || self.cutoff_seq_num <= 1 {
+            return Ok((target_schema, vec![]));
+        }
+        let descriptor_uids: Vec<String> = self
+            .descriptors
+            .iter()
+            .filter_map(|d| d.get_str("uid").ok().map(String::from))
+            .collect();
+
+        let collection = self.db.collection::<Document>("event");
+        let cursor = collection
+            .find(doc! {
+                "descriptor": { "$in": &descriptor_uids },
+                "seq_num": { "$lt": self.cutoff_seq_num as i64 },
+            })
+            .sort(doc! { "seq_num": 1 })
+            .run()
+            .map_err(|e| TiledError::Internal(format!("event find: {e}")))?;
 
         // Per-column accumulators, keyed by name.
         let mut columns: std::collections::HashMap<String, ColumnBuilder> =
@@ -166,7 +170,7 @@ impl EventStreamTable {
             row_count += 1;
         }
         if row_count == 0 {
-            return Ok(vec![]);
+            return Ok((target_schema, vec![]));
         }
         let mut arrow_columns: Vec<ArrayRef> = Vec::with_capacity(target_schema.fields().len());
         for f in target_schema.fields() {
@@ -178,7 +182,7 @@ impl EventStreamTable {
         }
         let batch = RecordBatch::try_new(target_schema.clone(), arrow_columns)
             .map_err(|e| TiledError::Internal(format!("arrow batch: {e}")))?;
-        Ok(vec![batch])
+        Ok((target_schema, vec![batch]))
     }
 }
 
@@ -203,27 +207,7 @@ impl TableAdapterRead for EventStreamTable {
             let me = clone_self(self);
             let fields = fields.map(|s| s.to_vec());
             tokio::task::spawn_blocking(move || -> Result<ArrowTable> {
-                let batches = me.read_batches(fields.as_deref())?;
-                let schema: SchemaRef = match &fields {
-                    Some(names) => {
-                        let indices: Vec<usize> = names
-                            .iter()
-                            .map(|n| {
-                                me.schema
-                                    .fields()
-                                    .iter()
-                                    .position(|f: &Arc<Field>| f.name() == n)
-                                    .unwrap_or(0)
-                            })
-                            .collect();
-                        Arc::new(
-                            me.schema
-                                .project(&indices)
-                                .unwrap_or_else(|_| (*me.schema).clone()),
-                        )
-                    }
-                    None => me.schema.clone(),
-                };
+                let (schema, batches) = me.read_batches(fields.as_deref())?;
                 Ok(ArrowTable { schema, batches })
             })
             .await

@@ -39,8 +39,18 @@ impl BlueskyRunAdapter {
         handler_registry: Arc<HandlerRegistry>,
     ) -> Self {
         // Build metadata as {"start": {...}, "stop": {...}}
-        let start_json: serde_json::Value =
-            mongodb::bson::from_document(start_doc.clone()).unwrap_or_default();
+        let start_json: serde_json::Value = mongodb::bson::from_document(start_doc.clone())
+            .unwrap_or_else(|e| {
+                let uid = start_doc.get_str("uid").unwrap_or("<missing>");
+                tracing::warn!(
+                    target: "tiled.mongo",
+                    run_uid = %uid,
+                    error = %e,
+                    "BSON→JSON decode failed for run_start; metadata.start will be null \
+                     (run is visible in unfiltered listing but invisible to metadata filters)"
+                );
+                serde_json::Value::Null
+            });
         let stop_json: serde_json::Value = stop_doc
             .as_ref()
             .and_then(|d| mongodb::bson::from_document(d.clone()).ok())
