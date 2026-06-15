@@ -129,8 +129,8 @@ impl ArrayAdapterRead for ArrayAdapter {
         &self.structure
     }
 
-    fn read<'a>(&'a self, _slice: &'a NDSlice) -> BoxFuture<'a, Result<DynNDArray>> {
-        Box::pin(async move { Ok(self.array.clone()) })
+    fn read<'a>(&'a self, slice: &'a NDSlice) -> BoxFuture<'a, Result<DynNDArray>> {
+        Box::pin(async move { self.array.apply_slice(slice) })
     }
 
     fn read_block<'a>(
@@ -330,6 +330,23 @@ mod tests {
         let result = adapter.read(&slice).await.unwrap();
         assert_eq!(result.len(), 0);
         assert_eq!(result.nbytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_read_with_slice_returns_subarray() {
+        // 4x5 array, values 0..20. arr[1:3, 1:3] → rows 1-2, cols 1-2.
+        let data: Vec<f64> = (0..20).map(|i| i as f64).collect();
+        let adapter = ArrayAdapter::from_f64_2d(&data, 4, 5, serde_json::json!({}));
+
+        let slice = NDSlice::from_numpy_str("1:3,1:3").unwrap();
+        let result = adapter.read(&slice).await.unwrap();
+        assert_eq!(result.shape, vec![2, 2]);
+        let floats: Vec<f64> = result
+            .data
+            .chunks_exact(8)
+            .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(floats, vec![6.0, 7.0, 11.0, 12.0]);
     }
 
     #[tokio::test]

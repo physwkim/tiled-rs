@@ -183,7 +183,7 @@ impl ArrayAdapterRead for SequenceAdapter {
         &self.structure
     }
 
-    fn read<'a>(&'a self, _slice: &'a NDSlice) -> BoxFuture<'a, Result<DynNDArray>> {
+    fn read<'a>(&'a self, slice: &'a NDSlice) -> BoxFuture<'a, Result<DynNDArray>> {
         let frame_bytes = self.frame_size_bytes();
         let paths = self.paths.clone();
         let opener = self.opener.clone();
@@ -207,7 +207,8 @@ impl ArrayAdapterRead for SequenceAdapter {
                 }
                 buf.extend_from_slice(&dyn_arr.data);
             }
-            Ok(DynNDArray::new(buf.freeze(), dtype, full_shape))
+            // Sub-slice the assembled stack (Python sequence.py:117-220).
+            DynNDArray::new(buf.freeze(), dtype, full_shape).apply_slice(slice)
         })
     }
 
@@ -381,5 +382,32 @@ mod tests {
         let full = seq.read(&NDSlice::empty()).await.unwrap();
         assert_eq!(full.shape, vec![2, 3, 4]);
         assert_eq!(full.data.len(), 2 * 3 * 4 * 8);
+    }
+
+    #[tokio::test]
+    async fn read_with_slice_selects_subsequence() {
+        let dir = tempfile::tempdir().unwrap();
+        let p1 = dir.path().join("a.npy");
+        let p2 = dir.path().join("b.npy");
+        write_simple_npy(&p1, 1.0, 4, 3);
+        write_simple_npy(&p2, 2.0, 4, 3);
+
+        let seq = SequenceAdapter::from_paths(
+            vec![p1, p2],
+            Arc::new(NpyFrameOpener),
+            serde_json::json!({}),
+        )
+        .unwrap();
+
+        // arr[1] → second frame, dropping the stack axis → [3, 4] all 2.0.
+        let slice = NDSlice::from_numpy_str("1").unwrap();
+        let result = seq.read(&slice).await.unwrap();
+        assert_eq!(result.shape, vec![3, 4]);
+        let floats: Vec<f64> = result
+            .data
+            .chunks_exact(8)
+            .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(floats, vec![2.0; 12]);
     }
 }
