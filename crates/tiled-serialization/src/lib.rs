@@ -5,6 +5,8 @@ pub mod registry;
 pub mod table;
 
 #[cfg(feature = "csv")]
+pub mod csv_table;
+#[cfg(feature = "csv")]
 pub mod excel_table;
 #[cfg(feature = "hdf5")]
 pub mod hdf5_array;
@@ -26,6 +28,8 @@ pub fn default_registry() -> SerializationRegistry {
     image_array::register_image_serializers(&reg);
     #[cfg(feature = "parquet")]
     parquet_table::register_parquet_serializer(&reg);
+    #[cfg(feature = "csv")]
+    csv_table::register_csv_table_serializer(&reg);
     #[cfg(feature = "csv")]
     excel_table::register_excel_serializer(&reg);
     #[cfg(feature = "hdf5")]

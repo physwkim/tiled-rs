@@ -1099,22 +1099,28 @@ async fn test_table_full_endpoint() {
         assert_eq!(&body[..4], b"PAR1", "parquet file magic");
     }
 
-    // ?format=csv is accepted (200). The Rust port has not registered a Table
-    // text/csv serializer (only Arrow IPC / parquet / xlsx), so csv negotiation
-    // falls back to Arrow IPC — identical to `table_partition`.
-    let (status, headers, body) =
-        get_with_headers(&app, "/api/v1/table/full/some_table?format=csv", &[]).await;
-    assert_eq!(status, 200);
-    let ct = headers
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    assert!(
-        ct.contains("arrow"),
-        "no Table csv serializer in the port → csv falls back to Arrow IPC; got {ct}"
-    );
-    let (cols, _) = decode_arrow(&body);
-    assert_eq!(cols, vec!["x", "y"]);
+    // ?format=csv is served as real CSV: Content-Type text/csv, header row + data rows.
+    {
+        let (status, headers, body) =
+            get_with_headers(&app, "/api/v1/table/full/some_table?format=csv", &[]).await;
+        assert_eq!(status, 200);
+        let ct = headers
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            ct.contains("text/csv"),
+            "?format=csv must negotiate text/csv; got {ct}"
+        );
+        let text = std::str::from_utf8(&body).expect("csv must be valid utf-8");
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(
+            !lines.is_empty(),
+            "csv body must have at least a header row"
+        );
+        assert_eq!(lines[0], "x,y", "csv header row must list columns");
+        assert_eq!(lines.len(), 4, "csv must have header + 3 data rows");
+    }
 }
 
 // ---------------------------------------------------------------------------
