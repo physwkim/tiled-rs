@@ -54,11 +54,11 @@ async fn redirect_to_keys() -> Redirect {
 fn render<T: Template>(template: T) -> Response {
     match template.render() {
         Ok(html) => Html(html).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("template render: {e}"),
-        )
-            .into_response(),
+        Err(e) => {
+            // Don't echo internal template/render details to the browser.
+            tracing::error!(error = %e, "admin template render failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "internal error").into_response()
+        }
     }
 }
 
@@ -158,7 +158,10 @@ async fn login_submit(State(state): State<Arc<WebState>>, Form(form): Form<Login
     };
     let (principal, identity) = match db.ensure_principal(&subject.provider, &subject.sub).await {
         Ok(p) => p,
-        Err(e) => return error_login(&format!("auth failed: {e}")),
+        Err(e) => {
+            tracing::error!(error = %e, "admin login: ensure_principal failed");
+            return error_login("login failed");
+        }
     };
     db.touch_identity_login(identity.id).await.ok();
     // Cap the minted scopes by the principal's role, exactly like the API
@@ -173,11 +176,17 @@ async fn login_submit(State(state): State<Arc<WebState>>, Form(form): Form<Login
         .await
     {
         Ok(s) => s,
-        Err(e) => return error_login(&format!("session create: {e}")),
+        Err(e) => {
+            tracing::error!(error = %e, "admin login: create_session failed");
+            return error_login("login failed");
+        }
     };
     let access_token = match issuer.issue_access(&principal.uuid, &session.uuid, scopes) {
         Ok(t) => t,
-        Err(e) => return error_login(&format!("issue token: {e}")),
+        Err(e) => {
+            tracing::error!(error = %e, "admin login: issue_access failed");
+            return error_login("login failed");
+        }
     };
     let cookie = build_session_cookie(
         &access_token,
@@ -346,7 +355,14 @@ async fn api_keys_create(
     {
         Ok(m) => m,
         Err(e) => {
-            return render_api_keys(&state, &session, Some(format!("create: {e}")), None).await;
+            tracing::error!(error = %e, "admin: create_api_key failed");
+            return render_api_keys(
+                &state,
+                &session,
+                Some("failed to create API key".into()),
+                None,
+            )
+            .await;
         }
     };
     render_api_keys(&state, &session, None, Some(material.secret)).await
@@ -401,7 +417,14 @@ async fn api_keys_revoke(
         Some(session.principal.id)
     };
     if let Err(e) = db.revoke_api_key(&first_eight, caller_id).await {
-        return render_api_keys(&state, &session, Some(format!("revoke: {e}")), None).await;
+        tracing::error!(error = %e, "admin: revoke_api_key failed");
+        return render_api_keys(
+            &state,
+            &session,
+            Some("failed to revoke API key".into()),
+            None,
+        )
+        .await;
     }
     render_api_keys(
         &state,
