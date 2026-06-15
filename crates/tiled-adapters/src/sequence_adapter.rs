@@ -215,7 +215,7 @@ impl ArrayAdapterRead for SequenceAdapter {
     fn read_block<'a>(
         &'a self,
         block: &'a [usize],
-        _slice: &'a NDSlice,
+        slice: &'a NDSlice,
     ) -> BoxFuture<'a, Result<DynNDArray>> {
         let block = block.to_vec();
         let n_shape_dims = self.structure.shape.len();
@@ -272,7 +272,8 @@ impl ArrayAdapterRead for SequenceAdapter {
             }
             let mut block_shape = vec![1usize; outer_dims];
             block_shape.extend_from_slice(&inner_shape);
-            Ok(DynNDArray::new(dyn_arr.data, dtype, block_shape))
+            // Sub-slice within the block (Python sequence.py:222-227).
+            DynNDArray::new(dyn_arr.data, dtype, block_shape).apply_slice(slice)
         })
     }
 }

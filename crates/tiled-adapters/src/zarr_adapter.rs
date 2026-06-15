@@ -131,7 +131,7 @@ impl ArrayAdapterRead for ZarrAdapter {
     fn read_block<'a>(
         &'a self,
         block: &'a [usize],
-        _slice: &'a NDSlice,
+        slice: &'a NDSlice,
     ) -> BoxFuture<'a, Result<DynNDArray>> {
         Box::pin(async move {
             let subset = self.array_subset_for_block(block)?;
@@ -140,11 +140,13 @@ impl ArrayAdapterRead for ZarrAdapter {
                 .array
                 .retrieve_array_subset(&subset)
                 .map_err(|e| TiledError::Internal(format!("zarr retrieve: {e}")))?;
-            Ok(DynNDArray::new(
+            // Sub-slice within the block (Python zarr.py:114-117).
+            DynNDArray::new(
                 bytes_from_array_bytes(bytes)?,
                 self.dtype.clone(),
                 block_shape,
-            ))
+            )
+            .apply_slice(slice)
         })
     }
 }
@@ -209,4 +211,54 @@ fn parse_data_type(dt: &zarrs::array::DataType) -> Result<BuiltinDType> {
             )));
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::num::NonZeroU64;
+    use tiled_core::ndslice::NDSlice;
+    use zarrs::array::{ArrayBuilder, DataType, FillValue};
+
+    fn nz(v: u64) -> NonZeroU64 {
+        NonZeroU64::new(v).unwrap()
+    }
+
+    #[tokio::test]
+    async fn read_block_within_block_slice() {
+        // 4x4 f64 array on a 2x2 chunk grid; arr[r][c] = r*4 + c.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(FilesystemStore::new(dir.path()).unwrap());
+        let array = ArrayBuilder::new(
+            vec![4, 4],
+            DataType::Float64,
+            vec![nz(2), nz(2)].into(),
+            FillValue::from(0.0_f64),
+        )
+        .build(store, "/data")
+        .unwrap();
+        array.store_metadata().unwrap();
+        let elements: Vec<f64> = (0..16).map(|i| i as f64).collect();
+        array
+            .store_array_subset_elements(&ArraySubset::new_with_shape(vec![4, 4]), &elements)
+            .unwrap();
+
+        let adapter =
+            ZarrAdapter::from_path(dir.path().to_path_buf(), "/data", serde_json::json!({}))
+                .unwrap();
+        // 2x2 chunk grid recovered from the store.
+        assert_eq!(adapter.structure().chunks, vec![vec![2, 2], vec![2, 2]]);
+
+        // Block [1,1] covers rows 2-3, cols 2-3 → [[10,11],[14,15]].
+        // Within-block slice "0,:" selects row 0 of the block → [10, 11].
+        let slice = NDSlice::from_numpy_str("0,:").unwrap();
+        let result = adapter.read_block(&[1, 1], &slice).await.unwrap();
+        assert_eq!(result.shape, vec![2]);
+        let floats: Vec<f64> = result
+            .data
+            .chunks_exact(8)
+            .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(floats, vec![10.0, 11.0]);
+    }
 }

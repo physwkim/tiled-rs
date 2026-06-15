@@ -136,9 +136,9 @@ impl ArrayAdapterRead for ArrayAdapter {
     fn read_block<'a>(
         &'a self,
         block: &'a [usize],
-        _slice: &'a NDSlice,
+        slice: &'a NDSlice,
     ) -> BoxFuture<'a, Result<DynNDArray>> {
-        Box::pin(async move { self.read_block_inner(block) })
+        Box::pin(async move { self.read_block_inner(block)?.apply_slice(slice) })
     }
 }
 
@@ -342,6 +342,24 @@ mod tests {
         let result = adapter.read(&slice).await.unwrap();
         assert_eq!(result.shape, vec![2, 2]);
         let floats: Vec<f64> = result
+            .data
+            .chunks_exact(8)
+            .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(floats, vec![6.0, 7.0, 11.0, 12.0]);
+    }
+
+    #[tokio::test]
+    async fn test_read_block_within_block_slice() {
+        // 4x5 single-chunk array. Block [0,0] is the whole array; the
+        // within-block slice arr[1:3, 1:3] must trim it to [[6,7],[11,12]].
+        let data: Vec<f64> = (0..20).map(|i| i as f64).collect();
+        let adapter = ArrayAdapter::from_f64_2d(&data, 4, 5, serde_json::json!({}));
+
+        let slice = NDSlice::from_numpy_str("1:3,1:3").unwrap();
+        let block = adapter.read_block(&[0, 0], &slice).await.unwrap();
+        assert_eq!(block.shape, vec![2, 2]);
+        let floats: Vec<f64> = block
             .data
             .chunks_exact(8)
             .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
