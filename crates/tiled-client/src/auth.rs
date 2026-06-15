@@ -17,9 +17,10 @@ use std::sync::Arc;
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use url::Url;
 
+use crate::context::extract_tiled_csrf;
 use crate::error::{ClientError, Result};
 use crate::utils::handle_error;
 
@@ -223,7 +224,10 @@ impl std::fmt::Debug for TiledAuth {
 
 pub struct TiledAuthInner {
     pub(crate) refresh_url: Url,
-    pub(crate) csrf_token: String,
+    /// SHARED with the owning `Context` (not a snapshot): the refresh path
+    /// reads it live so a rotated `tiled_csrf` is echoed as `x-csrf`, and
+    /// writes back the cookie the refresh response itself may rotate.
+    pub(crate) csrf_token: Arc<RwLock<Option<String>>>,
     pub(crate) client_id: Option<String>,
     pub(crate) tokens: TokenStore,
 }
@@ -231,7 +235,7 @@ pub struct TiledAuthInner {
 impl TiledAuth {
     pub async fn new(
         refresh_url: Url,
-        csrf_token: impl Into<String>,
+        csrf_token: Arc<RwLock<Option<String>>>,
         token_directory: Option<PathBuf>,
         client_id: Option<String>,
     ) -> Result<Self> {
@@ -239,7 +243,7 @@ impl TiledAuth {
         Ok(Self {
             inner: Arc::new(TiledAuthInner {
                 refresh_url,
-                csrf_token: csrf_token.into(),
+                csrf_token,
                 client_id,
                 tokens,
             }),
@@ -248,13 +252,13 @@ impl TiledAuth {
 
     pub fn in_memory(
         refresh_url: Url,
-        csrf_token: impl Into<String>,
+        csrf_token: Arc<RwLock<Option<String>>>,
         client_id: Option<String>,
     ) -> Self {
         Self {
             inner: Arc::new(TiledAuthInner {
                 refresh_url,
-                csrf_token: csrf_token.into(),
+                csrf_token,
                 client_id,
                 tokens: TokenStore::in_memory(),
             }),
@@ -293,11 +297,21 @@ impl TiledAuth {
                 ClientError::AuthRequired("no refresh_token in cache; please log in again".into())
             })?;
 
+        // Read the csrf value LIVE (not a construction-time snapshot) so a
+        // server-rotated `tiled_csrf` is echoed correctly on the double-submit
+        // `x-csrf` header — parity with Python's live `context.csrf_token`.
+        let csrf = self
+            .inner
+            .csrf_token
+            .read()
+            .await
+            .clone()
+            .unwrap_or_default();
         let resp = build_refresh_request(
             http,
             &self.inner.refresh_url,
             &refresh_token,
-            &self.inner.csrf_token,
+            &csrf,
             self.inner.client_id.as_deref(),
         )
         .send()
@@ -309,6 +323,12 @@ impl TiledAuth {
             ));
         }
         let resp = handle_error(resp).await?;
+        // The refresh response can itself rotate the csrf cookie. This call
+        // bypasses Context::send_with_auth, so capture it into the shared
+        // store here, or the NEXT refresh would send the stale value.
+        if let Some(rotated) = extract_tiled_csrf(&resp) {
+            *self.inner.csrf_token.write().await = Some(rotated);
+        }
         let tokens: Tokens = resp.json().await?;
         self.save_tokens(&tokens).await?;
         Ok(tokens)

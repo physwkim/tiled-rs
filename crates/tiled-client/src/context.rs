@@ -45,7 +45,13 @@ pub(crate) struct ContextInner {
     /// Cached About payload from `GET /api/v1/`.
     pub(crate) server_info: tokio::sync::OnceCell<About>,
     /// CSRF cookie value, captured after the initial about fetch.
-    pub(crate) csrf_token: RwLock<Option<String>>,
+    ///
+    /// `Arc` so the live value is SHARED with `TiledAuth` (the token-refresh
+    /// path) rather than snapshotted: when the server rotates `tiled_csrf`,
+    /// the next refresh must echo the new value as `x-csrf` (double-submit),
+    /// not a stale construction-time copy. Mirrors Python, where
+    /// `build_refresh_request` reads `context.csrf_token` live (auth.py:170).
+    pub(crate) csrf_token: Arc<RwLock<Option<String>>>,
     /// Serialises the token-refresh network call so concurrent 401s produce
     /// exactly one refresh round-trip. Mirrors Python `_sync_lock`.
     pub(crate) refresh_lock: Mutex<()>,
@@ -70,6 +76,16 @@ impl std::fmt::Debug for ContextInner {
             .field("resolver", &self.resolver.as_ref().map(|_| "<set>"))
             .finish()
     }
+}
+
+/// Pull the `tiled_csrf` cookie value out of a response, if present. Single
+/// owner of the double-submit-cookie parse so both [`Context::maybe_capture_csrf`]
+/// and [`crate::auth::TiledAuth::refresh`] update the shared csrf store the
+/// same way (the refresh response can itself rotate the cookie).
+pub(crate) fn extract_tiled_csrf(resp: &Response) -> Option<String> {
+    resp.cookies()
+        .find(|c| c.name() == "tiled_csrf")
+        .map(|c| c.value().to_string())
 }
 
 impl Context {
@@ -179,7 +195,7 @@ impl Context {
                 api_key: RwLock::new(api_key),
                 auth: RwLock::new(None),
                 server_info: tokio::sync::OnceCell::new(),
-                csrf_token: RwLock::new(None),
+                csrf_token: Arc::new(RwLock::new(None)),
                 refresh_lock: Mutex::new(()),
                 cache: options.cache,
                 resolver: options.resolver,
@@ -489,11 +505,8 @@ impl Context {
         // (double-submit-cookie pattern). Always overwrite — if the server
         // rotates the cookie (e.g. after a session refresh), we must pick up
         // the new value or every subsequent write will 401.
-        for cookie in resp.cookies() {
-            if cookie.name() == "tiled_csrf" {
-                *self.inner.csrf_token.write().await = Some(cookie.value().to_string());
-                return;
-            }
+        if let Some(value) = extract_tiled_csrf(resp) {
+            *self.inner.csrf_token.write().await = Some(value);
         }
     }
 
@@ -584,9 +597,15 @@ impl Context {
             .map(String::from);
 
         let auth = if let Some(dir) = token_dir {
-            TiledAuth::new(refresh_url, csrf, Some(dir), client_id).await?
+            TiledAuth::new(
+                refresh_url,
+                self.inner.csrf_token.clone(),
+                Some(dir),
+                client_id,
+            )
+            .await?
         } else {
-            TiledAuth::in_memory(refresh_url, csrf, client_id)
+            TiledAuth::in_memory(refresh_url, self.inner.csrf_token.clone(), client_id)
         };
         auth.save_tokens(&tokens).await?;
         self.set_auth(Some(auth)).await?;
@@ -605,7 +624,6 @@ impl Context {
             return Ok(false);
         };
         let refresh_url = self.resolve_link(refresh_url)?;
-        let csrf = self.csrf_token().await.unwrap_or_default();
         let dir = crate::auth::token_directory_for_server(&self.inner.api_uri);
         if !dir.exists() {
             return Ok(false);
@@ -618,7 +636,13 @@ impl Context {
             .and_then(|l| l.get("client_id"))
             .and_then(|v| v.as_str())
             .map(String::from);
-        let auth = TiledAuth::new(refresh_url, csrf, Some(dir), client_id).await?;
+        let auth = TiledAuth::new(
+            refresh_url,
+            self.inner.csrf_token.clone(),
+            Some(dir),
+            client_id,
+        )
+        .await?;
         // Probe with whoami; success means tokens are valid.
         self.set_auth(Some(auth)).await?;
         match self.whoami().await {

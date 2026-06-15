@@ -287,6 +287,122 @@ async fn csrf_token_rotates_on_subsequent_responses() {
 }
 
 // ---------------------------------------------------------------------------
+// (5b) client-M1: token refresh must echo the LIVE (rotated) csrf as x-csrf,
+// not a construction-time snapshot, and must capture a csrf the refresh
+// response itself rotates. Native (non-OIDC) mode uses the x-csrf header.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn refresh_uses_live_csrf_and_captures_rotation() {
+    #[derive(Default)]
+    struct StateM1 {
+        seen_refresh_csrf: Mutex<Option<String>>,
+    }
+    let state: Arc<StateM1> = Arc::new(StateM1::default());
+
+    async fn handle_about() -> impl IntoResponse {
+        let mut about = about_payload();
+        about["authentication"]["links"]["refresh_session"] = "auth/session/refresh".into();
+        // Initial csrf snapshot at login time.
+        (
+            [(SET_COOKIE, "tiled_csrf=csrf-initial; Path=/")],
+            Json(about),
+        )
+    }
+
+    // Rotates the csrf cookie on a normal authenticated GET (goes through
+    // send_with_auth → maybe_capture_csrf), simulating server-side rotation
+    // after login but before the refresh.
+    async fn handle_rotate() -> impl IntoResponse {
+        (
+            [(SET_COOKIE, "tiled_csrf=csrf-rotated; Path=/")],
+            Json(serde_json::json!({
+                "data": {"id": "", "attributes": {"ancestors": [], "structure_family": "container"}, "links": {}}
+            })),
+        )
+    }
+
+    async fn handle_metadata(headers: HeaderMap) -> impl IntoResponse {
+        let val = headers
+            .get(AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if val == "Bearer new-token" {
+            return Json(serde_json::json!({
+                "data": {"id": "", "attributes": {"ancestors": [], "structure_family": "container"}, "links": {}}
+            }))
+            .into_response();
+        }
+        (StatusCode::UNAUTHORIZED, "expired").into_response()
+    }
+
+    async fn handle_refresh(
+        State(state): State<Arc<StateM1>>,
+        headers: HeaderMap,
+        Json(_body): Json<serde_json::Value>,
+    ) -> impl IntoResponse {
+        // Record the x-csrf the client actually sent.
+        let csrf = headers
+            .get("x-csrf")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        *state.seen_refresh_csrf.lock().await = Some(csrf);
+        // The refresh response itself rotates the csrf cookie again.
+        (
+            [(SET_COOKIE, "tiled_csrf=csrf-after-refresh; Path=/")],
+            Json(serde_json::json!({
+                "access_token": "new-token",
+                "refresh_token": "new-refresh",
+            })),
+        )
+    }
+
+    let app = Router::new()
+        .route("/api/v1/", get(handle_about))
+        .route("/api/v1/metadata/", get(handle_metadata))
+        .route("/api/v1/rotate/", get(handle_rotate))
+        .route("/api/v1/auth/session/refresh", post(handle_refresh))
+        .with_state(state.clone());
+    let base = spawn(app).await;
+
+    let (ctx, _) = Context::from_uri(&base).unwrap();
+    let _ = ctx.server_info().await.unwrap();
+    ctx.configure_auth(
+        tiled_client::Tokens {
+            access_token: "old-token".into(),
+            refresh_token: "old-refresh".into(),
+            id_token: None,
+        },
+        false,
+    )
+    .await
+    .unwrap();
+
+    // Server rotates csrf AFTER configure_auth froze the original snapshot.
+    let rotate_url = url::Url::parse(&format!("{base}/api/v1/rotate/")).unwrap();
+    let _ = ctx.get(&rotate_url).await.unwrap();
+    assert_eq!(ctx.csrf_token().await.as_deref(), Some("csrf-rotated"));
+
+    // A request with the expired token triggers a refresh; the refresh must
+    // carry the rotated csrf, not the frozen "csrf-initial".
+    let url = url::Url::parse(&format!("{base}/api/v1/metadata/")).unwrap();
+    let resp = ctx.get(&url).await.unwrap();
+    assert_eq!(resp.status(), 200);
+
+    assert_eq!(
+        state.seen_refresh_csrf.lock().await.as_deref(),
+        Some("csrf-rotated"),
+        "refresh must echo the LIVE csrf, not the construction-time snapshot"
+    );
+    assert_eq!(
+        ctx.csrf_token().await.as_deref(),
+        Some("csrf-after-refresh"),
+        "the csrf rotated by the refresh response must be captured into the shared store"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // (6) ClientResolver dispatch wraps a node with a custom client type
 // ---------------------------------------------------------------------------
 
