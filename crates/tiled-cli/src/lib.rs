@@ -540,8 +540,22 @@ pub async fn run(command: Command) -> Result<()> {
 
             let app = tiled_server::build_app(state);
 
-            let listener = tokio::net::TcpListener::bind(format!("{host}:{port}")).await?;
-            tracing::info!("Tiled server listening on {host}:{port}");
+            // Bind via the (host, port) tuple rather than format!("{host}:{port}").
+            // A bare IPv6 literal (e.g. `--host ::1`) string-concatenated with the
+            // port produces "::1:8000", which is not a valid SocketAddr — IPv6
+            // authorities must be bracketed ("[::1]:8000"). The tuple form goes
+            // through ToSocketAddrs, which resolves bare IPv6 literals, IPv4
+            // literals, and hostnames correctly without any manual bracketing.
+            let listener = tokio::net::TcpListener::bind((host.as_str(), port)).await?;
+            // Log the address actually bound (correctly bracketed for IPv6, and
+            // reflecting the real port when 0 was requested) rather than the raw
+            // host/port concatenation.
+            match listener.local_addr() {
+                Ok(addr) => tracing::info!("Tiled server listening on {addr}"),
+                Err(e) => {
+                    tracing::info!(host = %host, port, "Tiled server listening (local_addr unavailable: {e})")
+                }
+            }
             axum::serve(listener, app)
                 .with_graceful_shutdown(shutdown_signal())
                 .await?;
@@ -825,6 +839,29 @@ mod tests {
             panic!("expected Serve variant");
         };
         assert_eq!(host, "0.0.0.0");
+    }
+
+    // cli-L1: an IPv6 `--host` must not be string-concatenated with the port.
+    #[test]
+    fn ipv6_host_must_not_be_string_concatenated_with_port() {
+        use std::net::{SocketAddr, ToSocketAddrs};
+        // The bug: format!("{host}:{port}") for host="::1" yields "::1:8000",
+        // which is NOT a valid SocketAddr — IPv6 literals require bracketing.
+        assert!(
+            "::1:8000".parse::<SocketAddr>().is_err(),
+            "bare IPv6 host concatenated with port is not a valid SocketAddr"
+        );
+        // The fix: the (host, port) tuple goes through ToSocketAddrs (the same
+        // path tokio's TcpListener::bind((&str, u16)) takes), which resolves the
+        // bare IPv6 literal to a bracketed loopback addr with no manual work.
+        let resolved: Vec<SocketAddr> = ("::1", 8000u16)
+            .to_socket_addrs()
+            .expect("(\"::1\", port) must resolve")
+            .collect();
+        assert!(
+            resolved.iter().any(|a| a.is_ipv6() && a.port() == 8000),
+            "tuple form must resolve ::1 to an IPv6 socket addr; got {resolved:?}"
+        );
     }
 
     #[test]
