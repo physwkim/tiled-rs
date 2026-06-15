@@ -190,6 +190,56 @@ async fn register_then_read_then_patch_then_delete() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
+/// F-F: DELETE on a subtree holding an internally-managed (writable) data
+/// source is refused by default with 409 (mirrors Python `WouldDeleteData`,
+/// app.py:367-374). Passing `?external_only=false` forces the delete.
+#[tokio::test]
+async fn delete_internally_managed_requires_external_only_false() {
+    let (app, _dir) = build_test_app().await;
+
+    // Register an array node carrying a *writable* data source.
+    let register = |key: &str| {
+        serde_json::json!({
+            "key": key,
+            "structure_family": "array",
+            "metadata": {},
+            "specs": [],
+            "data_sources": [{
+                "structure_family": "array",
+                "mimetype": "application/x-hdf5",
+                "management": "writable",
+                "assets": [{
+                    "data_uri": "file:///tmp/frame.h5",
+                    "is_directory": false,
+                    "parameter": "data_uri"
+                }]
+            }]
+        })
+    };
+
+    let (status, body) =
+        json_request(&app, Method::POST, "/api/v1/register/", register("managed")).await;
+    assert_eq!(status, StatusCode::CREATED, "register: {body}");
+
+    // Default delete is refused with 409 Conflict.
+    let (status, _) = empty_request(&app, Method::DELETE, "/api/v1/metadata/managed").await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    // Node still present.
+    let (status, _) = empty_request(&app, Method::GET, "/api/v1/metadata/managed").await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Forced delete succeeds.
+    let (status, _) = empty_request(
+        &app,
+        Method::DELETE,
+        "/api/v1/metadata/managed?external_only=false",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = empty_request(&app, Method::GET, "/api/v1/metadata/managed").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
 /// F-A: json-patch ops are applied DIRECTLY to each document (metadata ops
 /// target the metadata doc, specs ops target the specs array), the body
 /// `content-type` discriminator is read from the body (not the transport

@@ -112,8 +112,9 @@ async fn migrate_create_lookup_delete() {
     assert_eq!(kids.len(), 1);
     assert_eq!(kids[0].key, "frame");
 
-    // Delete cascades.
-    cat.delete_node(container.id).await.unwrap();
+    // Delete cascades. The only descendant data source is `external`, so the
+    // default safety gate (external_only=true) permits it.
+    cat.delete_node(container.id, true).await.unwrap();
     assert!(
         cat.lookup(&["experiment_a".into()])
             .await
@@ -122,6 +123,90 @@ async fn migrate_create_lookup_delete() {
     );
     let assets_after = cat.list_assets(ds.id).await.unwrap();
     assert_eq!(assets_after.len(), 0);
+}
+
+/// F-F: `delete_node` with `external_only=true` (the safe default) refuses to
+/// delete a subtree that holds an internally-managed data source, mirroring
+/// Python `WouldDeleteData` (adapter.py:1037-1055). Passing `external_only=false`
+/// forces the cascade.
+#[tokio::test]
+async fn delete_refuses_internally_managed_subtree() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("sqlite://{}", dir.path().join("catalog.db").display());
+    let cat = Catalog::connect(&uri).await.unwrap();
+    cat.migrate().await.unwrap();
+
+    // container/frame, where `frame` carries a *writable* (internally-managed)
+    // data source nested one level below the delete target.
+    let container = cat
+        .create_node(
+            None,
+            vec![],
+            RegisterRequest {
+                key: "expt".into(),
+                structure_family: "container".into(),
+                metadata: json!({}),
+                specs: json!([]),
+                access_blob: json!({}),
+            },
+        )
+        .await
+        .unwrap();
+    let array = cat
+        .create_node(
+            Some(container.id),
+            vec!["expt".into()],
+            RegisterRequest {
+                key: "frame".into(),
+                structure_family: "array".into(),
+                metadata: json!({}),
+                specs: json!([]),
+                access_blob: json!({}),
+            },
+        )
+        .await
+        .unwrap();
+    cat.create_data_source(
+        array.id,
+        DataSourceSpec {
+            structure_family: "array".into(),
+            structure: json!({
+                "shape": [10],
+                "data_type": {"endianness": "little", "kind": "f", "itemsize": 8},
+                "chunks": [[10]],
+            }),
+            mimetype: "application/x-hdf5".into(),
+            parameters: json!({}),
+            management: "writable".into(),
+            assets: vec![AssetSpec {
+                data_uri: "file:///tmp/frame.h5".into(),
+                is_directory: false,
+                parameter: "data_uri".into(),
+                num: None,
+            }],
+        },
+    )
+    .await
+    .unwrap();
+
+    // Default gate refuses, even when deleting an ancestor of the managed node.
+    let err = cat.delete_node(container.id, true).await.unwrap_err();
+    assert!(
+        matches!(err, tiled_catalog::CatalogError::WouldDeleteData(_)),
+        "expected WouldDeleteData, got {err:?}"
+    );
+    // Nothing was deleted.
+    assert!(cat.lookup(&["expt".into()]).await.unwrap().is_some());
+
+    // Forced delete (external_only=false) cascades through.
+    cat.delete_node(container.id, false).await.unwrap();
+    assert!(cat.lookup(&["expt".into()]).await.unwrap().is_none());
+    assert!(
+        cat.lookup(&["expt".into(), "frame".into()])
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[tokio::test]

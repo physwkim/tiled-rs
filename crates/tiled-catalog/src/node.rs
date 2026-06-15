@@ -34,6 +34,36 @@ const MAX_REFERENCES: usize = 20;
 const MAX_REFERENCE_LABEL_CHARS: usize = 255;
 const MAX_REFERENCE_URL_CHARS: usize = 2047;
 
+/// Refusal message for `delete_node` when `external_only` blocks a delete that
+/// would orphan internally-managed storage. Verbatim from Python
+/// `tiled.catalog.adapter` (adapter.py:1051-1055).
+const WOULD_DELETE_DATA_MSG: &str = "Some items in this tree are internally managed. \
+Deleting the records will also delete the underlying data files. \
+If you want to delete them, pass external_only=False.";
+
+/// Count data sources in the subtree rooted at the bound node id (inclusive)
+/// whose `management` is not `external`. The recursive CTE walks `parent_id`,
+/// which is exactly the set the FK `ON DELETE CASCADE` would remove — so the
+/// gate covers precisely what the delete would destroy.
+const SUBTREE_INTERNAL_COUNT_SQLITE: &str = "WITH RECURSIVE subtree(id) AS (
+    SELECT id FROM nodes WHERE id = ?
+    UNION ALL
+    SELECT n.id FROM nodes n JOIN subtree s ON n.parent_id = s.id
+)
+SELECT COUNT(*) FROM data_sources ds
+  JOIN subtree s ON ds.node_id = s.id
+ WHERE ds.management <> 'external'";
+
+/// Postgres variant of [`SUBTREE_INTERNAL_COUNT_SQLITE`] (positional `$1`).
+const SUBTREE_INTERNAL_COUNT_POSTGRES: &str = "WITH RECURSIVE subtree(id) AS (
+    SELECT id FROM nodes WHERE id = $1
+    UNION ALL
+    SELECT n.id FROM nodes n JOIN subtree s ON n.parent_id = s.id
+)
+SELECT COUNT(*) FROM data_sources ds
+  JOIN subtree s ON ds.node_id = s.id
+ WHERE ds.management <> 'external'";
+
 /// Validate metadata + specs against the size limits Python tiled enforces
 /// (bluesky/tiled#342, #262). Caught early so a misbehaving client can't
 /// push a 100 MB blob through to disk.
@@ -445,9 +475,29 @@ impl Catalog {
 
     /// Delete a node and all its descendants. Cascades through data sources
     /// + assets via the FK ON DELETE CASCADE wiring.
-    pub async fn delete_node(&self, node_id: i64) -> Result<()> {
+    ///
+    /// When `external_only` is true (the safe default), refuse the delete if
+    /// any data source in the subtree is internally managed (`management !=
+    /// 'external'`): cascading the catalog rows would orphan the underlying
+    /// managed storage files. The subtree is enumerated with a recursive CTE
+    /// over `parent_id`, which is exactly the set the FK `ON DELETE CASCADE`
+    /// will remove. Mirrors Python
+    /// `tiled.catalog.adapter.CatalogNodeAdapter.delete` (adapter.py:1037-1055,
+    /// raising `WouldDeleteData`).
+    pub async fn delete_node(&self, node_id: i64, external_only: bool) -> Result<()> {
         match self.pool() {
             DbPool::Sqlite(pool) => {
+                if external_only {
+                    let internal: i64 = sqlx::query_scalar(SUBTREE_INTERNAL_COUNT_SQLITE)
+                        .bind(node_id)
+                        .fetch_one(pool)
+                        .await?;
+                    if internal > 0 {
+                        return Err(CatalogError::WouldDeleteData(
+                            WOULD_DELETE_DATA_MSG.to_string(),
+                        ));
+                    }
+                }
                 let res = sqlx::query("DELETE FROM nodes WHERE id = ?")
                     .bind(node_id)
                     .execute(pool)
@@ -457,6 +507,17 @@ impl Catalog {
                 }
             }
             DbPool::Postgres(pool) => {
+                if external_only {
+                    let internal: i64 = sqlx::query_scalar(SUBTREE_INTERNAL_COUNT_POSTGRES)
+                        .bind(node_id)
+                        .fetch_one(pool)
+                        .await?;
+                    if internal > 0 {
+                        return Err(CatalogError::WouldDeleteData(
+                            WOULD_DELETE_DATA_MSG.to_string(),
+                        ));
+                    }
+                }
                 let res = sqlx::query("DELETE FROM nodes WHERE id = $1")
                     .bind(node_id)
                     .execute(pool)

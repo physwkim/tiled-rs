@@ -16,6 +16,12 @@ pub enum CatalogError {
     #[error("conflict: {0}")]
     Conflict(String),
 
+    /// Deleting this subtree would orphan internally-managed storage. Raised
+    /// by `delete_node` when `external_only` is set and any descendant data
+    /// source is not `external`. Mirrors Python `WouldDeleteData`.
+    #[error("would delete data: {0}")]
+    WouldDeleteData(String),
+
     #[error("validation: {0}")]
     Validation(String),
 

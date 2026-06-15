@@ -10,6 +10,11 @@ use tiled_core::schemas;
 pub enum ServerError {
     NotFound(String),
     Validation(String),
+    /// The request conflicts with the current state of the resource. Maps to
+    /// HTTP 409 to match Python tiled, which raises `WouldDeleteData` and
+    /// answers `HTTP_409_CONFLICT` (app.py:367-374) when a delete would orphan
+    /// internally-managed data sources.
+    Conflict(String),
     Internal(String),
     UnsupportedMediaType(String),
     /// The client requested (via `?format=` or `Accept`) a media type this
@@ -36,6 +41,7 @@ impl std::fmt::Display for ServerError {
         match self {
             Self::NotFound(msg) => write!(f, "Not found: {msg}"),
             Self::Validation(msg) => write!(f, "Validation error: {msg}"),
+            Self::Conflict(msg) => write!(f, "Conflict: {msg}"),
             Self::Internal(msg) => write!(f, "Internal error: {msg}"),
             Self::UnsupportedMediaType(msg) => write!(f, "Unsupported media type: {msg}"),
             Self::NotAcceptable(msg) => write!(f, "Not acceptable: {msg}"),
@@ -53,6 +59,7 @@ impl IntoResponse for ServerError {
         let (status, code, message) = match self {
             Self::NotFound(msg) => (StatusCode::NOT_FOUND, 404, msg),
             Self::Validation(msg) => (StatusCode::UNPROCESSABLE_ENTITY, 422, msg),
+            Self::Conflict(msg) => (StatusCode::CONFLICT, 409, msg),
             // Internal errors carry MongoDB driver text, filesystem paths,
             // and similar details that should not reach unauthenticated
             // clients. Log the full message server-side and return a

@@ -2238,6 +2238,9 @@ fn map_catalog_err(e: tiled_catalog::CatalogError) -> ServerError {
         CE::NotFound(m) => ServerError::NotFound(m),
         CE::Validation(m) => ServerError::Validation(m),
         CE::Conflict(m) => ServerError::Validation(m),
+        // Deleting a subtree with internally-managed data sources → 409,
+        // matching Python's WouldDeleteData handler (app.py:367-374).
+        CE::WouldDeleteData(m) => ServerError::Conflict(m),
         // Database/Migration/Json/Io are all 500-class; the IntoResponse
         // impl logs the detail and returns a generic 500 body so we don't
         // leak DB internals to the client (R7).
@@ -2546,9 +2549,24 @@ pub async fn put_data_source(
 pub async fn delete_metadata(
     State(state): State<AppState>,
     OriginalUri(uri): OriginalUri,
+    Query(params): Query<HashMap<String, String>>,
     auth: crate::AuthContext,
 ) -> Result<impl IntoResponse, ServerError> {
     let segments = segments_from_uri(&uri, "/api/v1/metadata/");
+    // Safety gate, on by default (Python `external_only=True`, router.py:1979).
+    // When true, the catalog refuses to delete a subtree that holds any
+    // internally-managed data source (would orphan the storage files).
+    // Only an explicit false-ish value disables it; an unrecognized value
+    // keeps the gate on, the data-safe choice.
+    let external_only = params
+        .get("external_only")
+        .map(|v| {
+            !matches!(
+                v.to_ascii_lowercase().as_str(),
+                "false" | "0" | "no" | "off"
+            )
+        })
+        .unwrap_or(true);
     let catalog = state.catalog.as_ref().ok_or_else(|| {
         ServerError::Validation("server has no catalog DB; DELETE not supported".into())
     })?;
@@ -2583,7 +2601,7 @@ pub async fn delete_metadata(
         }
     }
     catalog
-        .delete_node(node.id)
+        .delete_node(node.id, external_only)
         .await
         .map_err(map_catalog_err)?;
     let path = segments.join("/");
