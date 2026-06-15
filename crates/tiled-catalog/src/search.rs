@@ -197,8 +197,20 @@ impl WhereBuilder {
     }
 
     fn push_key_present(&mut self, key: &str, exists: bool) {
-        let lhs = self.dialect.json_value("metadata", key);
         let op = if exists { "IS NOT NULL" } else { "IS NULL" };
+        let lhs = match self.dialect {
+            // SQLite: the `->` operator returns JSON 'null' (text) for a
+            // present-but-null key and SQL NULL only for an absent key, so a
+            // present null reports present — matching Python
+            // `metadata_.op("->")("$."+key) != None` (adapter.py:2144-2145).
+            // `json_extract` would coerce a JSON null to SQL NULL and wrongly
+            // report the key absent.
+            Dialect::Sqlite => format!("(metadata -> '$.{}')", sanitize_json_key(key)),
+            // Postgres: `#>` path access returns jsonb 'null' for a present
+            // null and SQL NULL for absent — already correct
+            // (adapter.py:2147-2149).
+            Dialect::Postgres => self.dialect.json_value("metadata", key),
+        };
         self.pieces.push(format!("{lhs} {op}"));
     }
 
@@ -1133,6 +1145,32 @@ mod tests {
         b.push_eq("count", &json!(5));
         let (sql, _) = b.finish();
         assert_eq!(sql, "json_extract(metadata, '$.count') = ?");
+    }
+
+    // F-Q: SQLite KeyPresent must use the `->` operator so a present-but-null
+    // key reports present (json_extract would coerce JSON null → SQL NULL).
+    #[test]
+    fn push_key_present_sqlite_uses_arrow_operator() {
+        let mut b = WhereBuilder::new(Dialect::Sqlite);
+        b.push_key_present("color", true);
+        let (sql, _) = b.finish();
+        assert_eq!(sql, "(metadata -> '$.color') IS NOT NULL");
+    }
+
+    #[test]
+    fn push_key_present_sqlite_absent_uses_is_null() {
+        let mut b = WhereBuilder::new(Dialect::Sqlite);
+        b.push_key_present("color", false);
+        let (sql, _) = b.finish();
+        assert_eq!(sql, "(metadata -> '$.color') IS NULL");
+    }
+
+    #[test]
+    fn push_key_present_postgres_uses_hash_arrow_path() {
+        let mut b = WhereBuilder::new(Dialect::Postgres);
+        b.push_key_present("a.b", true);
+        let (sql, _) = b.finish();
+        assert_eq!(sql, "(metadata #> '{a,b}') IS NOT NULL");
     }
 
     // H2: Specs SQL generation
