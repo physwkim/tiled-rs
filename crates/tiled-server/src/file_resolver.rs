@@ -207,14 +207,70 @@ fn build_leaf_adapter(
     Ok(any_adapter)
 }
 
+/// Decode a `data_uri` into a local filesystem path.
+///
+/// Mirrors Python tiled's `path_from_uri` (`tiled/utils.py`): only the
+/// `file:` scheme maps to a local path. A bare absolute path with no scheme
+/// (`/etc/passwd`) or any other scheme (`s3://`, `http://`, …) is rejected,
+/// so a registered `data_uri` cannot read an arbitrary file off disk by
+/// skipping the scheme. (Previously a `starts_with('/')` fallback accepted
+/// scheme-less absolute paths — that bypass is N1 and is removed here.)
+///
+/// Both authority forms decode to the absolute path that begins at the first
+/// `/` after the scheme: `file:///a/b/c` (empty authority) and
+/// `file://localhost/a/b/c` (host authority) both yield `/a/b/c`, matching
+/// `urlparse`.
 fn uri_to_path(uri: &str) -> std::result::Result<PathBuf, CatalogError> {
-    if let Some(rest) = uri.strip_prefix("file://") {
-        Ok(PathBuf::from(rest))
-    } else if uri.starts_with('/') {
-        Ok(PathBuf::from(uri))
-    } else {
-        Err(CatalogError::Validation(format!(
-            "data_uri {uri} is not a file:// URI"
-        )))
+    let rest = uri.strip_prefix("file://").ok_or_else(|| {
+        CatalogError::Validation(format!("data_uri {uri} must use the file:// scheme"))
+    })?;
+    // `rest` is `<authority><path>`; the path is everything from the first
+    // `/`. No `/` means a malformed `file://` with no absolute path.
+    match rest.find('/') {
+        Some(i) => Ok(PathBuf::from(&rest[i..])),
+        None => Err(CatalogError::Validation(format!(
+            "data_uri {uri} has no absolute file:// path"
+        ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uri_to_path_accepts_empty_authority() {
+        assert_eq!(
+            uri_to_path("file:///data/scan001.h5").unwrap(),
+            PathBuf::from("/data/scan001.h5")
+        );
+    }
+
+    #[test]
+    fn uri_to_path_strips_host_authority() {
+        // file://localhost/a/b -> /a/b, matching Python's urlparse.
+        assert_eq!(
+            uri_to_path("file://localhost/a/b").unwrap(),
+            PathBuf::from("/a/b")
+        );
+    }
+
+    #[test]
+    fn uri_to_path_rejects_bare_absolute_path() {
+        // N1: a scheme-less absolute path must not bypass the file:// check.
+        assert!(uri_to_path("/etc/passwd").is_err());
+    }
+
+    #[test]
+    fn uri_to_path_rejects_other_schemes() {
+        assert!(uri_to_path("s3://bucket/key").is_err());
+        assert!(uri_to_path("http://host/p").is_err());
+        assert!(uri_to_path("sqlite:///db.sqlite").is_err());
+    }
+
+    #[test]
+    fn uri_to_path_rejects_malformed_file_uri() {
+        assert!(uri_to_path("file://").is_err());
+        assert!(uri_to_path("file://relative-no-slash").is_err());
     }
 }
