@@ -125,7 +125,11 @@ impl Issuer {
 
     pub fn verify_access(&self, token: &str) -> Result<AccessClaims> {
         let mut v = Validation::new(Algorithm::HS256);
-        v.leeway = 5;
+        // Parity with Python tiled: `jose.jwt.decode` is called with no
+        // leeway, so exp is checked exactly (default leeway 0). jsonwebtoken
+        // defaults to 60s; pin it to 0 so a token Python would reject as
+        // expired is not accepted here.
+        v.leeway = 0;
         let data = decode::<AccessClaims>(token, &self.decoding, &v)?;
         if data.claims.typ != "access" {
             return Err(AuthError::Unauthorized("not an access token".into()));
@@ -135,7 +139,11 @@ impl Issuer {
 
     pub fn verify_refresh(&self, token: &str) -> Result<RefreshClaims> {
         let mut v = Validation::new(Algorithm::HS256);
-        v.leeway = 5;
+        // Parity with Python tiled: `jose.jwt.decode` is called with no
+        // leeway, so exp is checked exactly (default leeway 0). jsonwebtoken
+        // defaults to 60s; pin it to 0 so a token Python would reject as
+        // expired is not accepted here.
+        v.leeway = 0;
         let data = decode::<RefreshClaims>(token, &self.decoding, &v)?;
         if data.claims.typ != "refresh" {
             return Err(AuthError::Unauthorized("not a refresh token".into()));
@@ -182,5 +190,34 @@ mod tests {
             issuer.verify_access(&refresh).unwrap_err(),
             AuthError::Jwt(_) | AuthError::Unauthorized(_)
         ));
+    }
+
+    // auth-M1: leeway must be 0 (Python parity), not 5s. A token that expired
+    // 3s ago was accepted under the old 5s leeway; with leeway 0 it must be
+    // rejected — same as Python, whose jose.jwt.decode uses no leeway.
+    // Negative TTL puts exp deterministically in the past (no sleep, no flake).
+
+    #[test]
+    fn access_token_expired_within_old_leeway_is_rejected() {
+        let issuer = Issuer::new(b"this-is-a-test-secret-32-bytes-long!!")
+            .unwrap()
+            .with_ttls(Duration::seconds(-3), Duration::days(7));
+        let token = issuer.issue_access("p", "s", ScopeSet::default()).unwrap();
+        assert!(
+            issuer.verify_access(&token).is_err(),
+            "token expired 3s ago must be rejected with leeway=0 (was accepted under 5s leeway)"
+        );
+    }
+
+    #[test]
+    fn refresh_token_expired_within_old_leeway_is_rejected() {
+        let issuer = Issuer::new(b"this-is-a-test-secret-32-bytes-long!!")
+            .unwrap()
+            .with_ttls(Duration::minutes(15), Duration::seconds(-3));
+        let token = issuer.issue_refresh("p", "s").unwrap();
+        assert!(
+            issuer.verify_refresh(&token).is_err(),
+            "refresh token expired 3s ago must be rejected with leeway=0"
+        );
     }
 }
