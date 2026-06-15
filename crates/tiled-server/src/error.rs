@@ -12,6 +12,11 @@ pub enum ServerError {
     Validation(String),
     Internal(String),
     UnsupportedMediaType(String),
+    /// The client requested (via `?format=` or `Accept`) a media type this
+    /// structure family cannot serialize. Maps to HTTP 406 to match Python
+    /// tiled, which raises `UnsupportedMediaTypes` and answers
+    /// `HTTP_406_NOT_ACCEPTABLE` (router.py:642-643, core.py:374-419).
+    NotAcceptable(String),
     Unauthorized(String),
     Forbidden(String),
     /// Decoded response payload exceeds the configured
@@ -33,6 +38,7 @@ impl std::fmt::Display for ServerError {
             Self::Validation(msg) => write!(f, "Validation error: {msg}"),
             Self::Internal(msg) => write!(f, "Internal error: {msg}"),
             Self::UnsupportedMediaType(msg) => write!(f, "Unsupported media type: {msg}"),
+            Self::NotAcceptable(msg) => write!(f, "Not acceptable: {msg}"),
             Self::Unauthorized(msg) => write!(f, "Unauthorized: {msg}"),
             Self::Forbidden(msg) => write!(f, "Forbidden: {msg}"),
             Self::ResponseTooLarge(msg) => write!(f, "Response too large: {msg}"),
@@ -60,6 +66,7 @@ impl IntoResponse for ServerError {
                 )
             }
             Self::UnsupportedMediaType(msg) => (StatusCode::UNSUPPORTED_MEDIA_TYPE, 415, msg),
+            Self::NotAcceptable(msg) => (StatusCode::NOT_ACCEPTABLE, 406, msg),
             Self::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, 401, msg),
             Self::Forbidden(msg) => (StatusCode::FORBIDDEN, 403, msg),
             Self::ResponseTooLarge(msg) => (StatusCode::BAD_REQUEST, 400, msg),

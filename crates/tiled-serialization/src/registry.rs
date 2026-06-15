@@ -123,21 +123,30 @@ impl Default for SerializationRegistry {
     }
 }
 
-/// Resolve the appropriate media type, honoring an explicit `?format=` query
-/// param before falling back to the Accept header.
+/// Resolve the appropriate media type. An explicit `?format=` query param is
+/// given **hard priority**: if it is present, the `Accept` header is never
+/// consulted, matching Python tiled (`tiled/server/core.py:374-419`, which
+/// raises `UnsupportedMediaTypes` rather than falling back to `Accept`).
 ///
-/// Resolution order for `format_param`:
+/// Resolution order for `format_param` (returns `None` if none apply):
 ///  1. Verbatim full MIME type (e.g. `"text/csv"`) — accepted only when a
 ///     serializer is registered for this `family`.
 ///  2. Registry alias table — bare extensions and dotted forms
 ///     (e.g. `"png"` / `".png"`) registered via [`SerializationRegistry::register_alias`].
-///     No family check here; the router may handle some formats (e.g. `application/zip`)
-///     outside the serializer registry.
+///     No family/dispatch check here: some aliases (e.g. `".zip"` →
+///     `"application/zip"`) name a format the **router** produces *outside* the
+///     serializer registry, so producibility is the router's concern. The router
+///     errors (HTTP 406) when the resolved media type is neither registry-
+///     dispatchable nor one it handles itself — it must never serve raw bytes
+///     under a foreign Content-Type (see `tiled-server` `build_array_response`/
+///     `build_table_response`).
 ///  3. [`tiled_core::media_type::resolve_alias`] — for bare extensions known to
 ///     the core alias table but not explicitly registered in this registry instance
 ///     (e.g. `"csv"` → `"text/csv"`). Accepted only when a serializer is registered
 ///     for this `family`.
-///  4. Fall back to the `Accept` header via [`resolve_media_type`].
+///
+/// When `format_param` is `None`, fall back to the `Accept` header via
+/// [`resolve_media_type`].
 pub fn negotiate_media_type(
     format_param: Option<&str>,
     accept: &str,
@@ -168,6 +177,12 @@ pub fn negotiate_media_type(
         {
             return Some(mt.to_string());
         }
+
+        // An explicit `?format=` was given but resolved to nothing serviceable for
+        // this family. Give `format` hard priority (Python parity): return `None`
+        // so the caller raises an error, rather than silently falling back to the
+        // `Accept` default and serving the wrong representation.
+        return None;
     }
     resolve_media_type(accept, family, registry)
 }
@@ -198,5 +213,81 @@ fn default_media_type(family: StructureFamily) -> Option<String> {
         }
         StructureFamily::Table => Some(tiled_core::media_type::mime::ARROW_FILE.to_string()),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn array_registry() -> SerializationRegistry {
+        let reg = SerializationRegistry::new();
+        crate::array::register_array_serializers(&reg);
+        reg
+    }
+
+    #[test]
+    fn format_priority_unresolved_returns_none_no_accept_fallback() {
+        let reg = array_registry();
+        // An explicit but unresolvable `?format=` must NOT fall back to the
+        // Accept header (which here asks for the serviceable octet-stream).
+        // Python gives `format` hard priority and raises UnsupportedMediaTypes.
+        let got = negotiate_media_type(
+            Some("definitely-not-a-format"),
+            "application/octet-stream",
+            StructureFamily::Array,
+            &reg,
+        );
+        assert_eq!(
+            got, None,
+            "unresolved ?format= must not fall back to Accept"
+        );
+    }
+
+    #[test]
+    fn format_priority_resolvable_returns_media_type() {
+        let reg = array_registry();
+        // "csv" resolves via the core alias table to text/csv, which the array
+        // family serializes → returned despite Accept asking for octet-stream.
+        let got = negotiate_media_type(
+            Some("csv"),
+            "application/octet-stream",
+            StructureFamily::Array,
+            &reg,
+        );
+        assert_eq!(got.as_deref(), Some(tiled_core::media_type::mime::CSV));
+    }
+
+    #[test]
+    fn no_format_falls_back_to_accept() {
+        let reg = array_registry();
+        let got = negotiate_media_type(
+            None,
+            tiled_core::media_type::mime::CSV,
+            StructureFamily::Array,
+            &reg,
+        );
+        assert_eq!(got.as_deref(), Some(tiled_core::media_type::mime::CSV));
+    }
+
+    #[test]
+    fn format_alias_resolves_optimistically_router_enforces() {
+        // With the full registry, `.zip` is a globally-registered alias
+        // (html_container) → `application/zip`. negotiate resolves it even for
+        // the array family (which cannot serialize it): producibility is the
+        // router's concern (it errors HTTP 406). This documents the split.
+        let reg = crate::default_registry();
+        let got = negotiate_media_type(
+            Some("zip"),
+            "application/octet-stream",
+            StructureFamily::Array,
+            &reg,
+        );
+        assert_eq!(got.as_deref(), Some("application/zip"));
+        assert!(
+            reg.dispatch(StructureFamily::Array, "application/zip")
+                .is_none(),
+            "no array serializer for application/zip → router must reject"
+        );
     }
 }

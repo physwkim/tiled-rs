@@ -962,6 +962,36 @@ async fn array_full_format_param_beats_accept_header() {
     assert_eq!(lines[9].trim(), "9", "last CSV line must be 9");
 }
 
+/// Finding 1 (H2 export-corruption family, unsupported-format case): a
+/// `?format=` that resolves to a media type with no serializer for this family
+/// must return HTTP 406, NOT HTTP 200 with the raw payload mislabeled under the
+/// foreign Content-Type. Mirrors Python's `UnsupportedMediaTypes` → 406
+/// (tiled/server/router.py:642-643). Here `?format=zip` resolves `.zip` →
+/// `application/zip` (a router/container format the array family cannot encode).
+#[tokio::test]
+async fn array_export_unsupported_format_returns_406_not_raw_bytes() {
+    let app = build_app();
+    let (status, headers, body) =
+        get_with_headers(&app, "/api/v1/array/full/some_array?format=zip", &[]).await;
+    assert_eq!(
+        status, 406,
+        "array.export with an unsupported format must be 406, not 200-with-raw-bytes"
+    );
+    let content_type = headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        !content_type.contains("application/zip"),
+        "must not label the response with the foreign Content-Type; got {content_type}"
+    );
+    // The 80-byte little-endian array buffer would never parse as JSON; this
+    // proves the raw payload is not served.
+    let json: serde_json::Value =
+        serde_json::from_slice(&body).expect("406 body must be a JSON error, not raw array bytes");
+    assert_eq!(json["error"]["code"], 406);
+}
+
 // ---------------------------------------------------------------------------
 // /table/full — read the whole table (all partitions) with optional column
 // projection and format negotiation. Mirrors the upstream `table_full`
@@ -1148,6 +1178,40 @@ async fn test_table_full_endpoint() {
         assert_eq!(lines[0], "x,y", "csv header row must list columns");
         assert_eq!(lines.len(), 4, "csv must have header + 3 data rows");
     }
+}
+
+/// Finding 1 (table side): `?format=png` resolves `.png` → `image/png`, which
+/// the table family cannot serialize. Must be HTTP 406, not 200 with raw Arrow
+/// IPC bytes mislabeled as `image/png`.
+#[cfg(feature = "csv-adapter")]
+#[tokio::test]
+async fn table_export_unsupported_format_returns_406_not_raw_ipc() {
+    use std::io::Write;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.csv");
+    let mut f = std::fs::File::create(&path).unwrap();
+    writeln!(f, "x,y").unwrap();
+    writeln!(f, "1,10").unwrap();
+    f.flush().unwrap();
+
+    let app = build_table_app(path, 300_000_000);
+    let (status, headers, body) =
+        get_with_headers(&app, "/api/v1/table/full/some_table?format=png", &[]).await;
+    assert_eq!(
+        status, 406,
+        "table.export with an unsupported format must be 406, not 200-with-raw-IPC"
+    );
+    let content_type = headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        !content_type.contains("image/png"),
+        "must not label raw Arrow IPC as image/png; got {content_type}"
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&body).expect("406 body must be a JSON error, not raw Arrow IPC");
+    assert_eq!(json["error"]["code"], 406);
 }
 
 // ---------------------------------------------------------------------------

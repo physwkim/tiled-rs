@@ -529,6 +529,25 @@ fn check_response_size(nbytes: usize, limit: usize, hint: &str) -> Result<(), Se
 // Shared array response builder (used by array_block and array_full)
 // ---------------------------------------------------------------------------
 
+/// Build the HTTP 406 returned when a client's requested `?format=`/`Accept`
+/// resolves to a media type this structure `family` cannot serialize. Mirrors
+/// Python tiled's `UnsupportedMediaTypes` → `HTTP_406_NOT_ACCEPTABLE`
+/// (router.py:642-643, core.py:374-419). The data handlers must never fall
+/// back to serving the raw payload under the requested (foreign) Content-Type:
+/// that silently corrupts `client.export()` (HTTP 200 with mislabeled bytes).
+fn unsupported_media_type(
+    family: tiled_core::structures::StructureFamily,
+    requested: &str,
+    registry: &tiled_serialization::SerializationRegistry,
+) -> ServerError {
+    let mut supported = registry.media_types(family);
+    supported.sort();
+    ServerError::NotAcceptable(format!(
+        "Cannot serialize {family} as {requested:?}. Supported media types: {}.",
+        supported.join(", ")
+    ))
+}
+
 async fn build_array_response(
     data: tiled_core::dtype::DynNDArray,
     format_param: Option<&str>,
@@ -547,35 +566,47 @@ async fn build_array_response(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/octet-stream");
 
+    let family = tiled_core::structures::StructureFamily::Array;
     let media_type = tiled_serialization::negotiate_media_type(
         format_param,
         accept,
-        tiled_core::structures::StructureFamily::Array,
+        family,
         &state.serialization_registry,
     )
-    .unwrap_or_else(|| "application/octet-stream".to_string());
+    .ok_or_else(|| {
+        // `None` here means an explicit `?format=` was given but resolves to
+        // nothing serviceable for this family (Python format-priority error).
+        unsupported_media_type(
+            family,
+            format_param.unwrap_or_default(),
+            &state.serialization_registry,
+        )
+    })?;
 
-    let body = if let Some(serializer) = state
+    // Never serve the raw payload under a foreign Content-Type: if the negotiated
+    // media type has no serializer for this family, error (HTTP 406) like the
+    // container handler (router.rs ~:1320), instead of mislabeling raw bytes.
+    let serializer = state
         .serialization_registry
-        .dispatch(tiled_core::structures::StructureFamily::Array, &media_type)
-    {
-        let ser_meta = serde_json::json!({
-            "itemsize": data.dtype.element_size(),
-            "kind": String::from(data.dtype.kind.to_numpy_char()),
-            "byteorder": String::from(data.dtype.endianness.to_numpy_char()),
-            "shape": data.shape,
-        });
-        // Serializers run CPU-bound encode work (and, for HDF5, blocking file
-        // I/O); offload off the async executor so a large export can't stall
-        // the runtime. `dispatch` returns an Arc<SerializerFn> (Send + 'static).
-        let payload = data.data;
-        tokio::task::spawn_blocking(move || serializer(&payload, &ser_meta))
-            .await
-            .map_err(|e| ServerError::Internal(format!("serialize task failed: {e}")))?
-            .map_err(|e| ServerError::Internal(e.to_string()))?
-    } else {
-        data.data
-    };
+        .dispatch(family, &media_type)
+        .ok_or_else(|| {
+            unsupported_media_type(family, &media_type, &state.serialization_registry)
+        })?;
+
+    let ser_meta = serde_json::json!({
+        "itemsize": data.dtype.element_size(),
+        "kind": String::from(data.dtype.kind.to_numpy_char()),
+        "byteorder": String::from(data.dtype.endianness.to_numpy_char()),
+        "shape": data.shape,
+    });
+    // Serializers run CPU-bound encode work (and, for HDF5, blocking file
+    // I/O); offload off the async executor so a large export can't stall
+    // the runtime. `dispatch` returns an Arc<SerializerFn> (Send + 'static).
+    let payload = data.data;
+    let body = tokio::task::spawn_blocking(move || serializer(&payload, &ser_meta))
+        .await
+        .map_err(|e| ServerError::Internal(format!("serialize task failed: {e}")))?
+        .map_err(|e| ServerError::Internal(e.to_string()))?;
 
     Ok(serve_with_range(headers, &media_type, body))
 }
@@ -606,13 +637,22 @@ async fn build_table_response(
         .get(axum::http::header::ACCEPT)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
+    let family = tiled_core::structures::StructureFamily::Table;
     let media_type = tiled_serialization::negotiate_media_type(
         format_param,
         accept,
-        tiled_core::structures::StructureFamily::Table,
+        family,
         &state.serialization_registry,
     )
-    .unwrap_or_else(|| tiled_core::media_type::mime::ARROW_FILE.to_string());
+    .ok_or_else(|| {
+        // Explicit `?format=` that resolves to nothing this family serves →
+        // Python format-priority error. Bail before the (expensive) IPC encode.
+        unsupported_media_type(
+            family,
+            format_param.unwrap_or_default(),
+            &state.serialization_registry,
+        )
+    })?;
 
     // Arrow IPC encode is CPU-bound with no inner async — offload it.
     let ipc_bytes = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, ServerError> {
@@ -634,19 +674,22 @@ async fn build_table_response(
     .await
     .map_err(|e| ServerError::Internal(format!("blocking task failed: {e}")))??;
 
-    // Route the Arrow IPC bytes through the serialization registry so
-    // format negotiation applies (e.g., parquet re-encodes the IPC bytes).
-    let body = if let Some(serializer) = state
+    // Route the Arrow IPC bytes through the serialization registry so format
+    // negotiation applies (e.g., parquet/csv re-encode the IPC bytes). The
+    // default `application/vnd.apache.arrow.file` is registered as an identity
+    // serializer, so the only way `dispatch` misses is a `?format=` resolving
+    // to a non-table media type — error (HTTP 406), never mislabel raw IPC.
+    let serializer = state
         .serialization_registry
-        .dispatch(tiled_core::structures::StructureFamily::Table, &media_type)
-    {
+        .dispatch(family, &media_type)
+        .ok_or_else(|| {
+            unsupported_media_type(family, &media_type, &state.serialization_registry)
+        })?;
+    let body =
         tokio::task::spawn_blocking(move || serializer(&ipc_bytes, &serde_json::Value::Null))
             .await
             .map_err(|e| ServerError::Internal(format!("serialize task failed: {e}")))?
-            .map_err(|e| ServerError::Internal(e.to_string()))?
-    } else {
-        bytes::Bytes::from(ipc_bytes)
-    };
+            .map_err(|e| ServerError::Internal(e.to_string()))?;
 
     Ok(serve_with_range(headers, &media_type, body))
 }
