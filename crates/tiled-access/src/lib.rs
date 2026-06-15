@@ -52,15 +52,23 @@ pub trait AccessPolicy: Send + Sync {
 
     /// Filter to AND into listing/search queries so a principal only sees
     /// nodes they are permitted to access. `None` means no extra filter
-    /// (all nodes visible — passthrough behaviour).
+    /// (all nodes visible — passthrough / ALL_ACCESS behaviour).
     ///
     /// Called once per search/list request, NOT per node.  The returned
     /// filter is pushed down to SQL via [`AccessBlobFilter`] so that
     /// unpermitted rows never leave the database.
+    ///
+    /// `requested_scopes` are the scopes this listing operation needs (e.g.
+    /// `{read:metadata}` for a search, `{read:data}` for a full export).
+    /// A policy may deny the listing outright (an all-false filter) when the
+    /// caller's request exceeds what it can grant, and may widen the public
+    /// surface only for read-scoped listings. Mirrors the `scopes` argument
+    /// of Python `AccessPolicy.filters` (access_policies.py:368-413).
     async fn list_filter(
         &self,
         _principal: Option<&Principal>,
         _session_scopes: &ScopeSet,
+        _requested_scopes: &ScopeSet,
     ) -> Option<AccessBlobFilter> {
         None
     }
@@ -201,11 +209,32 @@ impl AccessPolicy for TagBasedPolicy {
     async fn list_filter(
         &self,
         principal: Option<&Principal>,
-        _session_scopes: &ScopeSet,
+        session_scopes: &ScopeSet,
+        requested_scopes: &ScopeSet,
     ) -> Option<AccessBlobFilter> {
+        // NO_ACCESS: the requested scopes must be grantable by this policy.
+        // Mirrors Python filters() line 378-379
+        // (`if not scopes.issubset(self.scopes): return NO_ACCESS`).
+        // ALL_ACCESS is `None`; NO_ACCESS is an all-false filter (deny-all).
+        if !requested_scopes.0.is_subset(&self.default_scopes.0) {
+            return Some(AccessBlobFilter::default());
+        }
+
+        // Admin short-circuit → ALL_ACCESS. Admins are not narrowed by tags.
+        // Mirrors filters() line 387-388 (`elif self._is_admin: return ALL_ACCESS`).
+        if principal.is_some() && session_scopes.contains(Scope::AdminApiKeys) {
+            return None;
+        }
+
         let (user_id, tags) = match principal {
             None => (None, vec![]),
             Some(p) => {
+                // Each granted tag confers `default_scopes` in this built-in,
+                // so Python's per-scope tag intersection
+                // (`∩ get_tags_from_scope(scope, id)` over the requested
+                // scopes, filters() line 391-398) reduces to the principal's
+                // full granted-tag set once the subset gate above confirmed
+                // every requested scope is grantable.
                 let granted = self
                     .principal_tags
                     .get(&p.uuid)
@@ -214,10 +243,112 @@ impl AccessPolicy for TagBasedPolicy {
                 (Some(p.uuid.clone()), granted)
             }
         };
+
+        // The untagged-public surface is read-only: it appears only when every
+        // requested scope is a read scope. Mirrors filters() line 400-407
+        // (`get_public_tags()` is added only for `scope in read_scopes`); in
+        // this built-in the untagged rows are that public surface. A
+        // write-scoped listing therefore sees no public rows.
+        let include_untagged = requested_scopes.0.is_subset(&ScopeSet::read_only().0);
+
         Some(AccessBlobFilter {
             user_id,
             tags,
-            include_untagged: true,
+            include_untagged,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn principal(uuid: &str) -> Principal {
+        serde_json::from_value(serde_json::json!({
+            "id": 1,
+            "uuid": uuid,
+            "type": "user",
+            "role": "user",
+            "time_created": "2020-01-01T00:00:00Z",
+        }))
+        .unwrap()
+    }
+
+    fn read_metadata() -> ScopeSet {
+        ScopeSet::from_iter([Scope::ReadMetadata])
+    }
+
+    #[tokio::test]
+    async fn list_filter_anonymous_lists_untagged_public_only() {
+        let policy = TagBasedPolicy::new(ScopeSet::full());
+        let f = policy
+            .list_filter(None, &ScopeSet::default(), &read_metadata())
+            .await
+            .unwrap();
+        assert_eq!(f.user_id, None);
+        assert!(f.tags.is_empty());
+        assert!(f.include_untagged);
+    }
+
+    #[tokio::test]
+    async fn list_filter_principal_includes_granted_and_owned() {
+        let mut policy = TagBasedPolicy::new(ScopeSet::full());
+        policy.grant("alice", "team-a");
+        let alice = principal("alice");
+        let session = ScopeSet::for_role("user");
+        let f = policy
+            .list_filter(Some(&alice), &session, &read_metadata())
+            .await
+            .unwrap();
+        assert_eq!(f.user_id.as_deref(), Some("alice"));
+        assert_eq!(f.tags, vec!["team-a".to_string()]);
+        assert!(f.include_untagged);
+    }
+
+    #[tokio::test]
+    async fn list_filter_admin_gets_all_access() {
+        let policy = TagBasedPolicy::new(ScopeSet::full());
+        let admin = principal("admin-uuid");
+        // An admin session (role "admin" → full scopes) carries admin:apikeys.
+        let session = ScopeSet::full();
+        let f = policy
+            .list_filter(Some(&admin), &session, &read_metadata())
+            .await;
+        assert!(f.is_none(), "admin must get ALL_ACCESS (no row filter)");
+    }
+
+    #[tokio::test]
+    async fn list_filter_denies_when_requested_scope_exceeds_policy() {
+        // Policy can grant only read scopes; a write listing is NO_ACCESS.
+        let policy = TagBasedPolicy::new(ScopeSet::read_only());
+        let alice = principal("alice");
+        let session = ScopeSet::for_role("user");
+        let write = ScopeSet::from_iter([Scope::WriteData]);
+        let f = policy
+            .list_filter(Some(&alice), &session, &write)
+            .await
+            .unwrap();
+        // Deny-all: no user arm, no tags, no untagged-public arm.
+        assert_eq!(f.user_id, None);
+        assert!(f.tags.is_empty());
+        assert!(!f.include_untagged);
+    }
+
+    #[tokio::test]
+    async fn list_filter_write_scope_excludes_untagged_public() {
+        let mut policy = TagBasedPolicy::new(ScopeSet::full());
+        policy.grant("alice", "team-a");
+        let alice = principal("alice");
+        let session = ScopeSet::for_role("user");
+        let write = ScopeSet::from_iter([Scope::WriteData]);
+        let f = policy
+            .list_filter(Some(&alice), &session, &write)
+            .await
+            .unwrap();
+        // Owned + granted rows still match, but untagged-public must NOT be
+        // exposed on a non-read listing.
+        assert_eq!(f.user_id.as_deref(), Some("alice"));
+        assert_eq!(f.tags, vec!["team-a".to_string()]);
+        assert!(!f.include_untagged);
     }
 }

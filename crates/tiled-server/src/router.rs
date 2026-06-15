@@ -363,10 +363,16 @@ pub async fn search(
     };
 
     // Inject the access-policy list filter so the SQL/in-memory path
-    // only returns nodes the principal is permitted to see.
+    // only returns nodes the principal is permitted to see. A listing/search
+    // needs read:metadata (parity with Python get_entry's filter_for_access
+    // scopes=["read:metadata"], dependencies.py:78).
     if let Some(ref policy) = state.access_policy {
         let principal_ref = auth.principal.as_deref();
-        if let Some(f) = policy.list_filter(principal_ref, &auth.scopes).await {
+        let requested = tiled_auth::ScopeSet::from_iter([tiled_auth::Scope::ReadMetadata]);
+        if let Some(f) = policy
+            .list_filter(principal_ref, &auth.scopes, &requested)
+            .await
+        {
             queries.insert(0, tiled_core::queries::Query::AccessBlobFilter(f));
         }
     }
@@ -1104,10 +1110,13 @@ pub async fn container_full(
     let path = segments.join("/");
 
     // H3: compute access filter once (async) so it can be pushed into the
-    // listing inside spawn_blocking.
+    // listing inside spawn_blocking. A full-container export reads child data,
+    // so it needs read:data (parity with Python's curried_filter
+    // scopes=["read:data"] for the deep export, router.py:1456).
     let access_filter = if let Some(ref policy) = state.access_policy {
+        let requested = tiled_auth::ScopeSet::from_iter([tiled_auth::Scope::ReadData]);
         policy
-            .list_filter(auth.principal.as_deref(), &auth.scopes)
+            .list_filter(auth.principal.as_deref(), &auth.scopes, &requested)
             .await
     } else {
         None
