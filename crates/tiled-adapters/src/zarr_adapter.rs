@@ -204,18 +204,25 @@ fn build_chunk_grid(array: &Array<FilesystemStore>, shape: &[usize]) -> Vec<Vec<
 
 fn parse_data_type(dt: &zarrs::array::DataType) -> Result<BuiltinDType> {
     use zarrs::array::DataType as DT;
+    // `retrieve_array_subset` hands back the chunk bytes in HOST-NATIVE order:
+    // zarrs' bytes codec reverses the stored endianness to native on decode
+    // (`do_encode_or_decode`), and this adapter forwards those bytes verbatim
+    // (no `to_le_bytes` normalisation, unlike the HDF5/in-memory adapters). So
+    // a multi-byte dtype must be reported with the host's native endianness,
+    // not a hardcoded `Little` — the two coincide only on little-endian hosts.
+    let native = Endianness::native();
     Ok(match dt {
         DT::Bool => BuiltinDType::new(Endianness::NotApplicable, Kind::Boolean, 1),
         DT::Int8 => BuiltinDType::new(Endianness::NotApplicable, Kind::Integer, 1),
-        DT::Int16 => BuiltinDType::new(Endianness::Little, Kind::Integer, 2),
-        DT::Int32 => BuiltinDType::new(Endianness::Little, Kind::Integer, 4),
-        DT::Int64 => BuiltinDType::new(Endianness::Little, Kind::Integer, 8),
+        DT::Int16 => BuiltinDType::new(native, Kind::Integer, 2),
+        DT::Int32 => BuiltinDType::new(native, Kind::Integer, 4),
+        DT::Int64 => BuiltinDType::new(native, Kind::Integer, 8),
         DT::UInt8 => BuiltinDType::new(Endianness::NotApplicable, Kind::UnsignedInteger, 1),
-        DT::UInt16 => BuiltinDType::new(Endianness::Little, Kind::UnsignedInteger, 2),
-        DT::UInt32 => BuiltinDType::new(Endianness::Little, Kind::UnsignedInteger, 4),
-        DT::UInt64 => BuiltinDType::new(Endianness::Little, Kind::UnsignedInteger, 8),
-        DT::Float32 => BuiltinDType::new(Endianness::Little, Kind::Float, 4),
-        DT::Float64 => BuiltinDType::new(Endianness::Little, Kind::Float, 8),
+        DT::UInt16 => BuiltinDType::new(native, Kind::UnsignedInteger, 2),
+        DT::UInt32 => BuiltinDType::new(native, Kind::UnsignedInteger, 4),
+        DT::UInt64 => BuiltinDType::new(native, Kind::UnsignedInteger, 8),
+        DT::Float32 => BuiltinDType::new(native, Kind::Float, 4),
+        DT::Float64 => BuiltinDType::new(native, Kind::Float, 8),
         other => {
             return Err(TiledError::Validation(format!(
                 "zarr dtype not supported by tiled adapter: {other:?}"
@@ -338,5 +345,54 @@ mod tests {
             }
             other => panic!("expected builtin dtype, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn multibyte_dtype_reports_native_byte_order() {
+        // Zarr/M7: the adapter forwards zarrs' decoded bytes verbatim, and
+        // zarrs decodes to host-native order. So the reported endianness must
+        // be the host's native order, and a client decoding the emitted bytes
+        // with that reported order must recover the original value. (On a
+        // little-endian host native == Little; on a big-endian host a revert to
+        // a hardcoded `Little` would make this decode produce garbage.)
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(FilesystemStore::new(dir.path()).unwrap());
+        let array = ArrayBuilder::new(
+            vec![1],
+            DataType::Float64,
+            vec![nz(1)].into(),
+            FillValue::from(0.0_f64),
+        )
+        .build(store, "/data")
+        .unwrap();
+        array.store_metadata().unwrap();
+        let value = 1234.5_f64;
+        array
+            .store_array_subset_elements(&ArraySubset::new_with_shape(vec![1]), &[value])
+            .unwrap();
+
+        let adapter =
+            ZarrAdapter::from_path(dir.path().to_path_buf(), "/data", serde_json::json!({}))
+                .unwrap();
+
+        let endianness = match &adapter.structure().data_type {
+            DType::Builtin(b) => {
+                // Reported order is the host's native order, by construction.
+                assert_eq!(b.endianness, Endianness::native());
+                b.endianness
+            }
+            other => panic!("expected builtin dtype, got {other:?}"),
+        };
+
+        let slice = NDSlice::from_numpy_str("").unwrap();
+        let result = adapter.read(&slice).await.unwrap();
+        let raw: [u8; 8] = result.data[..8].try_into().unwrap();
+        // Decode using the *reported* endianness — must recover the value.
+        let decoded = match endianness {
+            Endianness::Big => f64::from_be_bytes(raw),
+            Endianness::Little => f64::from_le_bytes(raw),
+            Endianness::NotApplicable => panic!("f64 must report a byte order"),
+        };
+        assert_eq!(decoded, value);
     }
 }

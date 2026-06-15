@@ -18,20 +18,25 @@ pub enum Endianness {
 }
 
 impl Endianness {
+    /// The host's native byte order. Multi-byte values that are held in
+    /// memory in native order (e.g. the bytes a zarr chunk decodes to —
+    /// zarrs reverses to native on decode) must be reported with this so a
+    /// client interprets them correctly regardless of the host's endianness.
+    pub const fn native() -> Self {
+        if cfg!(target_endian = "big") {
+            Self::Big
+        } else {
+            Self::Little
+        }
+    }
+
     /// Convert from numpy byte-order character.
     pub fn from_numpy_char(c: char) -> Result<Self> {
         match c {
             '>' => Ok(Self::Big),
             '<' => Ok(Self::Little),
             '|' => Ok(Self::NotApplicable),
-            '=' => {
-                // Native endianness
-                if cfg!(target_endian = "big") {
-                    Ok(Self::Big)
-                } else {
-                    Ok(Self::Little)
-                }
-            }
+            '=' => Ok(Self::native()),
             _ => Err(TiledError::InvalidDType(format!(
                 "Unknown endianness char: '{c}'"
             ))),
@@ -641,6 +646,18 @@ mod tests {
         assert_eq!(dt.kind, Kind::Float);
         assert_eq!(dt.itemsize, 8);
         assert_eq!(dt.to_numpy_str(), "<f8");
+    }
+
+    #[test]
+    fn native_endianness_matches_host() {
+        let expected = if cfg!(target_endian = "big") {
+            Endianness::Big
+        } else {
+            Endianness::Little
+        };
+        assert_eq!(Endianness::native(), expected);
+        // The numpy native marker '=' resolves to the same.
+        assert_eq!(Endianness::from_numpy_char('=').unwrap(), expected);
     }
 
     #[test]
