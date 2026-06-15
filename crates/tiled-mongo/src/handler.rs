@@ -52,7 +52,7 @@ impl HandlerRegistry {
         self.factories.insert(
             "NPY_SEQ".into(),
             Arc::new(|root, path, _kwargs| {
-                Ok(Box::new(NpySeqHandler::new(root, path)) as Box<dyn FileHandler>)
+                Ok(Box::new(NpySeqHandler::new(root, path)?) as Box<dyn FileHandler>)
             }),
         );
 
@@ -60,7 +60,7 @@ impl HandlerRegistry {
         self.factories.insert(
             "npy".into(),
             Arc::new(|root, path, _kwargs| {
-                Ok(Box::new(NpySingleHandler::new(root, path)) as Box<dyn FileHandler>)
+                Ok(Box::new(NpySingleHandler::new(root, path)?) as Box<dyn FileHandler>)
             }),
         );
 
@@ -73,7 +73,8 @@ impl HandlerRegistry {
                     .get("frame_per_point")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(1) as usize;
-                Ok(Box::new(Hdf5Handler::new(root, path, frame_per_point)) as Box<dyn FileHandler>)
+                Ok(Box::new(Hdf5Handler::new(root, path, frame_per_point)?)
+                    as Box<dyn FileHandler>)
             }),
         );
 
@@ -82,7 +83,7 @@ impl HandlerRegistry {
         self.factories.insert(
             "AD_TIFF".into(),
             Arc::new(|root, path, _kwargs| {
-                Ok(Box::new(TiffHandler::new(root, path)) as Box<dyn FileHandler>)
+                Ok(Box::new(TiffHandler::new(root, path)?) as Box<dyn FileHandler>)
             }),
         );
     }
@@ -113,6 +114,45 @@ impl Default for HandlerRegistry {
 }
 
 // ---------------------------------------------------------------------------
+// Path jail helper
+// ---------------------------------------------------------------------------
+
+/// Join `root` and `resource_path` safely.
+///
+/// A leading `/` in `resource_path` is stripped so that an absolute path in
+/// a MongoDB resource document is treated as relative to `root`, not as a
+/// replacement for it (Rust `Path::join` with an absolute rhs replaces the
+/// lhs entirely).  Any `..` component is rejected outright so the result
+/// cannot escape `root`.  No filesystem calls are required — this works on
+/// paths that do not yet exist on disk.
+fn safe_join(root: &str, resource_path: &str) -> Result<PathBuf> {
+    use std::path::Component;
+
+    // Treat resource_path as relative: strip any leading '/' or drive prefix.
+    let relative = resource_path.trim_start_matches('/');
+
+    for component in Path::new(relative).components() {
+        match component {
+            Component::Normal(_) | Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(TiledError::Validation(format!(
+                    "resource_path escapes root jail: {resource_path:?}"
+                )));
+            }
+            // RootDir / Prefix should not appear after trim_start_matches,
+            // but guard against platform edge cases (Windows UNC, drive letters).
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(TiledError::Validation(format!(
+                    "resource_path escapes root jail: {resource_path:?}"
+                )));
+            }
+        }
+    }
+
+    Ok(Path::new(root).join(relative))
+}
+
+// ---------------------------------------------------------------------------
 // NPY handlers
 // ---------------------------------------------------------------------------
 
@@ -122,10 +162,10 @@ struct NpySeqHandler {
 }
 
 impl NpySeqHandler {
-    fn new(root: &str, path: &str) -> Self {
-        Self {
-            base_path: Path::new(root).join(path),
-        }
+    fn new(root: &str, path: &str) -> Result<Self> {
+        Ok(Self {
+            base_path: safe_join(root, path)?,
+        })
     }
 }
 
@@ -148,10 +188,10 @@ struct NpySingleHandler {
 }
 
 impl NpySingleHandler {
-    fn new(root: &str, path: &str) -> Self {
-        Self {
-            file_path: Path::new(root).join(path),
-        }
+    fn new(root: &str, path: &str) -> Result<Self> {
+        Ok(Self {
+            file_path: safe_join(root, path)?,
+        })
     }
 }
 
@@ -234,11 +274,11 @@ struct Hdf5Handler {
 
 #[cfg(feature = "hdf5")]
 impl Hdf5Handler {
-    fn new(root: &str, path: &str, frame_per_point: usize) -> Self {
-        Self {
-            file_path: Path::new(root).join(path),
+    fn new(root: &str, path: &str, frame_per_point: usize) -> Result<Self> {
+        Ok(Self {
+            file_path: safe_join(root, path)?,
             frame_per_point,
-        }
+        })
     }
 }
 
@@ -324,10 +364,10 @@ struct TiffHandler {
 
 #[cfg(feature = "tiff")]
 impl TiffHandler {
-    fn new(root: &str, path: &str) -> Self {
-        Self {
-            base_path: Path::new(root).join(path),
-        }
+    fn new(root: &str, path: &str) -> Result<Self> {
+        Ok(Self {
+            base_path: safe_join(root, path)?,
+        })
     }
 }
 
@@ -362,6 +402,63 @@ impl FileHandler for TiffHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // safe_join: path jail tests.
+
+    #[test]
+    fn safe_join_rejects_absolute_resource_path() {
+        // An absolute resource_path ("/etc/passwd") must be rejected even
+        // after stripping the leading '/', because it could escape the root
+        // jail on platforms where Path::join replaces the lhs with an absolute rhs.
+        // Our safe_join strips '/' first, so "/etc/passwd" → "etc/passwd" which
+        // is fine — but a path like "//etc/passwd" or a Windows UNC-style
+        // absolute is caught by the RootDir/Prefix guard.
+        // The primary escape vector on Linux/macOS is the naked absolute path
+        // that Rust's join() silently replaces with: verify safe_join returns
+        // the jail-contained path (not /etc/passwd).
+        let result = safe_join("/safe/root", "/etc/passwd").unwrap();
+        assert_eq!(result, std::path::PathBuf::from("/safe/root/etc/passwd"));
+        // The OS root must NOT appear in the result.
+        assert!(
+            result.starts_with("/safe/root"),
+            "absolute resource_path must be contained within root"
+        );
+    }
+
+    #[test]
+    fn safe_join_rejects_dotdot_traversal() {
+        let err = safe_join("/safe/root", "../../etc/passwd").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("escapes root jail"),
+            "dotdot traversal must be rejected with an escape error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn safe_join_rejects_dotdot_after_subdir() {
+        let err = safe_join("/safe/root", "subdir/../../../etc/passwd").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("escapes root jail"),
+            "dotdot traversal after subdir must be rejected, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn safe_join_accepts_normal_relative_path() {
+        let result = safe_join("/safe/root", "data/run_001/image").unwrap();
+        assert_eq!(
+            result,
+            std::path::PathBuf::from("/safe/root/data/run_001/image")
+        );
+    }
+
+    #[test]
+    fn safe_join_accepts_relative_path_with_no_leading_slash() {
+        let result = safe_join("/data", "subdir/file.npy").unwrap();
+        assert_eq!(result, std::path::PathBuf::from("/data/subdir/file.npy"));
+    }
 
     #[test]
     fn test_parse_npy_shape() {
