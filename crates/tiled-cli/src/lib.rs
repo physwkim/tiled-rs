@@ -370,7 +370,15 @@ pub async fn run(command: Command) -> Result<()> {
             webhooks_allow_http,
             webhooks_allow_private_addresses,
         } => {
-            // Load config file if provided.
+            // cli-M6: with no --config flag, fall back to the TILED_CONFIG env
+            // var (container/k8s pattern). Unlike Python we do not additionally
+            // default to ./config.yml — the Rust `serve` is multi-modal (demo /
+            // mongo / catalog / config), so an implicit ./config.yml would break
+            // flag-only starts like `serve --demo`. The value may name a file or
+            // a directory of config.d files (see TiledConfig::from_file).
+            let config = config.or_else(|| std::env::var("TILED_CONFIG").ok());
+
+            // Load config file (or directory) if provided.
             let file_config = config
                 .as_deref()
                 .map(config::TiledConfig::from_file)

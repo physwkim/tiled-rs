@@ -227,19 +227,126 @@ fn default_path() -> String {
 }
 
 impl TiledConfig {
-    /// Load configuration from a YAML file.
+    /// Load configuration from a YAML file *or* a directory of YAML files.
+    ///
+    /// When `path` is a directory, every `*.yml`/`*.yaml` file in it is merged
+    /// (cli-M6, Python `parse_configs`, `config.py:472`): `trees:` lists
+    /// concatenate across files; any other top-level key appearing in more
+    /// than one file is a conflict. `TILED_*` env vars then override the
+    /// merged file values, matching Python's env-over-file precedence
+    /// (`settings_customise_sources`, `config.py:48`).
     pub fn from_file(path: &str) -> anyhow::Result<Self> {
-        // Name the path in both failure modes: a bare io::Error
-        // ("No such file or directory") or serde_yaml parse error gives the
-        // user no way to tell which config file was at fault.
-        let content =
-            std::fs::read_to_string(path).with_context(|| format!("reading config file {path}"))?;
-        let config: Self = serde_yaml::from_str(&content)
-            .with_context(|| format!("parsing config file {path}"))?;
+        let p = std::path::Path::new(path);
+        let mut config: Self = if p.is_dir() {
+            Self::from_dir(p)?
+        } else {
+            // Name the path in both failure modes: a bare io::Error
+            // ("No such file or directory") or serde_yaml parse error gives the
+            // user no way to tell which config file was at fault.
+            let content = std::fs::read_to_string(path)
+                .with_context(|| format!("reading config file {path}"))?;
+            serde_yaml::from_str(&content).with_context(|| format!("parsing config file {path}"))?
+        };
+        config.apply_env_overrides()?;
         config
             .reconcile_catalog_and_trees()
-            .with_context(|| format!("in config file {path}"))?;
+            .with_context(|| format!("in config {path}"))?;
         Ok(config)
+    }
+
+    /// Merge every `*.yml`/`*.yaml` file in a config directory (cli-M6).
+    ///
+    /// Files are processed in sorted filename order so numeric `config.d`
+    /// prefixes (`00-base.yml`, `10-trees.yml`) layer predictably — Python
+    /// iterates in arbitrary filesystem order (`config.py:476`), which makes
+    /// the merge result order-dependent; sorting removes that nondeterminism.
+    fn from_dir(dir: &std::path::Path) -> anyhow::Result<Self> {
+        use serde_yaml::Value;
+
+        // Top-level keys whose list values concatenate across files — Python's
+        // `mergeable_lists` (`config.py:484`) is {allow_origins, specs, trees};
+        // only `trees` is a top-level field of this Rust config.
+        const MERGEABLE: &[&str] = &["trees"];
+
+        let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+            .with_context(|| format!("reading config directory {}", dir.display()))?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| {
+                p.is_file()
+                    && matches!(
+                        p.extension().and_then(|e| e.to_str()),
+                        Some("yml") | Some("yaml")
+                    )
+            })
+            .collect();
+        files.sort();
+
+        let mut merged = serde_yaml::Mapping::new();
+        for f in &files {
+            let content = std::fs::read_to_string(f)
+                .with_context(|| format!("reading config file {}", f.display()))?;
+            let value: Value = serde_yaml::from_str(&content)
+                .with_context(|| format!("parsing config file {}", f.display()))?;
+            let map = match value {
+                Value::Mapping(map) => map,
+                // An empty file parses to Null — skip it.
+                Value::Null => continue,
+                _ => anyhow::bail!("config file {} is not a YAML mapping", f.display()),
+            };
+            for (k, v) in map {
+                let key_str = k.as_str().unwrap_or_default().to_string();
+                if merged.contains_key(&k) {
+                    if MERGEABLE.contains(&key_str.as_str()) {
+                        match (merged.get_mut(&k).expect("key present"), v) {
+                            (Value::Sequence(existing), Value::Sequence(new)) => {
+                                existing.extend(new)
+                            }
+                            _ => anyhow::bail!(
+                                "config key '{key_str}' must be a list to merge \
+                                 across files (in {})",
+                                f.display()
+                            ),
+                        }
+                    } else {
+                        anyhow::bail!("duplicate configuration for '{key_str}' in {}", f.display());
+                    }
+                } else {
+                    merged.insert(k, v);
+                }
+            }
+        }
+
+        serde_yaml::from_value(Value::Mapping(merged))
+            .with_context(|| format!("merging config directory {}", dir.display()))
+    }
+
+    /// Overlay `TILED_*` environment variables on the file/dir config
+    /// (cli-M6). Python gives env vars priority over the config file for all
+    /// `TILED_*`-prefixed settings (`settings_customise_sources`). Rust applies
+    /// this for the config-only scalar fields the server consumes; the
+    /// single-user API key already takes env priority via clap
+    /// (`--api-key`'s `env`) and [`Self::api_key`]. Nested structures
+    /// (`trees`, `authentication`, …) are not env-mapped — pydantic's
+    /// `__`-delimited nested env is rarely used and out of scope here.
+    fn apply_env_overrides(&mut self) -> anyhow::Result<()> {
+        self.overlay_response_bytesize_limit(
+            std::env::var("TILED_RESPONSE_BYTESIZE_LIMIT")
+                .ok()
+                .as_deref(),
+        )
+    }
+
+    /// Pure core of the `TILED_RESPONSE_BYTESIZE_LIMIT` overlay (cli-M6),
+    /// separated from the env read so the parse is unit-testable. `None`
+    /// (unset) leaves the current value; an invalid value is a hard error
+    /// (fail fast, matching pydantic's `ValidationError` on a bad env value).
+    fn overlay_response_bytesize_limit(&mut self, raw: Option<&str>) -> anyhow::Result<()> {
+        if let Some(raw) = raw {
+            self.response_bytesize_limit = raw.trim().parse::<usize>().with_context(|| {
+                format!("TILED_RESPONSE_BYTESIZE_LIMIT={raw:?} is not a valid byte count")
+            })?;
+        }
+        Ok(())
     }
 
     /// Enforce Python's `catalog`/`trees` mutual exclusion
@@ -383,5 +490,60 @@ mod tests {
     fn catalog_only_config_reconciles() {
         let cfg: TiledConfig = serde_yaml::from_str("catalog:\n  uri: sqlite:///c.db\n").unwrap();
         assert!(cfg.reconcile_catalog_and_trees().is_ok());
+    }
+
+    // cli-M6: a directory of config files merges — `trees:` lists concatenate
+    // across files (config.d layering), other keys come from their one file.
+    #[test]
+    fn config_directory_merges_trees_and_scalar_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("10-trees.yml"),
+            "trees:\n  - tree: mongo_normalized\n    args: {uri: mongodb://a/db}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("20-more.yml"),
+            "trees:\n  - tree: mongo_normalized\n    args: {uri: mongodb://b/db}\n\
+             response_bytesize_limit: 99\n",
+        )
+        .unwrap();
+        let cfg = TiledConfig::from_file(dir.path().to_str().unwrap()).unwrap();
+        assert_eq!(cfg.trees.len(), 2, "trees from both files must concatenate");
+        // Sorted filename order: 10-trees before 20-more.
+        assert_eq!(cfg.trees[0].args.uri.as_deref(), Some("mongodb://a/db"));
+        assert_eq!(cfg.trees[1].args.uri.as_deref(), Some("mongodb://b/db"));
+        assert_eq!(cfg.response_bytesize_limit, 99);
+    }
+
+    // cli-M6: a non-mergeable key duplicated across files is a conflict.
+    #[test]
+    fn config_directory_rejects_duplicate_nonmergeable_key() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.yml"), "response_bytesize_limit: 1\n").unwrap();
+        std::fs::write(dir.path().join("b.yml"), "response_bytesize_limit: 2\n").unwrap();
+        let err = TiledConfig::from_file(dir.path().to_str().unwrap()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("duplicate configuration for 'response_bytesize_limit'"),
+            "expected duplicate-key conflict; got: {err:#}"
+        );
+    }
+
+    // cli-M6: TILED_RESPONSE_BYTESIZE_LIMIT overlays the file value
+    // (env-over-file precedence); an invalid value is a hard error.
+    #[test]
+    fn response_bytesize_env_overlay() {
+        let mut cfg = TiledConfig::default();
+        // Unset → unchanged.
+        cfg.overlay_response_bytesize_limit(None).unwrap();
+        assert_eq!(cfg.response_bytesize_limit, 300_000_000);
+        // Set → override (env wins over file).
+        cfg.overlay_response_bytesize_limit(Some(" 4096 ")).unwrap();
+        assert_eq!(cfg.response_bytesize_limit, 4096);
+        // Invalid → hard error.
+        assert!(
+            cfg.overlay_response_bytesize_limit(Some("not-a-number"))
+                .is_err()
+        );
     }
 }
