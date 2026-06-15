@@ -992,6 +992,42 @@ async fn array_export_unsupported_format_returns_406_not_raw_bytes() {
     assert_eq!(json["error"]["code"], 406);
 }
 
+/// Finding 4: a >2-D array exported as CSV must return HTTP 406
+/// (UnsupportedShape, mirroring Python serialize_csv array.py:42-43), not 200
+/// with a silently-flattened single-column CSV.
+#[tokio::test]
+async fn array_csv_export_rejects_ndim_gt_2_with_406() {
+    // 2x2x2 f64 array (ndim 3) in its own tree (leaves build_test_tree intact).
+    let bytes: Vec<u8> = (0..8u64).flat_map(|i| (i as f64).to_le_bytes()).collect();
+    let dtype = tiled_core::dtype::BuiltinDType::new(
+        tiled_core::dtype::Endianness::Little,
+        tiled_core::dtype::Kind::Float,
+        8,
+    );
+    let arr = ArrayAdapter::from_array(
+        Bytes::from(bytes),
+        dtype,
+        vec![2, 2, 2],
+        vec![vec![2, 2, 2]],
+        serde_json::json!({}),
+        vec![],
+    );
+    let mut mapping = IndexMap::new();
+    mapping.insert("cube".to_string(), AnyAdapter::Array(Arc::new(arr)));
+    let root: Arc<dyn tiled_core::adapters::ContainerAdapter> =
+        Arc::new(MapAdapter::new(mapping, serde_json::json!({}), vec![]));
+    let app = build_app_for_root(root, 300_000_000);
+
+    let (status, _, body) = get_with_headers(&app, "/api/v1/array/full/cube?format=csv", &[]).await;
+    assert_eq!(
+        status, 406,
+        "3-D array exported as CSV must be 406 (UnsupportedShape), not flattened 200"
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&body).expect("406 body must be a JSON error");
+    assert_eq!(json["error"]["code"], 406);
+}
+
 // ---------------------------------------------------------------------------
 // /table/full — read the whole table (all partitions) with optional column
 // projection and format negotiation. Mirrors the upstream `table_full`

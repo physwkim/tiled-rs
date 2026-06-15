@@ -12,6 +12,29 @@ use tiled_core::structures::StructureFamily;
 /// Serialization error type.
 pub type SerializeError = Box<dyn std::error::Error + Send + Sync>;
 
+/// A serializer-level error signalling that the data's *shape* is incompatible
+/// with the requested format (e.g. a >2-D array requested as CSV). Mirrors
+/// Python tiled's `UnsupportedShape` (tiled/utils.py:597), which the server
+/// maps to HTTP 406 (core.py:441-445). Kept distinct from a generic
+/// [`SerializeError`] (I/O, encode failure) so the server can answer 406 vs 500
+/// — a serializer returns this boxed and the router downcasts it.
+#[derive(Debug)]
+pub struct UnsupportedShape {
+    pub shape: Vec<usize>,
+}
+
+impl std::fmt::Display for UnsupportedShape {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "shape {:?} is incompatible with the requested format",
+            self.shape
+        )
+    }
+}
+
+impl std::error::Error for UnsupportedShape {}
+
 /// A serializer function that converts raw data + metadata into bytes.
 pub type SerializerFn =
     Box<dyn Fn(&[u8], &serde_json::Value) -> Result<bytes::Bytes, SerializeError> + Send + Sync>;

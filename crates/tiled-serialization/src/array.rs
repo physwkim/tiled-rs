@@ -26,7 +26,6 @@ pub fn register_array_serializers(registry: &SerializationRegistry) {
             // metadata: {"itemsize": N, "kind": "f"|"i"|"u"|..., "byteorder": "<"|">"|"|", "shape": [...]}
             // 1-D → one value per line
             // 2-D → rows of comma-separated values (matches Python tiled CSV)
-            // ND  → flatten to 1-D row-major (Python tiled fallback)
             let itemsize = metadata
                 .get("itemsize")
                 .and_then(|v| v.as_u64())
@@ -44,6 +43,15 @@ pub fn register_array_serializers(registry: &SerializationRegistry) {
                         .collect()
                 })
                 .unwrap_or_default();
+            // Python `serialize_csv` raises `UnsupportedShape` for ndim > 2
+            // (array.py:42-43) — it has NO flatten fallback. Match it: a >2-D
+            // array must error (→ HTTP 406), not silently reshape to one column.
+            if shape.len() > 2 {
+                return Err(crate::registry::UnsupportedShape {
+                    shape: shape.clone(),
+                }
+                .into());
+            }
             let big_endian = metadata
                 .get("byteorder")
                 .and_then(|v| v.as_str())
@@ -230,4 +238,46 @@ pub fn register_array_serializers(registry: &SerializationRegistry) {
             Ok(bytes::Bytes::copy_from_slice(data))
         }),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::registry::{SerializationRegistry, UnsupportedShape};
+
+    fn csv_serializer() -> std::sync::Arc<crate::registry::SerializerFn> {
+        let reg = SerializationRegistry::new();
+        register_array_serializers(&reg);
+        reg.dispatch(StructureFamily::Array, mime::CSV).unwrap()
+    }
+
+    /// Finding 4: a >2-D array must error like Python `serialize_csv`
+    /// (UnsupportedShape, array.py:42-43), not silently flatten to one column.
+    #[test]
+    fn csv_rejects_ndim_gt_2_as_unsupported_shape() {
+        let ser = csv_serializer();
+        // 2x2x2 f64 (ndim 3).
+        let data: Vec<u8> = (0..8u64).flat_map(|i| (i as f64).to_le_bytes()).collect();
+        let meta = serde_json::json!({"itemsize": 8, "kind": "f", "shape": [2, 2, 2]});
+        let err = ser(&data, &meta).expect_err("ndim>2 CSV must error, not flatten");
+        let shape = err
+            .downcast_ref::<UnsupportedShape>()
+            .expect("error must be UnsupportedShape so the router answers 406");
+        assert_eq!(shape.shape, vec![2, 2, 2]);
+    }
+
+    /// 1-D and 2-D arrays remain valid CSV (the supported shapes).
+    #[test]
+    fn csv_accepts_1d_and_2d() {
+        let ser = csv_serializer();
+        let data: Vec<u8> = (0..6u64).flat_map(|i| (i as f64).to_le_bytes()).collect();
+
+        let meta_1d = serde_json::json!({"itemsize": 8, "kind": "f", "shape": [6]});
+        let out_1d = ser(&data, &meta_1d).expect("1-D CSV is supported");
+        assert_eq!(std::str::from_utf8(&out_1d).unwrap().lines().count(), 6);
+
+        let meta_2d = serde_json::json!({"itemsize": 8, "kind": "f", "shape": [2, 3]});
+        let out_2d = ser(&data, &meta_2d).expect("2-D CSV is supported");
+        assert_eq!(std::str::from_utf8(&out_2d).unwrap().lines().count(), 2);
+    }
 }

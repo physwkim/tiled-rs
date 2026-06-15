@@ -548,6 +548,22 @@ fn unsupported_media_type(
     ))
 }
 
+/// Map a serializer-execution error to an HTTP status, mirroring Python tiled:
+/// an `UnsupportedShape` (data shape incompatible with the requested format,
+/// e.g. a >2-D array as CSV) → 406; any other packing/I-O failure → 500
+/// (core.py:441-449). Single owner for all three data-handler serializer sites.
+fn map_serialize_error(e: tiled_serialization::SerializeError) -> ServerError {
+    if let Some(shape) = e.downcast_ref::<tiled_serialization::UnsupportedShape>() {
+        ServerError::NotAcceptable(format!(
+            "The shape of this data {:?} is incompatible with the requested format. \
+             Slice it (\"?slice=...\") or choose a different format.",
+            shape.shape
+        ))
+    } else {
+        ServerError::Internal(e.to_string())
+    }
+}
+
 async fn build_array_response(
     data: tiled_core::dtype::DynNDArray,
     format_param: Option<&str>,
@@ -606,7 +622,7 @@ async fn build_array_response(
     let body = tokio::task::spawn_blocking(move || serializer(&payload, &ser_meta))
         .await
         .map_err(|e| ServerError::Internal(format!("serialize task failed: {e}")))?
-        .map_err(|e| ServerError::Internal(e.to_string()))?;
+        .map_err(map_serialize_error)?;
 
     Ok(serve_with_range(headers, &media_type, body))
 }
@@ -689,7 +705,7 @@ async fn build_table_response(
         tokio::task::spawn_blocking(move || serializer(&ipc_bytes, &serde_json::Value::Null))
             .await
             .map_err(|e| ServerError::Internal(format!("serialize task failed: {e}")))?
-            .map_err(|e| ServerError::Internal(e.to_string()))?;
+            .map_err(map_serialize_error)?;
 
     Ok(serve_with_range(headers, &media_type, body))
 }
@@ -1362,7 +1378,7 @@ pub async fn container_full(
         tokio::task::spawn_blocking(move || serializer(&body_json, &meta))
             .await
             .map_err(|e| ServerError::Internal(format!("serialize task failed: {e}")))?
-            .map_err(|e| ServerError::Internal(e.to_string()))?
+            .map_err(map_serialize_error)?
     } else {
         return Err(ServerError::Validation(format!(
             "no container serializer for {media_type}"
