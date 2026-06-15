@@ -174,9 +174,10 @@ async fn register_then_read_then_patch_then_delete() {
     );
 
     // Upstream tiled #503: DELETE on a non-empty container is now
-    // rejected — explicit rmdir-style emptying is required.
+    // rejected — explicit rmdir-style emptying is required. F-R: this is a
+    // 409 Conflict, matching Python's Conflicts handler (app.py:350-353).
     let (status, _) = empty_request(&app, Method::DELETE, "/api/v1/metadata/expt").await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(status, StatusCode::CONFLICT);
 
     // Empty the child first, THEN the container.
     let (status, _) = empty_request(&app, Method::DELETE, "/api/v1/metadata/expt/scan_1").await;

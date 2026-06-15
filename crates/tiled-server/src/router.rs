@@ -2593,7 +2593,9 @@ pub async fn delete_metadata(
             .await
             .map_err(map_catalog_err)?;
         if kid_count > 0 {
-            return Err(ServerError::Validation(format!(
+            // 409 Conflict, matching Python's Conflicts handler
+            // (adapter.py:1024 -> app.py:350-353).
+            return Err(ServerError::Conflict(format!(
                 "container '{}' is not empty ({kid_count} children); \
                  delete its contents first or use a future recursive endpoint",
                 segments.join("/"),

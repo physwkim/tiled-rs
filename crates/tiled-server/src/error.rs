@@ -11,9 +11,10 @@ pub enum ServerError {
     NotFound(String),
     Validation(String),
     /// The request conflicts with the current state of the resource. Maps to
-    /// HTTP 409 to match Python tiled, which raises `WouldDeleteData` and
-    /// answers `HTTP_409_CONFLICT` (app.py:367-374) when a delete would orphan
-    /// internally-managed data sources.
+    /// HTTP 409 to match Python tiled, which raises `Conflicts` /
+    /// `WouldDeleteData` and answers `HTTP_409_CONFLICT` (app.py:350-374) — for
+    /// deleting a non-empty container, or a subtree holding internally-managed
+    /// data sources.
     Conflict(String),
     Internal(String),
     UnsupportedMediaType(String),
