@@ -157,7 +157,7 @@ fn matches_run_query(adapter: &AnyAdapter, query: &Query) -> bool {
             .and_then(|v| v.as_array())
             .is_some_and(|arr| arr.contains(&c.value)),
         Query::In(q) => lookup(&q.key).is_some_and(|v| q.value.iter().any(|x| x == v)),
-        Query::NotIn(q) => lookup(&q.key).is_some_and(|v| !q.value.iter().any(|x| x == v)),
+        Query::NotIn(q) => lookup(&q.key).is_none_or(|v| !q.value.iter().any(|x| x == v)),
         Query::Comparison(c) => lookup(&c.key).is_some_and(|v| {
             use std::cmp::Ordering;
             use tiled_core::queries::Operator;
@@ -203,6 +203,8 @@ mod tests {
     use tiled_core::adapters::{AnyAdapter, BaseAdapter, ContainerAdapter};
     use tiled_core::queries::{KeyLookup, KeysFilter, Like, Query, Regex};
     use tiled_core::structures::{ContainerStructure, Spec, StructureFamily};
+
+    use tiled_core::queries::NotIn as NotInQ;
 
     use super::matches_run_query;
 
@@ -304,6 +306,49 @@ mod tests {
     }
 
     // Implemented variants must continue to work correctly.
+
+    // NotIn semantics: a run whose key is absent must be INCLUDED (mirrors
+    // MongoDB $nin and SQL "IS NULL OR NOT IN (...)").
+
+    #[test]
+    fn notin_includes_run_missing_key() {
+        // run has no "detector" key at all — NotIn must pass it through.
+        let a = run(json!({"start": {"plan_name": "scan"}}));
+        let q = Query::NotIn(NotInQ {
+            key: "detector".into(),
+            value: vec![json!("area"), json!("strip")],
+        });
+        assert!(
+            matches_run_query(&a, &q),
+            "NotIn must include runs that lack the queried key (missing ≠ excluded)"
+        );
+    }
+
+    #[test]
+    fn notin_excludes_run_with_matching_value() {
+        let a = run(json!({"start": {"detector": "area"}}));
+        let q = Query::NotIn(NotInQ {
+            key: "detector".into(),
+            value: vec![json!("area"), json!("strip")],
+        });
+        assert!(
+            !matches_run_query(&a, &q),
+            "NotIn must exclude runs whose key value is in the list"
+        );
+    }
+
+    #[test]
+    fn notin_includes_run_with_non_matching_value() {
+        let a = run(json!({"start": {"detector": "pixel"}}));
+        let q = Query::NotIn(NotInQ {
+            key: "detector".into(),
+            value: vec![json!("area"), json!("strip")],
+        });
+        assert!(
+            matches_run_query(&a, &q),
+            "NotIn must include runs whose key value is not in the list"
+        );
+    }
 
     #[test]
     fn eq_on_start_field_matches() {

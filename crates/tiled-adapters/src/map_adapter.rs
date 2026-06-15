@@ -146,7 +146,7 @@ fn matches_query(adapter: &AnyAdapter, query: &Query) -> bool {
             .is_some_and(|v| q.value.iter().any(|x| x == v)),
         Query::NotIn(q) => meta
             .get(&q.key)
-            .is_some_and(|v| !q.value.iter().any(|x| x == v)),
+            .is_none_or(|v| !q.value.iter().any(|x| x == v)),
         Query::Like(l) => {
             let regex_pat = sql_like_to_regex(&l.pattern);
             regex::Regex::new(&regex_pat)
@@ -223,7 +223,42 @@ fn sql_like_to_regex(pat: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use tiled_core::queries::NotIn as NotInQ;
+
     use super::*;
+
+    fn leaf(meta: serde_json::Value) -> AnyAdapter {
+        AnyAdapter::Container(Arc::new(MapAdapter::new(IndexMap::new(), meta, vec![])))
+    }
+
+    // NotIn semantics: an adapter whose key is absent must be INCLUDED
+    // (mirrors MongoDB $nin and SQL "IS NULL OR NOT IN (...)").
+
+    #[test]
+    fn notin_includes_adapter_missing_key() {
+        let a = leaf(serde_json::json!({"color": "red"}));
+        let q = Query::NotIn(NotInQ {
+            key: "shape".into(),
+            value: vec![serde_json::json!("circle"), serde_json::json!("square")],
+        });
+        assert!(
+            matches_query(&a, &q),
+            "NotIn must include adapters that lack the queried key (missing ≠ excluded)"
+        );
+    }
+
+    #[test]
+    fn notin_excludes_adapter_with_matching_value() {
+        let a = leaf(serde_json::json!({"shape": "circle"}));
+        let q = Query::NotIn(NotInQ {
+            key: "shape".into(),
+            value: vec![serde_json::json!("circle"), serde_json::json!("square")],
+        });
+        assert!(
+            !matches_query(&a, &q),
+            "NotIn must exclude adapters whose key value is in the list"
+        );
+    }
 
     #[test]
     fn test_map_adapter_basic() {
