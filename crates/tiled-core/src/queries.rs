@@ -216,6 +216,34 @@ impl Query {
         }
     }
 
+    /// Returns the Python class name for this query variant.
+    ///
+    /// This is the identifier Python tiled embeds in its `UnsupportedQueryType`
+    /// 400 detail (`The query type {name!r} is not supported on this node.`,
+    /// tiled/server/app.py:355-365; the name comes from `class_.__name__`,
+    /// tiled/query_registration.py:127). The Rust enum variant names diverge
+    /// from the Python class names for three variants, so this is a distinct
+    /// mapping from [`Query::query_name`] (which returns the URL registry name).
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            Self::FullText(_) => "FullText",
+            Self::Lookup(_) => "KeyLookup",
+            Self::KeysFilter(_) => "KeysFilter",
+            Self::Regex(_) => "Regex",
+            Self::Eq(_) => "Eq",
+            Self::NotEq(_) => "NotEq",
+            Self::Comparison(_) => "Comparison",
+            Self::Contains(_) => "Contains",
+            Self::In(_) => "In",
+            Self::NotIn(_) => "NotIn",
+            Self::KeyPresent(_) => "KeyPresent",
+            Self::Like(_) => "Like",
+            Self::Specs(_) => "SpecsQuery",
+            Self::AccessBlobFilter(_) => "AccessBlobFilter",
+            Self::StructureFamily(_) => "StructureFamilyQuery",
+        }
+    }
+
     /// All registered query type names.
     pub fn all_query_names() -> Vec<&'static str> {
         vec![
@@ -353,6 +381,30 @@ impl Query {
         params
     }
 }
+
+/// A query variant a node cannot evaluate.
+///
+/// Returned by [`crate::adapters::ContainerAdapter::search`] when a query type
+/// is not supported by that adapter's search path. Mirrors Python tiled's
+/// `UnsupportedQueryType` (tiled/utils.py:601), which the server turns into
+/// HTTP 400 with detail `The query type {name!r} is not supported on this
+/// node.` (tiled/server/app.py:355-365). The wrapped string is the query's
+/// Python class name (see [`Query::type_name`]), so the 400 detail matches
+/// upstream byte-for-byte. `Display` renders that full detail string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsupportedQuery(pub String);
+
+impl std::fmt::Display for UnsupportedQuery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "The query type '{}' is not supported on this node.",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for UnsupportedQuery {}
 
 /// Regex pattern for extracting filter parameters from URL query string.
 /// Matches `filter[<name>][condition][<field>]`.

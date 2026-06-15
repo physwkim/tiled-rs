@@ -18,7 +18,7 @@ use std::sync::{Arc, OnceLock};
 use indexmap::IndexMap;
 
 use tiled_core::adapters::{AnyAdapter, BaseAdapter, ContainerAdapter};
-use tiled_core::queries::Query;
+use tiled_core::queries::{Query, UnsupportedQuery};
 use tiled_core::structures::{ContainerStructure, Spec, StructureFamily};
 
 use crate::db::Catalog;
@@ -188,14 +188,23 @@ impl ContainerAdapter for CatalogAdapter {
         self.load_children().len()
     }
 
-    fn search(&self, queries: &[Query]) -> Vec<String> {
+    fn search(&self, queries: &[Query]) -> Result<Vec<String>, UnsupportedQuery> {
         // Phase A4 will translate queries to SQL; for now apply Python
         // tiled's "match against in-memory metadata" fallback so the
         // existing search endpoint still returns sensible results.
-        if queries.is_empty() {
-            return self.keys();
+        //
+        // Validate every query type up front (before the empty-container
+        // shortcut and before per-node filtering) so an unsupported variant
+        // yields HTTP 400 regardless of node count or query order — matching
+        // Python tiled, which raises UnsupportedQueryType at query dispatch.
+        for q in queries {
+            ensure_supported(q)?;
         }
-        self.load_children()
+        if queries.is_empty() {
+            return Ok(self.keys());
+        }
+        Ok(self
+            .load_children()
             .iter()
             .filter(|(_, (adapter, access_blob))| {
                 queries
@@ -203,7 +212,27 @@ impl ContainerAdapter for CatalogAdapter {
                     .all(|q| matches_query(adapter, access_blob, q))
             })
             .map(|(k, _)| k.clone())
-            .collect()
+            .collect())
+    }
+}
+
+/// Single source of truth for which query variants this in-memory screening
+/// path can evaluate. `search` gates every query through this before calling
+/// `matches_query`, so the unsupported arms of `matches_query` are never
+/// reached at runtime. Variants this path cannot evaluate become
+/// `UnsupportedQuery` → HTTP 400 (parity: Python `UnsupportedQueryType`).
+fn ensure_supported(query: &Query) -> Result<(), UnsupportedQuery> {
+    use Query::*;
+    match query {
+        // Metadata predicates this in-memory path implements, plus the
+        // tree-position filters (Lookup/KeysFilter) that the authoritative SQL
+        // path resolves before this screening pass runs.
+        FullText(_) | Eq(_) | NotEq(_) | KeyPresent(_) | StructureFamily(_)
+        | AccessBlobFilter(_) | Lookup(_) | KeysFilter(_) => Ok(()),
+        // In, NotIn, Comparison, Contains, Like, Regex, Specs: metadata
+        // predicates not implemented in-memory. Surface as 400 rather than
+        // silently returning a filtered subset.
+        other => Err(UnsupportedQuery(other.type_name().to_string())),
     }
 }
 
@@ -231,11 +260,10 @@ fn matches_query(adapter: &AnyAdapter, access_blob: &serde_json::Value, query: &
         Lookup(_) | KeysFilter(_) => true,
         // All remaining variants (In, NotIn, Comparison, Contains, Like,
         // Regex, Specs) express metadata predicates that this in-memory path
-        // does not implement.  Return false rather than true so a future
-        // caller that mistakenly routes user queries here does not receive
-        // silently unfiltered results.  Upstream tiled raises
-        // UnsupportedQueryType (HTTP 400) for variants it cannot evaluate;
-        // false is the safe in-process equivalent.
+        // does not implement. `search` rejects them up front via
+        // `ensure_supported` (→ HTTP 400, parity with UnsupportedQueryType),
+        // so this arm is unreachable through the normal path; keep it as a
+        // fail-closed default for any direct caller.
         _ => false,
     }
 }
@@ -322,7 +350,7 @@ mod tests {
     };
     use tiled_core::structures::{ContainerStructure, Spec, StructureFamily};
 
-    use super::matches_query;
+    use super::{ensure_supported, matches_query};
 
     struct StubContainer {
         metadata: serde_json::Value,
@@ -363,37 +391,29 @@ mod tests {
         }))
     }
 
-    // L-1: unsupported metadata-predicate variants must return false, not true.
+    // L-1: unsupported metadata-predicate variants must surface as
+    // UnsupportedQuery (→ HTTP 400), not silently filter to a subset.
 
     #[test]
-    fn unsupported_in_returns_false_not_true() {
-        // metadata has count=5, so In([5]) WOULD match if implemented.
-        // The old `_ => true` arm would return true regardless — this test
-        // catches a regression back to that behaviour.
-        let a = adapter(json!({"count": 5}));
-        let blob = json!({});
+    fn unsupported_in_returns_error() {
         let q = Query::In(InQ {
             key: "count".into(),
             value: vec![json!(5)],
         });
-        assert!(
-            !matches_query(&a, &blob, &q),
-            "In must return false in-memory (unsupported), not silently pass"
+        let err = ensure_supported(&q).unwrap_err();
+        assert_eq!(
+            err.0, "In",
+            "In is unsupported in-memory and must error, not silently pass"
         );
     }
 
     #[test]
-    fn unsupported_not_in_returns_false_not_true() {
-        let a = adapter(json!({"tag": "x"}));
-        let blob = json!({});
+    fn unsupported_not_in_returns_error() {
         let q = Query::NotIn(NotInQ {
             key: "tag".into(),
             value: vec![json!("y")],
         });
-        assert!(
-            !matches_query(&a, &blob, &q),
-            "NotIn must return false in-memory, not silently pass"
-        );
+        assert_eq!(ensure_supported(&q).unwrap_err().0, "NotIn");
     }
 
     // Lookup / KeysFilter must still pass through (genuinely inapplicable
@@ -406,6 +426,9 @@ mod tests {
         let q = Query::Lookup(KeyLookup {
             key: "anything".into(),
         });
+        // Lookup stays supported here (the SQL path resolves keys), unlike the
+        // map/mongo adapters where it has no pre-filter and errors.
+        assert!(ensure_supported(&q).is_ok(), "Lookup must stay supported");
         assert!(matches_query(&a, &blob, &q), "Lookup must pass through");
     }
 
@@ -416,6 +439,10 @@ mod tests {
         let q = Query::KeysFilter(KeysFilter {
             keys: vec!["k".into()],
         });
+        assert!(
+            ensure_supported(&q).is_ok(),
+            "KeysFilter must stay supported"
+        );
         assert!(matches_query(&a, &blob, &q), "KeysFilter must pass through");
     }
 

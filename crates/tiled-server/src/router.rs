@@ -487,14 +487,16 @@ pub async fn search(
             }
         };
         let logical_path = segments.join("/");
-        Ok(core::construct_entries_response(
+        // construct_entries_response returns Result<_, ServerError>; an
+        // unsupported query variant propagates as HTTP 400.
+        core::construct_entries_response(
             container,
             &logical_path,
             &base_url,
             offset,
             limit,
             &queries,
-        ))
+        )
     })
     .await
     .map_err(|e| ServerError::Internal(format!("blocking task failed: {e}")))??;
@@ -1278,7 +1280,8 @@ pub async fn container_full(
         let visible_keys = if queries.is_empty() {
             container.keys()
         } else {
-            container.search(&queries)
+            // An unsupported query variant propagates as HTTP 400.
+            container.search(&queries)?
         };
         let children: Vec<tiled_core::schemas::Resource> = visible_keys
             .iter()
@@ -1354,7 +1357,9 @@ fn collect_zip_entries_blocking(
     out: &mut Vec<ZipEntry>,
 ) -> Result<(), ServerError> {
     let visible_keys = match access_filter {
-        Some(f) => container.search(&[tiled_core::queries::Query::AccessBlobFilter(f.clone())]),
+        // AccessBlobFilter is supported by the catalog/map adapters used here;
+        // an adapter that cannot evaluate it propagates HTTP 400.
+        Some(f) => container.search(&[tiled_core::queries::Query::AccessBlobFilter(f.clone())])?,
         None => container.keys(),
     };
     for key in visible_keys {

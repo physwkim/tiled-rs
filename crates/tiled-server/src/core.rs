@@ -139,9 +139,11 @@ pub fn construct_entries_response(
     offset: usize,
     limit: usize,
     queries: &[tiled_core::queries::Query],
-) -> Response<Vec<Resource>> {
-    // Apply search filters to get matching keys, then paginate.
-    let matched_keys = container.search(queries);
+) -> Result<Response<Vec<Resource>>, ServerError> {
+    // Apply search filters to get matching keys, then paginate. An unsupported
+    // query variant surfaces as ServerError::UnsupportedQuery (HTTP 400),
+    // matching Python tiled's UnsupportedQueryType handling.
+    let matched_keys = container.search(queries)?;
     let count = matched_keys.len();
     let path_trimmed = path.trim_matches('/');
 
@@ -162,7 +164,7 @@ pub fn construct_entries_response(
 
     let pagination = links::pagination_links(base_url, "search", path, offset, limit, count);
 
-    Response {
+    Ok(Response {
         data: Some(entries),
         error: None,
         links: Some(
@@ -172,5 +174,5 @@ pub fn construct_entries_response(
             serde_json::to_value(&ContainerMeta { count })
                 .expect("ContainerMeta is always serializable"),
         ),
-    }
+    })
 }

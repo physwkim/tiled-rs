@@ -153,8 +153,19 @@ pub trait ContainerAdapter: BaseAdapter {
     }
 
     /// Search/filter children. Default: return all keys (no filtering).
-    fn search(&self, _queries: &[crate::queries::Query]) -> Vec<String> {
-        self.keys()
+    ///
+    /// Returns `Err(UnsupportedQuery)` for a query variant this adapter's
+    /// search path cannot evaluate, so the server can answer HTTP 400 instead
+    /// of silently returning a filtered subset (parity with Python tiled's
+    /// `UnsupportedQueryType`). The default impl supports no filtering, so it
+    /// simply returns every key.
+    // Note: `Result` here is `std::result::Result`, not the crate's
+    // `error::Result<T>` alias (which fixes the error type to `TiledError`).
+    fn search(
+        &self,
+        _queries: &[crate::queries::Query],
+    ) -> std::result::Result<Vec<String>, crate::queries::UnsupportedQuery> {
+        Ok(self.keys())
     }
 }
 

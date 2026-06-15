@@ -10,7 +10,7 @@ use mongodb::bson::{Document, doc};
 use mongodb::sync::Database;
 
 use tiled_core::adapters::{AnyAdapter, BaseAdapter, ContainerAdapter};
-use tiled_core::queries::Query;
+use tiled_core::queries::{Query, UnsupportedQuery};
 use tiled_core::structures::{ContainerStructure, Spec, StructureFamily};
 
 use crate::run::BlueskyRunAdapter;
@@ -125,15 +125,41 @@ impl ContainerAdapter for MongoCatalog {
         self.load_runs().len()
     }
 
-    fn search(&self, queries: &[Query]) -> Vec<String> {
-        if queries.is_empty() {
-            return self.keys();
+    fn search(&self, queries: &[Query]) -> Result<Vec<String>, UnsupportedQuery> {
+        // Validate every query type up front (before the empty-container
+        // shortcut and per-run filtering) so an unsupported variant yields
+        // HTTP 400 regardless of run count or query order — parity with
+        // Python tiled, which raises UnsupportedQueryType at query dispatch.
+        for q in queries {
+            ensure_supported(q)?;
         }
-        self.load_runs()
+        if queries.is_empty() {
+            return Ok(self.keys());
+        }
+        Ok(self
+            .load_runs()
             .iter()
             .filter(|(_, adapter)| queries.iter().all(|q| matches_run_query(adapter, q)))
             .map(|(k, _)| k.clone())
-            .collect()
+            .collect())
+    }
+}
+
+/// Single source of truth for which query variants this in-memory run-metadata
+/// path can evaluate. `search` gates every query through this before calling
+/// `matches_run_query`. Unlike `tiled-catalog`, tiled-mongo has no SQL/Mongo
+/// pre-filter pass that resolves Lookup/KeysFilter or AccessBlobFilter before
+/// this function runs, so those are unsupported here too. Unsupported variants
+/// become `UnsupportedQuery` → HTTP 400 (parity: Python `UnsupportedQueryType`).
+fn ensure_supported(query: &Query) -> Result<(), UnsupportedQuery> {
+    use Query::*;
+    match query {
+        FullText(_) | StructureFamily(_) | Eq(_) | NotEq(_) | KeyPresent(_) | Contains(_)
+        | In(_) | NotIn(_) | Comparison(_) | Specs(_) => Ok(()),
+        // Like, Regex, Lookup, KeysFilter, AccessBlobFilter: no in-memory or
+        // pre-filter path evaluates these for a BlueskyRun. Surface as 400
+        // rather than silently returning a filtered subset.
+        other => Err(UnsupportedQuery(other.type_name().to_string())),
     }
 }
 
@@ -186,11 +212,10 @@ fn matches_run_query(adapter: &AnyAdapter, query: &Query) -> bool {
         // AccessBlobFilter) cannot be evaluated in-memory here — there is no
         // separate MongoDB or SQL path that pre-filters them before this
         // function is called (unlike tiled-catalog where Lookup/KeysFilter are
-        // resolved by SQL before the in-memory pass). Return false so that an
-        // unsupported query variant excludes all runs rather than leaking the
-        // whole catalog to the caller. Upstream tiled raises
-        // UnsupportedQueryType (HTTP 400); false is the safe in-process
-        // equivalent.
+        // resolved by SQL before the in-memory pass). `search` rejects them up
+        // front via `ensure_supported` (→ HTTP 400, parity with
+        // UnsupportedQueryType), so this arm is unreachable through the normal
+        // path; keep it as a fail-closed default for any direct caller.
         _ => false,
     }
 }
@@ -201,12 +226,12 @@ mod tests {
 
     use serde_json::json;
     use tiled_core::adapters::{AnyAdapter, BaseAdapter, ContainerAdapter};
-    use tiled_core::queries::{KeyLookup, KeysFilter, Like, Query, Regex};
+    use tiled_core::queries::{AccessBlobFilter, KeyLookup, KeysFilter, Like, Query, Regex};
     use tiled_core::structures::{ContainerStructure, Spec, StructureFamily};
 
     use tiled_core::queries::NotIn as NotInQ;
 
-    use super::matches_run_query;
+    use super::{ensure_supported, matches_run_query};
 
     struct StubRun {
         metadata: serde_json::Value,
@@ -244,65 +269,63 @@ mod tests {
         AnyAdapter::Container(Arc::new(StubRun { metadata: meta }))
     }
 
-    // Unimplemented variants must return false (fail-closed), not true.
-    // Returning true would silently leak the whole catalog when a client
-    // issues a query variant this in-memory path cannot evaluate.
+    // Unsupported variants must surface as UnsupportedQuery (→ HTTP 400),
+    // not silently filter to a subset. tiled-mongo has no SQL/Mongo pre-filter
+    // pass, so Like/Regex/Lookup/KeysFilter/AccessBlobFilter are all
+    // unsupported here.
 
     #[test]
-    fn like_returns_false_not_true() {
-        // metadata has plan_name matching the pattern, so Like WOULD match if
-        // implemented.  A `_ => true` arm would pass this run through anyway;
-        // fail-closed returns false.
-        let a = run(json!({"start": {"plan_name": "scan"}}));
+    fn like_returns_error() {
         let q = Query::Like(Like {
             key: "plan_name".into(),
             pattern: "scan".into(),
         });
-        assert!(
-            !matches_run_query(&a, &q),
-            "Like must return false (unimplemented), not silently pass"
+        assert_eq!(
+            ensure_supported(&q).unwrap_err().0,
+            "Like",
+            "Like is unimplemented and must error, not silently pass"
         );
     }
 
     #[test]
-    fn regex_returns_false_not_true() {
-        let a = run(json!({"start": {"plan_name": "scan"}}));
+    fn regex_returns_error() {
         let q = Query::Regex(Regex {
             key: "plan_name".into(),
             pattern: "scan".into(),
             case_sensitive: true,
         });
-        assert!(
-            !matches_run_query(&a, &q),
-            "Regex must return false (unimplemented), not silently pass"
-        );
+        assert_eq!(ensure_supported(&q).unwrap_err().0, "Regex");
     }
 
     #[test]
-    fn lookup_returns_false_not_true() {
-        // Lookup is key-based.  In tiled-mongo there is no SQL pre-filter
-        // path that resolves keys before this function — unlike tiled-catalog
-        // where Lookup passes through because SQL already handled it.
-        let a = run(json!({}));
+    fn lookup_returns_error() {
+        // Lookup is key-based. In tiled-mongo there is no SQL pre-filter path
+        // that resolves keys before search — unlike tiled-catalog where Lookup
+        // passes through because SQL already handled it.
         let q = Query::Lookup(KeyLookup {
             key: "any_uid".into(),
         });
-        assert!(
-            !matches_run_query(&a, &q),
-            "Lookup must return false in tiled-mongo (no pre-filter path)"
-        );
+        assert_eq!(ensure_supported(&q).unwrap_err().0, "KeyLookup");
     }
 
     #[test]
-    fn keys_filter_returns_false_not_true() {
-        let a = run(json!({}));
+    fn keys_filter_returns_error() {
         let q = Query::KeysFilter(KeysFilter {
             keys: vec!["k".into()],
         });
-        assert!(
-            !matches_run_query(&a, &q),
-            "KeysFilter must return false in tiled-mongo (no pre-filter path)"
-        );
+        assert_eq!(ensure_supported(&q).unwrap_err().0, "KeysFilter");
+    }
+
+    #[test]
+    fn access_blob_filter_returns_error() {
+        // Unlike tiled-catalog/tiled-adapters, a BlueskyRun carries no
+        // access_blob, so AccessBlobFilter cannot be evaluated here and must
+        // error rather than excluding every run.
+        let q = Query::AccessBlobFilter(AccessBlobFilter {
+            tags: vec!["team_a".into()],
+            ..Default::default()
+        });
+        assert_eq!(ensure_supported(&q).unwrap_err().0, "AccessBlobFilter");
     }
 
     // Implemented variants must continue to work correctly.

@@ -549,6 +549,33 @@ async fn test_search_on_non_container() {
 }
 
 #[tokio::test]
+async fn test_search_unsupported_query_type_returns_400() {
+    let app = build_app();
+    // `lookup` (Python class KeyLookup) has no in-memory evaluation on the
+    // MapAdapter search path. Python tiled raises UnsupportedQueryType and
+    // answers HTTP 400 with this exact detail string (app.py:355-365).
+    let (status, body) = get_json(&app, "/api/v1/search/?filter[lookup][condition][key]=foo").await;
+    assert_eq!(status, 400, "unsupported query must be HTTP 400: {body}");
+    assert_eq!(
+        body["error"]["message"].as_str().unwrap(),
+        "The query type 'KeyLookup' is not supported on this node."
+    );
+}
+
+#[tokio::test]
+async fn test_search_supported_query_type_ok() {
+    // A supported variant (eq) must still return 200 — the 400 path is
+    // specific to variants the adapter cannot evaluate.
+    let app = build_app();
+    let (status, _body) = get_json(
+        &app,
+        "/api/v1/search/?filter[eq][condition][key]=element&filter[eq][condition][value]=%22Cu%22",
+    )
+    .await;
+    assert_eq!(status, 200);
+}
+
+#[tokio::test]
 async fn test_block_wrong_dimension_count() {
     let app = build_app();
     // some_array is 1D but we pass 2 block indices

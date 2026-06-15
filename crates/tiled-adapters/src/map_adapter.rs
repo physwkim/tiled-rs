@@ -7,7 +7,7 @@ use std::sync::{Arc, OnceLock};
 use indexmap::IndexMap;
 
 use tiled_core::adapters::{AnyAdapter, BaseAdapter, ContainerAdapter};
-use tiled_core::queries::Query;
+use tiled_core::queries::{Query, UnsupportedQuery};
 use tiled_core::schemas::{SortDirection, SortingItem};
 use tiled_core::structures::{ContainerStructure, Spec, StructureFamily};
 
@@ -113,15 +113,41 @@ impl ContainerAdapter for MapAdapter {
         self.mapping.len()
     }
 
-    fn search(&self, queries: &[Query]) -> Vec<String> {
-        if queries.is_empty() {
-            return self.keys();
+    fn search(&self, queries: &[Query]) -> Result<Vec<String>, UnsupportedQuery> {
+        // Validate every query type up front (before the empty-container
+        // shortcut and per-node filtering) so an unsupported variant yields
+        // HTTP 400 regardless of node count or query order — parity with
+        // Python tiled, which raises UnsupportedQueryType at query dispatch.
+        for q in queries {
+            ensure_supported(q)?;
         }
-        self.mapping
+        if queries.is_empty() {
+            return Ok(self.keys());
+        }
+        Ok(self
+            .mapping
             .iter()
             .filter(|(_, adapter)| queries.iter().all(|q| matches_query(adapter, q)))
             .map(|(k, _)| k.clone())
-            .collect()
+            .collect())
+    }
+}
+
+/// Single source of truth for which query variants this in-memory adapter can
+/// evaluate. `search` gates every query through this before calling
+/// `matches_query`. The map adapter evaluates every metadata predicate, plus
+/// `AccessBlobFilter` (via `include_untagged`); only the tree-position filters
+/// `Lookup`/`KeysFilter` have no in-memory evaluation here (the search
+/// endpoint resolves `Lookup` by direct key lookup; `KeysFilter` is not
+/// implemented). Those become `UnsupportedQuery` → HTTP 400 (parity: Python's
+/// `MapAdapter` registers neither `KeyLookup`) rather than silently passing
+/// every node through.
+fn ensure_supported(query: &Query) -> Result<(), UnsupportedQuery> {
+    match query {
+        Query::Lookup(_) | Query::KeysFilter(_) => {
+            Err(UnsupportedQuery(query.type_name().to_string()))
+        }
+        _ => Ok(()),
     }
 }
 
@@ -174,12 +200,14 @@ fn matches_query(adapter: &AnyAdapter, query: &Query) -> bool {
             s.include.iter().all(|n| names.contains(n.as_str()))
                 && !s.exclude.iter().any(|n| names.contains(n.as_str()))
         }
-        // Lookup is resolved at the search endpoint via direct key lookup;
-        // KeysFilter the in-memory adapter does not implement — pass through.
+        // Lookup/KeysFilter have no in-memory evaluation here; `search`
+        // rejects them up front via `ensure_supported` (→ HTTP 400), so this
+        // arm is unreachable through the normal path. Keep it as a defensive
+        // default for any direct caller.
+        Query::Lookup(_) | Query::KeysFilter(_) => true,
         // AccessBlobFilter: in-memory nodes have no access_blob (untagged),
         // so they match only when include_untagged is true (fail-closed on
         // tagged filters that cannot be evaluated).
-        Query::Lookup(_) | Query::KeysFilter(_) => true,
         Query::AccessBlobFilter(f) => f.include_untagged,
     }
 }
@@ -257,6 +285,39 @@ mod tests {
         assert!(
             !matches_query(&a, &q),
             "NotIn must exclude adapters whose key value is in the list"
+        );
+    }
+
+    // An unsupported query variant must surface as UnsupportedQuery
+    // (→ HTTP 400), not silently pass every node through.
+
+    #[test]
+    fn search_unsupported_variant_errors() {
+        let mut mapping = IndexMap::new();
+        mapping.insert(
+            "a".to_string(),
+            AnyAdapter::Container(Arc::new(MapAdapter::new(
+                IndexMap::new(),
+                serde_json::json!({}),
+                vec![],
+            ))),
+        );
+        let map = MapAdapter::new(mapping, serde_json::json!({}), vec![]);
+        let q = Query::Lookup(tiled_core::queries::KeyLookup { key: "x".into() });
+        let err = map.search(std::slice::from_ref(&q)).unwrap_err();
+        assert_eq!(err.0, "KeyLookup");
+    }
+
+    #[test]
+    fn search_empty_container_still_errors_on_unsupported() {
+        // Up-front validation must fire even with no nodes to filter.
+        let map = MapAdapter::new(IndexMap::new(), serde_json::json!({}), vec![]);
+        let q = Query::KeysFilter(tiled_core::queries::KeysFilter {
+            keys: vec!["k".into()],
+        });
+        assert_eq!(
+            map.search(std::slice::from_ref(&q)).unwrap_err().0,
+            "KeysFilter"
         );
     }
 

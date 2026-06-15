@@ -18,6 +18,12 @@ pub enum ServerError {
     /// `response_bytesize_limit`. Maps to 400 to match Python tiled
     /// (router.py raises HTTP_400_BAD_REQUEST before serialization).
     ResponseTooLarge(String),
+    /// A search query used a variant the target node cannot evaluate. Maps to
+    /// 400 to match Python tiled, which raises `UnsupportedQueryType` and
+    /// answers HTTP 400 (app.py:355-365). The message is the full Python
+    /// detail string (`The query type {name!r} is not supported on this
+    /// node.`).
+    UnsupportedQuery(String),
 }
 
 impl std::fmt::Display for ServerError {
@@ -30,6 +36,7 @@ impl std::fmt::Display for ServerError {
             Self::Unauthorized(msg) => write!(f, "Unauthorized: {msg}"),
             Self::Forbidden(msg) => write!(f, "Forbidden: {msg}"),
             Self::ResponseTooLarge(msg) => write!(f, "Response too large: {msg}"),
+            Self::UnsupportedQuery(msg) => write!(f, "Unsupported query: {msg}"),
         }
     }
 }
@@ -56,6 +63,7 @@ impl IntoResponse for ServerError {
             Self::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, 401, msg),
             Self::Forbidden(msg) => (StatusCode::FORBIDDEN, 403, msg),
             Self::ResponseTooLarge(msg) => (StatusCode::BAD_REQUEST, 400, msg),
+            Self::UnsupportedQuery(msg) => (StatusCode::BAD_REQUEST, 400, msg),
         };
 
         let body = schemas::Response::<()> {
@@ -66,6 +74,14 @@ impl IntoResponse for ServerError {
         };
 
         (status, axum::Json(body)).into_response()
+    }
+}
+
+impl From<tiled_core::queries::UnsupportedQuery> for ServerError {
+    fn from(err: tiled_core::queries::UnsupportedQuery) -> Self {
+        // `Display` renders the full Python detail string, which becomes the
+        // 400 body message.
+        Self::UnsupportedQuery(err.to_string())
     }
 }
 
