@@ -94,7 +94,12 @@ pub fn pagination_links(
         }
     };
 
-    let last_offset = if count > 0 {
+    // The router accepts `page[limit]=0` (no CatchPanicLayer), and the bare
+    // `(count - 1) / limit` panics on divide-by-zero. Python `pagination_links`
+    // never divides (tiled/server/core.py:122-147). Guard the division so the
+    // illegal divisor cannot reach it: with `limit == 0` there is no meaningful
+    // last-page offset, so `last` collapses to the first page (offset 0).
+    let last_offset = if limit > 0 && count > 0 {
         ((count - 1) / limit) * limit
     } else {
         0
@@ -175,5 +180,44 @@ mod tests {
         let links = pagination_links("http://localhost:8000", "search", "", 90, 10, 100);
         assert!(links.next.is_none());
         assert!(links.prev.is_some());
+    }
+
+    #[test]
+    fn test_pagination_links_zero_limit_does_not_panic() {
+        // `page[limit]=0` is accepted by the router; the last-page division must
+        // not divide by zero. `last` collapses to the first page (offset 0).
+        let links = pagination_links("http://localhost:8000", "search", "", 0, 0, 100);
+        assert_eq!(
+            links.last.as_deref(),
+            Some("http://localhost:8000/api/v1/search/?page[offset]=0&page[limit]=0")
+        );
+        assert_eq!(
+            links.first.as_deref(),
+            Some("http://localhost:8000/api/v1/search/?page[offset]=0&page[limit]=0")
+        );
+    }
+
+    #[test]
+    fn test_pagination_links_zero_limit_zero_count_does_not_panic() {
+        // Both the `count == 0` and `limit == 0` guards exercised together.
+        let links = pagination_links("http://localhost:8000", "search", "", 0, 0, 0);
+        assert!(links.next.is_none());
+        assert!(links.prev.is_none());
+        assert_eq!(
+            links.last.as_deref(),
+            Some("http://localhost:8000/api/v1/search/?page[offset]=0&page[limit]=0")
+        );
+    }
+
+    #[test]
+    fn test_pagination_links_limit_exceeds_count() {
+        // A single page larger than the result set: last == first, no next/prev.
+        let links = pagination_links("http://localhost:8000", "search", "", 0, 50, 10);
+        assert!(links.next.is_none());
+        assert!(links.prev.is_none());
+        assert_eq!(
+            links.last.as_deref(),
+            Some("http://localhost:8000/api/v1/search/?page[offset]=0&page[limit]=50")
+        );
     }
 }
