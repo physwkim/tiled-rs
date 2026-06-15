@@ -2281,6 +2281,9 @@ fn catalog_ds_to_core_ds(
 const JSON_PATCH_MIMETYPE: &str = "application/json-patch+json";
 /// Body `content-type` discriminator: RFC 7396 partial doc merged into each.
 const MERGE_PATCH_MIMETYPE: &str = "application/merge-patch+json";
+/// Maximum specs a node may carry after a patch. Mirrors Python
+/// `schemas.MAX_ALLOWED_SPECS` (= 20) and the catalog's private `MAX_SPECS`.
+const MAX_ALLOWED_SPECS: usize = 20;
 
 pub async fn patch_metadata(
     State(state): State<AppState>,
@@ -2379,6 +2382,36 @@ pub async fn patch_metadata(
             (metadata, specs)
         }
     };
+
+    // Limits that bypass register-time schema validation when reached via
+    // patch — Python validates the FINAL specs in the handler before writing
+    // (server router.py:2370-2380; both return HTTP 422). The catalog also
+    // caps the count, but only the handler enforces uniqueness, and only here
+    // do the messages mirror Python.
+    if let Some(arr) = specs.as_array() {
+        if arr.len() > MAX_ALLOWED_SPECS {
+            return Err(ServerError::Validation(format!(
+                "Update cannot result in more than {MAX_ALLOWED_SPECS} specs"
+            )));
+        }
+        let mut seen: Vec<serde_json::Value> = Vec::with_capacity(arr.len());
+        for spec in arr {
+            let identity = spec_identity(spec);
+            if seen.contains(&identity) {
+                return Err(ServerError::Validation(
+                    "Update cannot result in non-unique specs".into(),
+                ));
+            }
+            seen.push(identity);
+        }
+    }
+
+    // NOTE: the `access_blob` patch document and the policy.modify_node hook
+    // are intentionally not applied — see the UNFIXED note in the worker
+    // report. Python discards the access_blob patch whenever no access policy
+    // exposes modify_node (router.py:2401-2404), which is exactly this crate's
+    // configuration (tiled-access AccessPolicy has no modify_node), so the
+    // stored access_blob is returned unchanged either way.
     let updated = catalog
         .update_metadata(node.id, metadata, specs, drop_revision)
         .await
@@ -2790,6 +2823,25 @@ fn apply_json_patch_field(
     json_patch::patch(&mut doc, &patch)
         .map_err(|e| ServerError::Validation(format!("json-patch failed: {e}")))?;
     Ok(doc)
+}
+
+/// Canonical `(name, version)` identity of a spec for the uniqueness check,
+/// mirroring Python's frozen `Spec` dataclass equality (structures/core.py):
+/// a bare string `"x"`, `{"name": "x"}`, and `{"name": "x", "version": null}`
+/// all collapse to the same identity.
+fn spec_identity(spec: &serde_json::Value) -> serde_json::Value {
+    if let Some(name) = spec.as_str() {
+        serde_json::json!([name, serde_json::Value::Null])
+    } else if let Some(obj) = spec.as_object() {
+        let name = obj.get("name").cloned().unwrap_or(serde_json::Value::Null);
+        let version = obj
+            .get("version")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        serde_json::json!([name, version])
+    } else {
+        spec.clone()
+    }
 }
 
 /// RFC 7396 merge-patch: recursively merge `patch` into `target`. A

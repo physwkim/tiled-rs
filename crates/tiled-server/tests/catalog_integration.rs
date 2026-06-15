@@ -351,6 +351,77 @@ async fn patch_unknown_or_missing_content_type_returns_406() {
     assert_eq!(body["data"]["attributes"]["metadata"]["a"], 1);
 }
 
+/// F-J: a patch that would push the node over MAX_ALLOWED_SPECS (= 20) is
+/// rejected with 422 (Python router.py:2371-2375).
+#[tokio::test]
+async fn patch_over_limit_specs_returns_422() {
+    let (app, _dir) = build_test_app().await;
+    let (status, _) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/register/",
+        serde_json::json!({
+            "key": "node",
+            "structure_family": "container",
+            "metadata": {},
+            "specs": [],
+            "data_sources": [],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // 21 distinct specs (merge-patch replaces the specs array wholesale).
+    let too_many: Vec<serde_json::Value> = (0..21)
+        .map(|i| serde_json::json!({"name": format!("spec{i}")}))
+        .collect();
+    let (status, _) = json_request(
+        &app,
+        Method::PATCH,
+        "/api/v1/metadata/node",
+        serde_json::json!({
+            "content-type": "application/merge-patch+json",
+            "specs": too_many,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+/// F-J: a patch that would result in non-unique specs is rejected with 422
+/// (Python router.py:2376-2380). The two entries below differ in JSON shape
+/// but share a `(name, version)` identity, mirroring Python's Spec equality.
+#[tokio::test]
+async fn patch_duplicate_specs_returns_422() {
+    let (app, _dir) = build_test_app().await;
+    let (status, _) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/register/",
+        serde_json::json!({
+            "key": "node",
+            "structure_family": "container",
+            "metadata": {},
+            "specs": [],
+            "data_sources": [],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, _) = json_request(
+        &app,
+        Method::PATCH,
+        "/api/v1/metadata/node",
+        serde_json::json!({
+            "content-type": "application/merge-patch+json",
+            "specs": [{"name": "x"}, {"name": "x", "version": null}],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+}
+
 #[tokio::test]
 async fn duplicate_key_at_same_level_returns_422() {
     let (app, _dir) = build_test_app().await;
