@@ -114,6 +114,12 @@ fn ok_response(path: &str, bytes: Vec<u8>) -> Response {
         HeaderValue::from_str(mime.as_ref())
             .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
     );
+    // Stop browsers from MIME-sniffing a served asset into a different,
+    // possibly executable, content type.
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
     // Cache static assets for a year — they're immutable per build.
     // index.html intentionally NOT cached so a reload picks up new
     // bundle hashes.
@@ -169,6 +175,18 @@ mod tests {
         let state = make_state(tmp.path()).await;
         let resp = serve_path(&state, "/etc/passwd", false).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn served_asset_sets_nosniff() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("app.js"), b"console.log('hi');").unwrap();
+        let state = make_state(tmp.path()).await;
+        let resp = serve_path(&state, "app.js", false).await;
+        assert_eq!(
+            resp.headers().get("x-content-type-options").unwrap(),
+            "nosniff"
+        );
     }
 
     #[tokio::test]

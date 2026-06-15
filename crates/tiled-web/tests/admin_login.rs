@@ -88,6 +88,24 @@ async fn correct_password_issues_session_cookie() {
 }
 
 #[tokio::test]
+async fn admin_page_sets_security_headers() {
+    // Server-rendered admin HTML must carry nosniff + DENY framing.
+    let (app, _dir, _issuer) = build_test_router().await;
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/admin/login")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get("x-content-type-options").unwrap(),
+        "nosniff"
+    );
+    assert_eq!(resp.headers().get("x-frame-options").unwrap(), "DENY");
+}
+
+#[tokio::test]
 async fn api_key_create_rejects_non_numeric_expires_in() {
     // A typo'd expiry ("30d") must NOT silently mint a non-expiring key;
     // it must be rejected with a validation message.

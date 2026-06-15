@@ -5,7 +5,7 @@ use std::sync::Arc;
 use askama::Template;
 use axum::Router;
 use axum::extract::{Form, Path, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use chrono::{Duration, Utc};
@@ -53,7 +53,20 @@ async fn redirect_to_keys() -> Redirect {
 /// askama_axum because it's pinned to axum 0.7 and we're on 0.8.
 fn render<T: Template>(template: T) -> Response {
     match template.render() {
-        Ok(html) => Html(html).into_response(),
+        Ok(html) => {
+            let mut resp = Html(html).into_response();
+            let h = resp.headers_mut();
+            // Harden the server-rendered admin HTML: never sniff the type,
+            // and refuse to be framed (clickjacking defence for the logout /
+            // revoke / revoke-all POST forms — the admin panel is never meant
+            // to be embedded).
+            h.insert(
+                header::X_CONTENT_TYPE_OPTIONS,
+                HeaderValue::from_static("nosniff"),
+            );
+            h.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+            resp
+        }
         Err(e) => {
             // Don't echo internal template/render details to the browser.
             tracing::error!(error = %e, "admin template render failed");
