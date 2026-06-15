@@ -2265,16 +2265,28 @@ fn catalog_ds_to_core_ds(
 // PATCH /api/v1/metadata/{*path} — update metadata + specs
 // ---------------------------------------------------------------------------
 //
-// JSON body: `{ "metadata": {...}, "specs": [...] }`. Everything else
-// (links, data_sources) is read-only here — use PUT /data_source for
-// structural changes.
+// The canonical client ALWAYS sends the HTTP header
+// `Content-Type: application/json` and carries the real patch type plus the
+// patch documents in the JSON body (tiled client/base.py:741-757):
+//
+//   `{ "content-type": <mimetype>, "metadata": <patch>, "specs": <patch>,
+//      "access_blob": <patch> }`
+//
+// `metadata`, `specs` and `access_blob` are three INDEPENDENT patch
+// documents — the discriminator lives in the body, not the transport
+// header. Everything else (links, data_sources) is read-only here — use
+// PUT /data_source for structural changes.
+
+/// Body `content-type` discriminator: RFC 6902 ops array applied to each doc.
+const JSON_PATCH_MIMETYPE: &str = "application/json-patch+json";
+/// Body `content-type` discriminator: RFC 7396 partial doc merged into each.
+const MERGE_PATCH_MIMETYPE: &str = "application/merge-patch+json";
 
 pub async fn patch_metadata(
     State(state): State<AppState>,
     OriginalUri(uri): OriginalUri,
     Query(params): Query<HashMap<String, String>>,
     BaseUrl(base_url): BaseUrl,
-    headers: HeaderMap,
     auth: crate::AuthContext,
     Json(req): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, ServerError> {
@@ -2304,81 +2316,66 @@ pub async fn patch_metadata(
         .map_err(map_catalog_err)?
         .ok_or_else(|| ServerError::NotFound(format!("'{}' not found", segments.join("/"))))?;
 
-    // Content-Type-driven dispatch (upstream tiled #688):
+    // Patch dispatch (upstream tiled #688). The discriminator is the BODY
+    // field `content-type` (it is data, not transport): the canonical client
+    // always sends the HTTP header `Content-Type: application/json` and puts
+    // the real patch type in the body (tiled client/base.py:741-757, server
+    // router.py:2344-2368). `metadata`, `specs` and `access_blob` are three
+    // INDEPENDENT patch documents, each applied to its own base:
     //
-    //   * application/json-patch+json   — body is an array of RFC 6902 ops
-    //     applied to the existing metadata + specs in place;
-    //   * application/merge-patch+json  — body is a partial document merged
-    //     into existing metadata + specs per RFC 7396 (null fields delete);
-    //   * default (any other / missing) — historical "partial replace": top-
-    //     level `metadata` and/or `specs` keys overwrite the old values.
-    let content_type = headers
-        .get(axum::http::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
+    //   * application/json-patch+json   — each field is an RFC 6902 ops array
+    //     applied directly to that document;
+    //   * application/merge-patch+json  — each field is a partial document
+    //     merged per RFC 7396 (null deletes a key; an array replaces
+    //     wholesale; a null/absent field means "no change");
+    //   * anything else / missing       — 406 Not Acceptable. There is no
+    //     silent fallback (mirrors Python's HTTP_406_NOT_ACCEPTABLE).
+    let content_type = req
+        .get("content-type")
+        .and_then(|v| v.as_str())
         .unwrap_or("");
-    let mode = if content_type.contains("application/json-patch+json") {
+    let mode = if content_type == JSON_PATCH_MIMETYPE {
         PatchMode::JsonPatch
-    } else if content_type.contains("application/merge-patch+json") {
+    } else if content_type == MERGE_PATCH_MIMETYPE {
         PatchMode::MergePatch
     } else {
-        PatchMode::PartialReplace
+        return Err(ServerError::NotAcceptable(format!(
+            "valid content types: {JSON_PATCH_MIMETYPE}, {MERGE_PATCH_MIMETYPE}"
+        )));
+    };
+    // Python treats `entry.specs or []`: a null/absent specs column is an
+    // empty array for patch purposes.
+    let base_specs = if node.specs.is_null() {
+        serde_json::Value::Array(Vec::new())
+    } else {
+        node.specs.clone()
     };
     let (metadata, specs) = match mode {
-        PatchMode::PartialReplace => {
-            let metadata = req
-                .get("metadata")
-                .cloned()
-                .unwrap_or_else(|| node.metadata.clone());
-            let specs = req
-                .get("specs")
-                .cloned()
-                .unwrap_or_else(|| node.specs.clone());
-            (metadata, specs)
-        }
         PatchMode::JsonPatch => {
-            let ops_array = req.as_array().ok_or_else(|| {
-                ServerError::Validation(
-                    "application/json-patch+json body must be a JSON array of ops".into(),
-                )
-            })?;
-            // Build a single working doc {metadata, specs}, run the ops,
-            // then split it back. RFC 6902 paths starting with /metadata
-            // or /specs work without further translation.
-            let mut working = serde_json::json!({
-                "metadata": node.metadata,
-                "specs": node.specs,
-            });
-            let patch: json_patch::Patch =
-                serde_json::from_value(serde_json::Value::Array(ops_array.clone()))
-                    .map_err(|e| ServerError::Validation(format!("invalid json-patch: {e}")))?;
-            json_patch::patch(&mut working, &patch)
-                .map_err(|e| ServerError::Validation(format!("json-patch failed: {e}")))?;
-            let metadata = working
-                .get("metadata")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null);
-            let specs = working
-                .get("specs")
-                .cloned()
-                .unwrap_or_else(|| serde_json::Value::Array(Vec::new()));
+            // RFC 6902 ops applied DIRECTLY to each document — `metadata` ops
+            // target the metadata doc, `specs` ops target the specs array.
+            // (No combined {metadata, specs} envelope: the ops paths are
+            // relative to each document, matching Python's
+            // `apply_json_patch(entry.metadata(), body.metadata or [])`.)
+            let metadata = apply_json_patch_field(&node.metadata, req.get("metadata"))?;
+            let specs = apply_json_patch_field(&base_specs, req.get("specs"))?;
             (metadata, specs)
         }
         PatchMode::MergePatch => {
-            // RFC 7396: recursively merge into the working doc; null
-            // values in the patch delete the corresponding key. We only
-            // merge the top-level `metadata` and `specs` fields (everything
-            // else on the body is ignored — this matches upstream's
-            // behaviour where merge-patch doesn't touch structure).
+            // RFC 7396 merge into each document. A null/absent field means
+            // "no change"; for `specs`, an explicit array replaces wholesale.
             let mut metadata = node.metadata.clone();
-            let mut specs = node.specs.clone();
-            if let Some(m) = req.get("metadata") {
-                merge_patch_apply(&mut metadata, m);
+            if let Some(patch) = req.get("metadata").filter(|v| !v.is_null()) {
+                merge_patch_apply(&mut metadata, patch);
             }
-            if let Some(s) = req.get("specs") {
-                // specs is conventionally an array; replace wholesale on
-                // merge-patch (RFC 7396 says non-objects are replaced).
-                specs = s.clone();
-            }
+            let specs = match req.get("specs") {
+                None | Some(serde_json::Value::Null) => base_specs,
+                Some(patch) => {
+                    let mut specs = base_specs;
+                    merge_patch_apply(&mut specs, patch);
+                    specs
+                }
+            };
             (metadata, specs)
         }
     };
@@ -2754,16 +2751,45 @@ mod block_parser_tests {
     }
 }
 
-/// Which dispatch arm `patch_metadata` takes, derived from
-/// `Content-Type`. Mirrors upstream tiled PR #688's three modes.
+/// Which dispatch arm `patch_metadata` takes, derived from the body
+/// `content-type` field. Mirrors upstream tiled PR #688's two patch modes
+/// (an unrecognized/absent content-type is rejected with 406, not dispatched
+/// here).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PatchMode {
-    /// Default. Top-level `metadata`/`specs` keys overwrite the old values.
-    PartialReplace,
     /// RFC 6902 ops array (`application/json-patch+json`).
     JsonPatch,
     /// RFC 7396 partial doc (`application/merge-patch+json`).
     MergePatch,
+}
+
+/// Apply an RFC 6902 json-patch ops array (`ops`, taken straight from a
+/// request body field) directly to `base`, returning the patched document.
+/// A null/absent/empty ops list leaves `base` unchanged — mirrors Python's
+/// `apply_json_patch(base, field or [])` (server router.py:2345-2347).
+fn apply_json_patch_field(
+    base: &serde_json::Value,
+    ops: Option<&serde_json::Value>,
+) -> Result<serde_json::Value, ServerError> {
+    let ops = match ops {
+        None | Some(serde_json::Value::Null) => return Ok(base.clone()),
+        Some(v) => v,
+    };
+    let ops_array = ops.as_array().ok_or_else(|| {
+        ServerError::Validation(
+            "application/json-patch+json fields must be JSON arrays of RFC 6902 ops".into(),
+        )
+    })?;
+    if ops_array.is_empty() {
+        return Ok(base.clone());
+    }
+    let patch: json_patch::Patch =
+        serde_json::from_value(serde_json::Value::Array(ops_array.clone()))
+            .map_err(|e| ServerError::Validation(format!("invalid json-patch: {e}")))?;
+    let mut doc = base.clone();
+    json_patch::patch(&mut doc, &patch)
+        .map_err(|e| ServerError::Validation(format!("json-patch failed: {e}")))?;
+    Ok(doc)
 }
 
 /// RFC 7396 merge-patch: recursively merge `patch` into `target`. A

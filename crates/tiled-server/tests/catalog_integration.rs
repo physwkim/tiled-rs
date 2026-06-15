@@ -144,12 +144,17 @@ async fn register_then_read_then_patch_then_delete() {
         "first run"
     );
 
-    // PATCH metadata.
+    // PATCH metadata. The canonical client always sends the HTTP header
+    // `Content-Type: application/json` and carries the real patch type in the
+    // body; merge-patch here updates `description`.
     let (status, body) = json_request(
         &app,
         Method::PATCH,
         "/api/v1/metadata/expt",
-        serde_json::json!({"metadata": {"description": "updated"}}),
+        serde_json::json!({
+            "content-type": "application/merge-patch+json",
+            "metadata": {"description": "updated"},
+        }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "patch: {body}");
@@ -183,6 +188,167 @@ async fn register_then_read_then_patch_then_delete() {
     assert_eq!(status, StatusCode::NOT_FOUND);
     let (status, _) = empty_request(&app, Method::GET, "/api/v1/metadata/expt/scan_1").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// F-A: json-patch ops are applied DIRECTLY to each document (metadata ops
+/// target the metadata doc, specs ops target the specs array), the body
+/// `content-type` discriminator is read from the body (not the transport
+/// header), and that field never leaks into the stored metadata.
+#[tokio::test]
+async fn patch_json_patch_applies_ops_to_each_document() {
+    let (app, _dir) = build_test_app().await;
+    let (status, _) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/register/",
+        serde_json::json!({
+            "key": "node",
+            "structure_family": "container",
+            "metadata": {"a": 1, "b": 2},
+            "specs": [],
+            "data_sources": [],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // HTTP header is application/json; the real patch type and the ops live
+    // in the body. metadata ops add /c and replace /a; specs ops append one.
+    let (status, body) = json_request(
+        &app,
+        Method::PATCH,
+        "/api/v1/metadata/node",
+        serde_json::json!({
+            "content-type": "application/json-patch+json",
+            "metadata": [
+                {"op": "add", "path": "/c", "value": 3},
+                {"op": "replace", "path": "/a", "value": 9},
+            ],
+            "specs": [
+                {"op": "add", "path": "/-", "value": {"name": "beta"}},
+            ],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "patch: {body}");
+
+    let (_, body) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/metadata/node",
+        serde_json::Value::Null,
+    )
+    .await;
+    let meta = &body["data"]["attributes"]["metadata"];
+    assert_eq!(meta["a"], 9, "replace op applied: {meta}");
+    assert_eq!(meta["b"], 2, "unpatched key preserved: {meta}");
+    assert_eq!(meta["c"], 3, "add op applied: {meta}");
+    assert!(
+        meta.get("content-type").is_none(),
+        "body content-type leaked into stored metadata: {meta}"
+    );
+    let specs = body["data"]["attributes"]["specs"].as_array().unwrap();
+    assert_eq!(specs.len(), 1, "specs ops applied independently: {specs:?}");
+    assert_eq!(specs[0]["name"], "beta");
+}
+
+/// F-A: merge-patch merges into the existing metadata document, preserving
+/// keys the patch does not mention (the old "partial replace" mode dropped
+/// them).
+#[tokio::test]
+async fn patch_merge_patch_preserves_unpatched_keys() {
+    let (app, _dir) = build_test_app().await;
+    let (status, _) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/register/",
+        serde_json::json!({
+            "key": "node",
+            "structure_family": "container",
+            "metadata": {"a": 1, "b": 2},
+            "specs": [],
+            "data_sources": [],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) = json_request(
+        &app,
+        Method::PATCH,
+        "/api/v1/metadata/node",
+        serde_json::json!({
+            "content-type": "application/merge-patch+json",
+            "metadata": {"b": 99},
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "patch: {body}");
+
+    let (_, body) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/metadata/node",
+        serde_json::Value::Null,
+    )
+    .await;
+    let meta = &body["data"]["attributes"]["metadata"];
+    assert_eq!(meta["a"], 1, "unpatched key preserved: {meta}");
+    assert_eq!(meta["b"], 99, "patched key updated: {meta}");
+}
+
+/// F-A/F-K: an unrecognized or absent body `content-type` is rejected with
+/// 406 Not Acceptable — there is no silent fallback that overwrites metadata.
+#[tokio::test]
+async fn patch_unknown_or_missing_content_type_returns_406() {
+    let (app, _dir) = build_test_app().await;
+    let (status, _) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/register/",
+        serde_json::json!({
+            "key": "node",
+            "structure_family": "container",
+            "metadata": {"a": 1},
+            "specs": [],
+            "data_sources": [],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // Unrecognized body content-type.
+    let (status, _) = json_request(
+        &app,
+        Method::PATCH,
+        "/api/v1/metadata/node",
+        serde_json::json!({
+            "content-type": "application/garbage",
+            "metadata": {"a": 2},
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_ACCEPTABLE);
+
+    // Absent body content-type (the old "partial replace" shape).
+    let (status, _) = json_request(
+        &app,
+        Method::PATCH,
+        "/api/v1/metadata/node",
+        serde_json::json!({"metadata": {"a": 3}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_ACCEPTABLE);
+
+    // The rejected patches must not have mutated the stored metadata.
+    let (_, body) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/metadata/node",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(body["data"]["attributes"]["metadata"]["a"], 1);
 }
 
 #[tokio::test]
