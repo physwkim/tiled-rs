@@ -149,7 +149,7 @@ fn role_scopes_user_matches_python_defaults() {
         Scope::CreateApiKeys,
         Scope::RevokeApiKeys,
     ] {
-        assert!(user_scopes.0.contains(&s), "user role must contain {s:?}");
+        assert!(user_scopes.contains(s), "user role must contain {s:?}");
     }
     // Must NOT include admin-only scopes.
     for s in [
@@ -158,10 +158,7 @@ fn role_scopes_user_matches_python_defaults() {
         Scope::WritePrincipals,
         Scope::Admin,
     ] {
-        assert!(
-            !user_scopes.0.contains(&s),
-            "user role must NOT contain {s:?}"
-        );
+        assert!(!user_scopes.contains(s), "user role must NOT contain {s:?}");
     }
 }
 
@@ -178,7 +175,7 @@ fn role_scopes_admin_is_full() {
 #[test]
 fn role_scopes_unknown_is_empty() {
     let unknown = ScopeSet::for_role("superuser");
-    assert!(unknown.0.is_empty(), "unknown role must yield empty scopes");
+    assert!(unknown.is_empty(), "unknown role must yield empty scopes");
 }
 
 #[tokio::test]

@@ -100,10 +100,31 @@ impl<'de> Deserialize<'de> for Scope {
 /// A set of scopes attached to a principal / api-key / session. Stored as
 /// JSON arrays of strings on disk; held as `BTreeSet<Scope>` in memory so
 /// `contains` is O(log n) and ordering is stable.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ScopeSet(pub BTreeSet<Scope>);
+///
+/// The `admin` superscope implies every scope. To keep that implication
+/// from having two meanings (honored on the `contains` path but ignored by
+/// the literal `intersect`/subset cap primitive), the inner set is
+/// **canonicalized on construction**: any set that contains [`Scope::Admin`]
+/// is materialized to the full set. The invariant `Admin ∈ set ⟹ set ==
+/// full()` therefore holds *by construction*, so `contains`, `intersect`,
+/// and the JSON/subset paths all agree — there is no bare `{Admin}` that
+/// could mean "all" on one operation and "just admin" on another. The inner
+/// field is private so no caller can bypass canonicalization.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ScopeSet(BTreeSet<Scope>);
 
 impl ScopeSet {
+    /// Materialize the `admin ⟹ all` implication: a set that contains
+    /// [`Scope::Admin`] becomes the full set, so no constructed `ScopeSet`
+    /// ever encodes "all scopes" as a bare `{Admin}`.
+    fn canonicalize(set: BTreeSet<Scope>) -> BTreeSet<Scope> {
+        if set.contains(&Scope::Admin) {
+            Scope::ALL.iter().copied().collect()
+        } else {
+            set
+        }
+    }
+
     pub fn new() -> Self {
         Self(BTreeSet::new())
     }
@@ -152,7 +173,7 @@ impl ScopeSet {
             })?;
             set.insert(scope);
         }
-        Ok(Self(set))
+        Ok(Self(Self::canonicalize(set)))
     }
 
     pub fn to_json(&self) -> String {
@@ -161,17 +182,32 @@ impl ScopeSet {
     }
 
     pub fn insert(&mut self, scope: Scope) -> bool {
-        self.0.insert(scope)
+        let added = self.0.insert(scope);
+        if scope == Scope::Admin {
+            // Maintain the canonical invariant: granting `admin` confers all.
+            self.0 = Scope::ALL.iter().copied().collect();
+        }
+        added
     }
 
+    /// True iff `scope` is granted. No `admin` special-case is needed: a set
+    /// that holds [`Scope::Admin`] was canonicalized to the full set at
+    /// construction, so plain membership already honors the implication.
     pub fn contains(&self, scope: Scope) -> bool {
-        self.0.contains(&scope) || self.0.contains(&Scope::Admin)
+        self.0.contains(&scope)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
     }
 
     pub fn iter(&self) -> impl Iterator<Item = Scope> + '_ {
         self.0.iter().copied()
     }
 
+    /// Set intersection used as the scope cap/subset primitive. Because no
+    /// operand can be a bare `{Admin}` (canonicalized to full on
+    /// construction), this literal intersection agrees with [`contains`].
     pub fn intersect(&self, other: &Self) -> Self {
         Self(self.0.intersection(&other.0).copied().collect())
     }
@@ -179,7 +215,17 @@ impl ScopeSet {
 
 impl FromIterator<Scope> for ScopeSet {
     fn from_iter<I: IntoIterator<Item = Scope>>(iter: I) -> Self {
-        Self(iter.into_iter().collect())
+        Self(Self::canonicalize(iter.into_iter().collect()))
+    }
+}
+
+impl<'de> Deserialize<'de> for ScopeSet {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        // On-disk / wire form is a JSON array of scope strings. Canonicalize
+        // on load so a stored bare `["admin"]` becomes the full set, keeping
+        // the `Admin ⟹ all` invariant true at the store/load boundary.
+        let set = BTreeSet::<Scope>::deserialize(de)?;
+        Ok(Self(Self::canonicalize(set)))
     }
 }
 
@@ -201,6 +247,42 @@ mod tests {
         assert!(s.contains(Scope::DeleteNode));
         assert!(s.contains(Scope::CreateApiKeys));
         assert!(s.contains(Scope::AdminApiKeys));
+    }
+
+    /// Finding 3: the `admin` superscope must mean the same thing on the
+    /// `intersect`/subset cap path as on `contains`. Because a set holding
+    /// `Admin` is canonicalized to `full()` on construction, intersecting it
+    /// with X is identical to intersecting `full()` with X (i.e. yields X).
+    #[test]
+    fn admin_set_intersect_matches_full_intersect() {
+        let admin = ScopeSet::from_iter([Scope::Admin]);
+        let full = ScopeSet::full();
+        // Canonicalization: a bare `{Admin}` is materialized to the full set.
+        assert_eq!(admin, full, "a set containing Admin normalizes to full()");
+
+        let x = ScopeSet::from_iter([Scope::ReadData, Scope::WriteData]);
+        assert_eq!(
+            admin.intersect(&x),
+            full.intersect(&x),
+            "intersect must treat Admin the same as full()"
+        );
+        // full ∩ x == x — capping by an admin set never drops a real scope.
+        assert_eq!(admin.intersect(&x), x);
+    }
+
+    /// Canonicalization holds at every construction boundary, including the
+    /// JSON/serde load path used for sessions stored as `["admin"]`.
+    #[test]
+    fn admin_canonicalizes_on_load() {
+        let from_text = ScopeSet::from_json("[\"admin\"]").unwrap();
+        assert_eq!(from_text, ScopeSet::full());
+
+        let from_serde: ScopeSet = serde_json::from_str("[\"admin\"]").unwrap();
+        assert_eq!(from_serde, ScopeSet::full());
+
+        let mut grown = ScopeSet::read_only();
+        grown.insert(Scope::Admin);
+        assert_eq!(grown, ScopeSet::full());
     }
 
     #[test]
