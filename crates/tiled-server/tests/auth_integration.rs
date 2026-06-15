@@ -8,7 +8,7 @@ use axum::http::{Method, Request, StatusCode};
 use serde_json::json;
 use tower::ServiceExt;
 
-use tiled_auth::{AuthDb, DummyAuthenticator, Issuer};
+use tiled_auth::{AuthDb, DummyAuthenticator, Issuer, Scope};
 use tiled_catalog::Catalog;
 use tiled_core::adapters::ContainerAdapter;
 use tiled_core::queries::Query;
@@ -421,6 +421,128 @@ async fn refresh_rotates_token_and_returns_full_response() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "second refresh failed: {body2}");
+}
+
+/// Finding 2: refresh must re-derive access scopes from the principal's
+/// current role (Python slide_session parity), so a role downgrade takes
+/// effect on the next refresh rather than surviving until hard expiry.
+#[tokio::test]
+async fn refresh_rederives_scopes_from_current_role() {
+    let (app, _dir, _cat, auth_db) = build_test_app().await;
+    let issuer = Issuer::new(b"this-is-a-test-secret-32-bytes-long!!").unwrap();
+
+    // alice logs in, is promoted to admin, then re-logs in for an admin session.
+    let (_, body) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/auth/dummy/login",
+        &[],
+        Some(json!({"username": "alice", "password": "wonderland"})),
+    )
+    .await;
+    let alice_sub = body["identity"]["id"].as_str().unwrap().to_string();
+    let (alice, _) = auth_db.ensure_principal("dummy", &alice_sub).await.unwrap();
+    auth_db
+        .update_principal_role(alice.id, "admin")
+        .await
+        .unwrap();
+
+    let (_, body) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/auth/dummy/login",
+        &[],
+        Some(json!({"username": "alice", "password": "wonderland"})),
+    )
+    .await;
+    let refresh = body["refresh_token"].as_str().unwrap().to_string();
+    // Sanity: the admin access token carries the admin-only `register` scope.
+    let admin_claims = issuer
+        .verify_access(body["access_token"].as_str().unwrap())
+        .unwrap();
+    assert!(admin_claims.scopes.contains(Scope::Register));
+
+    // Downgrade to 'user', then refresh.
+    auth_db
+        .update_principal_role(alice.id, "user")
+        .await
+        .unwrap();
+    let (status, body) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/auth/refresh",
+        &[],
+        Some(json!({"refresh_token": refresh})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // The refreshed access token reflects the *current* (user) role: read
+    // survives, admin-only `register` is gone. On the unfixed code the frozen
+    // admin session scopes would persist and `register` would still be set.
+    let claims = issuer
+        .verify_access(body["access_token"].as_str().unwrap())
+        .unwrap();
+    assert!(
+        claims.scopes.contains(Scope::ReadData),
+        "user role retains read"
+    );
+    assert!(
+        !claims.scopes.contains(Scope::Register),
+        "role downgrade must drop admin-only scopes on refresh"
+    );
+}
+
+/// Finding 2: refresh re-derives from role but must NEVER widen a
+/// deliberately-narrowed session beyond its stored scopes.
+#[tokio::test]
+async fn refresh_does_not_widen_a_narrowed_session() {
+    let (app, _dir, _cat, auth_db) = build_test_app().await;
+    let issuer = Issuer::new(b"this-is-a-test-secret-32-bytes-long!!").unwrap();
+
+    // An admin principal, but a session deliberately narrowed to read-only.
+    let (alice, _) = auth_db.ensure_principal("dummy", "alice").await.unwrap();
+    auth_db
+        .update_principal_role(alice.id, "admin")
+        .await
+        .unwrap();
+    let narrow = tiled_auth::ScopeSet::read_only();
+    let session = auth_db
+        .create_session(
+            alice.id,
+            narrow,
+            chrono::Utc::now() + chrono::Duration::hours(1),
+        )
+        .await
+        .unwrap();
+    let refresh = issuer.issue_refresh(&alice.uuid, &session.uuid).unwrap();
+
+    let (status, body) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/auth/refresh",
+        &[],
+        Some(json!({"refresh_token": refresh})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Even though alice is admin, the narrowed session is not re-widened.
+    let claims = issuer
+        .verify_access(body["access_token"].as_str().unwrap())
+        .unwrap();
+    assert!(
+        claims.scopes.contains(Scope::ReadData),
+        "narrow read survives"
+    );
+    assert!(
+        !claims.scopes.contains(Scope::Register),
+        "a narrowed session must not regain admin scopes on refresh"
+    );
+    assert!(
+        !claims.scopes.contains(Scope::WriteData),
+        "a narrowed session must not regain write scopes on refresh"
+    );
 }
 
 #[tokio::test]

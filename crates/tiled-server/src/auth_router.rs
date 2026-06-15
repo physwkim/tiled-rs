@@ -146,8 +146,20 @@ pub async fn refresh(
     }
     db.touch_session(&claims.sid).await.ok();
     db.increment_refresh_count(&claims.sid).await.ok();
+    // Re-derive scopes from the principal's *current* role on every refresh
+    // (Python parity: slide_session, authentication.py:1526-1528) so a role
+    // downgrade or a tightened `default_login_scopes` takes effect on the next
+    // refresh instead of surviving until the session hard-expires. Cap by the
+    // stored `session.scopes` so a deliberately-narrowed session (e.g. one
+    // minted for a specific apikey) is never *widened* back to the role max.
+    let principal = db
+        .get_principal(session.principal_id)
+        .await
+        .map_err(map_auth_err)?
+        .ok_or_else(|| ServerError::Unauthorized(OPAQUE_SESSION_ERR.into()))?;
+    let scopes = crate::app::mint_session_scopes(&principal, &state).intersect(&session.scopes);
     let access = issuer
-        .issue_access(&claims.sub, &claims.sid, session.scopes)
+        .issue_access(&claims.sub, &claims.sid, scopes)
         .map_err(map_auth_err)?;
     let new_refresh = issuer
         .issue_refresh(&claims.sub, &claims.sid)
