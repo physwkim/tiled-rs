@@ -159,12 +159,7 @@ impl ExternalOidcValidator {
         } else {
             provider.algorithms.clone()
         };
-        let mut validation = Validation::new(algorithms[0]);
-        validation.algorithms = algorithms;
-        validation.set_issuer(&[&provider.issuer]);
-        // Non-empty audiences is guaranteed by ExternalOidcValidator::new.
-        let refs: Vec<&str> = provider.audiences.iter().map(|s| s.as_str()).collect();
-        validation.set_audience(&refs);
+        let validation = build_validation(provider, algorithms);
 
         let claims = decode::<serde_json::Value>(token, &key, &validation)
             .map_err(AuthError::from)?
@@ -238,6 +233,26 @@ pub struct ValidatedToken {
     pub claims: serde_json::Value,
 }
 
+/// Build the JWT `Validation` for a provider. `exp`, `iss`, `aud`, and
+/// `nbf` (not-before) are all enforced; `algorithms` is pinned by the caller
+/// from the JWKS/config, never from the attacker-controlled token header.
+/// Factored out so the not-before enforcement is unit-testable without a
+/// live JWKS fetch. `algorithms` must be non-empty (guaranteed by the
+/// caller).
+fn build_validation(provider: &OidcProvider, algorithms: Vec<Algorithm>) -> Validation {
+    let mut validation = Validation::new(algorithms[0]);
+    validation.algorithms = algorithms;
+    validation.set_issuer(&[&provider.issuer]);
+    // Enforce `nbf`: a token presented before its not-before time is
+    // rejected. jsonwebtoken defaults `validate_nbf` to false; Python's
+    // authlib validates nbf by default.
+    validation.validate_nbf = true;
+    // Non-empty audiences is guaranteed by ExternalOidcValidator::new.
+    let refs: Vec<&str> = provider.audiences.iter().map(|s| s.as_str()).collect();
+    validation.set_audience(&refs);
+    validation
+}
+
 /// Returns the decoding key and the signing algorithm to use.
 ///
 /// Algorithm priority: JWK `alg` field (IdP-declared) > kty-based
@@ -270,4 +285,64 @@ fn base64_url_decode(s: &str) -> Result<Vec<u8>> {
     base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(s)
         .map_err(|e| AuthError::Validation(format!("base64: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use jsonwebtoken::{EncodingKey, Header, encode};
+
+    fn test_provider() -> OidcProvider {
+        OidcProvider {
+            name: "test".into(),
+            jwks_url: "https://example.test/jwks".into(),
+            issuer: "https://issuer.test/".into(),
+            audiences: vec!["tiled".into()],
+            subject_claim: "sub".into(),
+            algorithms: vec![Algorithm::HS256],
+        }
+    }
+
+    fn hs256_token(nbf_offset_secs: i64, secret: &[u8]) -> String {
+        let now = Utc::now().timestamp();
+        let claims = serde_json::json!({
+            "iss": "https://issuer.test/",
+            "aud": "tiled",
+            "sub": "alice",
+            "exp": now + 3600,
+            "nbf": now + nbf_offset_secs,
+        });
+        encode(
+            &Header::new(Algorithm::HS256),
+            &claims,
+            &EncodingKey::from_secret(secret),
+        )
+        .unwrap()
+    }
+
+    /// Finding 4: `nbf` (not-before) must be enforced. A token presented
+    /// before its not-before time is rejected; one past its nbf validates.
+    #[test]
+    fn validation_enforces_nbf() {
+        let secret = b"unit-test-secret-for-nbf-check!!";
+        let validation = build_validation(&test_provider(), vec![Algorithm::HS256]);
+        assert!(validation.validate_nbf, "nbf enforcement must be enabled");
+
+        let key = DecodingKey::from_secret(secret);
+
+        // nbf an hour in the future (well beyond jsonwebtoken's default
+        // leeway) → rejected.
+        let future = hs256_token(3600, secret);
+        assert!(
+            decode::<serde_json::Value>(&future, &key, &validation).is_err(),
+            "token presented before its nbf must be rejected"
+        );
+
+        // nbf in the past → accepted (iss/aud/exp all valid).
+        let past = hs256_token(-60, secret);
+        assert!(
+            decode::<serde_json::Value>(&past, &key, &validation).is_ok(),
+            "token past its nbf must validate"
+        );
+    }
 }
