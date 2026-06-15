@@ -74,6 +74,38 @@ impl AuthDb {
         Ok(())
     }
 
+    /// Create a standalone service principal with the given role. Unlike
+    /// [`ensure_principal`], this creates no Identity row: the principal is
+    /// accessed only via API keys, not via login. Mirrors Python's
+    /// `create_service` in `authn_database/core.py`.
+    pub async fn create_service_principal(&self, role: &str) -> Result<Principal> {
+        let new_uuid = Uuid::new_v4().to_string();
+        match self.pool() {
+            AuthPool::Sqlite(pool) => {
+                let row = sqlx::query(
+                    "INSERT INTO principals (uuid, type, role) VALUES (?, 'service', ?)
+                     RETURNING id, uuid, type, role, time_created",
+                )
+                .bind(&new_uuid)
+                .bind(role)
+                .fetch_one(pool)
+                .await?;
+                Ok(principal_from_sqlite(&row)?)
+            }
+            AuthPool::Postgres(pool) => {
+                let row = sqlx::query(
+                    "INSERT INTO principals (uuid, type, role) VALUES ($1, 'service', $2)
+                     RETURNING id, uuid, type, role, time_created",
+                )
+                .bind(&new_uuid)
+                .bind(role)
+                .fetch_one(pool)
+                .await?;
+                Ok(principal_from_postgres(&row)?)
+            }
+        }
+    }
+
     pub async fn create_principal(&self, kind: &str) -> Result<Principal> {
         let new_uuid = Uuid::new_v4().to_string();
         match self.pool() {
