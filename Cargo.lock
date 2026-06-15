@@ -4976,6 +4976,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tiled-auth",
  "tiled-core",
+ "tokio",
 ]
 
 [[package]]
