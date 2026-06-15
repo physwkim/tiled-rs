@@ -18,6 +18,17 @@ use crate::WebState;
 use crate::cookie::{build_session_cookie, clear_session_cookie, read_session_cookie};
 
 pub fn admin_router(state: WebState) -> Router {
+    // Validate login_provider at construction time (once, during server startup).
+    // Control chars or non-ASCII bytes would contaminate cookie values and header
+    // strings if the field is ever interpolated into a Set-Cookie attribute.
+    assert!(
+        state
+            .login_provider
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'),
+        "login_provider must contain only ASCII alphanumeric, '_', or '-'; got {:?}",
+        state.login_provider,
+    );
     Router::new()
         .route("/admin/login", get(login_form).post(login_submit))
         .route("/admin/logout", post(logout_submit))

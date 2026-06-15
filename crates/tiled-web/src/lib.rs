@@ -116,3 +116,44 @@ fn build_settings_json(spec_views: &[SpecViewEntry]) -> String {
     }))
     .unwrap_or_else(|_| "{\"spec_views\":[]}".into())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use tiled_auth::ScopeSet;
+
+    use super::*;
+
+    fn minimal_state(login_provider: &str) -> WebState {
+        WebState {
+            auth_db: None,
+            issuer: None,
+            default_login_scopes: ScopeSet::default(),
+            login_provider: login_provider.into(),
+            channel_count_fn: Arc::new(|| 0),
+            secure_cookies: false,
+            assets_dir: None,
+            spec_views: Vec::new(),
+            authenticator: None,
+        }
+    }
+
+    #[test]
+    fn build_router_accepts_alphanumeric_provider() {
+        let _ = build_router(minimal_state("dummy"));
+        let _ = build_router(minimal_state("my-provider_1"));
+    }
+
+    #[test]
+    #[should_panic(expected = "login_provider must contain only ASCII")]
+    fn build_router_panics_on_control_char_in_provider() {
+        let _ = build_router(minimal_state("bad\x00provider"));
+    }
+
+    #[test]
+    #[should_panic(expected = "login_provider must contain only ASCII")]
+    fn build_router_panics_on_space_in_provider() {
+        let _ = build_router(minimal_state("bad provider"));
+    }
+}

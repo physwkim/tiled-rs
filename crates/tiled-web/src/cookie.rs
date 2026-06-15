@@ -18,7 +18,9 @@ pub fn build_session_cookie(jwt: &str, max_age: i64, secure: bool) -> HeaderValu
     if secure {
         s.push_str("; Secure");
     }
-    HeaderValue::from_str(&s).unwrap_or_else(|_| HeaderValue::from_static(""))
+    // JWT tokens are base64url-encoded (printable ASCII: [A-Za-z0-9_\-\.]+)
+    // and all cookie attribute strings are static ASCII — from_str cannot fail.
+    HeaderValue::from_str(&s).expect("JWT and cookie attributes are printable ASCII")
 }
 
 /// Header value that clears the session cookie — used by `/admin/logout`.
@@ -27,7 +29,8 @@ pub fn clear_session_cookie(secure: bool) -> HeaderValue {
     if secure {
         s.push_str("; Secure");
     }
-    HeaderValue::from_str(&s).unwrap_or_else(|_| HeaderValue::from_static(""))
+    // Fully static ASCII — from_str cannot fail.
+    HeaderValue::from_str(&s).expect("cookie clear string is static ASCII")
 }
 
 /// Read the session cookie from a Cookie request header. Returns the
@@ -41,4 +44,37 @@ pub fn read_session_cookie(headers: &axum::http::HeaderMap) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_session_cookie_sets_expected_attributes() {
+        let v = build_session_cookie("hdr.payload.sig", 3600, false);
+        let s = v.to_str().unwrap();
+        assert!(
+            s.starts_with("tiled_session=hdr.payload.sig;"),
+            "cookie value"
+        );
+        assert!(s.contains("HttpOnly"), "HttpOnly attribute");
+        assert!(s.contains("SameSite=Lax"), "SameSite=Lax attribute");
+        assert!(s.contains("Max-Age=3600"), "Max-Age attribute");
+        assert!(!s.contains("Secure"), "no Secure when secure=false");
+    }
+
+    #[test]
+    fn build_session_cookie_adds_secure_flag() {
+        let v = build_session_cookie("h.p.s", 60, true);
+        assert!(v.to_str().unwrap().contains("Secure"));
+    }
+
+    #[test]
+    fn clear_session_cookie_zeroes_max_age() {
+        let v = clear_session_cookie(false);
+        let s = v.to_str().unwrap();
+        assert!(s.starts_with("tiled_session=;"), "empty value");
+        assert!(s.contains("Max-Age=0"), "Max-Age=0 to expire cookie");
+    }
 }
