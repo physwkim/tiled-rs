@@ -86,59 +86,83 @@ impl BlueskyRunAdapter {
             let filler = Arc::new(Filler::new(self.db.clone(), self.handler_registry.clone()));
 
             let collection = self.db.collection::<Document>("event_descriptor");
-            if let Ok(cursor) = collection.find(doc! { "run_start": &uid }).run() {
-                let mut descriptors_by_stream: IndexMap<String, Vec<Document>> = IndexMap::new();
-                for desc in cursor.flatten() {
-                    let name = desc.get_str("name").unwrap_or("primary").to_string();
-                    descriptors_by_stream.entry(name).or_default().push(desc);
+            // M5: surface a failed descriptor query instead of silently
+            // returning a run with no streams (a client cannot distinguish
+            // that from a run that genuinely recorded none).
+            let cursor = match collection.find(doc! { "run_start": &uid }).run() {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::error!(
+                        target: "tiled.mongo",
+                        run_uid = %uid,
+                        error = %e,
+                        "event_descriptor query failed; run will expose no streams"
+                    );
+                    return mapping;
                 }
+            };
 
-                // `stop.num_events` is a `{stream_name: count}` dict — use the
-                // per-stream count so each EventStream declares the right
-                // number of rows. Streams not listed there default to 1 (no
-                // events), matching Bluesky's "stop emitted before any events
-                // arrived" case.
-                let num_events_doc = self
-                    .stop_doc
+            let mut descriptors_by_stream: IndexMap<String, Vec<Document>> = IndexMap::new();
+            for result in cursor {
+                match result {
+                    Ok(desc) => {
+                        let name = desc.get_str("name").unwrap_or("primary").to_string();
+                        descriptors_by_stream.entry(name).or_default().push(desc);
+                    }
+                    Err(e) => tracing::error!(
+                        target: "tiled.mongo",
+                        run_uid = %uid,
+                        error = %e,
+                        "event_descriptor document decode failed; descriptor skipped"
+                    ),
+                }
+            }
+
+            // `stop.num_events` is a `{stream_name: count}` dict — use the
+            // per-stream count so each EventStream declares the right
+            // number of rows. Streams not listed there default to 1 (no
+            // events), matching Bluesky's "stop emitted before any events
+            // arrived" case.
+            let num_events_doc = self
+                .stop_doc
+                .as_ref()
+                .and_then(|d| d.get_document("num_events").ok())
+                .cloned();
+
+            for (stream_name, descriptors) in descriptors_by_stream {
+                let cutoff_seq_num = num_events_doc
                     .as_ref()
-                    .and_then(|d| d.get_document("num_events").ok())
-                    .cloned();
-
-                for (stream_name, descriptors) in descriptors_by_stream {
-                    let cutoff_seq_num = num_events_doc
-                        .as_ref()
-                        .and_then(|ne| {
-                            // Accept i64 or i32; reject negative event counts
-                            // (would wrap when cast to usize).
-                            let n = ne
-                                .get_i64(&stream_name)
-                                .ok()
-                                .or_else(|| ne.get_i32(&stream_name).ok().map(i64::from))?;
-                            usize::try_from(n).ok().map(|n| n + 1)
-                        })
-                        .unwrap_or(1);
-                    let stream = EventStreamAdapter::new(
-                        self.db.clone(),
-                        stream_name.clone(),
-                        descriptors.clone(),
-                        cutoff_seq_num,
-                        Some(filler.clone()),
-                    );
-                    mapping.insert(stream_name.clone(), AnyAdapter::Container(Arc::new(stream)));
-                    // Surface a table-shaped sibling so clients that want
-                    // a flat Arrow view (pandas / polars / datafusion)
-                    // can read it without composing per-column reads.
-                    let table = crate::EventStreamTable::new(
-                        self.db.clone(),
-                        stream_name.clone(),
-                        descriptors,
-                        cutoff_seq_num,
-                    );
-                    mapping.insert(
-                        format!("{stream_name}_table"),
-                        AnyAdapter::Table(Arc::new(table)),
-                    );
-                }
+                    .and_then(|ne| {
+                        // Accept i64 or i32; reject negative event counts
+                        // (would wrap when cast to usize).
+                        let n = ne
+                            .get_i64(&stream_name)
+                            .ok()
+                            .or_else(|| ne.get_i32(&stream_name).ok().map(i64::from))?;
+                        usize::try_from(n).ok().map(|n| n + 1)
+                    })
+                    .unwrap_or(1);
+                let stream = EventStreamAdapter::new(
+                    self.db.clone(),
+                    stream_name.clone(),
+                    descriptors.clone(),
+                    cutoff_seq_num,
+                    Some(filler.clone()),
+                );
+                mapping.insert(stream_name.clone(), AnyAdapter::Container(Arc::new(stream)));
+                // Surface a table-shaped sibling so clients that want
+                // a flat Arrow view (pandas / polars / datafusion)
+                // can read it without composing per-column reads.
+                let table = crate::EventStreamTable::new(
+                    self.db.clone(),
+                    stream_name.clone(),
+                    descriptors,
+                    cutoff_seq_num,
+                );
+                mapping.insert(
+                    format!("{stream_name}_table"),
+                    AnyAdapter::Table(Arc::new(table)),
+                );
             }
             mapping
         })

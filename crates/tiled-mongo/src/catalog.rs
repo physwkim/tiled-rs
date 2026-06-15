@@ -68,41 +68,82 @@ impl MongoCatalog {
                 .sort(doc! { "time": -1 })
                 .build();
 
-            if let Ok(cursor) = collection.find(doc! {}).with_options(opts).run() {
-                // Collect every run_start first (the in-memory catalog design
-                // materialises all runs anyway), preserving the cursor's
-                // time-descending order.
-                let starts: Vec<(String, Document)> = cursor
-                    .flatten()
-                    .filter_map(|start_doc| {
-                        let uid = start_doc.get_str("uid").unwrap_or_default().to_string();
-                        (!uid.is_empty()).then_some((uid, start_doc))
-                    })
-                    .collect();
+            // M5: a connection/query failure must be observable — log it
+            // rather than silently returning an empty catalog, which a client
+            // cannot distinguish from "this database has no runs".
+            let cursor = match collection.find(doc! {}).with_options(opts).run() {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::error!(
+                        target: "tiled.mongo",
+                        error = %e,
+                        "run_start query failed; catalog will appear empty"
+                    );
+                    return mapping;
+                }
+            };
 
-                // Batch the run_stop lookup into ONE find({run_start: {$in:
-                // [...]}}) keyed by run_start, instead of an N+1 find_one per
-                // run. A run with no stop doc is left as `None`.
-                let uids: Vec<String> = starts.iter().map(|(u, _)| u.clone()).collect();
-                let mut stops: HashMap<String, Document> = HashMap::new();
-                if !uids.is_empty()
-                    && let Ok(stop_cursor) = self
-                        .db
-                        .collection::<Document>("run_stop")
-                        .find(doc! { "run_start": { "$in": uids } })
-                        .run()
-                {
-                    for stop_doc in stop_cursor.flatten() {
-                        if let Ok(rs) = stop_doc.get_str("run_start") {
-                            stops.insert(rs.to_string(), stop_doc);
+            // Collect every run_start first (the in-memory catalog design
+            // materialises all runs anyway), preserving the cursor's
+            // time-descending order. Per-doc decode errors are logged, not
+            // silently dropped.
+            let mut starts: Vec<(String, Document)> = Vec::new();
+            for result in cursor {
+                match result {
+                    Ok(start_doc) => {
+                        let uid = start_doc.get_str("uid").unwrap_or_default().to_string();
+                        if !uid.is_empty() {
+                            starts.push((uid, start_doc));
                         }
                     }
+                    Err(e) => tracing::error!(
+                        target: "tiled.mongo",
+                        error = %e,
+                        "run_start document decode failed; run skipped"
+                    ),
                 }
+            }
 
-                for (uid, start_doc, stop_doc) in pair_starts_with_stops(starts, stops) {
-                    let run = BlueskyRunAdapter::new(self.db.clone(), start_doc, stop_doc);
-                    mapping.insert(uid, AnyAdapter::Container(Arc::new(run)));
+            // Batch the run_stop lookup into ONE find({run_start: {$in: [...]}})
+            // keyed by run_start, instead of an N+1 find_one per run. A run with
+            // no stop doc is left as `None`. A failed stop query is logged but
+            // not fatal — the runs are still listed, just without stop metadata.
+            let uids: Vec<String> = starts.iter().map(|(u, _)| u.clone()).collect();
+            let mut stops: HashMap<String, Document> = HashMap::new();
+            if !uids.is_empty() {
+                match self
+                    .db
+                    .collection::<Document>("run_stop")
+                    .find(doc! { "run_start": { "$in": uids } })
+                    .run()
+                {
+                    Ok(stop_cursor) => {
+                        for result in stop_cursor {
+                            match result {
+                                Ok(stop_doc) => {
+                                    if let Ok(rs) = stop_doc.get_str("run_start") {
+                                        stops.insert(rs.to_string(), stop_doc);
+                                    }
+                                }
+                                Err(e) => tracing::error!(
+                                    target: "tiled.mongo",
+                                    error = %e,
+                                    "run_stop document decode failed; run will show no stop"
+                                ),
+                            }
+                        }
+                    }
+                    Err(e) => tracing::error!(
+                        target: "tiled.mongo",
+                        error = %e,
+                        "run_stop batch query failed; runs will show no stop metadata"
+                    ),
                 }
+            }
+
+            for (uid, start_doc, stop_doc) in pair_starts_with_stops(starts, stops) {
+                let run = BlueskyRunAdapter::new(self.db.clone(), start_doc, stop_doc);
+                mapping.insert(uid, AnyAdapter::Container(Arc::new(run)));
             }
             mapping
         })
