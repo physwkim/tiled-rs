@@ -3,6 +3,7 @@
 //! Corresponds to `databroker.mongo_normalized.MongoAdapter`.
 //! Lists BlueskyRuns from the `run_start` collection.
 
+use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
 use indexmap::IndexMap;
@@ -68,21 +69,37 @@ impl MongoCatalog {
                 .build();
 
             if let Ok(cursor) = collection.find(doc! {}).with_options(opts).run() {
-                for start_doc in cursor.flatten() {
-                    let uid = start_doc.get_str("uid").unwrap_or_default().to_string();
-                    if uid.is_empty() {
-                        continue;
-                    }
+                // Collect every run_start first (the in-memory catalog design
+                // materialises all runs anyway), preserving the cursor's
+                // time-descending order.
+                let starts: Vec<(String, Document)> = cursor
+                    .flatten()
+                    .filter_map(|start_doc| {
+                        let uid = start_doc.get_str("uid").unwrap_or_default().to_string();
+                        (!uid.is_empty()).then_some((uid, start_doc))
+                    })
+                    .collect();
 
-                    // Look up the corresponding stop document.
-                    let stop_doc = self
+                // Batch the run_stop lookup into ONE find({run_start: {$in:
+                // [...]}}) keyed by run_start, instead of an N+1 find_one per
+                // run. A run with no stop doc is left as `None`.
+                let uids: Vec<String> = starts.iter().map(|(u, _)| u.clone()).collect();
+                let mut stops: HashMap<String, Document> = HashMap::new();
+                if !uids.is_empty()
+                    && let Ok(stop_cursor) = self
                         .db
                         .collection::<Document>("run_stop")
-                        .find_one(doc! { "run_start": &uid })
+                        .find(doc! { "run_start": { "$in": uids } })
                         .run()
-                        .ok()
-                        .flatten();
+                {
+                    for stop_doc in stop_cursor.flatten() {
+                        if let Ok(rs) = stop_doc.get_str("run_start") {
+                            stops.insert(rs.to_string(), stop_doc);
+                        }
+                    }
+                }
 
+                for (uid, start_doc, stop_doc) in pair_starts_with_stops(starts, stops) {
                     let run = BlueskyRunAdapter::new(self.db.clone(), start_doc, stop_doc);
                     mapping.insert(uid, AnyAdapter::Container(Arc::new(run)));
                 }
@@ -90,6 +107,24 @@ impl MongoCatalog {
             mapping
         })
     }
+}
+
+/// Pair each run_start (in cursor order) with its run_stop from the batched
+/// `$in` lookup. A run whose uid has no stop doc gets `None`; a stop doc whose
+/// `run_start` matches no loaded run is ignored. Pure (no I/O) so the
+/// N+1→batch pairing — the part that can scramble order or mismatch a run with
+/// the wrong stop — is unit-testable without a live MongoDB.
+fn pair_starts_with_stops(
+    starts: Vec<(String, Document)>,
+    mut stops: HashMap<String, Document>,
+) -> Vec<(String, Document, Option<Document>)> {
+    starts
+        .into_iter()
+        .map(|(uid, start_doc)| {
+            let stop_doc = stops.remove(&uid);
+            (uid, start_doc, stop_doc)
+        })
+        .collect()
 }
 
 impl BaseAdapter for MongoCatalog {
@@ -231,7 +266,7 @@ mod tests {
 
     use tiled_core::queries::NotIn as NotInQ;
 
-    use super::{ensure_supported, matches_run_query};
+    use super::{ensure_supported, matches_run_query, pair_starts_with_stops};
 
     struct StubRun {
         metadata: serde_json::Value,
@@ -391,5 +426,84 @@ mod tests {
             value: json!("count"),
         });
         assert!(!matches_run_query(&a, &q));
+    }
+
+    // H7: the batched run_stop lookup replaces an N+1 find_one per run. The
+    // pairing of each run_start with the right run_stop (and the order/missing
+    // handling) is the part that can regress; cover it without a live MongoDB.
+
+    use mongodb::bson::{Document, doc};
+    use std::collections::HashMap;
+
+    fn start(uid: &str) -> (String, Document) {
+        (uid.to_string(), doc! { "uid": uid })
+    }
+
+    #[test]
+    fn pairs_each_run_with_its_own_stop_preserving_order() {
+        // Cursor order is time-descending; pairing must not reorder.
+        let starts = vec![start("c"), start("b"), start("a")];
+        let mut stops = HashMap::new();
+        stops.insert(
+            "a".to_string(),
+            doc! { "run_start": "a", "exit_status": "success" },
+        );
+        stops.insert(
+            "b".to_string(),
+            doc! { "run_start": "b", "exit_status": "abort" },
+        );
+        stops.insert(
+            "c".to_string(),
+            doc! { "run_start": "c", "exit_status": "fail" },
+        );
+
+        let paired = pair_starts_with_stops(starts, stops);
+
+        let uids: Vec<&str> = paired.iter().map(|(u, _, _)| u.as_str()).collect();
+        assert_eq!(
+            uids,
+            vec!["c", "b", "a"],
+            "order must follow the cursor, not the HashMap"
+        );
+        // Each run carries its OWN stop, not another run's.
+        for (uid, _, stop) in &paired {
+            let got = stop.as_ref().unwrap().get_str("run_start").unwrap();
+            assert_eq!(got, uid, "run {uid} was paired with the wrong stop ({got})");
+        }
+    }
+
+    #[test]
+    fn run_without_stop_gets_none() {
+        let starts = vec![start("a"), start("b")];
+        let mut stops = HashMap::new();
+        stops.insert("a".to_string(), doc! { "run_start": "a" });
+        // "b" has no stop doc (run still in progress).
+
+        let paired = pair_starts_with_stops(starts, stops);
+
+        assert!(paired[0].2.is_some(), "run a has a stop");
+        assert!(
+            paired[1].2.is_none(),
+            "run b without a stop must be None, not another run's stop"
+        );
+    }
+
+    #[test]
+    fn orphan_stop_does_not_create_a_phantom_run() {
+        // A run_stop whose run_start matches no loaded run must be ignored —
+        // it must not appear as an extra run.
+        let starts = vec![start("a")];
+        let mut stops = HashMap::new();
+        stops.insert("a".to_string(), doc! { "run_start": "a" });
+        stops.insert("orphan".to_string(), doc! { "run_start": "orphan" });
+
+        let paired = pair_starts_with_stops(starts, stops);
+
+        assert_eq!(
+            paired.len(),
+            1,
+            "only loaded runs may appear; orphan stop is dropped"
+        );
+        assert_eq!(paired[0].0, "a");
     }
 }
