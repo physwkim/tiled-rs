@@ -107,6 +107,18 @@ impl Hdf5Adapter {
         // Probe dtype on the actual (raw) shape so rust-hdf5's hyperslab
         // accepts the offsets/counts. For empty arrays we skip the read
         // and assume f64.
+        //
+        // UNFIXED (FINDING A-1): the Kind (float / integer / unsigned) and
+        // signedness produced here are GUESSED by element byte size inside
+        // `read_native` (see its `try_read!` ladder, this file), not read
+        // from the dataset's true HDF5 datatype class. Because libhdf5
+        // silently converts numeric types on read, a uint8 dataset is
+        // reported as signed i8 and an int64 dataset as f64.
+        // BLOCKER: rust-hdf5 0.2.12 exposes no public datatype-class / sign
+        // accessor for an already-opened dataset (no `H5Dataset::datatype()`
+        // yielding a `Datatype` with `class()` / `is_signed()`). Fixing this
+        // requires that upstream accessor; see the `#[ignore]`'d
+        // `dtype_tripwire` tests at the bottom of this file.
         let dtype = if has_zero_axis {
             BuiltinDType::new(Endianness::Little, Kind::Float, 8)
         } else if scalar_promoted {
@@ -347,6 +359,20 @@ fn postprocess(raw: Vec<u8>, plan: &SlicePlan, element_size: usize) -> (Vec<u8>,
     (out, final_shape)
 }
 
+// UNFIXED (FINDING A-1): this function infers `Kind` (and thus
+// signedness) purely from `element_size` via the `try_read!` ladder,
+// returning the FIRST candidate type whose `read_slice::<T>` succeeds.
+// libhdf5 silently converts between numeric types on read, so the first
+// candidate almost always succeeds regardless of the dataset's real
+// type: an 8-byte dataset is labelled f64 even when it is i64/u64, and a
+// 1-byte dataset is labelled i8 even when it is u8. The reported Kind is
+// therefore a size-ordered GUESS, not the dataset's datatype class.
+// BLOCKER: rust-hdf5 0.2.12 has no public datatype-class / sign accessor
+// for an opened dataset (no `H5Dataset::datatype()` -> `Datatype` with
+// `class()` / `is_signed()`). The structural fix — read Kind from the
+// datatype class instead of probing by size — needs that upstream API.
+// Tripwire: the `#[ignore]`'d tests in `dtype_tripwire` (bottom of file)
+// assert the correct Kind and fail until the accessor lands.
 fn read_native(
     ds: &rust_hdf5::H5Dataset,
     element_size: usize,
@@ -458,5 +484,89 @@ impl ArrayAdapterRead for Hdf5Adapter {
             .await
             .map_err(|e| TiledError::Internal(format!("hdf5 spawn: {e}")))?
         })
+    }
+}
+
+#[cfg(test)]
+mod dtype_tripwire {
+    //! Tripwire regression tests for the HDF5 dtype Kind / signedness
+    //! misdetection (FINDING A-1, carried UNFIXED).
+    //!
+    //! `read_native` (this file) selects the element type purely by byte
+    //! SIZE via its `try_read!` ladder, taking the first candidate whose
+    //! `H5Dataset::read_slice::<T>` call succeeds. libhdf5 silently
+    //! converts between numeric types on read, so the first candidate
+    //! succeeds regardless of the dataset's real type — mislabelling a
+    //! `uint8` dataset as signed `i8` (ladder tries `i8` first) and an
+    //! `int64` dataset as `f64` (ladder tries `f64` first). `Kind` and
+    //! signedness are therefore guesses, not the dataset's datatype class.
+    //!
+    //! BLOCKER: rust-hdf5 0.2.12 exposes no public datatype-class / sign
+    //! accessor for an already-opened dataset (no `H5Dataset::datatype()`
+    //! returning a `Datatype` with `class()` / `is_signed()`), so the
+    //! adapter cannot read the true Kind. These tests assert the CORRECT
+    //! Kind and therefore FAIL today.
+    //!
+    //! VERIFICATION when upstream lands the accessor (e.g.
+    //! `H5Dataset::datatype()`): rewrite `read_native` to read Kind from
+    //! the datatype class, then DELETE the `#[ignore]` attributes below —
+    //! they must then pass.
+    use std::path::PathBuf;
+
+    use super::*;
+
+    fn write_dataset<T: rust_hdf5::types::H5Type>(
+        name: &str,
+        data: &[T],
+    ) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dt.h5");
+        let file = rust_hdf5::H5File::create(&path).unwrap();
+        let ds = file
+            .new_dataset::<T>()
+            .shape([data.len()])
+            .create(name)
+            .unwrap();
+        ds.write_raw(data).unwrap();
+        // Drop the handles so the adapter can reopen the flushed file.
+        drop(ds);
+        drop(file);
+        (dir, path)
+    }
+
+    fn adapter_kind(path: PathBuf, dataset: &str) -> Kind {
+        let adapter = Hdf5Adapter::from_path(path, dataset, serde_json::json!({})).unwrap();
+        match &adapter.structure().data_type {
+            DType::Builtin(b) => b.kind,
+            other => panic!("expected builtin dtype, got {other:?}"),
+        }
+    }
+
+    /// A `uint8` dataset must report `Kind::UnsignedInteger`. Fails today:
+    /// `read_native` tries `i8` first for 1-byte elements, so the adapter
+    /// reports a signed integer.
+    #[test]
+    #[ignore = "blocked on rust-hdf5 exposing a datatype-class/sign accessor (e.g. H5Dataset::datatype()); read_native guesses Kind by byte size, so uint8 reads back as signed i8. Delete this #[ignore] to verify once the accessor lands."]
+    fn uint8_dataset_reports_unsigned_kind() {
+        let (_dir, path) = write_dataset::<u8>("u8", &[1u8, 2, 3]);
+        assert_eq!(
+            adapter_kind(path, "u8"),
+            Kind::UnsignedInteger,
+            "uint8 dataset must report Kind::UnsignedInteger; the try_read! ladder picks i8 first -> signed (misdetection)"
+        );
+    }
+
+    /// An `int64` dataset must report `Kind::Integer`. Fails today:
+    /// `read_native` tries `f64` first for 8-byte elements and libhdf5
+    /// converts the int64 data to float, so the adapter reports a float.
+    #[test]
+    #[ignore = "blocked on rust-hdf5 exposing a datatype-class/sign accessor (e.g. H5Dataset::datatype()); read_native guesses Kind by byte size, so int64 reads back as f64. Delete this #[ignore] to verify once the accessor lands."]
+    fn int64_dataset_reports_integer_kind() {
+        let (_dir, path) = write_dataset::<i64>("i64", &[1i64, 2, 3]);
+        assert_eq!(
+            adapter_kind(path, "i64"),
+            Kind::Integer,
+            "int64 dataset must report Kind::Integer; the try_read! ladder picks f64 first -> float (misdetection)"
+        );
     }
 }
