@@ -20,7 +20,7 @@ use crate::cookie::{build_session_cookie, clear_session_cookie, read_session_coo
 pub fn admin_router(state: WebState) -> Router {
     Router::new()
         .route("/admin/login", get(login_form).post(login_submit))
-        .route("/admin/logout", post(logout_submit).get(logout_submit))
+        .route("/admin/logout", post(logout_submit))
         .route("/admin/", get(redirect_to_keys))
         .route("/admin/api-keys", get(api_keys_page))
         .route("/admin/api-keys/create", post(api_keys_create))
