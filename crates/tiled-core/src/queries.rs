@@ -416,6 +416,29 @@ impl std::fmt::Display for UnsupportedQuery {
 
 impl std::error::Error for UnsupportedQuery {}
 
+/// A query filter that could not be decoded from its URL params: a required
+/// field was absent, or a present value failed to parse.
+///
+/// Returned by [`decode_query_filters`] for any *recognised* query name whose
+/// params are malformed. Mirrors Python tiled, where `query_class.decode(**p)`
+/// raising (a `QueryValueError`, or a bare `ValueError`/`TypeError` from a bad
+/// enum value or a missing field) surfaces as an HTTP error rather than a
+/// silently dropped filter — the server maps it to HTTP 400, matching
+/// `apply_search`'s `except QueryValueError` → `HTTP_400_BAD_REQUEST`
+/// (tiled/server/core.py:180-184). Silently dropping such a filter would widen
+/// the result set past what the client asked for. An *unrecognised* query name
+/// is not this error: like Python's FastAPI param binding, it is ignored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryDecodeError(pub String);
+
+impl std::fmt::Display for QueryDecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for QueryDecodeError {}
+
 /// Regex pattern for extracting filter parameters from URL query string.
 /// Matches `filter[<name>][condition][<field>]`.
 static FILTER_PARAM_PATTERN: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
@@ -430,7 +453,14 @@ static FILTER_PARAM_PATTERN: std::sync::LazyLock<regex::Regex> = std::sync::Lazy
 /// reconstructed via positional zip (index 0 → first query, index 1 → second, …).
 /// This matches Python's wire format where `params[key].append(value)` builds
 /// per-field lists and the server iterates `i = 0, 1, …` until `IndexError`.
-pub fn decode_query_filters(params: &[(String, String)]) -> Vec<Query> {
+///
+/// Returns [`QueryDecodeError`] (→ HTTP 400) if any *recognised* query type has
+/// a required field absent or a present value that fails to parse, mirroring
+/// Python `apply_search` raising `HTTP_400_BAD_REQUEST` on `QueryValueError`
+/// (tiled/server/core.py:180-184). An *unrecognised* query name is silently
+/// ignored, matching Python's FastAPI param binding which never binds
+/// `filter[...]` params for unregistered query types.
+pub fn decode_query_filters(params: &[(String, String)]) -> Result<Vec<Query>, QueryDecodeError> {
     // name → field → ordered list of values (one entry per query of that type)
     let mut groups: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
     for (key, value) in params {
@@ -453,79 +483,142 @@ pub fn decode_query_filters(params: &[(String, String)]) -> Vec<Query> {
                 .iter()
                 .map(|(f, vs)| (f.clone(), vs[i].clone()))
                 .collect();
-            if let Some(q) = decode_single_query(name, &fields) {
+            // `Ok(None)` => unrecognised query name: skip it, exactly as Python's
+            // FastAPI param binding drops `filter[...]` params for unregistered
+            // query types. `Err(_)` => a recognised query whose params are
+            // malformed: propagate it (→ HTTP 400), never silently drop — that
+            // would widen the result set past what the client filtered for.
+            if let Some(q) = decode_single_query(name, &fields)? {
                 queries.push(q);
             }
         }
     }
-    queries
+    Ok(queries)
 }
 
-fn decode_single_query(name: &str, fields: &HashMap<String, String>) -> Option<Query> {
-    match name {
-        "fulltext" => {
-            let text = fields.get("text")?.clone();
-            Some(Query::FullText(FullText { text }))
-        }
-        "lookup" => {
-            let key = fields.get("key")?.clone();
-            Some(Query::Lookup(KeyLookup { key }))
-        }
-        "keys_filter" => {
-            let keys_str = fields.get("keys")?;
-            let keys: Vec<String> = serde_json::from_str(keys_str).ok()?;
-            Some(Query::KeysFilter(KeysFilter { keys }))
-        }
+/// Decode one query of a recognised type from its (already positionally-zipped)
+/// fields.
+///
+/// - `Ok(None)` — the name is *not* a recognised query type; the caller skips
+///   it (parity with Python's FastAPI param binding ignoring unregistered
+///   `filter[...]` params).
+/// - `Ok(Some(query))` — decoded successfully.
+/// - `Err(_)` — a recognised query whose params are malformed: a required field
+///   is absent, or a present value failed to parse. The caller turns this into
+///   an HTTP 400 (parity with Python `decode(**params)` raising). It is never
+///   silently dropped, which would widen the result set.
+fn decode_single_query(
+    name: &str,
+    fields: &HashMap<String, String>,
+) -> Result<Option<Query>, QueryDecodeError> {
+    // Required string field; absent => malformed query (Python `decode(**p)`
+    // raises a TypeError for the missing keyword argument).
+    fn req<'a>(
+        fields: &'a HashMap<String, String>,
+        name: &str,
+        field: &str,
+    ) -> Result<&'a String, QueryDecodeError> {
+        fields.get(field).ok_or_else(|| {
+            QueryDecodeError(format!(
+                "query '{name}' is missing required field '{field}'"
+            ))
+        })
+    }
+
+    // Required field whose value is JSON-encoded (Python `decode` runs
+    // json.loads); present-but-invalid JSON => malformed query.
+    fn json_field<T: serde::de::DeserializeOwned>(
+        fields: &HashMap<String, String>,
+        name: &str,
+        field: &str,
+    ) -> Result<T, QueryDecodeError> {
+        let raw = req(fields, name, field)?;
+        serde_json::from_str(raw).map_err(|e| {
+            QueryDecodeError(format!(
+                "query '{name}' field '{field}' is not valid JSON: {e}"
+            ))
+        })
+    }
+
+    // Required field parsed via `FromStr` (Python `decode` constructs an enum);
+    // present-but-unparseable => malformed query.
+    fn parse_field<T>(
+        fields: &HashMap<String, String>,
+        name: &str,
+        field: &str,
+    ) -> Result<T, QueryDecodeError>
+    where
+        T: std::str::FromStr,
+        T::Err: std::fmt::Display,
+    {
+        let raw = req(fields, name, field)?;
+        raw.parse().map_err(|e| {
+            QueryDecodeError(format!(
+                "query '{name}' field '{field}' value '{raw}' is invalid: {e}"
+            ))
+        })
+    }
+
+    let query = match name {
+        "fulltext" => Query::FullText(FullText {
+            text: req(fields, name, "text")?.clone(),
+        }),
+        "lookup" => Query::Lookup(KeyLookup {
+            key: req(fields, name, "key")?.clone(),
+        }),
+        "keys_filter" => Query::KeysFilter(KeysFilter {
+            keys: json_field(fields, name, "keys")?,
+        }),
         "regex" => {
-            let key = fields.get("key")?.clone();
-            let pattern = fields.get("pattern")?.clone();
+            let key = req(fields, name, "key")?.clone();
+            let pattern = req(fields, name, "pattern")?.clone();
             let case_sensitive = fields
                 .get("case_sensitive")
                 .map(|v| v != "false")
                 .unwrap_or(true);
-            Some(Query::Regex(Regex {
+            Query::Regex(Regex {
                 key,
                 pattern,
                 case_sensitive,
-            }))
+            })
         }
         "eq" => {
-            let key = fields.get("key")?.clone();
-            let value: serde_json::Value = serde_json::from_str(fields.get("value")?).ok()?;
-            Some(Query::Eq(Eq { key, value }))
+            let key = req(fields, name, "key")?.clone();
+            let value = json_field(fields, name, "value")?;
+            Query::Eq(Eq { key, value })
         }
         "noteq" => {
-            let key = fields.get("key")?.clone();
-            let value: serde_json::Value = serde_json::from_str(fields.get("value")?).ok()?;
-            Some(Query::NotEq(NotEq { key, value }))
+            let key = req(fields, name, "key")?.clone();
+            let value = json_field(fields, name, "value")?;
+            Query::NotEq(NotEq { key, value })
         }
         "comparison" => {
-            let operator: Operator = fields.get("operator")?.parse().ok()?;
-            let key = fields.get("key")?.clone();
-            let value: serde_json::Value = serde_json::from_str(fields.get("value")?).ok()?;
-            Some(Query::Comparison(Comparison {
+            let operator = parse_field(fields, name, "operator")?;
+            let key = req(fields, name, "key")?.clone();
+            let value = json_field(fields, name, "value")?;
+            Query::Comparison(Comparison {
                 operator,
                 key,
                 value,
-            }))
+            })
         }
         "contains" => {
-            let key = fields.get("key")?.clone();
-            let value: serde_json::Value = serde_json::from_str(fields.get("value")?).ok()?;
-            Some(Query::Contains(Contains { key, value }))
+            let key = req(fields, name, "key")?.clone();
+            let value = json_field(fields, name, "value")?;
+            Query::Contains(Contains { key, value })
         }
         "in" => {
-            let key = fields.get("key")?.clone();
-            let value: Vec<serde_json::Value> = serde_json::from_str(fields.get("value")?).ok()?;
-            Some(Query::In(In { key, value }))
+            let key = req(fields, name, "key")?.clone();
+            let value: Vec<serde_json::Value> = json_field(fields, name, "value")?;
+            Query::In(In { key, value })
         }
         "notin" => {
-            let key = fields.get("key")?.clone();
-            let value: Vec<serde_json::Value> = serde_json::from_str(fields.get("value")?).ok()?;
-            Some(Query::NotIn(NotIn { key, value }))
+            let key = req(fields, name, "key")?.clone();
+            let value: Vec<serde_json::Value> = json_field(fields, name, "value")?;
+            Query::NotIn(NotIn { key, value })
         }
         "keypresent" => {
-            let key = fields.get("key")?.clone();
+            let key = req(fields, name, "key")?.clone();
             let exists = fields
                 .get("exists")
                 .map(|v| {
@@ -533,20 +626,20 @@ fn decode_single_query(name: &str, fields: &HashMap<String, String>) -> Option<Q
                     serde_json::from_str::<bool>(v).unwrap_or_else(|_| v.to_lowercase() != "false")
                 })
                 .unwrap_or(true);
-            Some(Query::KeyPresent(KeyPresent { key, exists }))
+            Query::KeyPresent(KeyPresent { key, exists })
         }
         "like" => {
-            let key = fields.get("key")?.clone();
-            let pattern: String = serde_json::from_str(fields.get("pattern")?).ok()?;
-            Some(Query::Like(Like { key, pattern }))
+            let key = req(fields, name, "key")?.clone();
+            let pattern: String = json_field(fields, name, "pattern")?;
+            Query::Like(Like { key, pattern })
         }
         "specs" => {
-            let include: Vec<String> = serde_json::from_str(fields.get("include")?).ok()?;
+            let include: Vec<String> = json_field(fields, name, "include")?;
             let exclude: Vec<String> = fields
                 .get("exclude")
                 .and_then(|s| serde_json::from_str(s).ok())
                 .unwrap_or_default();
-            Some(Query::Specs(SpecsQuery { include, exclude }))
+            Query::Specs(SpecsQuery { include, exclude })
         }
         "access_blob_filter" => {
             let user_id = fields.get("user_id").cloned();
@@ -560,18 +653,18 @@ fn decode_single_query(name: &str, fields: &HashMap<String, String>) -> Option<Q
                 .get("tags")
                 .map(|s| vec![s.clone()])
                 .unwrap_or_default();
-            Some(Query::AccessBlobFilter(AccessBlobFilter {
+            Query::AccessBlobFilter(AccessBlobFilter {
                 user_id,
                 tags,
                 include_untagged: false,
-            }))
+            })
         }
-        "structure_family" => {
-            let value: StructureFamily = fields.get("value")?.parse().ok()?;
-            Some(Query::StructureFamily(StructureFamilyQuery { value }))
-        }
-        _ => None,
-    }
+        "structure_family" => Query::StructureFamily(StructureFamilyQuery {
+            value: parse_field(fields, name, "value")?,
+        }),
+        _ => return Ok(None),
+    };
+    Ok(Some(query))
 }
 
 /// Builder for metadata key queries (mirrors Python `Key` class).
@@ -682,7 +775,7 @@ mod tests {
     fn test_encode_decode_roundtrip_eq() {
         let q = Key::new("color").eq("red");
         let pairs = q.encode();
-        let decoded = decode_query_filters(&pairs);
+        let decoded = decode_query_filters(&pairs).unwrap();
         assert_eq!(decoded.len(), 1);
         assert_eq!(decoded[0].query_name(), "eq");
         match &decoded[0] {
@@ -700,7 +793,7 @@ mod tests {
             text: "hello world".into(),
         });
         let pairs = q.encode();
-        let decoded = decode_query_filters(&pairs);
+        let decoded = decode_query_filters(&pairs).unwrap();
         assert_eq!(decoded.len(), 1);
         match &decoded[0] {
             Query::FullText(ft) => assert_eq!(ft.text, "hello world"),
@@ -712,7 +805,7 @@ mod tests {
     fn test_encode_decode_roundtrip_comparison() {
         let q = Key::new("temperature").gt(300);
         let pairs = q.encode();
-        let decoded = decode_query_filters(&pairs);
+        let decoded = decode_query_filters(&pairs).unwrap();
         assert_eq!(decoded.len(), 1);
         match &decoded[0] {
             Query::Comparison(c) => {
@@ -731,7 +824,7 @@ mod tests {
             exclude: vec!["draft".into()],
         });
         let pairs = q.encode();
-        let decoded = decode_query_filters(&pairs);
+        let decoded = decode_query_filters(&pairs).unwrap();
         assert_eq!(decoded.len(), 1);
         match &decoded[0] {
             Query::Specs(s) => {
@@ -748,7 +841,7 @@ mod tests {
             value: StructureFamily::Array,
         });
         let pairs = q.encode();
-        let decoded = decode_query_filters(&pairs);
+        let decoded = decode_query_filters(&pairs).unwrap();
         assert_eq!(decoded.len(), 1);
         match &decoded[0] {
             Query::StructureFamily(sf) => {
@@ -770,7 +863,7 @@ mod tests {
         let mut pairs = gt.encode();
         pairs.extend(lt.encode());
 
-        let decoded = decode_query_filters(&pairs);
+        let decoded = decode_query_filters(&pairs).unwrap();
         assert_eq!(
             decoded.len(),
             2,
@@ -807,7 +900,7 @@ mod tests {
             pairs.iter().any(|(k, _)| k.contains("[exists]")),
             "exists field must be emitted even when true"
         );
-        let decoded = decode_query_filters(&pairs);
+        let decoded = decode_query_filters(&pairs).unwrap();
         assert_eq!(decoded.len(), 1);
         match &decoded[0] {
             Query::KeyPresent(kp) => {
@@ -826,7 +919,7 @@ mod tests {
             exists: false,
         });
         let pairs = q.encode();
-        let decoded = decode_query_filters(&pairs);
+        let decoded = decode_query_filters(&pairs).unwrap();
         assert_eq!(decoded.len(), 1);
         match &decoded[0] {
             Query::KeyPresent(kp) => {
@@ -856,7 +949,7 @@ mod tests {
             pattern_val, "\"Ni%\"",
             "pattern must be JSON-quoted (json.dumps parity)"
         );
-        let decoded = decode_query_filters(&pairs);
+        let decoded = decode_query_filters(&pairs).unwrap();
         assert_eq!(decoded.len(), 1);
         match &decoded[0] {
             Query::Like(like) => {
@@ -884,7 +977,7 @@ mod tests {
             pairs.iter().any(|(k, _)| k.contains("[exclude]")),
             "exclude field must always be emitted"
         );
-        let decoded = decode_query_filters(&pairs);
+        let decoded = decode_query_filters(&pairs).unwrap();
         assert_eq!(decoded.len(), 1);
         match &decoded[0] {
             Query::Specs(s) => {
@@ -932,7 +1025,7 @@ mod tests {
             include_untagged: false,
         });
         let pairs = q.encode();
-        let decoded = decode_query_filters(&pairs);
+        let decoded = decode_query_filters(&pairs).unwrap();
         assert_eq!(decoded.len(), 1);
         match &decoded[0] {
             Query::AccessBlobFilter(f) => {
@@ -941,5 +1034,71 @@ mod tests {
             }
             _ => panic!("Expected AccessBlobFilter"),
         }
+    }
+
+    /// B3: a recognised query whose value is present but unparseable must surface
+    /// as a decode error (→ HTTP 400), never be silently dropped. Dropping it
+    /// would widen the result set past the client's filter. Mirrors Python
+    /// `apply_search`, where `query_class.decode(**params)` raising becomes
+    /// `HTTP_400_BAD_REQUEST` (tiled/server/core.py:180-184).
+    #[test]
+    fn malformed_query_value_errors_not_silently_dropped() {
+        // structure_family with a value that is not a known family.
+        let pairs = vec![(
+            "filter[structure_family][condition][value]".to_string(),
+            "not_a_family".to_string(),
+        )];
+        let err = decode_query_filters(&pairs).unwrap_err();
+        assert!(
+            err.to_string().contains("structure_family"),
+            "error must name the offending query; got: {err}"
+        );
+
+        // eq with a value that is not valid JSON.
+        let pairs = vec![
+            (
+                "filter[eq][condition][key]".to_string(),
+                "color".to_string(),
+            ),
+            (
+                "filter[eq][condition][value]".to_string(),
+                "not json".to_string(),
+            ),
+        ];
+        assert!(
+            decode_query_filters(&pairs).is_err(),
+            "an eq value that is not valid JSON must be a decode error"
+        );
+    }
+
+    /// B3: a required field that is entirely absent is also a malformed query
+    /// (Python `decode(**params)` raises a TypeError for the missing keyword
+    /// argument), not a reason to silently drop the filter.
+    #[test]
+    fn missing_required_query_field_errors() {
+        // `eq` provided with a key but no value.
+        let pairs = vec![(
+            "filter[eq][condition][key]".to_string(),
+            "color".to_string(),
+        )];
+        let err = decode_query_filters(&pairs).unwrap_err();
+        assert!(
+            err.to_string().contains("value"),
+            "error must name the missing field; got: {err}"
+        );
+    }
+
+    /// B3: an *unrecognised* query name is NOT an error — it is ignored, matching
+    /// Python's FastAPI param binding, which never binds `filter[...]` params for
+    /// unregistered query types.
+    #[test]
+    fn unknown_query_name_is_ignored_not_errored() {
+        let pairs = vec![("filter[bogus][condition][key]".to_string(), "x".to_string())];
+        let decoded =
+            decode_query_filters(&pairs).expect("an unrecognised query name must not error");
+        assert!(
+            decoded.is_empty(),
+            "an unrecognised query name must be skipped, got: {decoded:?}"
+        );
     }
 }

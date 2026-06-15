@@ -35,6 +35,13 @@ pub enum ServerError {
     /// detail string (`The query type {name!r} is not supported on this
     /// node.`).
     UnsupportedQuery(String),
+    /// A search query filter could not be decoded: a required field was absent
+    /// or a present value failed to parse. Maps to HTTP 400 to match Python
+    /// tiled, whose `apply_search` catches `QueryValueError` and answers
+    /// `HTTP_400_BAD_REQUEST` (tiled/server/core.py:180-184). Distinct from
+    /// [`Self::UnsupportedQuery`] (query *type* not evaluable on this node);
+    /// this is a malformed *value* for a recognised query type.
+    InvalidQuery(String),
 }
 
 impl std::fmt::Display for ServerError {
@@ -50,6 +57,7 @@ impl std::fmt::Display for ServerError {
             Self::Forbidden(msg) => write!(f, "Forbidden: {msg}"),
             Self::ResponseTooLarge(msg) => write!(f, "Response too large: {msg}"),
             Self::UnsupportedQuery(msg) => write!(f, "Unsupported query: {msg}"),
+            Self::InvalidQuery(msg) => write!(f, "Invalid query: {msg}"),
         }
     }
 }
@@ -79,6 +87,7 @@ impl IntoResponse for ServerError {
             Self::Forbidden(msg) => (StatusCode::FORBIDDEN, 403, msg),
             Self::ResponseTooLarge(msg) => (StatusCode::BAD_REQUEST, 400, msg),
             Self::UnsupportedQuery(msg) => (StatusCode::BAD_REQUEST, 400, msg),
+            Self::InvalidQuery(msg) => (StatusCode::BAD_REQUEST, 400, msg),
         };
 
         let body = schemas::Response::<()> {
@@ -97,6 +106,14 @@ impl From<tiled_core::queries::UnsupportedQuery> for ServerError {
         // `Display` renders the full Python detail string, which becomes the
         // 400 body message.
         Self::UnsupportedQuery(err.to_string())
+    }
+}
+
+impl From<tiled_core::queries::QueryDecodeError> for ServerError {
+    fn from(err: tiled_core::queries::QueryDecodeError) -> Self {
+        // A malformed query filter → 400, parity with Python `apply_search`
+        // catching `QueryValueError` (tiled/server/core.py:180-184).
+        Self::InvalidQuery(err.to_string())
     }
 }
 

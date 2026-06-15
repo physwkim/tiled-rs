@@ -381,7 +381,7 @@ pub async fn search(
         .into_iter()
         .filter(|(k, _)| k.starts_with("filter["))
         .collect();
-    let mut queries = tiled_core::queries::decode_query_filters(&filter_params);
+    let mut queries = tiled_core::queries::decode_query_filters(&filter_params)?;
 
     // Per-ancestor auth gate on the parent container path.
     // Returns 404 (not 403) when any ancestor's per-node policy drops
