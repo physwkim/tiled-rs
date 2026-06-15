@@ -18,7 +18,7 @@ pub mod mime {
     pub const PNG: &str = "image/png";
     pub const EXCEL: &str = "application/vnd.ms-excel";
     pub const ZIP: &str = "application/zip";
-    pub const NETCDF: &str = "application/x-netcdf4";
+    pub const NETCDF: &str = "application/netcdf";
     pub const ZARR: &str = "application/x-zarr";
 }
 
@@ -59,5 +59,12 @@ mod tests {
         assert_eq!(resolve_alias(".parquet"), Some(mime::PARQUET));
         assert_eq!(resolve_alias("CSV"), Some(mime::CSV));
         assert_eq!(resolve_alias("unknown"), None);
+    }
+
+    #[test]
+    fn netcdf_alias_matches_python() {
+        // Python DEFAULT_ALIASES: nc -> application/netcdf (not x-netcdf4).
+        assert_eq!(resolve_alias("nc"), Some("application/netcdf"));
+        assert_eq!(resolve_alias("nc4"), Some("application/netcdf"));
     }
 }
