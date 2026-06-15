@@ -2,6 +2,7 @@
 
 use serde_json::json;
 use tiled_core::queries::{Eq, In, Like, NotEq, NotIn, Query, SpecsQuery};
+use tiled_core::schemas::SortDirection;
 
 use tiled_catalog::data_source::{AssetSpec, DataSourceSpec};
 use tiled_catalog::{Catalog, RegisterRequest};
@@ -197,6 +198,7 @@ async fn search_like_filters_correct_subset() {
                 key: "material".into(),
                 pattern: "Cu".into(),
             })],
+            &[],
             0,
             100,
         )
@@ -213,6 +215,7 @@ async fn search_like_filters_correct_subset() {
                 key: "material".into(),
                 pattern: "N%".into(),
             })],
+            &[],
             0,
             100,
         )
@@ -266,6 +269,7 @@ async fn search_specs_include_and_exclude() {
                 include: vec!["XAS".into()],
                 exclude: vec![],
             })],
+            &[],
             0,
             100,
         )
@@ -282,6 +286,7 @@ async fn search_specs_include_and_exclude() {
                 include: vec!["BlueskyRun".into()],
                 exclude: vec![],
             })],
+            &[],
             0,
             100,
         )
@@ -297,6 +302,7 @@ async fn search_specs_include_and_exclude() {
                 include: vec![],
                 exclude: vec!["XAS".into()],
             })],
+            &[],
             0,
             100,
         )
@@ -348,6 +354,7 @@ async fn search_numeric_eq_in_notin_sqlite() {
                 key: "scan_id".into(),
                 value: json!(2),
             })],
+            &[],
             0,
             100,
         )
@@ -364,6 +371,7 @@ async fn search_numeric_eq_in_notin_sqlite() {
                 key: "scan_id".into(),
                 value: json!(2),
             })],
+            &[],
             0,
             100,
         )
@@ -379,6 +387,7 @@ async fn search_numeric_eq_in_notin_sqlite() {
                 key: "scan_id".into(),
                 value: vec![json!(1), json!(3)],
             })],
+            &[],
             0,
             100,
         )
@@ -396,6 +405,7 @@ async fn search_numeric_eq_in_notin_sqlite() {
                 key: "scan_id".into(),
                 value: vec![json!(1), json!(2)],
             })],
+            &[],
             0,
             100,
         )
@@ -415,6 +425,7 @@ async fn search_numeric_eq_in_notin_sqlite() {
                 key: "count".into(),
                 value: json!(10),
             })],
+            &[],
             0,
             100,
         )
@@ -423,5 +434,75 @@ async fn search_numeric_eq_in_notin_sqlite() {
     assert_eq!(
         total_count, 2,
         "Eq(count=10) must match 2 nodes (run_1 + run_3)"
+    );
+}
+
+/// F-C: the `sorting` argument drives ORDER BY — default id tiebreaker
+/// (insertion order), single metadata key ascending/descending, and the
+/// logical "id" key mapping to the `key` (node name) column.
+#[tokio::test]
+async fn search_children_honors_sorting() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("sqlite://{}", dir.path().join("catalog.db").display());
+    let cat = Catalog::connect(&uri).await.unwrap();
+    cat.migrate().await.unwrap();
+
+    // Insertion order gamma,alpha,beta so id order differs from name and color.
+    for (key, color) in [("gamma", "b"), ("alpha", "c"), ("beta", "a")] {
+        cat.create_node(
+            None,
+            vec![],
+            RegisterRequest {
+                key: key.into(),
+                structure_family: "container".into(),
+                metadata: json!({ "color": color }),
+                specs: json!([]),
+                access_blob: json!({}),
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    let names = |nodes: &[tiled_catalog::orm::Node]| -> Vec<String> {
+        nodes.iter().map(|n| n.key.clone()).collect()
+    };
+
+    // No sort → default id tiebreaker → insertion order.
+    let (nodes, _) = cat.search_children(None, &[], &[], 0, 100).await.unwrap();
+    assert_eq!(
+        names(&nodes),
+        vec!["gamma", "alpha", "beta"],
+        "no sort → insertion (id) order"
+    );
+
+    // Sort by metadata.color ascending → a(beta), b(gamma), c(alpha).
+    let asc = [("color".to_string(), SortDirection::Ascending)];
+    let (nodes, _) = cat.search_children(None, &[], &asc, 0, 100).await.unwrap();
+    assert_eq!(
+        names(&nodes),
+        vec!["beta", "gamma", "alpha"],
+        "color ascending"
+    );
+
+    // Sort by metadata.color descending → c(alpha), b(gamma), a(beta).
+    let desc = [("color".to_string(), SortDirection::Descending)];
+    let (nodes, _) = cat.search_children(None, &[], &desc, 0, 100).await.unwrap();
+    assert_eq!(
+        names(&nodes),
+        vec!["alpha", "gamma", "beta"],
+        "color descending"
+    );
+
+    // Logical "id" sort key maps to the `key` column (node name).
+    let by_name = [("id".to_string(), SortDirection::Ascending)];
+    let (nodes, _) = cat
+        .search_children(None, &[], &by_name, 0, 100)
+        .await
+        .unwrap();
+    assert_eq!(
+        names(&nodes),
+        vec!["alpha", "beta", "gamma"],
+        "sort 'id' → key column (name) order"
     );
 }

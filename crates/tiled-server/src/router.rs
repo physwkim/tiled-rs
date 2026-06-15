@@ -14,7 +14,7 @@ use crate::extractors::PathSegments;
 
 use tiled_core::adapters::{AnyAdapter, ContainerAdapter};
 use tiled_core::links;
-use tiled_core::schemas::{About, AboutAuthentication, Response};
+use tiled_core::schemas::{About, AboutAuthentication, Response, SortDirection};
 
 use crate::core;
 use crate::error::ServerError;
@@ -307,6 +307,32 @@ pub async fn metadata(
 // GET /api/v1/search/{*path}
 // ---------------------------------------------------------------------------
 
+/// Parse the `sort` query parameter(s) into ordered `(key, direction)` pairs,
+/// mirroring Python `sorting_param` (dependencies.py:218-255): values are
+/// comma-separated; a leading `-` means descending, a leading `+` (or no
+/// prefix) ascending. Truly empty items (old clients send a bare `sort=`) are
+/// dropped; a bare `-`/`+` yields an empty key — the default-direction
+/// sentinel honored by the `id` tiebreaker in `construct_order_by_clauses`.
+fn parse_sort(params: &[(String, String)]) -> Vec<(String, SortDirection)> {
+    let mut sorting = Vec::new();
+    for (_, raw) in params.iter().filter(|(k, _)| k == "sort") {
+        for item in raw.split(',') {
+            if item.is_empty() {
+                continue;
+            }
+            let (key, dir) = if let Some(rest) = item.strip_prefix('-') {
+                (rest, SortDirection::Descending)
+            } else if let Some(rest) = item.strip_prefix('+') {
+                (rest, SortDirection::Ascending)
+            } else {
+                (item, SortDirection::Ascending)
+            };
+            sorting.push((key.to_string(), dir));
+        }
+    }
+    sorting
+}
+
 pub async fn search_root(
     state: State<AppState>,
     // Vec<(K,V)> preserves repeated keys so multiple same-type filters all survive.
@@ -346,6 +372,10 @@ pub async fn search(
         .and_then(|(_, v)| v.parse().ok())
         .unwrap_or(links::DEFAULT_PAGE_SIZE)
         .min(links::MAX_PAGE_SIZE);
+
+    // Parse `sort` before consuming `params`: comma-separated keys, leading
+    // `-` descending. Threaded into the catalog ORDER BY below.
+    let sorting = parse_sort(&params);
 
     let filter_params: Vec<(String, String)> = params
         .into_iter()
@@ -401,7 +431,7 @@ pub async fn search(
         };
 
         let (rows, total) = catalog
-            .search_children(parent_id, &queries, offset as i64, limit as i64)
+            .search_children(parent_id, &queries, &sorting, offset as i64, limit as i64)
             .await
             .map_err(map_catalog_err)?;
         let logical_path = segments.join("/");
@@ -2713,6 +2743,72 @@ fn synthetic_seed() -> (u64, u64) {
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
     (nanos, COUNTER.fetch_add(1, Ordering::Relaxed))
+}
+
+#[cfg(test)]
+mod sort_param_tests {
+    use super::*;
+
+    fn p(pairs: &[(&str, &str)]) -> Vec<(String, SortDirection)> {
+        let owned: Vec<(String, String)> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        parse_sort(&owned)
+    }
+
+    #[test]
+    fn empty_param_yields_no_sorting() {
+        // Old clients send a bare `sort=`; it must not produce a sort key.
+        assert!(p(&[("sort", "")]).is_empty());
+        assert!(p(&[]).is_empty());
+    }
+
+    #[test]
+    fn comma_separated_keys_with_directions() {
+        let got = p(&[("sort", "color,-count,+name")]);
+        assert_eq!(
+            got,
+            vec![
+                ("color".to_string(), SortDirection::Ascending),
+                ("count".to_string(), SortDirection::Descending),
+                ("name".to_string(), SortDirection::Ascending),
+            ]
+        );
+    }
+
+    #[test]
+    fn leading_minus_is_descending() {
+        assert_eq!(
+            p(&[("sort", "-time")]),
+            vec![("time".to_string(), SortDirection::Descending)]
+        );
+    }
+
+    #[test]
+    fn bare_minus_is_default_direction_sentinel() {
+        // A bare "-" → empty key, descending: the default-direction sentinel.
+        assert_eq!(
+            p(&[("sort", "-")]),
+            vec![(String::new(), SortDirection::Descending)]
+        );
+    }
+
+    #[test]
+    fn repeated_sort_params_accumulate() {
+        assert_eq!(
+            p(&[("sort", "a"), ("sort", "-b")]),
+            vec![
+                ("a".to_string(), SortDirection::Ascending),
+                ("b".to_string(), SortDirection::Descending),
+            ]
+        );
+    }
+
+    #[test]
+    fn non_sort_params_ignored() {
+        assert!(p(&[("page[limit]", "10"), ("filter[eq]", "x")]).is_empty());
+    }
 }
 
 #[cfg(test)]

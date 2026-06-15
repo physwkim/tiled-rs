@@ -15,6 +15,7 @@ use serde_json::Value;
 
 use sqlx::Row;
 use tiled_core::queries::{Operator, Query};
+use tiled_core::schemas::SortDirection;
 
 use crate::db::{Catalog, DbPool};
 use crate::error::Result;
@@ -120,6 +121,52 @@ impl Dialect {
             Self::Sqlite => "metadata",
             Self::Postgres => "metadata::text",
         }
+    }
+
+    /// Build the `ORDER BY` clause body (without the leading `ORDER BY`),
+    /// mirroring Python `construct_order_by_clauses` (adapter.py:1891-1923):
+    ///
+    /// - each sort key becomes a column / JSON-path clause, descending keys
+    ///   get a `DESC` suffix;
+    /// - the empty key `""` is the default-direction sentinel — it applies only
+    ///   to the trailing `id` tiebreaker, not a column of its own;
+    /// - the strictly-monotonic `id` column is always appended last so the
+    ///   ordering is deterministic (and a sufficient keyset-pagination cursor).
+    ///
+    /// No bind parameters are produced (keys are sanitized and spliced;
+    /// direction is a literal), so this can be appended after the WHERE
+    /// bindings without disturbing placeholder numbering.
+    fn order_by(self, sorting: &[(String, SortDirection)]) -> String {
+        let mut clauses: Vec<String> = Vec::new();
+        let mut default_desc = false;
+        for (key, dir) in sorting {
+            if key.is_empty() {
+                default_desc = matches!(dir, SortDirection::Descending);
+                continue;
+            }
+            let col = if key == "id" {
+                // _STANDARD_SORT_KEYS maps the logical "id" to the `key` column
+                // (the node's name); the real `id` is reserved for the
+                // tiebreaker below.
+                "key".to_string()
+            } else {
+                // Bare ("color") or namespaced ("metadata.color"): strip the
+                // optional "metadata." prefix, then address the JSON path.
+                let k = key.strip_prefix("metadata.").unwrap_or(key);
+                self.json_value("metadata", k)
+            };
+            if matches!(dir, SortDirection::Descending) {
+                clauses.push(format!("{col} DESC"));
+            } else {
+                clauses.push(col);
+            }
+        }
+        clauses.push(if default_desc {
+            "id DESC".to_string()
+        } else {
+            "id".to_string()
+        });
+        clauses.join(", ")
     }
 }
 
@@ -618,6 +665,7 @@ impl Catalog {
         &self,
         parent_id: Option<i64>,
         queries: &[Query],
+        sorting: &[(String, SortDirection)],
         offset: i64,
         limit: i64,
     ) -> Result<(Vec<Node>, i64)> {
@@ -657,6 +705,9 @@ impl Catalog {
             }
         }
         let (where_clause, bindings) = builder.finish();
+        // ORDER BY is parameter-free (sanitized keys + literal direction), so
+        // it does not affect the LIMIT/OFFSET placeholder numbering below.
+        let order_by = dialect.order_by(sorting);
         let parent_clause = if parent_id.is_some() {
             "parent_id = ?"
         } else {
@@ -691,7 +742,7 @@ impl Catalog {
                     "SELECT id, key, parent_id, ancestors, structure_family, metadata,
                             specs, access_blob, time_created, time_updated
                        FROM nodes WHERE {parent_clause} AND {where_clause}
-                       ORDER BY id LIMIT ? OFFSET ?"
+                       ORDER BY {order_by} LIMIT ? OFFSET ?"
                 );
                 let mut q = sqlx::query(&select_sql);
                 if parent_id.is_some() {
@@ -732,7 +783,7 @@ impl Catalog {
                     "SELECT id, key, parent_id, ancestors, structure_family, metadata,
                             specs, access_blob, time_created, time_updated
                        FROM nodes WHERE {parent_clause} AND {where_clause}
-                       ORDER BY id LIMIT {limit_p} OFFSET {offset_p}"
+                       ORDER BY {order_by} LIMIT {limit_p} OFFSET {offset_p}"
                 );
                 let mut q = sqlx::query(&select_sql);
                 for b in &bindings {
@@ -1171,6 +1222,61 @@ mod tests {
         b.push_key_present("a.b", true);
         let (sql, _) = b.finish();
         assert_eq!(sql, "(metadata #> '{a,b}') IS NOT NULL");
+    }
+
+    // F-C: ORDER BY construction mirrors Python construct_order_by_clauses.
+    #[test]
+    fn order_by_empty_defaults_to_id_asc() {
+        assert_eq!(Dialect::Sqlite.order_by(&[]), "id");
+    }
+
+    #[test]
+    fn order_by_single_metadata_key_asc() {
+        let s = [("color".to_string(), SortDirection::Ascending)];
+        assert_eq!(
+            Dialect::Sqlite.order_by(&s),
+            "json_extract(metadata, '$.color'), id"
+        );
+    }
+
+    #[test]
+    fn order_by_metadata_key_desc() {
+        let s = [("color".to_string(), SortDirection::Descending)];
+        assert_eq!(
+            Dialect::Sqlite.order_by(&s),
+            "json_extract(metadata, '$.color') DESC, id"
+        );
+    }
+
+    #[test]
+    fn order_by_strips_metadata_prefix() {
+        let s = [("metadata.color".to_string(), SortDirection::Ascending)];
+        assert_eq!(
+            Dialect::Sqlite.order_by(&s),
+            "json_extract(metadata, '$.color'), id"
+        );
+    }
+
+    #[test]
+    fn order_by_standard_id_key_maps_to_key_column() {
+        let s = [("id".to_string(), SortDirection::Ascending)];
+        assert_eq!(Dialect::Sqlite.order_by(&s), "key, id");
+    }
+
+    #[test]
+    fn order_by_default_direction_sentinel_applies_to_id_tiebreaker() {
+        // A bare "-" from the client → empty key, descending → id DESC.
+        let s = [(String::new(), SortDirection::Descending)];
+        assert_eq!(Dialect::Sqlite.order_by(&s), "id DESC");
+    }
+
+    #[test]
+    fn order_by_postgres_uses_hash_arrow_path() {
+        let s = [("color".to_string(), SortDirection::Descending)];
+        assert_eq!(
+            Dialect::Postgres.order_by(&s),
+            "(metadata #> '{color}') DESC, id"
+        );
     }
 
     // H2: Specs SQL generation
