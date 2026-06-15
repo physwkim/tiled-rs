@@ -88,6 +88,38 @@ async fn correct_password_issues_session_cookie() {
 }
 
 #[tokio::test]
+async fn api_key_create_rejects_non_numeric_expires_in() {
+    // A typo'd expiry ("30d") must NOT silently mint a non-expiring key;
+    // it must be rejected with a validation message.
+    let (app, _dir, _issuer) = build_test_router().await;
+    let login = post_login(&app, "dummy", "alice", "s3cret").await;
+    let cookie = login
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/admin/api-keys/create")
+        .header("cookie", cookie)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(Body::from("note=&scopes=&expires_in=30d"))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let html = String::from_utf8_lossy(&body);
+    assert!(
+        html.contains("whole number of seconds"),
+        "non-numeric expires_in must be rejected, not silently treated as never; body: {html}"
+    );
+}
+
+#[tokio::test]
 async fn streaming_page_requires_metrics_scope() {
     // alice (role "user") has no `metrics` scope even with default_login_scopes
     // = full() (the login cap drops it). /admin/streaming exposes server-global

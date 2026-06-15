@@ -294,9 +294,41 @@ async fn api_keys_create(
         }
         set
     };
-    let exp = match form.expires_in.trim().parse::<i64>() {
-        Ok(s) => Some(Utc::now() + Duration::seconds(s)),
-        Err(_) => None,
+    // Empty means "never expires". A non-empty value MUST parse to a
+    // positive number of seconds — previously any parse error (a typo like
+    // "30d", or a stray word) silently fell through to None, minting a
+    // non-expiring key the operator didn't intend, and a negative value
+    // produced a key already expired in the past. Validate explicitly.
+    let expires_in = form.expires_in.trim();
+    let exp = if expires_in.is_empty() {
+        None
+    } else {
+        match expires_in.parse::<i64>() {
+            Ok(s) if s > 0 => Some(Utc::now() + Duration::seconds(s)),
+            Ok(_) => {
+                return render_api_keys(
+                    &state,
+                    &session,
+                    Some(
+                        "expires_in must be a positive number of seconds (or empty for never)"
+                            .into(),
+                    ),
+                    None,
+                )
+                .await;
+            }
+            Err(_) => {
+                return render_api_keys(
+                    &state,
+                    &session,
+                    Some(
+                        "expires_in must be a whole number of seconds (or empty for never)".into(),
+                    ),
+                    None,
+                )
+                .await;
+            }
+        }
     };
     let note = if form.note.trim().is_empty() {
         None
