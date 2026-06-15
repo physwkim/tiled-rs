@@ -1,9 +1,11 @@
 //! Session cookie helpers.
 //!
 //! The server admin pages bridge browser sessions to the same JWT the
-//! API middleware understands. We set `tiled_session=<jwt>; HttpOnly;
-//! SameSite=Lax` on login, and the auth middleware reads the cookie as
-//! an alternative source for the Bearer token.
+//! API issues. We set `tiled_session=<jwt>; HttpOnly; SameSite=Lax` on
+//! login. The cookie is read **only** by the admin shell's own session
+//! resolver to authenticate the `/admin/*` pages — the API auth
+//! middleware never reads it (it accepts the token only as
+//! `Authorization: Bearer`, `Apikey`/`?api_key=`, or the proxied header).
 
 use axum::http::header::HeaderValue;
 

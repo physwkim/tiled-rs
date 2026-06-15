@@ -12,8 +12,11 @@
 //!
 //! Auth: the admin shell uses cookie-based sessions (`tiled_session=...
 //! HttpOnly`) so a browser doesn't have to juggle bearer tokens. The
-//! cookie value is a JWT signed by the same `Issuer` the API uses, so
-//! the regular middleware already understands it.
+//! cookie value is a JWT signed by the same `Issuer` the API uses, but
+//! the cookie authenticates **only** the server-rendered `/admin/*`
+//! pages (via the admin shell's own session resolver). The API auth
+//! middleware never reads `tiled_session` — it accepts the token only as
+//! `Authorization: Bearer`, `Apikey`/`?api_key=`, or the proxied header.
 
 mod admin;
 mod assets;
