@@ -16,7 +16,12 @@ pub mod mime {
     pub const HDF5: &str = "application/x-hdf5";
     pub const TIFF: &str = "image/tiff";
     pub const PNG: &str = "image/png";
+    /// Legacy `.xls` (BIFF) workbooks.
     pub const EXCEL: &str = "application/vnd.ms-excel";
+    /// Modern `.xlsx` (OOXML) workbooks — the type Python registers for
+    /// `.xlsx` and the one tiled-serialization's Excel writer emits.
+    pub const EXCEL_XLSX: &str =
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
     pub const ZIP: &str = "application/zip";
     pub const NETCDF: &str = "application/netcdf";
     pub const ZARR: &str = "application/x-zarr";
@@ -40,7 +45,8 @@ pub fn resolve_alias(ext: &str) -> Option<&'static str> {
         "json" => Some(mime::JSON),
         "tif" | "tiff" => Some(mime::TIFF),
         "png" => Some(mime::PNG),
-        "xlsx" | "xls" => Some(mime::EXCEL),
+        "xlsx" => Some(mime::EXCEL_XLSX),
+        "xls" => Some(mime::EXCEL),
         "nc" | "nc4" => Some(mime::NETCDF),
         "zarr" => Some(mime::ZARR),
         "msgpack" => Some(mime::MSGPACK),
@@ -59,6 +65,17 @@ mod tests {
         assert_eq!(resolve_alias(".parquet"), Some(mime::PARQUET));
         assert_eq!(resolve_alias("CSV"), Some(mime::CSV));
         assert_eq!(resolve_alias("unknown"), None);
+    }
+
+    #[test]
+    fn xlsx_resolves_to_ooxml_not_legacy_xls() {
+        // .xlsx is the OOXML spreadsheet type (what Python registers and
+        // what the Excel serializer emits); only legacy .xls is vnd.ms-excel.
+        assert_eq!(
+            resolve_alias("xlsx"),
+            Some("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        );
+        assert_eq!(resolve_alias("xls"), Some("application/vnd.ms-excel"));
     }
 
     #[test]
