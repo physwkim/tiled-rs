@@ -195,11 +195,11 @@ fn parse_data_type(dt: &zarrs::array::DataType) -> Result<BuiltinDType> {
     use zarrs::array::DataType as DT;
     Ok(match dt {
         DT::Bool => BuiltinDType::new(Endianness::NotApplicable, Kind::Boolean, 1),
-        DT::Int8 => BuiltinDType::new(Endianness::Little, Kind::Integer, 1),
+        DT::Int8 => BuiltinDType::new(Endianness::NotApplicable, Kind::Integer, 1),
         DT::Int16 => BuiltinDType::new(Endianness::Little, Kind::Integer, 2),
         DT::Int32 => BuiltinDType::new(Endianness::Little, Kind::Integer, 4),
         DT::Int64 => BuiltinDType::new(Endianness::Little, Kind::Integer, 8),
-        DT::UInt8 => BuiltinDType::new(Endianness::Little, Kind::UnsignedInteger, 1),
+        DT::UInt8 => BuiltinDType::new(Endianness::NotApplicable, Kind::UnsignedInteger, 1),
         DT::UInt16 => BuiltinDType::new(Endianness::Little, Kind::UnsignedInteger, 2),
         DT::UInt32 => BuiltinDType::new(Endianness::Little, Kind::UnsignedInteger, 4),
         DT::UInt64 => BuiltinDType::new(Endianness::Little, Kind::UnsignedInteger, 8),
@@ -260,5 +260,36 @@ mod tests {
             .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
             .collect();
         assert_eq!(floats, vec![10.0, 11.0]);
+    }
+
+    #[tokio::test]
+    async fn uint8_dtype_is_byteorder_agnostic() {
+        // numpy reports single-byte dtypes with byte-order '|' (NotApplicable),
+        // not '<' (Little).
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(FilesystemStore::new(dir.path()).unwrap());
+        let array = ArrayBuilder::new(
+            vec![2, 2],
+            DataType::UInt8,
+            vec![nz(2), nz(2)].into(),
+            FillValue::from(0u8),
+        )
+        .build(store, "/data")
+        .unwrap();
+        array.store_metadata().unwrap();
+        array
+            .store_array_subset_elements(&ArraySubset::new_with_shape(vec![2, 2]), &[1u8, 2, 3, 4])
+            .unwrap();
+
+        let adapter =
+            ZarrAdapter::from_path(dir.path().to_path_buf(), "/data", serde_json::json!({}))
+                .unwrap();
+        match &adapter.structure().data_type {
+            DType::Builtin(b) => {
+                assert_eq!(b.endianness, Endianness::NotApplicable);
+                assert_eq!(b.to_numpy_str(), "|u1");
+            }
+            other => panic!("expected builtin dtype, got {other:?}"),
+        }
     }
 }

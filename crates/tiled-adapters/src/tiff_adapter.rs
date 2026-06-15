@@ -61,7 +61,8 @@ impl TiffAdapter {
         let (bytes, dtype): (Vec<u8>, BuiltinDType) = match result {
             tiff::decoder::DecodingResult::U8(v) => (
                 v,
-                BuiltinDType::new(Endianness::Little, Kind::UnsignedInteger, 1),
+                // Single-byte dtypes are byte-order agnostic — numpy reports '|'.
+                BuiltinDType::new(Endianness::NotApplicable, Kind::UnsignedInteger, 1),
             ),
             tiff::decoder::DecodingResult::U16(v) => {
                 let mut buf = Vec::with_capacity(v.len() * 2);
@@ -210,5 +211,22 @@ mod tests {
         let result = adapter.read_block(&[0, 0], &slice).await.unwrap();
         assert_eq!(result.shape, vec![4]);
         assert_eq!(&result.data[..], &[0u8, 1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn u8_dtype_is_byteorder_agnostic() {
+        // numpy reports single-byte dtypes with byte-order '|' (NotApplicable).
+        let tiff_bytes = make_tiff_3x4_gray8();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), &tiff_bytes).unwrap();
+        let adapter =
+            TiffAdapter::from_path(tmp.path().to_path_buf(), serde_json::json!({})).unwrap();
+        match &adapter.structure().data_type {
+            DType::Builtin(b) => {
+                assert_eq!(b.endianness, Endianness::NotApplicable);
+                assert_eq!(b.to_numpy_str(), "|u1");
+            }
+            other => panic!("expected builtin dtype, got {other:?}"),
+        }
     }
 }

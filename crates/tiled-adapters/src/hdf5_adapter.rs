@@ -361,10 +361,13 @@ fn read_native(
                     for v in &values {
                         buf.extend_from_slice(&v.to_le_bytes());
                     }
-                    return Ok((
-                        buf,
-                        BuiltinDType::new(Endianness::Little, $kind, element_size),
-                    ));
+                    // Single-byte dtypes are byte-order agnostic — numpy reports '|'.
+                    let endianness = if element_size == 1 {
+                        Endianness::NotApplicable
+                    } else {
+                        Endianness::Little
+                    };
+                    return Ok((buf, BuiltinDType::new(endianness, $kind, element_size)));
                 }
                 Err(_) => {} // wrong type — try the next candidate
             }

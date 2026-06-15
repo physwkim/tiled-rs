@@ -92,7 +92,13 @@ impl ImageAdapter {
 
 #[cfg(feature = "tiff")]
 fn pixel_dtype(itemsize: usize) -> BuiltinDType {
-    BuiltinDType::new(Endianness::Little, Kind::UnsignedInteger, itemsize)
+    // Single-byte dtypes are byte-order agnostic — numpy reports '|', not '<'.
+    let endianness = if itemsize == 1 {
+        Endianness::NotApplicable
+    } else {
+        Endianness::Little
+    };
+    BuiltinDType::new(endianness, Kind::UnsignedInteger, itemsize)
 }
 
 #[cfg(feature = "tiff")]
@@ -138,5 +144,43 @@ impl ArrayAdapterRead for ImageAdapter {
             }
             self.array.apply_slice(slice)
         })
+    }
+}
+
+#[cfg(all(test, feature = "tiff"))]
+mod tests {
+    use super::*;
+    use ::image::{DynamicImage, ImageBuffer};
+
+    #[test]
+    fn l8_dtype_is_byteorder_agnostic() {
+        // numpy reports single-byte dtypes with byte-order '|' (NotApplicable).
+        let img = ImageBuffer::from_raw(2, 2, vec![1u8, 2, 3, 4]).unwrap();
+        let adapter =
+            ImageAdapter::from_dynamic(DynamicImage::ImageLuma8(img), serde_json::json!({}))
+                .unwrap();
+        match &adapter.structure().data_type {
+            DType::Builtin(b) => {
+                assert_eq!(b.endianness, Endianness::NotApplicable);
+                assert_eq!(b.to_numpy_str(), "|u1");
+            }
+            other => panic!("expected builtin dtype, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn l16_dtype_keeps_little_endian() {
+        // Multi-byte dtypes keep native byte-order '<' (Little).
+        let img = ImageBuffer::from_raw(2, 2, vec![1u16, 2, 3, 4]).unwrap();
+        let adapter =
+            ImageAdapter::from_dynamic(DynamicImage::ImageLuma16(img), serde_json::json!({}))
+                .unwrap();
+        match &adapter.structure().data_type {
+            DType::Builtin(b) => {
+                assert_eq!(b.endianness, Endianness::Little);
+                assert_eq!(b.to_numpy_str(), "<u2");
+            }
+            other => panic!("expected builtin dtype, got {other:?}"),
+        }
     }
 }
