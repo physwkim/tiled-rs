@@ -3,6 +3,7 @@
 //! Mirrors `tiled/client/utils.py` — MIME type constants, error decoding,
 //! retry policy.
 
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use reqwest::Response;
@@ -22,6 +23,59 @@ pub const USER_AGENT_VALUE: &str = concat!("rust-tiled/", env!("CARGO_PKG_VERSIO
 pub const DEFAULT_RETRY_ATTEMPTS: u32 = 10;
 /// Default retry timeout in seconds (matches Python `TILED_RETRY_TIMEOUT`).
 pub const DEFAULT_RETRY_TIMEOUT_SECS: f64 = 45.0;
+
+/// Effective retry attempt cap. Overridable via the `TILED_RETRY_ATTEMPTS`
+/// env var, read once at first use — parity with Python tiled, which reads
+/// the same var at import time (`tiled/client/utils.py:148`).
+static RETRY_ATTEMPTS: LazyLock<u32> =
+    LazyLock::new(|| resolve_retry_attempts(std::env::var("TILED_RETRY_ATTEMPTS").ok().as_deref()));
+
+/// Effective retry timeout in seconds. Overridable via `TILED_RETRY_TIMEOUT`
+/// (`tiled/client/utils.py:149`), read once at first use.
+static RETRY_TIMEOUT_SECS: LazyLock<f64> = LazyLock::new(|| {
+    resolve_retry_timeout_secs(std::env::var("TILED_RETRY_TIMEOUT").ok().as_deref())
+});
+
+/// Resolve the retry attempt cap from an optional env value. Unset → default.
+/// Set-but-unparseable → default with a warning. (Python's `int(os.getenv())`
+/// raises at import on a bad value; a client library warns and falls back
+/// rather than panicking inside the per-request retry loop.)
+fn resolve_retry_attempts(raw: Option<&str>) -> u32 {
+    match raw {
+        None => DEFAULT_RETRY_ATTEMPTS,
+        Some(s) => s.trim().parse::<u32>().unwrap_or_else(|_| {
+            tracing::warn!(
+                target: "tiled.client",
+                env = "TILED_RETRY_ATTEMPTS",
+                value = %s,
+                "not a non-negative integer; using default {DEFAULT_RETRY_ATTEMPTS}"
+            );
+            DEFAULT_RETRY_ATTEMPTS
+        }),
+    }
+}
+
+/// Resolve the retry timeout (seconds) from an optional env value. Unset →
+/// default. Set-but-unparseable, non-finite, or negative → default with a
+/// warning (a non-finite/negative timeout would otherwise panic
+/// `Duration::from_secs_f64`).
+fn resolve_retry_timeout_secs(raw: Option<&str>) -> f64 {
+    match raw {
+        None => DEFAULT_RETRY_TIMEOUT_SECS,
+        Some(s) => match s.trim().parse::<f64>() {
+            Ok(v) if v.is_finite() && v >= 0.0 => v,
+            _ => {
+                tracing::warn!(
+                    target: "tiled.client",
+                    env = "TILED_RETRY_TIMEOUT",
+                    value = %s,
+                    "not a finite non-negative number of seconds; using default {DEFAULT_RETRY_TIMEOUT_SECS}"
+                );
+                DEFAULT_RETRY_TIMEOUT_SECS
+            }
+        },
+    }
+}
 
 /// Build the standard set of request headers used on every call.
 ///
@@ -158,8 +212,7 @@ where
     Fut: std::future::Future<Output = Result<T>>,
 {
     let mut delay_ms: u64 = 250;
-    let deadline =
-        tokio::time::Instant::now() + Duration::from_secs_f64(DEFAULT_RETRY_TIMEOUT_SECS);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs_f64(*RETRY_TIMEOUT_SECS);
     let mut attempt: u32 = 0;
     loop {
         match op().await {
@@ -168,7 +221,7 @@ where
             Err(e) => {
                 attempt += 1;
                 let now = tokio::time::Instant::now();
-                if attempt >= DEFAULT_RETRY_ATTEMPTS || now >= deadline {
+                if attempt >= *RETRY_ATTEMPTS || now >= deadline {
                     return Err(e);
                 }
                 // A 429 carries a parsed `Retry-After`; honor it as this
@@ -245,6 +298,48 @@ mod tests {
         assert_eq!(parse_retry_after(Some("-1")), None);
         assert_eq!(parse_retry_after(Some("abc")), None);
         assert_eq!(parse_retry_after(None), None);
+    }
+
+    #[test]
+    fn resolve_retry_attempts_honors_env_and_falls_back() {
+        // Unset → default.
+        assert_eq!(resolve_retry_attempts(None), DEFAULT_RETRY_ATTEMPTS);
+        // Valid override (incl. surrounding whitespace).
+        assert_eq!(resolve_retry_attempts(Some("3")), 3);
+        assert_eq!(resolve_retry_attempts(Some(" 7 ")), 7);
+        assert_eq!(resolve_retry_attempts(Some("0")), 0);
+        // Invalid (non-numeric, negative, float) → default.
+        assert_eq!(resolve_retry_attempts(Some("abc")), DEFAULT_RETRY_ATTEMPTS);
+        assert_eq!(resolve_retry_attempts(Some("-1")), DEFAULT_RETRY_ATTEMPTS);
+        assert_eq!(resolve_retry_attempts(Some("2.5")), DEFAULT_RETRY_ATTEMPTS);
+    }
+
+    #[test]
+    fn resolve_retry_timeout_honors_env_and_falls_back() {
+        // Unset → default.
+        assert_eq!(resolve_retry_timeout_secs(None), DEFAULT_RETRY_TIMEOUT_SECS);
+        // Valid override.
+        assert_eq!(resolve_retry_timeout_secs(Some("12.5")), 12.5);
+        assert_eq!(resolve_retry_timeout_secs(Some(" 30 ")), 30.0);
+        assert_eq!(resolve_retry_timeout_secs(Some("0")), 0.0);
+        // Invalid (non-numeric, negative, non-finite) → default — guards the
+        // `Duration::from_secs_f64` panic on a bad value.
+        assert_eq!(
+            resolve_retry_timeout_secs(Some("nope")),
+            DEFAULT_RETRY_TIMEOUT_SECS
+        );
+        assert_eq!(
+            resolve_retry_timeout_secs(Some("-5")),
+            DEFAULT_RETRY_TIMEOUT_SECS
+        );
+        assert_eq!(
+            resolve_retry_timeout_secs(Some("inf")),
+            DEFAULT_RETRY_TIMEOUT_SECS
+        );
+        assert_eq!(
+            resolve_retry_timeout_secs(Some("nan")),
+            DEFAULT_RETRY_TIMEOUT_SECS
+        );
     }
 
     #[tokio::test]
