@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use anyhow::Context;
 use serde::Deserialize;
 
 use tiled_access::{AccessPolicy, PassthroughPolicy, TagBasedPolicy};
@@ -205,8 +206,13 @@ fn default_path() -> String {
 impl TiledConfig {
     /// Load configuration from a YAML file.
     pub fn from_file(path: &str) -> anyhow::Result<Self> {
-        let content = std::fs::read_to_string(path)?;
-        let config: Self = serde_yaml::from_str(&content)?;
+        // Name the path in both failure modes: a bare io::Error
+        // ("No such file or directory") or serde_yaml parse error gives the
+        // user no way to tell which config file was at fault.
+        let content =
+            std::fs::read_to_string(path).with_context(|| format!("reading config file {path}"))?;
+        let config: Self = serde_yaml::from_str(&content)
+            .with_context(|| format!("parsing config file {path}"))?;
         Ok(config)
     }
 
@@ -244,5 +250,33 @@ mod tests {
         // Explicit value is honored.
         let cfg: TiledConfig = serde_yaml::from_str("response_bytesize_limit: 42").unwrap();
         assert_eq!(cfg.response_bytesize_limit, 42);
+    }
+
+    // cli-L4: a failed read must name the offending config path.
+    #[test]
+    fn from_file_read_error_names_the_path() {
+        let missing = "/nonexistent/dir/tiled-cli-test-config.yml";
+        let err = TiledConfig::from_file(missing).unwrap_err();
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains(missing),
+            "read error must name the config path; got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn from_file_parse_error_names_the_path() {
+        // Write invalid YAML to a temp file so the read succeeds but the parse
+        // fails — the parse error must also name the path.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.yml");
+        std::fs::write(&path, "trees: [unterminated").unwrap();
+        let path_str = path.to_str().unwrap();
+        let err = TiledConfig::from_file(path_str).unwrap_err();
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains(path_str),
+            "parse error must name the config path; got: {rendered}"
+        );
     }
 }
