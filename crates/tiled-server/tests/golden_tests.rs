@@ -1293,3 +1293,42 @@ async fn test_container_full_zip_deep_export() {
         .collect();
     assert_eq!(cols, vec!["x", "y"]);
 }
+
+// ---------------------------------------------------------------------------
+// L4 (zip): cumulative decoded bytesize across zip leaves must respect
+// response_bytesize_limit.  A single leaf under the limit succeeds; two leaves
+// whose combined decoded size exceeds the limit returns 400.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_zip_deep_export_cumulative_bytesize_limit() {
+    // arr1 = 4 f64 = 32 decoded bytes; arr2 = 3 f64 = 24 bytes → total 56.
+    // Limit = 40: first leaf (32) passes, second leaf (32+24=56) exceeds → 400.
+    let arr1 = ArrayAdapter::from_f64_1d(&[0.0, 1.0, 2.0, 3.0], serde_json::json!({}));
+    let arr2 = ArrayAdapter::from_f64_1d(&[10.0, 20.0, 30.0], serde_json::json!({}));
+    let mut mapping = IndexMap::new();
+    mapping.insert("arr1".to_string(), AnyAdapter::Array(Arc::new(arr1)));
+    mapping.insert("arr2".to_string(), AnyAdapter::Array(Arc::new(arr2)));
+    let root: Arc<dyn tiled_core::adapters::ContainerAdapter> =
+        Arc::new(MapAdapter::new(mapping, serde_json::json!({}), vec![]));
+
+    let app = build_app_for_root(root.clone(), 40);
+    let (status, _, body) = get_with_headers(&app, "/api/v1/container/full/?format=zip", &[]).await;
+    assert_eq!(
+        status, 400,
+        "cumulative decoded size 56 > limit 40 must return 400; got {status}"
+    );
+    let err: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+    assert!(
+        err["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Response would exceed"),
+        "error body must mention the limit; got {err:?}"
+    );
+
+    // Generous limit (400 bytes) → 200 and valid zip.
+    let app2 = build_app_for_root(root, 400);
+    let (status2, _, _) = get_with_headers(&app2, "/api/v1/container/full/?format=zip", &[]).await;
+    assert_eq!(status2, 200, "under limit must succeed");
+}

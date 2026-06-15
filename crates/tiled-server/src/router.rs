@@ -1145,15 +1145,24 @@ pub async fn container_full(
         // that deflates it into the ZipWriter and returns the writer. Read-one →
         // write-one keeps live memory bounded to one decoded leaf + the zip
         // state, exactly as the previous streaming loop did.
+        //
+        // Cumulative bytesize cap: decoded bytes across all leaves are summed and
+        // checked against response_bytesize_limit after every Array/Table leaf.
+        // Crumbs (small JSON metadata placeholders for unhandled families) are not
+        // counted — they carry no decoded payload. The non-zip container listing
+        // (Resource JSON metadata) has no decoded payload either and is uncapped.
         use zip::write::SimpleFileOptions;
         let opts =
             SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
         let mut writer: ZipBuf = zip::ZipWriter::new(Cursor::new(Vec::<u8>::new()));
+        let mut cumulative_bytes: usize = 0;
         for ZipEntry { name, leaf } in entries {
             match leaf {
                 ZipLeaf::Array(arc) => {
                     let slice = tiled_core::ndslice::NDSlice::empty();
                     let data = arc.read(&slice).await.map_err(ServerError::from)?;
+                    cumulative_bytes += data.data.len();
+                    check_response_size(cumulative_bytes, state.response_bytesize_limit)?;
                     writer = tokio::task::spawn_blocking(move || -> Result<ZipBuf, ServerError> {
                         writer
                             .start_file(name, opts)
@@ -1168,6 +1177,13 @@ pub async fn container_full(
                 }
                 ZipLeaf::Table(arc) => {
                     let table = arc.read(None).await.map_err(ServerError::from)?;
+                    let leaf_bytes: usize = table
+                        .batches
+                        .iter()
+                        .map(|b| b.get_array_memory_size())
+                        .sum();
+                    cumulative_bytes += leaf_bytes;
+                    check_response_size(cumulative_bytes, state.response_bytesize_limit)?;
                     writer = tokio::task::spawn_blocking(move || -> Result<ZipBuf, ServerError> {
                         let mut ipc_bytes = Vec::new();
                         {
