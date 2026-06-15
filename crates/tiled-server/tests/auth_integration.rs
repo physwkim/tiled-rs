@@ -257,6 +257,120 @@ async fn api_key_via_db_grants_scope_subset() {
 }
 
 #[tokio::test]
+async fn refresh_rotates_token_and_returns_full_response() {
+    let (app, _dir, _cat, _auth_db) = build_test_app().await;
+
+    let (status, body) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/auth/dummy/login",
+        &[],
+        Some(json!({"username": "alice", "password": "wonderland"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let original_refresh = body["refresh_token"].as_str().unwrap().to_string();
+
+    let (status, body) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/auth/refresh",
+        &[],
+        Some(json!({"refresh_token": original_refresh})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["access_token"].is_string(), "missing access_token");
+    assert!(body["refresh_token"].is_string(), "missing refresh_token");
+    assert!(
+        body["refresh_token_expires_in"].is_number(),
+        "missing refresh_token_expires_in"
+    );
+    assert!(body["expires_in"].is_number(), "missing expires_in");
+    let new_refresh = body["refresh_token"].as_str().unwrap().to_string();
+
+    // The new refresh token must itself be a valid, usable refresh token
+    // (functional rotation: the returned token works for the next cycle).
+    let (status, body2) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/auth/refresh",
+        &[],
+        Some(json!({"refresh_token": new_refresh})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "second refresh failed: {body2}");
+}
+
+#[tokio::test]
+async fn revoked_and_missing_session_refresh_return_identical_opaque_401() {
+    let (app, _dir, _cat, auth_db) = build_test_app().await;
+
+    // Login to get a valid refresh token.
+    let (_, body) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/auth/dummy/login",
+        &[],
+        Some(json!({"username": "alice", "password": "wonderland"})),
+    )
+    .await;
+    let access = body["access_token"].as_str().unwrap().to_string();
+    let refresh = body["refresh_token"].as_str().unwrap().to_string();
+
+    // Revoke the session via logout.
+    let (status, _) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/auth/logout",
+        &[("authorization", &format!("Bearer {access}"))],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // Refresh on a revoked session → opaque 401.
+    let (status, revoked_body) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/auth/refresh",
+        &[],
+        Some(json!({"refresh_token": refresh})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{revoked_body}");
+
+    // Forge a valid-looking refresh JWT for a session UUID that never existed.
+    let issuer = tiled_auth::Issuer::new(b"this-is-a-test-secret-32-bytes-long!!").unwrap();
+    let _ = auth_db; // keep alive
+    let bogus_refresh = issuer
+        .issue_refresh(
+            "00000000-0000-0000-0000-000000000000",
+            "deadbeef-dead-dead-dead-deaddeadbeef",
+        )
+        .unwrap();
+
+    let (status, missing_body) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/auth/refresh",
+        &[],
+        Some(json!({"refresh_token": bogus_refresh})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{missing_body}");
+
+    // Both must return the same error message (opaque — does not reveal revoked vs missing).
+    let revoked_msg = revoked_body["error"]["message"].as_str().unwrap_or("");
+    let missing_msg = missing_body["error"]["message"].as_str().unwrap_or("");
+    assert_eq!(
+        revoked_msg, missing_msg,
+        "error messages differ: revoked={revoked_msg:?} missing={missing_msg:?}"
+    );
+    assert_eq!(revoked_msg, "Session has expired. Please re-authenticate.");
+}
+
+#[tokio::test]
 async fn write_endpoint_demands_write_scope() {
     let (app, _dir, _cat, auth_db) = build_test_app().await;
 

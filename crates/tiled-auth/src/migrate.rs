@@ -14,6 +14,10 @@ const SQLITE_MIGRATIONS: &[(&str, &str)] = &[
         "0002_add_principal_role",
         include_str!("../migrations/sqlite/0002_add_principal_role.sql"),
     ),
+    (
+        "0003_add_session_refresh_count",
+        include_str!("../migrations/sqlite/0003_add_session_refresh_count.sql"),
+    ),
 ];
 
 const POSTGRES_MIGRATIONS: &[(&str, &str)] = &[
@@ -24,6 +28,10 @@ const POSTGRES_MIGRATIONS: &[(&str, &str)] = &[
     (
         "0002_add_principal_role",
         include_str!("../migrations/postgres/0002_add_principal_role.sql"),
+    ),
+    (
+        "0003_add_session_refresh_count",
+        include_str!("../migrations/postgres/0003_add_session_refresh_count.sql"),
     ),
 ];
 

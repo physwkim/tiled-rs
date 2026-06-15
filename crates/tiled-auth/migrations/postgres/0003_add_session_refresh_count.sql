@@ -1,0 +1,1 @@
+ALTER TABLE sessions ADD COLUMN refresh_count BIGINT NOT NULL DEFAULT 0;

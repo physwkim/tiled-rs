@@ -144,6 +144,28 @@ impl AuthDb {
         Ok(())
     }
 
+    /// Increment `refresh_count` atomically. Best-effort — failures are not
+    /// surfaced because skipping the counter shouldn't fail the request.
+    pub async fn increment_refresh_count(&self, uuid: &str) -> Result<()> {
+        match self.pool() {
+            AuthPool::Sqlite(pool) => {
+                sqlx::query("UPDATE sessions SET refresh_count = refresh_count + 1 WHERE uuid = ?")
+                    .bind(uuid)
+                    .execute(pool)
+                    .await?;
+            }
+            AuthPool::Postgres(pool) => {
+                sqlx::query(
+                    "UPDATE sessions SET refresh_count = refresh_count + 1 WHERE uuid = $1",
+                )
+                .bind(uuid)
+                .execute(pool)
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
     /// Touch `time_last_used = now`. Best-effort — failures are not
     /// surfaced because skipping the touch shouldn't fail the request.
     pub async fn touch_session(&self, uuid: &str) -> Result<()> {

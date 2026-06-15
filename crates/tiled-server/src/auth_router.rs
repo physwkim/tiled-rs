@@ -125,6 +125,10 @@ pub struct RefreshRequest {
     pub refresh_token: String,
 }
 
+// Same opaque message for revoked, expired, and missing sessions — deliberately
+// does not reveal which condition triggered it (Python parity: slide_session).
+const OPAQUE_SESSION_ERR: &str = "Session has expired. Please re-authenticate.";
+
 pub async fn refresh(
     State(state): State<AppState>,
     Json(body): Json<RefreshRequest>,
@@ -133,19 +137,27 @@ pub async fn refresh(
     let claims = issuer
         .verify_refresh(&body.refresh_token)
         .map_err(map_auth_err)?;
-    let session = db.lookup_session(&claims.sid).await.map_err(map_auth_err)?;
+    let session = db.lookup_session(&claims.sid).await.map_err(|e| match e {
+        tiled_auth::AuthError::NotFound(_) => ServerError::Unauthorized(OPAQUE_SESSION_ERR.into()),
+        other => map_auth_err(other),
+    })?;
     if session.revoked || session.expiration_time <= Utc::now() {
-        return Err(ServerError::Unauthorized(
-            "session revoked or expired".into(),
-        ));
+        return Err(ServerError::Unauthorized(OPAQUE_SESSION_ERR.into()));
     }
+    db.touch_session(&claims.sid).await.ok();
+    db.increment_refresh_count(&claims.sid).await.ok();
     let access = issuer
         .issue_access(&claims.sub, &claims.sid, session.scopes)
         .map_err(map_auth_err)?;
+    let new_refresh = issuer
+        .issue_refresh(&claims.sub, &claims.sid)
+        .map_err(map_auth_err)?;
     Ok(Json(serde_json::json!({
         "access_token": access,
-        "token_type": "Bearer",
         "expires_in": issuer.access_ttl.num_seconds(),
+        "refresh_token": new_refresh,
+        "refresh_token_expires_in": issuer.refresh_ttl.num_seconds(),
+        "token_type": "bearer",
     })))
 }
 
