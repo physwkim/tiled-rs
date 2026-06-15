@@ -299,7 +299,12 @@ impl WhereBuilder {
     }
 
     /// `NotIn(key, [v1, v2, ...])` — inverse of `push_in`. Empty list
-    /// → match everything (always true). NULLs (missing key) also pass.
+    /// → match everything (always true).
+    ///
+    /// Missing-key handling is dialect-specific, matching Python: SQLite
+    /// `attr.not_in(...)` yields `NULL NOT IN (...)` → NULL → the row is
+    /// EXCLUDED (adapter.py:2096); Postgres `NOT (OR of @>)` is true for a
+    /// missing key → the row is INCLUDED (adapter.py:2117-2124).
     fn push_not_in(&mut self, key: &str, values: &[Value]) {
         if values.is_empty() {
             self.pieces.push("TRUE".into());
@@ -314,10 +319,11 @@ impl WhereBuilder {
                     placeholders.push(p);
                     self.bindings.push(value_to_bind(v));
                 }
-                self.pieces.push(format!(
-                    "({lhs} IS NULL OR {lhs} NOT IN ({}))",
-                    placeholders.join(", ")
-                ));
+                // No `IS NULL OR` arm: a missing key (json_extract → NULL)
+                // makes `NULL NOT IN (...)` evaluate to NULL, excluding the
+                // row — matching Python SQLite `attr.not_in`.
+                self.pieces
+                    .push(format!("{lhs} NOT IN ({})", placeholders.join(", ")));
             }
             Dialect::Postgres => {
                 // `NOT (OR of JSONB containments)` — type-safe and includes
@@ -860,15 +866,20 @@ mod tests {
         assert_eq!(n, 2);
     }
 
+    // F-O: SQLite NotIn excludes missing-key rows (no `IS NULL OR` arm),
+    // matching Python SQLite `attr.not_in` where `NULL NOT IN (...)` → NULL.
     #[test]
-    fn notin_two_values_keeps_null_through() {
+    fn notin_two_values_sqlite_excludes_missing_key() {
         let q = Query::NotIn(tiled_core::queries::NotIn {
             key: "tag".into(),
             value: vec![json!("a"), json!("b")],
         });
         let (sql, _) = build(Dialect::Sqlite, &[q]);
-        assert!(sql.contains("IS NULL OR"));
-        assert!(sql.contains("NOT IN (?, ?)"));
+        assert!(
+            !sql.contains("IS NULL OR"),
+            "must not keep missing-key rows"
+        );
+        assert_eq!(sql, "json_extract(metadata, '$.tag') NOT IN (?, ?)");
     }
 
     #[test]
