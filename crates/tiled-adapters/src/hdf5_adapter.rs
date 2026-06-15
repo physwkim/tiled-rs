@@ -102,37 +102,14 @@ impl Hdf5Adapter {
         } else {
             raw_shape.clone()
         };
-        let has_zero_axis = shape.contains(&0);
-        let element_size = ds.element_size();
-        // Probe dtype on the actual (raw) shape so rust-hdf5's hyperslab
-        // accepts the offsets/counts. For empty arrays we skip the read
-        // and assume f64.
-        //
-        // UNFIXED (FINDING A-1): the Kind (float / integer / unsigned) and
-        // signedness produced here are GUESSED by element byte size inside
-        // `read_native` (see its `try_read!` ladder, this file), not read
-        // from the dataset's true HDF5 datatype class. Because libhdf5
-        // silently converts numeric types on read, a uint8 dataset is
-        // reported as signed i8 and an int64 dataset as f64.
-        // BLOCKER: rust-hdf5 0.2.12 exposes no public datatype-class / sign
-        // accessor for an already-opened dataset (no `H5Dataset::datatype()`
-        // yielding a `Datatype` with `class()` / `is_signed()`). Fixing this
-        // requires that upstream accessor; see the `#[ignore]`'d
-        // `dtype_tripwire` tests at the bottom of this file.
-        let dtype = if has_zero_axis {
-            BuiltinDType::new(Endianness::Little, Kind::Float, 8)
-        } else if scalar_promoted {
-            let (_b, dt) = read_native(&ds, element_size, &[], &[])?;
-            dt
-        } else {
-            let (_b, dt) = read_native(
-                &ds,
-                element_size,
-                &vec![0; shape.len()],
-                &vec![1; shape.len()],
-            )?;
-            dt
-        };
+        // Read the dtype from the dataset's true HDF5 datatype class: Kind
+        // (integer / unsigned / float) and signedness come from the stored
+        // type via rust-hdf5's `H5Dataset::datatype()` accessor, NOT guessed
+        // from the element byte size. (FINDING A-1 closed — the byte-size
+        // guess could not tell `u8` from `i8` or `i32` from `f32`.) This
+        // needs no data read, so it is correct for empty/zero-axis datasets
+        // too.
+        let dtype = dtype_from_hdf5(&ds)?;
 
         let chunks: Vec<Vec<usize>> = shape.iter().map(|d| vec![*d]).collect();
         let structure = ArrayStructure {
@@ -175,12 +152,12 @@ fn read_hdf5_slice(
         .map_err(|e| TiledError::Internal(format!("hdf5 dataset {dataset}: {e}")))?;
 
     if scalar_promoted {
-        let (raw, _) = read_native(&ds, dtype.element_size(), &[], &[])?;
+        let raw = read_native(&ds, &dtype, &[], &[])?;
         return Ok(DynNDArray::new(Bytes::from(raw), dtype, vec![1]));
     }
 
     let plan = SlicePlan::from_ndslice(&slice, &shape)?;
-    let (raw, _) = read_native(&ds, dtype.element_size(), &plan.offsets, &plan.counts)?;
+    let raw = read_native(&ds, &dtype, &plan.offsets, &plan.counts)?;
     let (final_bytes, final_shape) = postprocess(raw, &plan, dtype.element_size());
     Ok(DynNDArray::new(
         Bytes::from(final_bytes),
@@ -359,70 +336,80 @@ fn postprocess(raw: Vec<u8>, plan: &SlicePlan, element_size: usize) -> (Vec<u8>,
     (out, final_shape)
 }
 
-// UNFIXED (FINDING A-1): this function infers `Kind` (and thus
-// signedness) purely from `element_size` via the `try_read!` ladder,
-// returning the FIRST candidate type whose `read_slice::<T>` succeeds.
-// libhdf5 silently converts between numeric types on read, so the first
-// candidate almost always succeeds regardless of the dataset's real
-// type: an 8-byte dataset is labelled f64 even when it is i64/u64, and a
-// 1-byte dataset is labelled i8 even when it is u8. The reported Kind is
-// therefore a size-ordered GUESS, not the dataset's datatype class.
-// BLOCKER: rust-hdf5 0.2.12 has no public datatype-class / sign accessor
-// for an opened dataset (no `H5Dataset::datatype()` -> `Datatype` with
-// `class()` / `is_signed()`). The structural fix — read Kind from the
-// datatype class instead of probing by size — needs that upstream API.
-// Tripwire: the `#[ignore]`'d tests in `dtype_tripwire` (bottom of file)
-// assert the correct Kind and fail until the accessor lands.
+/// Map the dataset's stored HDF5 datatype to a numpy-style [`BuiltinDType`].
+///
+/// `Kind` and signedness come from the datatype CLASS
+/// (`DatatypeMessage::FixedPoint { signed, .. }` / `FloatingPoint`), not from
+/// the element byte size — this is what closes FINDING A-1 (the byte-size
+/// guess could not distinguish `u8` from `i8` or `i32` from `f32`). The
+/// reported endianness is `Little` (or `NotApplicable` for single-byte
+/// types) because [`read_native`] normalises every value to little-endian
+/// via `to_le_bytes`; the stored byte order is consumed by `read_slice`
+/// during the read itself.
+fn dtype_from_hdf5(ds: &rust_hdf5::H5Dataset) -> Result<BuiltinDType> {
+    use rust_hdf5::DatatypeMessage;
+    let datatype = ds
+        .datatype()
+        .map_err(|e| TiledError::Internal(format!("hdf5 datatype: {e}")))?;
+    let element_size = ds.element_size();
+    let kind = match datatype {
+        DatatypeMessage::FixedPoint { signed: true, .. } => Kind::Integer,
+        DatatypeMessage::FixedPoint { signed: false, .. } => Kind::UnsignedInteger,
+        DatatypeMessage::FloatingPoint { .. } => Kind::Float,
+        other => {
+            return Err(TiledError::Internal(format!(
+                "hdf5 datatype {other:?} not supported by tiled-rs adapter"
+            )));
+        }
+    };
+    // Single-byte dtypes are byte-order agnostic — numpy reports '|'.
+    let endianness = if element_size == 1 {
+        Endianness::NotApplicable
+    } else {
+        Endianness::Little
+    };
+    Ok(BuiltinDType::new(endianness, kind, element_size))
+}
+
+/// Read raw element bytes for a hyperslab using the dataset's KNOWN element
+/// type (from [`dtype_from_hdf5`]). Reading with the correct type — rather
+/// than guessing by byte size — is required: `read_slice::<T>` converts the
+/// stored values to `T`, so reading an `i64` dataset as `f64` would corrupt
+/// it. Every value is emitted little-endian (`to_le_bytes`) to match the
+/// endianness reported by `dtype_from_hdf5`.
 fn read_native(
     ds: &rust_hdf5::H5Dataset,
-    element_size: usize,
+    dtype: &BuiltinDType,
     offsets: &[usize],
     counts: &[usize],
-) -> Result<(Vec<u8>, BuiltinDType)> {
-    macro_rules! try_read {
-        ($t:ty, $kind:expr) => {{
-            match ds.read_slice::<$t>(offsets, counts) {
-                Ok(values) => {
-                    let mut buf = Vec::with_capacity(values.len() * element_size);
-                    for v in &values {
-                        buf.extend_from_slice(&v.to_le_bytes());
-                    }
-                    // Single-byte dtypes are byte-order agnostic — numpy reports '|'.
-                    let endianness = if element_size == 1 {
-                        Endianness::NotApplicable
-                    } else {
-                        Endianness::Little
-                    };
-                    return Ok((buf, BuiltinDType::new(endianness, $kind, element_size)));
-                }
-                Err(_) => {} // wrong type — try the next candidate
+) -> Result<Vec<u8>> {
+    macro_rules! read_as {
+        ($t:ty) => {{
+            let values = ds
+                .read_slice::<$t>(offsets, counts)
+                .map_err(|e| TiledError::Internal(format!("hdf5 read: {e}")))?;
+            let mut buf = Vec::with_capacity(values.len() * dtype.element_size());
+            for v in &values {
+                buf.extend_from_slice(&v.to_le_bytes());
             }
+            Ok(buf)
         }};
     }
-    match element_size {
-        8 => {
-            try_read!(f64, Kind::Float);
-            try_read!(i64, Kind::Integer);
-            try_read!(u64, Kind::UnsignedInteger);
-        }
-        4 => {
-            try_read!(f32, Kind::Float);
-            try_read!(i32, Kind::Integer);
-            try_read!(u32, Kind::UnsignedInteger);
-        }
-        2 => {
-            try_read!(i16, Kind::Integer);
-            try_read!(u16, Kind::UnsignedInteger);
-        }
-        1 => {
-            try_read!(i8, Kind::Integer);
-            try_read!(u8, Kind::UnsignedInteger);
-        }
-        _ => {}
+    match (dtype.kind, dtype.element_size()) {
+        (Kind::Float, 8) => read_as!(f64),
+        (Kind::Float, 4) => read_as!(f32),
+        (Kind::Integer, 8) => read_as!(i64),
+        (Kind::Integer, 4) => read_as!(i32),
+        (Kind::Integer, 2) => read_as!(i16),
+        (Kind::Integer, 1) => read_as!(i8),
+        (Kind::UnsignedInteger, 8) => read_as!(u64),
+        (Kind::UnsignedInteger, 4) => read_as!(u32),
+        (Kind::UnsignedInteger, 2) => read_as!(u16),
+        (Kind::UnsignedInteger, 1) => read_as!(u8),
+        (kind, size) => Err(TiledError::Internal(format!(
+            "hdf5 dtype {kind:?} of {size} bytes not supported by tiled-rs adapter"
+        ))),
     }
-    Err(TiledError::Internal(format!(
-        "hdf5 dataset element size {element_size} not supported by tiled-rs adapter"
-    )))
 }
 
 impl BaseAdapter for Hdf5Adapter {
@@ -488,29 +475,16 @@ impl ArrayAdapterRead for Hdf5Adapter {
 }
 
 #[cfg(test)]
-mod dtype_tripwire {
-    //! Tripwire regression tests for the HDF5 dtype Kind / signedness
-    //! misdetection (FINDING A-1, carried UNFIXED).
+mod dtype_class {
+    //! Regression tests for HDF5 dtype Kind / signedness detection
+    //! (FINDING A-1, CLOSED).
     //!
-    //! `read_native` (this file) selects the element type purely by byte
-    //! SIZE via its `try_read!` ladder, taking the first candidate whose
-    //! `H5Dataset::read_slice::<T>` call succeeds. libhdf5 silently
-    //! converts between numeric types on read, so the first candidate
-    //! succeeds regardless of the dataset's real type — mislabelling a
-    //! `uint8` dataset as signed `i8` (ladder tries `i8` first) and an
-    //! `int64` dataset as `f64` (ladder tries `f64` first). `Kind` and
-    //! signedness are therefore guesses, not the dataset's datatype class.
-    //!
-    //! BLOCKER: rust-hdf5 0.2.12 exposes no public datatype-class / sign
-    //! accessor for an already-opened dataset (no `H5Dataset::datatype()`
-    //! returning a `Datatype` with `class()` / `is_signed()`), so the
-    //! adapter cannot read the true Kind. These tests assert the CORRECT
-    //! Kind and therefore FAIL today.
-    //!
-    //! VERIFICATION when upstream lands the accessor (e.g.
-    //! `H5Dataset::datatype()`): rewrite `read_native` to read Kind from
-    //! the datatype class, then DELETE the `#[ignore]` attributes below —
-    //! they must then pass.
+    //! `dtype_from_hdf5` reads the dataset's true datatype CLASS via
+    //! rust-hdf5's `H5Dataset::datatype()` accessor, so the reported `Kind`
+    //! and signedness reflect the stored type — `u8` is not confused with
+    //! `i8`, nor `i64`/`i32` with `f64`/`f32`. Before the accessor existed,
+    //! `read_native` guessed the type by element byte size and mislabelled
+    //! these; these tests asserted the correct Kind and used to fail.
     use std::path::PathBuf;
 
     use super::*;
@@ -542,31 +516,42 @@ mod dtype_tripwire {
         }
     }
 
-    /// A `uint8` dataset must report `Kind::UnsignedInteger`. Fails today:
-    /// `read_native` tries `i8` first for 1-byte elements, so the adapter
-    /// reports a signed integer.
+    /// A `uint8` dataset must report `Kind::UnsignedInteger` (not signed `i8`,
+    /// which the old byte-size guess picked first for 1-byte elements).
     #[test]
-    #[ignore = "blocked on rust-hdf5 exposing a datatype-class/sign accessor (e.g. H5Dataset::datatype()); read_native guesses Kind by byte size, so uint8 reads back as signed i8. Delete this #[ignore] to verify once the accessor lands."]
     fn uint8_dataset_reports_unsigned_kind() {
         let (_dir, path) = write_dataset::<u8>("u8", &[1u8, 2, 3]);
-        assert_eq!(
-            adapter_kind(path, "u8"),
-            Kind::UnsignedInteger,
-            "uint8 dataset must report Kind::UnsignedInteger; the try_read! ladder picks i8 first -> signed (misdetection)"
-        );
+        assert_eq!(adapter_kind(path, "u8"), Kind::UnsignedInteger);
     }
 
-    /// An `int64` dataset must report `Kind::Integer`. Fails today:
-    /// `read_native` tries `f64` first for 8-byte elements and libhdf5
-    /// converts the int64 data to float, so the adapter reports a float.
+    /// An `int64` dataset must report `Kind::Integer` (not `f64`, which the
+    /// old byte-size guess picked first for 8-byte elements).
     #[test]
-    #[ignore = "blocked on rust-hdf5 exposing a datatype-class/sign accessor (e.g. H5Dataset::datatype()); read_native guesses Kind by byte size, so int64 reads back as f64. Delete this #[ignore] to verify once the accessor lands."]
     fn int64_dataset_reports_integer_kind() {
         let (_dir, path) = write_dataset::<i64>("i64", &[1i64, 2, 3]);
-        assert_eq!(
-            adapter_kind(path, "i64"),
-            Kind::Integer,
-            "int64 dataset must report Kind::Integer; the try_read! ladder picks f64 first -> float (misdetection)"
-        );
+        assert_eq!(adapter_kind(path, "i64"), Kind::Integer);
+    }
+
+    /// An `int32` dataset must report `Kind::Integer` (not `f32`); confirms
+    /// the 4-byte int-vs-float class is resolved from the datatype, not size.
+    #[test]
+    fn int32_dataset_reports_integer_kind() {
+        let (_dir, path) = write_dataset::<i32>("i32", &[1i32, 2, 3]);
+        assert_eq!(adapter_kind(path, "i32"), Kind::Integer);
+    }
+
+    /// A `uint16` dataset must report `Kind::UnsignedInteger` (not signed
+    /// `i16`).
+    #[test]
+    fn uint16_dataset_reports_unsigned_kind() {
+        let (_dir, path) = write_dataset::<u16>("u16", &[1u16, 2, 3]);
+        assert_eq!(adapter_kind(path, "u16"), Kind::UnsignedInteger);
+    }
+
+    /// A genuine `f64` dataset still reports `Kind::Float`.
+    #[test]
+    fn float64_dataset_reports_float_kind() {
+        let (_dir, path) = write_dataset::<f64>("f64", &[1.0f64, 2.0, 3.0]);
+        assert_eq!(adapter_kind(path, "f64"), Kind::Float);
     }
 }

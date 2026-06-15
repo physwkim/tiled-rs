@@ -103,8 +103,10 @@ tempfile = "3"
 tiff = "0.9"
 image = "0.25"
 
-# HDF5 (feature-gated) — pure-Rust HDF5 reader/writer, no system libhdf5
-rust-hdf5 = { version = "0.2.12", features = ["deflate"] }
+# HDF5 (feature-gated) — pure-Rust HDF5 reader/writer, no system libhdf5.
+# The adapter reads the dtype class + sign via H5Dataset::datatype(), added
+# in rust-hdf5 0.2.18 — see hdf5_adapter.rs dtype_from_hdf5().
+rust-hdf5 = { version = "0.2.18", features = ["deflate"] }
 
 # Zarr
 zarrs = { version = "0.20", features = ["filesystem"] }
