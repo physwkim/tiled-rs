@@ -1,7 +1,7 @@
 //! Route handlers for the Tiled API.
 
 use std::collections::HashMap;
-use std::io::{Cursor, Seek, Write};
+use std::io::{Cursor, Write};
 use std::sync::Arc;
 
 use axum::Json;
@@ -1110,11 +1110,20 @@ pub async fn container_full(
     let base_url_c = base_url.clone();
     let filter_c = access_filter.clone();
 
-    // Deep-export branch (upstream tiled #660): build the zip entirely
-    // inside one spawn_blocking using Handle::block_on for async reads.
+    // Deep-export branch (upstream tiled #660): two-phase build. Phase 1
+    // walks the tree in one spawn_blocking and collects owned leaf handles;
+    // phase 2 reads each leaf on the executor (no block_on) and deflates it
+    // into the zip. This avoids nesting spawn_blocking -> block_on -> adapter
+    // spawn_blocking, which exhausted the blocking pool under concurrent
+    // exports.
     if media_type == "application/zip" {
-        let handle = tokio::runtime::Handle::current();
-        let bytes = tokio::task::spawn_blocking(move || -> Result<bytes::Bytes, ServerError> {
+        // Phase 1 (spawn_blocking): walk the container tree and collect a FLAT,
+        // ordered list of leaf entries. Each leaf captures an OWNED Arc handle
+        // (via as_array_arc/as_table_arc) — NOT decoded data — so the reads can
+        // run on the executor in phase 2. Container search/keys/get are sync and
+        // safe on the blocking pool; only read() must move off it. No read() and
+        // therefore NO `block_on` happen in this phase.
+        let entries = tokio::task::spawn_blocking(move || -> Result<Vec<ZipEntry>, ServerError> {
             let container: &dyn ContainerAdapter = if segs.is_empty() {
                 root_arc.as_ref()
             } else {
@@ -1124,33 +1133,97 @@ pub async fn container_full(
                         ServerError::Validation(format!("'{}' is not a container", segs.join("/")))
                     })?
             };
-            // Stream each leaf directly into the ZipWriter — bytes are deflated
-            // and dropped as we go, bounding live memory to one leaf + zip state
-            // rather than Σ(all decoded leaves) before the compress stage.
-            use zip::write::SimpleFileOptions;
-            let mut buf = Vec::new();
-            {
-                let mut writer = zip::ZipWriter::new(Cursor::new(&mut buf));
-                let opts = SimpleFileOptions::default()
-                    .compression_method(zip::CompressionMethod::Deflated);
-                collect_zip_entries_blocking(
-                    container,
-                    "",
-                    &path_c,
-                    &mut writer,
-                    opts,
-                    &handle,
-                    filter_c.as_ref(),
-                )?;
-                writer
-                    .finish()
-                    .map_err(|e| ServerError::Internal(format!("zip finalize: {e}")))?;
-            }
-            Ok(bytes::Bytes::from(buf))
+            let mut out = Vec::new();
+            collect_zip_entries_blocking(container, "", &path_c, filter_c.as_ref(), &mut out)?;
+            Ok(out)
         })
         .await
-        .map_err(|e| ServerError::Internal(format!("zip task failed: {e}")))??;
-        return Ok(serve_with_range(&headers, "application/zip", bytes));
+        .map_err(|e| ServerError::Internal(format!("zip walk task failed: {e}")))??;
+
+        // Phase 2: for each entry IN ORDER, read the leaf on the executor (no
+        // `block_on`), then hand that single decoded leaf to a spawn_blocking
+        // that deflates it into the ZipWriter and returns the writer. Read-one →
+        // write-one keeps live memory bounded to one decoded leaf + the zip
+        // state, exactly as the previous streaming loop did.
+        use zip::write::SimpleFileOptions;
+        let opts =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        let mut writer: ZipBuf = zip::ZipWriter::new(Cursor::new(Vec::<u8>::new()));
+        for ZipEntry { name, leaf } in entries {
+            match leaf {
+                ZipLeaf::Array(arc) => {
+                    let slice = tiled_core::ndslice::NDSlice::empty();
+                    let data = arc.read(&slice).await.map_err(ServerError::from)?;
+                    writer = tokio::task::spawn_blocking(move || -> Result<ZipBuf, ServerError> {
+                        writer
+                            .start_file(name, opts)
+                            .map_err(|e| ServerError::Internal(format!("zip: {e}")))?;
+                        writer
+                            .write_all(&data.data)
+                            .map_err(|e| ServerError::Internal(format!("zip write: {e}")))?;
+                        Ok(writer)
+                    })
+                    .await
+                    .map_err(|e| ServerError::Internal(format!("zip write task failed: {e}")))??;
+                }
+                ZipLeaf::Table(arc) => {
+                    let table = arc.read(None).await.map_err(ServerError::from)?;
+                    writer = tokio::task::spawn_blocking(move || -> Result<ZipBuf, ServerError> {
+                        let mut ipc_bytes = Vec::new();
+                        {
+                            let mut writer_ipc = arrow::ipc::writer::FileWriter::try_new(
+                                &mut ipc_bytes,
+                                &table.schema,
+                            )
+                            .map_err(|e| ServerError::Internal(format!("arrow ipc: {e}")))?;
+                            for batch in &table.batches {
+                                writer_ipc.write(batch).map_err(|e| {
+                                    ServerError::Internal(format!("arrow ipc: {e}"))
+                                })?;
+                            }
+                            writer_ipc
+                                .finish()
+                                .map_err(|e| ServerError::Internal(format!("arrow ipc: {e}")))?;
+                        }
+                        writer
+                            .start_file(name, opts)
+                            .map_err(|e| ServerError::Internal(format!("zip: {e}")))?;
+                        writer
+                            .write_all(&ipc_bytes)
+                            .map_err(|e| ServerError::Internal(format!("zip write: {e}")))?;
+                        Ok(writer)
+                    })
+                    .await
+                    .map_err(|e| ServerError::Internal(format!("zip write task failed: {e}")))??;
+                }
+                ZipLeaf::Crumb(crumb_bytes) => {
+                    writer = tokio::task::spawn_blocking(move || -> Result<ZipBuf, ServerError> {
+                        writer
+                            .start_file(name, opts)
+                            .map_err(|e| ServerError::Internal(format!("zip: {e}")))?;
+                        writer
+                            .write_all(&crumb_bytes)
+                            .map_err(|e| ServerError::Internal(format!("zip write: {e}")))?;
+                        Ok(writer)
+                    })
+                    .await
+                    .map_err(|e| ServerError::Internal(format!("zip write task failed: {e}")))??;
+                }
+            }
+        }
+        let buf = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, ServerError> {
+            let cursor = writer
+                .finish()
+                .map_err(|e| ServerError::Internal(format!("zip finalize: {e}")))?;
+            Ok(cursor.into_inner())
+        })
+        .await
+        .map_err(|e| ServerError::Internal(format!("zip finalize task failed: {e}")))??;
+        return Ok(serve_with_range(
+            &headers,
+            "application/zip",
+            bytes::Bytes::from(buf),
+        ));
     }
 
     // Non-zip: build Vec<Resource> inside spawn_blocking (Async A).
@@ -1210,20 +1283,41 @@ pub async fn container_full(
     Ok(serve_with_range(&headers, &media_type, body))
 }
 
-/// Recursively collect every leaf below `container` as (path, bytes) pairs.
-/// Must be called from a `spawn_blocking` thread so adapters that call
-/// `Handle::block_on` internally (CatalogAdapter, FileLeafResolver) do not
-/// panic. Async reads are driven via `handle.block_on(...)`.
+/// One leaf to bundle into a deep-export zip. Phase 1 captures only an OWNED
+/// Arc handle (no decoded data) so the read can run on the executor in phase 2.
+enum ZipLeaf {
+    Array(Arc<dyn tiled_core::adapters::ArrayAdapterRead>),
+    Table(Arc<dyn tiled_core::adapters::TableAdapterRead>),
+    /// Pre-serialized `.json` crumb for families not yet bundled
+    /// (Sparse/Awkward). No read is needed, so the bytes are captured directly.
+    Crumb(Vec<u8>),
+}
+
+/// One ordered entry in the deep-export zip.
+struct ZipEntry {
+    /// Full in-zip filename including extension (`.bin` / `.arrow` / `.json`).
+    name: String,
+    leaf: ZipLeaf,
+}
+
+/// The owned-buffer ZipWriter that ping-pongs through `spawn_blocking` in
+/// phase 2 (one write per leaf, returned for the next iteration).
+type ZipBuf = zip::ZipWriter<Cursor<Vec<u8>>>;
+
+/// Phase 1 of the deep-export: recursively collect every visible leaf below
+/// `container` into a flat, ordered `out` list. Must be called from a
+/// `spawn_blocking` thread — container `search`/`keys`/`get` may call
+/// `Handle::block_on` internally and are safe only on the blocking pool. It
+/// captures OWNED Arc handles via `as_array_arc`/`as_table_arc` and performs NO
+/// `read()` and NO `block_on`; the leaf reads run on the executor in phase 2.
 /// H3: `access_filter` (when Some) is applied at each level to skip children
 /// the caller is not permitted to see.
-fn collect_zip_entries_blocking<W: Write + Seek>(
+fn collect_zip_entries_blocking(
     container: &dyn ContainerAdapter,
     prefix: &str,
     base_path: &str,
-    writer: &mut zip::ZipWriter<W>,
-    opts: zip::write::SimpleFileOptions,
-    handle: &tokio::runtime::Handle,
     access_filter: Option<&tiled_core::queries::AccessBlobFilter>,
+    out: &mut Vec<ZipEntry>,
 ) -> Result<(), ServerError> {
     let visible_keys = match access_filter {
         Some(f) => container.search(&[tiled_core::queries::Query::AccessBlobFilter(f.clone())]),
@@ -1238,69 +1332,32 @@ fn collect_zip_entries_blocking<W: Write + Seek>(
         } else {
             format!("{prefix}/{key}")
         };
-        match child {
-            AnyAdapter::Array(a) => {
-                let data = handle
-                    .block_on(a.read(&tiled_core::ndslice::NDSlice::empty()))
-                    .map_err(ServerError::from)?;
-                writer
-                    .start_file(format!("{entry_name}.bin"), opts)
-                    .map_err(|e| ServerError::Internal(format!("zip: {e}")))?;
-                writer
-                    .write_all(&data.data)
-                    .map_err(|e| ServerError::Internal(format!("zip write: {e}")))?;
-                // data is dropped here — one leaf at a time in memory
-            }
-            AnyAdapter::Container(child_c) => {
-                collect_zip_entries_blocking(
-                    child_c.as_ref(),
-                    &entry_name,
-                    base_path,
-                    writer,
-                    opts,
-                    handle,
-                    access_filter,
-                )?;
-            }
-            AnyAdapter::Table(t) => {
-                let table = handle.block_on(t.read(None)).map_err(ServerError::from)?;
-                let mut ipc_bytes = Vec::new();
-                {
-                    let mut writer_ipc =
-                        arrow::ipc::writer::FileWriter::try_new(&mut ipc_bytes, &table.schema)
-                            .map_err(|e| ServerError::Internal(format!("arrow ipc: {e}")))?;
-                    for batch in &table.batches {
-                        writer_ipc
-                            .write(batch)
-                            .map_err(|e| ServerError::Internal(format!("arrow ipc: {e}")))?;
-                    }
-                    writer_ipc
-                        .finish()
-                        .map_err(|e| ServerError::Internal(format!("arrow ipc: {e}")))?;
-                }
-                writer
-                    .start_file(format!("{entry_name}.arrow"), opts)
-                    .map_err(|e| ServerError::Internal(format!("zip: {e}")))?;
-                writer
-                    .write_all(&ipc_bytes)
-                    .map_err(|e| ServerError::Internal(format!("zip write: {e}")))?;
-                // ipc_bytes dropped here
-            }
-            other => {
-                let crumb = serde_json::json!({
-                    "path": format!("{base_path}/{entry_name}"),
-                    "structure_family": format!("{:?}", other.structure_family()),
-                    "note": "leaf format not yet bundled in deep export",
-                });
-                let crumb_bytes = serde_json::to_vec(&crumb)
-                    .map_err(|e| ServerError::Internal(format!("json: {e}")))?;
-                writer
-                    .start_file(format!("{entry_name}.json"), opts)
-                    .map_err(|e| ServerError::Internal(format!("zip: {e}")))?;
-                writer
-                    .write_all(&crumb_bytes)
-                    .map_err(|e| ServerError::Internal(format!("zip write: {e}")))?;
-            }
+        if let Some(arc) = child.as_array_arc() {
+            out.push(ZipEntry {
+                name: format!("{entry_name}.bin"),
+                leaf: ZipLeaf::Array(arc),
+            });
+        } else if let Some(arc) = child.as_table_arc() {
+            out.push(ZipEntry {
+                name: format!("{entry_name}.arrow"),
+                leaf: ZipLeaf::Table(arc),
+            });
+        } else if let Some(child_c) = child.as_container() {
+            collect_zip_entries_blocking(child_c, &entry_name, base_path, access_filter, out)?;
+        } else {
+            // Sparse/Awkward and any future family: drop a crumb describing the
+            // leaf (identical to the previous behaviour).
+            let crumb = serde_json::json!({
+                "path": format!("{base_path}/{entry_name}"),
+                "structure_family": format!("{:?}", child.structure_family()),
+                "note": "leaf format not yet bundled in deep export",
+            });
+            let crumb_bytes = serde_json::to_vec(&crumb)
+                .map_err(|e| ServerError::Internal(format!("json: {e}")))?;
+            out.push(ZipEntry {
+                name: format!("{entry_name}.json"),
+                leaf: ZipLeaf::Crumb(crumb_bytes),
+            });
         }
     }
     Ok(())

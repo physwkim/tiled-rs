@@ -52,6 +52,15 @@ fn build_app() -> axum::Router {
 /// L4 size-cap behavior can be exercised with a tiny limit.
 fn build_app_with_limit(response_bytesize_limit: usize) -> axum::Router {
     let root_tree: Arc<dyn tiled_core::adapters::ContainerAdapter> = Arc::new(build_test_tree());
+    build_app_for_root(root_tree, response_bytesize_limit)
+}
+
+/// Build an app over a caller-supplied root tree (used by the deep-export zip
+/// test, which needs a nested array/table/container layout).
+fn build_app_for_root(
+    root_tree: Arc<dyn tiled_core::adapters::ContainerAdapter>,
+    response_bytesize_limit: usize,
+) -> axum::Router {
     let registry = Arc::new(tiled_serialization::default_registry());
 
     let state = tiled_server::AppState {
@@ -1176,4 +1185,105 @@ async fn test_response_bytesize_limit_table_returns_400() {
         status, 200,
         "table_full under the limit must still serve 200"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Deep-export zip: container/full?format=zip bundles every leaf. The two-phase
+// path reads each leaf on the executor (no block_on inside spawn_blocking) and
+// must still produce a correct, ordered zip across nested containers, arrays,
+// and tables.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "csv-adapter")]
+#[tokio::test]
+async fn test_container_full_zip_deep_export() {
+    use std::io::{Read, Write};
+
+    // A CSV-backed table leaf.
+    let dir = tempfile::tempdir().unwrap();
+    let csv_path = dir.path().join("t.csv");
+    {
+        let mut f = std::fs::File::create(&csv_path).unwrap();
+        writeln!(f, "x,y").unwrap();
+        writeln!(f, "1,10").unwrap();
+        writeln!(f, "2,20").unwrap();
+    }
+    let csv = tiled_adapters::CsvAdapter::from_path(csv_path, serde_json::json!({})).unwrap();
+
+    // Nested container holding one array.
+    let mut inner = IndexMap::new();
+    let nested = ArrayAdapter::from_f64_1d(&[1.0, 2.0, 3.0], serde_json::json!({}));
+    inner.insert(
+        "nested_arr".to_string(),
+        AnyAdapter::Array(Arc::new(nested)),
+    );
+    let subgroup = MapAdapter::new(inner, serde_json::json!({}), vec![]);
+
+    // Root: array, subgroup (container), table — in this insertion order.
+    let mut mapping = IndexMap::new();
+    let arr = ArrayAdapter::from_f64_1d(&[0.0, 1.0, 2.0, 3.0], serde_json::json!({}));
+    mapping.insert("some_array".to_string(), AnyAdapter::Array(Arc::new(arr)));
+    mapping.insert(
+        "subgroup".to_string(),
+        AnyAdapter::Container(Arc::new(subgroup)),
+    );
+    mapping.insert("some_table".to_string(), AnyAdapter::Table(Arc::new(csv)));
+    let root: Arc<dyn tiled_core::adapters::ContainerAdapter> =
+        Arc::new(MapAdapter::new(mapping, serde_json::json!({}), vec![]));
+
+    let app = build_app_for_root(root, 300_000_000);
+
+    let (status, headers, body) =
+        get_with_headers(&app, "/api/v1/container/full/?format=zip", &[]).await;
+    assert_eq!(status, 200);
+    let ct = headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        ct.contains("zip"),
+        "deep export Content-Type must be zip; got {ct}"
+    );
+
+    // Parse the produced zip.
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(body.to_vec())).expect("valid zip");
+
+    // Entry order is preserved depth-first in container key (insertion) order.
+    let ordered: Vec<String> = (0..zip.len())
+        .map(|i| zip.by_index(i).unwrap().name().to_string())
+        .collect();
+    assert_eq!(
+        ordered,
+        vec![
+            "some_array.bin".to_string(),
+            "subgroup/nested_arr.bin".to_string(),
+            "some_table.arrow".to_string(),
+        ],
+        "zip entries must be the depth-first ordered leaves"
+    );
+
+    // some_array.bin = 4 f64 little-endian = 32 raw bytes; first value 0.0.
+    let mut bin = Vec::new();
+    zip.by_name("some_array.bin")
+        .unwrap()
+        .read_to_end(&mut bin)
+        .unwrap();
+    assert_eq!(bin.len(), 32);
+    assert_eq!(f64::from_le_bytes(bin[0..8].try_into().unwrap()), 0.0);
+
+    // some_table.arrow is a valid Arrow IPC file with columns x, y.
+    let mut arrow_bytes = Vec::new();
+    zip.by_name("some_table.arrow")
+        .unwrap()
+        .read_to_end(&mut arrow_bytes)
+        .unwrap();
+    let rdr = arrow::ipc::reader::FileReader::try_new(std::io::Cursor::new(arrow_bytes), None)
+        .expect("table leaf must be valid Arrow IPC");
+    let cols: Vec<String> = rdr
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect();
+    assert_eq!(cols, vec!["x", "y"]);
 }
