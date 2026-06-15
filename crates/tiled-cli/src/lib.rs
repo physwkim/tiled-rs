@@ -230,6 +230,29 @@ fn generate_single_user_key() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Validate an operator-supplied single-user API key at startup, mirroring
+/// Python `build_app` (server/app.py:549-561) and the config schema
+/// `[a-zA-Z0-9]+` (config.py:149). An empty key would pass the server's
+/// constant-time compare against `?api_key=` / `Authorization: Apikey ` and
+/// silently grant access; a non-alphanumeric key carries reserved URL/header
+/// bytes (`&`, `=`, space, control chars) that cannot round-trip cleanly. The
+/// auto-generated key is hex and never reaches this gate.
+fn validate_single_user_api_key(key: &str) -> anyhow::Result<()> {
+    if key.is_empty() {
+        anyhow::bail!(
+            "--api-key (or config single_user_api_key) is empty; \
+             either omit it for anonymous access or supply a non-empty key"
+        );
+    }
+    if !key.chars().all(|c| c.is_ascii_alphanumeric()) {
+        anyhow::bail!(
+            "--api-key (or config single_user_api_key) must be alphanumeric \
+             ([a-zA-Z0-9]); generate one with `openssl rand -hex 32`"
+        );
+    }
+    Ok(())
+}
+
 /// Build a demo MapAdapter with sample arrays for testing.
 fn build_demo_tree() -> MapAdapter {
     let mut mapping = IndexMap::new();
@@ -362,15 +385,11 @@ pub async fn run(command: Command) -> Result<()> {
 
             // Resolve API key: CLI flag > config file > env var.
             let api_key = api_key.or_else(|| file_config.as_ref().and_then(|c| c.api_key()));
-            // Empty string means "auth enabled but expected key is empty" — a
-            // request with `?api_key=` or `Authorization: Apikey ` would then
-            // pass the constant-time compare and silently grant access while
-            // the startup log still claims auth is on. Refuse to start.
-            if api_key.as_deref() == Some("") {
-                anyhow::bail!(
-                    "--api-key (or config single_user_api_key) is empty; \
-                     either omit it for anonymous access or supply a non-empty key"
-                );
+            // Validate an operator-supplied single-user key once, at startup.
+            // The auto-generated key below is hex, so only an operator-provided
+            // key reaches this gate.
+            if let Some(key) = api_key.as_deref() {
+                validate_single_user_api_key(key)?;
             }
 
             // Warn early: explicit 0.0.0.0 bind with no operator-configured auth.
@@ -896,5 +915,39 @@ mod tests {
         let k1 = generate_single_user_key();
         let k2 = generate_single_user_key();
         assert_ne!(k1, k2, "consecutive generated keys must differ");
+    }
+
+    #[test]
+    fn api_key_accepts_alphanumeric() {
+        // A hex key (the canonical `openssl rand -hex 32` / token_hex output)
+        // and a mixed alphanumeric key are both accepted.
+        assert!(validate_single_user_api_key(&generate_single_user_key()).is_ok());
+        assert!(validate_single_user_api_key("abcDEF0123").is_ok());
+    }
+
+    #[test]
+    fn api_key_rejects_empty() {
+        let err = validate_single_user_api_key("").unwrap_err().to_string();
+        assert!(err.contains("empty"), "empty key must be rejected: {err}");
+    }
+
+    #[test]
+    fn api_key_rejects_non_alphanumeric_chars() {
+        // Reserved URL/header bytes and whitespace cannot round-trip through
+        // `?api_key=` / `Authorization: Apikey `; Python rejects them via
+        // `single_user_api_key.isalnum()`.
+        for bad in [
+            "key with space",
+            "key&evil=1",
+            "key\ninject",
+            "kéy",
+            "key-dash",
+        ] {
+            let err = validate_single_user_api_key(bad).unwrap_err().to_string();
+            assert!(
+                err.contains("alphanumeric"),
+                "non-alphanumeric key {bad:?} must be rejected: {err}"
+            );
+        }
     }
 }
