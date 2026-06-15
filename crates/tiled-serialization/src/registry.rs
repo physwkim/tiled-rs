@@ -222,6 +222,19 @@ pub fn resolve_media_type(
         if media_type == "*/*" {
             return default_media_type(family);
         }
+        // Python maps the `image/*` wildcard to image/png for the array family
+        // (core.py:397-398, DEFAULT_MEDIA_TYPES[array]["image/*"]), then checks
+        // whether image/png is actually serviceable: if no image/png serializer
+        // is registered (the `image` feature is off) it falls through to the
+        // next Accept entry rather than committing to a format it cannot
+        // produce. Mirror both halves — map, then verify before returning.
+        if media_type == "image/*" && family == StructureFamily::Array {
+            let png = tiled_core::media_type::mime::PNG;
+            if available.iter().any(|m| m == png) {
+                return Some(png.to_string());
+            }
+            continue;
+        }
         if available.iter().any(|m| m == media_type) {
             return Some(media_type.to_string());
         }
@@ -312,5 +325,64 @@ mod tests {
                 .is_none(),
             "no array serializer for application/zip → router must reject"
         );
+    }
+
+    /// Finding 6: Python maps the `image/*` Accept wildcard to image/png for the
+    /// array family (core.py:397-398). When an image/png serializer is
+    /// registered, `image/*` must resolve to it instead of the octet-stream
+    /// default.
+    #[test]
+    fn image_wildcard_resolves_to_png_for_array_when_registered() {
+        let reg = array_registry();
+        // Register a stand-in image/png serializer. The real one is feature-
+        // gated, but wildcard resolution must not depend on the `image` feature
+        // being compiled into this test — only on a serializer being present.
+        reg.register(
+            StructureFamily::Array,
+            tiled_core::media_type::mime::PNG,
+            Box::new(|_d: &[u8], _m: &serde_json::Value| Ok(bytes::Bytes::new())),
+        );
+        let got = resolve_media_type("image/*", StructureFamily::Array, &reg);
+        assert_eq!(got.as_deref(), Some(tiled_core::media_type::mime::PNG));
+    }
+
+    /// `image/*` with no registered image/png serializer must NOT invent the
+    /// format: it falls through to the next Accept entry (mirroring Python's
+    /// inner `for…else: continue`), and to the array default when alone.
+    #[test]
+    fn image_wildcard_falls_through_when_png_unregistered() {
+        let reg = array_registry(); // octet-stream + CSV, but no image/png
+        // `image/*` alone → array default (octet-stream), not a bogus image/png.
+        let only = resolve_media_type("image/*", StructureFamily::Array, &reg);
+        assert_eq!(
+            only.as_deref(),
+            Some(tiled_core::media_type::mime::OCTET_STREAM)
+        );
+        // `image/*, application/octet-stream` → the second, serviceable entry
+        // wins (faithful Accept-list fallback, not a short-circuit on image/*).
+        let listed = resolve_media_type(
+            "image/*, application/octet-stream",
+            StructureFamily::Array,
+            &reg,
+        );
+        assert_eq!(
+            listed.as_deref(),
+            Some(tiled_core::media_type::mime::OCTET_STREAM)
+        );
+    }
+
+    /// The wildcard rewrite is array-only — Python guards on
+    /// `structure_family == array`, so `image/*` is not special for the table
+    /// family even if an image/png serializer happens to be registered there.
+    #[test]
+    fn image_wildcard_not_special_for_non_array_family() {
+        let reg = SerializationRegistry::new();
+        reg.register(
+            StructureFamily::Table,
+            tiled_core::media_type::mime::PNG,
+            Box::new(|_d: &[u8], _m: &serde_json::Value| Ok(bytes::Bytes::new())),
+        );
+        let got = resolve_media_type("image/*", StructureFamily::Table, &reg);
+        assert_ne!(got.as_deref(), Some(tiled_core::media_type::mime::PNG));
     }
 }
