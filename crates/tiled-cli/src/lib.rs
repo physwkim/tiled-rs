@@ -383,6 +383,17 @@ pub async fn run(command: Command) -> Result<()> {
                     .and_then(|c| c.mongo_uri().map(String::from))
             });
 
+            // Resolve catalog URI: CLI flag > config file. The config source is
+            // the recommended `catalog:` block or a `trees:` entry with a
+            // catalog adapter (cli-M4). Symmetric with mongo_uri above; without
+            // this a valid Python `catalog: {uri: ...}` config never reaches the
+            // catalog and the server bails as if no source were given.
+            let resolved_catalog_uri = catalog_uri.or_else(|| {
+                file_config
+                    .as_ref()
+                    .and_then(|c| c.catalog_uri().map(String::from))
+            });
+
             // Resolve API key: CLI flag > config file > env var.
             let api_key = api_key.or_else(|| file_config.as_ref().and_then(|c| c.api_key()));
             // Validate an operator-supplied single-user key once, at startup.
@@ -420,19 +431,20 @@ pub async fn run(command: Command) -> Result<()> {
             // Open the persistent catalog up-front (before the read tree) so
             // a misconfigured DB fails the start-up rather than the first
             // write request.
-            let catalog_handle: Option<tiled_catalog::Catalog> = match catalog_uri.as_deref() {
-                None => None,
-                Some(uri) => {
-                    tracing::info!("Opening catalog: {}", redact_mongo_uri(uri));
-                    let cat = tiled_catalog::Catalog::connect(uri)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("catalog connect: {e}"))?;
-                    cat.migrate()
-                        .await
-                        .map_err(|e| anyhow::anyhow!("catalog migrate: {e}"))?;
-                    Some(cat)
-                }
-            };
+            let catalog_handle: Option<tiled_catalog::Catalog> =
+                match resolved_catalog_uri.as_deref() {
+                    None => None,
+                    Some(uri) => {
+                        tracing::info!("Opening catalog: {}", redact_mongo_uri(uri));
+                        let cat = tiled_catalog::Catalog::connect(uri)
+                            .await
+                            .map_err(|e| anyhow::anyhow!("catalog connect: {e}"))?;
+                        cat.migrate()
+                            .await
+                            .map_err(|e| anyhow::anyhow!("catalog migrate: {e}"))?;
+                        Some(cat)
+                    }
+                };
 
             let root_tree: Arc<dyn tiled_core::adapters::ContainerAdapter> = if let Some(ref uri) =
                 resolved_mongo_uri

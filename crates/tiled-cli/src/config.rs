@@ -16,6 +16,13 @@ use tiled_auth::ScopeSet;
 pub struct TiledConfig {
     #[serde(default)]
     pub trees: Vec<TreeConfig>,
+    /// Optional `catalog:` block — Python tiled's *recommended* single-catalog
+    /// config form (`config.py:271`). Mutually exclusive with `trees:`
+    /// (Python `reconcile_catalog_and_trees`, `config.py:331`): a config may
+    /// specify the recommended single `catalog:` or the advanced multi-tree
+    /// `trees:`, never both. See [`CatalogConfig`].
+    #[serde(default)]
+    pub catalog: Option<CatalogConfig>,
     #[serde(default)]
     pub authentication: Option<AuthConfig>,
     /// Optional `web:` section. Right now only `spec_views` is read —
@@ -50,6 +57,7 @@ impl Default for TiledConfig {
     fn default() -> Self {
         Self {
             trees: Vec::new(),
+            catalog: None,
             authentication: None,
             web: None,
             access_control: None,
@@ -199,6 +207,21 @@ pub struct AuthConfig {
     pub single_user_api_key: Option<String>,
 }
 
+/// `catalog:` block — Python tiled's recommended config form
+/// (`config.py:60`, `CatalogConfig`). Specifies a single persistent catalog
+/// (SQLite/Postgres) by URI.
+///
+/// Only `uri` is consumed by the Rust server today; Python's additional
+/// fields (`writable_storage`, `readable_storage`, `init_if_not_exists`, …)
+/// are accepted-and-ignored — serde skips unknown keys — so a standard
+/// Python `catalog:` block parses without error.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CatalogConfig {
+    /// SQLite or Postgres URI for the persistent catalog
+    /// (e.g. `sqlite:///path/to/catalog.db`).
+    pub uri: String,
+}
+
 fn default_path() -> String {
     "/".to_string()
 }
@@ -213,13 +236,50 @@ impl TiledConfig {
             std::fs::read_to_string(path).with_context(|| format!("reading config file {path}"))?;
         let config: Self = serde_yaml::from_str(&content)
             .with_context(|| format!("parsing config file {path}"))?;
+        config
+            .reconcile_catalog_and_trees()
+            .with_context(|| format!("in config file {path}"))?;
         Ok(config)
+    }
+
+    /// Enforce Python's `catalog`/`trees` mutual exclusion
+    /// (`config.py:331`, `reconcile_catalog_and_trees`): the recommended
+    /// single `catalog:` block and the advanced multi-tree `trees:` list may
+    /// not both be specified. Validation-only — unlike Python, the Rust
+    /// server keeps the two representations separate and bridges `catalog:`
+    /// into the catalog via [`Self::catalog_uri`].
+    fn reconcile_catalog_and_trees(&self) -> anyhow::Result<()> {
+        if self.catalog.is_some() && !self.trees.is_empty() {
+            anyhow::bail!(
+                "The configuration 'catalog' specifies a single catalog, whereas \
+                 'trees' can specify multiple catalogs. It is not allowed to use \
+                 both 'catalog' and 'trees'."
+            );
+        }
+        Ok(())
     }
 
     /// Extract the MongoDB URI from the first tree that looks like a mongo adapter.
     pub fn mongo_uri(&self) -> Option<&str> {
         self.trees.iter().find_map(|t| {
             if t.adapter.contains("mongo") || t.adapter.contains("Mongo") {
+                t.args.uri.as_deref()
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Extract the persistent-catalog URI: from the recommended `catalog:`
+    /// block, or from a `trees:` entry whose adapter selects the catalog
+    /// (Python `TREE_ALIASES = {"catalog": "tiled.catalog:from_uri"}`,
+    /// `config.py:39`). Symmetric with [`Self::mongo_uri`].
+    pub fn catalog_uri(&self) -> Option<&str> {
+        if let Some(catalog) = &self.catalog {
+            return Some(catalog.uri.as_str());
+        }
+        self.trees.iter().find_map(|t| {
+            if t.adapter.contains("catalog") || t.adapter.contains("Catalog") {
                 t.args.uri.as_deref()
             } else {
                 None
@@ -278,5 +338,50 @@ mod tests {
             rendered.contains(path_str),
             "parse error must name the config path; got: {rendered}"
         );
+    }
+
+    // cli-M4: the recommended `catalog: {uri: ...}` block must resolve to the
+    // catalog URI the server opens — without it a valid Python config never
+    // starts a server.
+    #[test]
+    fn catalog_block_resolves_catalog_uri() {
+        let cfg: TiledConfig =
+            serde_yaml::from_str("catalog:\n  uri: sqlite:///data/catalog.db\n").unwrap();
+        assert_eq!(cfg.catalog_uri(), Some("sqlite:///data/catalog.db"));
+        // A catalog block is not a mongo source.
+        assert_eq!(cfg.mongo_uri(), None);
+    }
+
+    // cli-M4: a `trees:` entry whose adapter selects the catalog
+    // (Python TREE_ALIASES "catalog") also resolves the catalog URI.
+    #[test]
+    fn catalog_adapter_tree_resolves_catalog_uri() {
+        let cfg: TiledConfig =
+            serde_yaml::from_str("trees:\n  - tree: catalog\n    args: {uri: sqlite:///t.db}\n")
+                .unwrap();
+        assert_eq!(cfg.catalog_uri(), Some("sqlite:///t.db"));
+    }
+
+    // cli-M4: `catalog:` and `trees:` are mutually exclusive (Python
+    // reconcile_catalog_and_trees).
+    #[test]
+    fn catalog_and_trees_are_mutually_exclusive() {
+        let cfg: TiledConfig = serde_yaml::from_str(
+            "catalog:\n  uri: sqlite:///c.db\n\
+             trees:\n  - tree: mongo_normalized\n    args: {uri: mongodb://h/db}\n",
+        )
+        .unwrap();
+        let err = cfg.reconcile_catalog_and_trees().unwrap_err();
+        assert!(
+            format!("{err}").contains("not allowed to use both"),
+            "mutual-exclusion error expected; got: {err}"
+        );
+    }
+
+    // cli-M4: a `catalog:`-only config (no `trees:`) passes reconciliation.
+    #[test]
+    fn catalog_only_config_reconciles() {
+        let cfg: TiledConfig = serde_yaml::from_str("catalog:\n  uri: sqlite:///c.db\n").unwrap();
+        assert!(cfg.reconcile_catalog_and_trees().is_ok());
     }
 }
