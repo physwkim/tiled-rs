@@ -161,7 +161,12 @@ async fn login_submit(State(state): State<Arc<WebState>>, Form(form): Form<Login
         Err(e) => return error_login(&format!("auth failed: {e}")),
     };
     db.touch_identity_login(identity.id).await.ok();
-    let scopes = state.default_login_scopes.clone();
+    // Cap the minted scopes by the principal's role, exactly like the API
+    // login path (`mint_session_scopes`, app.rs) and the other four session
+    // mint sites: `for_role(role) ∩ default_login_scopes`. Using the cap
+    // directly would let a broadened `default_login_scopes` hand a low-role
+    // principal more than its role allows (latent privilege escalation).
+    let scopes = ScopeSet::for_role(&principal.role).intersect(&state.default_login_scopes);
     let session_ttl = issuer.refresh_ttl;
     let session = match db
         .create_session(principal.id, scopes.clone(), Utc::now() + session_ttl)

@@ -7,7 +7,7 @@ use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use tower::ServiceExt;
 
-async fn build_test_router() -> (axum::Router, tempfile::TempDir) {
+async fn build_test_router() -> (axum::Router, tempfile::TempDir, tiled_auth::Issuer) {
     let dir = tempfile::tempdir().unwrap();
     let auth_uri = format!("sqlite://{}", dir.path().join("auth.db").display());
     let auth_db = tiled_auth::AuthDb::connect(&auth_uri).await.unwrap();
@@ -20,7 +20,7 @@ async fn build_test_router() -> (axum::Router, tempfile::TempDir) {
 
     let state = tiled_web::WebState {
         auth_db: Some(auth_db),
-        issuer: Some(issuer),
+        issuer: Some(issuer.clone()),
         default_login_scopes: tiled_auth::ScopeSet::full(),
         login_provider: "dummy".into(),
         channel_count_fn: Arc::new(|| 0),
@@ -29,7 +29,21 @@ async fn build_test_router() -> (axum::Router, tempfile::TempDir) {
         spec_views: Vec::new(),
         authenticator: Some(Arc::new(dummy)),
     };
-    (tiled_web::build_router(state), dir)
+    (tiled_web::build_router(state), dir, issuer)
+}
+
+/// Extract the `tiled_session` JWT from a Set-Cookie response header.
+fn session_jwt(resp: &axum::response::Response) -> String {
+    let raw = resp
+        .headers()
+        .get("set-cookie")
+        .expect("set-cookie present")
+        .to_str()
+        .unwrap();
+    raw.strip_prefix("tiled_session=")
+        .and_then(|s| s.split(';').next())
+        .expect("session cookie value")
+        .to_string()
 }
 
 async fn post_login(
@@ -50,7 +64,7 @@ async fn post_login(
 
 #[tokio::test]
 async fn wrong_password_issues_no_session_cookie() {
-    let (app, _dir) = build_test_router().await;
+    let (app, _dir, _issuer) = build_test_router().await;
     let resp = post_login(&app, "dummy", "alice", "wrongpassword").await;
     assert_eq!(
         resp.status(),
@@ -65,7 +79,7 @@ async fn wrong_password_issues_no_session_cookie() {
 
 #[tokio::test]
 async fn correct_password_issues_session_cookie() {
-    let (app, _dir) = build_test_router().await;
+    let (app, _dir, _issuer) = build_test_router().await;
     let resp = post_login(&app, "dummy", "alice", "s3cret").await;
     assert!(
         resp.headers().get("set-cookie").is_some(),
@@ -74,8 +88,31 @@ async fn correct_password_issues_session_cookie() {
 }
 
 #[tokio::test]
+async fn login_caps_session_scopes_to_role() {
+    // alice is a fresh principal → role "user" (no admin scope), while the
+    // server's default_login_scopes is full(). The minted session must be
+    // for_role("user") ∩ full() = for_role("user"), i.e. NOT include Admin.
+    // Before the cap fix the session inherited the uncapped full() and so
+    // carried Scope::Admin — a privilege escalation for a non-admin login.
+    let (app, _dir, issuer) = build_test_router().await;
+    let resp = post_login(&app, "dummy", "alice", "s3cret").await;
+    let jwt = session_jwt(&resp);
+    let claims = issuer.verify_access(&jwt).expect("session JWT verifies");
+    assert!(
+        !claims.scopes.contains(tiled_auth::Scope::Admin),
+        "non-admin login must not be granted Admin scope, got {:?}",
+        claims.scopes,
+    );
+    assert!(
+        claims.scopes.contains(tiled_auth::Scope::ReadData),
+        "role 'user' read scope must survive the cap, got {:?}",
+        claims.scopes,
+    );
+}
+
+#[tokio::test]
 async fn unknown_user_issues_no_session_cookie() {
-    let (app, _dir) = build_test_router().await;
+    let (app, _dir, _issuer) = build_test_router().await;
     let resp = post_login(&app, "dummy", "nobody", "anything").await;
     assert_eq!(
         resp.status(),
