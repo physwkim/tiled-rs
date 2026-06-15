@@ -112,19 +112,25 @@ impl ArrayAdapterRead for ZarrAdapter {
     }
 
     fn read<'a>(&'a self, slice: &'a NDSlice) -> BoxFuture<'a, Result<DynNDArray>> {
+        // `retrieve_array_subset` does blocking store I/O + decode; offload it
+        // to the blocking pool so it never stalls an async worker thread (S7,
+        // matching the HDF5/Sequence adapters).
+        let array = self.array.clone();
+        let dtype = self.dtype.clone();
+        let shape = self.structure.shape.clone();
+        let slice = slice.clone();
         Box::pin(async move {
-            let subset_shape: Vec<u64> = self.structure.shape.iter().map(|&d| d as u64).collect();
-            let subset = ArraySubset::new_with_shape(subset_shape);
-            let bytes = self
-                .array
-                .retrieve_array_subset(&subset)
-                .map_err(|e| TiledError::Internal(format!("zarr retrieve: {e}")))?;
-            let full = DynNDArray::new(
-                bytes_from_array_bytes(bytes)?,
-                self.dtype.clone(),
-                self.structure.shape.clone(),
-            );
-            full.apply_slice(slice)
+            tokio::task::spawn_blocking(move || {
+                let subset_shape: Vec<u64> = shape.iter().map(|&d| d as u64).collect();
+                let subset = ArraySubset::new_with_shape(subset_shape);
+                let bytes = array
+                    .retrieve_array_subset(&subset)
+                    .map_err(|e| TiledError::Internal(format!("zarr retrieve: {e}")))?;
+                let full = DynNDArray::new(bytes_from_array_bytes(bytes)?, dtype, shape);
+                full.apply_slice(&slice)
+            })
+            .await
+            .map_err(|e| TiledError::Internal(format!("zarr spawn: {e}")))?
         })
     }
 
@@ -133,20 +139,25 @@ impl ArrayAdapterRead for ZarrAdapter {
         block: &'a [usize],
         slice: &'a NDSlice,
     ) -> BoxFuture<'a, Result<DynNDArray>> {
+        // Compute the subset (pure arithmetic) up front, then offload the
+        // blocking store I/O + decode to the blocking pool (S7).
+        let array = self.array.clone();
+        let dtype = self.dtype.clone();
+        let slice = slice.clone();
+        let subset = self.array_subset_for_block(block);
         Box::pin(async move {
-            let subset = self.array_subset_for_block(block)?;
-            let block_shape: Vec<usize> = subset.shape().iter().map(|&d| d as usize).collect();
-            let bytes = self
-                .array
-                .retrieve_array_subset(&subset)
-                .map_err(|e| TiledError::Internal(format!("zarr retrieve: {e}")))?;
-            // Sub-slice within the block (Python zarr.py:114-117).
-            DynNDArray::new(
-                bytes_from_array_bytes(bytes)?,
-                self.dtype.clone(),
-                block_shape,
-            )
-            .apply_slice(slice)
+            let subset = subset?;
+            tokio::task::spawn_blocking(move || {
+                let block_shape: Vec<usize> = subset.shape().iter().map(|&d| d as usize).collect();
+                let bytes = array
+                    .retrieve_array_subset(&subset)
+                    .map_err(|e| TiledError::Internal(format!("zarr retrieve: {e}")))?;
+                // Sub-slice within the block (Python zarr.py:114-117).
+                DynNDArray::new(bytes_from_array_bytes(bytes)?, dtype, block_shape)
+                    .apply_slice(&slice)
+            })
+            .await
+            .map_err(|e| TiledError::Internal(format!("zarr spawn: {e}")))?
         })
     }
 }
@@ -260,6 +271,42 @@ mod tests {
             .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
             .collect();
         assert_eq!(floats, vec![10.0, 11.0]);
+    }
+
+    #[tokio::test]
+    async fn read_full_applies_slice_offloaded() {
+        // `read` now runs its blocking store I/O on the blocking pool; this
+        // guards that the offload preserves correctness across all chunks +
+        // the within-array slice (S7 regression).
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(FilesystemStore::new(dir.path()).unwrap());
+        let array = ArrayBuilder::new(
+            vec![4, 4],
+            DataType::Float64,
+            vec![nz(2), nz(2)].into(),
+            FillValue::from(0.0_f64),
+        )
+        .build(store, "/data")
+        .unwrap();
+        array.store_metadata().unwrap();
+        let elements: Vec<f64> = (0..16).map(|i| i as f64).collect();
+        array
+            .store_array_subset_elements(&ArraySubset::new_with_shape(vec![4, 4]), &elements)
+            .unwrap();
+
+        let adapter =
+            ZarrAdapter::from_path(dir.path().to_path_buf(), "/data", serde_json::json!({}))
+                .unwrap();
+        // Full read with slice "1,:" → row 1 of the whole 4x4 = [4,5,6,7].
+        let slice = NDSlice::from_numpy_str("1,:").unwrap();
+        let result = adapter.read(&slice).await.unwrap();
+        assert_eq!(result.shape, vec![4]);
+        let floats: Vec<f64> = result
+            .data
+            .chunks_exact(8)
+            .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(floats, vec![4.0, 5.0, 6.0, 7.0]);
     }
 
     #[tokio::test]
