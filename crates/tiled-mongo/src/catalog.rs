@@ -182,10 +182,146 @@ fn matches_run_query(adapter: &AnyAdapter, query: &Query) -> bool {
             s.include.iter().all(|n| names.contains(n.as_str()))
                 && !s.exclude.iter().any(|n| names.contains(n.as_str()))
         }
-        // Other variants (Like/Regex/Lookup/KeysFilter/AccessBlobFilter):
-        // not implemented for the catalog scan (would need MongoDB-side
-        // query translation). Keep results unchanged rather than silently
-        // dropping all runs.
-        _ => true,
+        // Unimplemented variants (Like, Regex, Lookup, KeysFilter,
+        // AccessBlobFilter) cannot be evaluated in-memory here — there is no
+        // separate MongoDB or SQL path that pre-filters them before this
+        // function is called (unlike tiled-catalog where Lookup/KeysFilter are
+        // resolved by SQL before the in-memory pass). Return false so that an
+        // unsupported query variant excludes all runs rather than leaking the
+        // whole catalog to the caller. Upstream tiled raises
+        // UnsupportedQueryType (HTTP 400); false is the safe in-process
+        // equivalent.
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use serde_json::json;
+    use tiled_core::adapters::{AnyAdapter, BaseAdapter, ContainerAdapter};
+    use tiled_core::queries::{KeyLookup, KeysFilter, Like, Query, Regex};
+    use tiled_core::structures::{ContainerStructure, Spec, StructureFamily};
+
+    use super::matches_run_query;
+
+    struct StubRun {
+        metadata: serde_json::Value,
+    }
+
+    impl BaseAdapter for StubRun {
+        fn structure_family(&self) -> StructureFamily {
+            StructureFamily::Container
+        }
+        fn metadata(&self) -> &serde_json::Value {
+            &self.metadata
+        }
+        fn specs(&self) -> &[Spec] {
+            &[]
+        }
+    }
+
+    impl ContainerAdapter for StubRun {
+        fn structure(&self) -> &ContainerStructure {
+            static S: ContainerStructure = ContainerStructure { keys: vec![] };
+            &S
+        }
+        fn get(&self, _key: &str) -> Option<&AnyAdapter> {
+            None
+        }
+        fn keys(&self) -> Vec<String> {
+            vec![]
+        }
+        fn len(&self) -> usize {
+            0
+        }
+    }
+
+    fn run(meta: serde_json::Value) -> AnyAdapter {
+        AnyAdapter::Container(Arc::new(StubRun { metadata: meta }))
+    }
+
+    // Unimplemented variants must return false (fail-closed), not true.
+    // Returning true would silently leak the whole catalog when a client
+    // issues a query variant this in-memory path cannot evaluate.
+
+    #[test]
+    fn like_returns_false_not_true() {
+        // metadata has plan_name matching the pattern, so Like WOULD match if
+        // implemented.  A `_ => true` arm would pass this run through anyway;
+        // fail-closed returns false.
+        let a = run(json!({"start": {"plan_name": "scan"}}));
+        let q = Query::Like(Like {
+            key: "plan_name".into(),
+            pattern: "scan".into(),
+        });
+        assert!(
+            !matches_run_query(&a, &q),
+            "Like must return false (unimplemented), not silently pass"
+        );
+    }
+
+    #[test]
+    fn regex_returns_false_not_true() {
+        let a = run(json!({"start": {"plan_name": "scan"}}));
+        let q = Query::Regex(Regex {
+            key: "plan_name".into(),
+            pattern: "scan".into(),
+            case_sensitive: true,
+        });
+        assert!(
+            !matches_run_query(&a, &q),
+            "Regex must return false (unimplemented), not silently pass"
+        );
+    }
+
+    #[test]
+    fn lookup_returns_false_not_true() {
+        // Lookup is key-based.  In tiled-mongo there is no SQL pre-filter
+        // path that resolves keys before this function — unlike tiled-catalog
+        // where Lookup passes through because SQL already handled it.
+        let a = run(json!({}));
+        let q = Query::Lookup(KeyLookup {
+            key: "any_uid".into(),
+        });
+        assert!(
+            !matches_run_query(&a, &q),
+            "Lookup must return false in tiled-mongo (no pre-filter path)"
+        );
+    }
+
+    #[test]
+    fn keys_filter_returns_false_not_true() {
+        let a = run(json!({}));
+        let q = Query::KeysFilter(KeysFilter {
+            keys: vec!["k".into()],
+        });
+        assert!(
+            !matches_run_query(&a, &q),
+            "KeysFilter must return false in tiled-mongo (no pre-filter path)"
+        );
+    }
+
+    // Implemented variants must continue to work correctly.
+
+    #[test]
+    fn eq_on_start_field_matches() {
+        let a = run(json!({"start": {"plan_name": "scan"}}));
+        let q = Query::Eq(tiled_core::queries::Eq {
+            key: "plan_name".into(),
+            value: json!("scan"),
+        });
+        assert!(matches_run_query(&a, &q));
+    }
+
+    #[test]
+    fn eq_on_start_field_does_not_match_wrong_value() {
+        let a = run(json!({"start": {"plan_name": "scan"}}));
+        let q = Query::Eq(tiled_core::queries::Eq {
+            key: "plan_name".into(),
+            value: json!("count"),
+        });
+        assert!(!matches_run_query(&a, &q));
     }
 }
