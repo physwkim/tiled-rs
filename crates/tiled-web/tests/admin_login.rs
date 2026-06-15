@@ -88,6 +88,38 @@ async fn correct_password_issues_session_cookie() {
 }
 
 #[tokio::test]
+async fn streaming_page_requires_metrics_scope() {
+    // alice (role "user") has no `metrics` scope even with default_login_scopes
+    // = full() (the login cap drops it). /admin/streaming exposes server-global
+    // channel counts, so it must refuse rather than leak them to her.
+    let (app, _dir, _issuer) = build_test_router().await;
+    let login = post_login(&app, "dummy", "alice", "s3cret").await;
+    let cookie = login
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/admin/streaming")
+        .header("cookie", cookie)
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let html = String::from_utf8_lossy(&body);
+    assert!(
+        html.contains("missing scope: metrics"),
+        "streaming page must gate on the metrics scope for a non-metrics principal; body: {html}"
+    );
+}
+
+#[tokio::test]
 async fn login_caps_session_scopes_to_role() {
     // alice is a fresh principal → role "user" (no admin scope), while the
     // server's default_login_scopes is full(). The minted session must be

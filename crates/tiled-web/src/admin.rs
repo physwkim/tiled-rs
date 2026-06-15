@@ -537,10 +537,22 @@ async fn list_sessions_for_principal(db: &AuthDb, principal_id: i64) -> Vec<Sess
 // ---------------------------------------------------------------------------
 
 async fn streaming_page(State(state): State<Arc<WebState>>, headers: HeaderMap) -> Response {
-    let _session = match resolve_session(&state, &headers).await {
+    let session = match resolve_session(&state, &headers).await {
         Ok(s) => s,
         Err(redir) => return redir,
     };
+    // Unlike the api-keys/sessions pages (which only ever show the caller's
+    // OWN keys/sessions), this page exposes server-global state — the live
+    // count of every streaming channel. Gate it on the `metrics` scope so a
+    // low-privilege principal can't read infra internals; the other admin
+    // pages need no such gate because their data is already principal-scoped.
+    if !session.scopes.contains(Scope::Metrics) {
+        return render(StreamingTemplate {
+            title: "streaming",
+            message: Some("missing scope: metrics".into()),
+            total_channels: 0,
+        });
+    }
     let total = (state.channel_count_fn)();
     render(StreamingTemplate {
         title: "streaming",
