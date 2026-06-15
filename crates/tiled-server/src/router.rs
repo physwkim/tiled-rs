@@ -353,6 +353,12 @@ pub async fn search(
         .and_then(|(_, v)| v.parse().ok())
         .unwrap_or(links::DEFAULT_PAGE_SIZE)
         .min(links::MAX_PAGE_SIZE);
+    // Keyset cursor (a node id) the client got from a previous `next` link.
+    // Present ⇒ serve the page after it instead of the offset window.
+    let cursor: Option<i64> = params
+        .iter()
+        .find(|(k, _)| k == "page[cursor]")
+        .and_then(|(_, v)| v.parse().ok());
 
     // Parse `sort` before consuming `params`: comma-separated keys, leading
     // `-` descending. Threaded into the catalog ORDER BY below.
@@ -413,6 +419,7 @@ pub async fn search(
         container,
         &logical_path,
         &base_url,
+        cursor,
         offset,
         limit,
         &queries,

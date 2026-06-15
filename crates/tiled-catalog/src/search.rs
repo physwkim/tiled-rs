@@ -657,7 +657,202 @@ fn value_to_bind(v: &Value) -> Bind {
     Bind::Text(render_value_as_text(v))
 }
 
+/// Translate every `Query` filter into `WhereBuilder` pieces. Shared by the
+/// offset ([`Catalog::search_children`]) and keyset
+/// ([`Catalog::search_children_cursor`]) paths so both apply an identical
+/// WHERE clause.
+fn apply_queries(builder: &mut WhereBuilder, queries: &[Query]) {
+    for q in queries {
+        match q {
+            Query::Eq(eq) => builder.push_eq(&eq.key, &eq.value),
+            Query::NotEq(neq) => builder.push_neq(&neq.key, &neq.value),
+            Query::KeyPresent(kp) => builder.push_key_present(&kp.key, kp.exists),
+            Query::FullText(ft) => builder.push_full_text(&ft.text),
+            Query::StructureFamily(sf) => {
+                let s = match sf.value {
+                    tiled_core::structures::StructureFamily::Container => "container",
+                    tiled_core::structures::StructureFamily::Array => "array",
+                    tiled_core::structures::StructureFamily::Table => "table",
+                    tiled_core::structures::StructureFamily::Sparse => "sparse",
+                    tiled_core::structures::StructureFamily::Awkward => "awkward",
+                    tiled_core::structures::StructureFamily::Ragged => "ragged",
+                };
+                builder.push_structure_family(s);
+            }
+            Query::KeysFilter(kf) => builder.push_keys_filter(&kf.keys),
+            Query::Lookup(l) => {
+                builder.push_keys_filter(std::slice::from_ref(&l.key));
+            }
+            Query::Comparison(c) => builder.push_comparison(&c.key, c.operator, &c.value),
+            // Variants we don't push down still influence ranking, but
+            // we leave them as no-ops here (see header doc).
+            Query::In(in_q) => builder.push_in(&in_q.key, &in_q.value),
+            Query::NotIn(nin) => builder.push_not_in(&nin.key, &nin.value),
+            Query::Contains(c) => builder.push_contains(&c.key, &c.value),
+            Query::Like(l) => builder.push_like(&l.key, &l.pattern),
+            Query::Regex(r) => builder.push_regex(&r.key, &r.pattern, r.case_sensitive),
+            Query::Specs(s) => builder.push_specs(&s.include, &s.exclude),
+            Query::AccessBlobFilter(f) => builder.push_access_blob_filter(f),
+        }
+    }
+}
+
+/// Whether the trailing `id` tiebreaker (and therefore the keyset cursor
+/// direction) is descending for this sort. Mirrors `Dialect::order_by`: the
+/// empty-key sentinel carries the default direction.
+fn default_sort_descending(sorting: &[(String, SortDirection)]) -> bool {
+    sorting
+        .iter()
+        .rfind(|(k, _)| k.is_empty())
+        .map(|(_, d)| matches!(d, SortDirection::Descending))
+        .unwrap_or(false)
+}
+
 impl Catalog {
+    /// Keyset (cursor) page of children of `parent_id`, valid for the default
+    /// sort order only. Returns the page rows, the total match count, and the
+    /// cursor (the last row's id) for the next page when more rows remain.
+    ///
+    /// Mirrors Python `CatalogContainerAdapter.keys_page`/`items_page` +
+    /// `_apply_cursor_pagination` (catalog/adapter.py:1341-1412): order by the
+    /// strictly-monotonic `id` (ASC or DESC), filter `id > cursor` (ASC) /
+    /// `id < cursor` (DESC), and fetch one extra row to detect whether a
+    /// following page exists. The count is the full filtered match count (for
+    /// the response `meta`), independent of the page window.
+    pub async fn search_children_cursor(
+        &self,
+        parent_id: Option<i64>,
+        queries: &[Query],
+        sorting: &[(String, SortDirection)],
+        cursor: Option<i64>,
+        limit: i64,
+    ) -> Result<(Vec<Node>, i64, Option<i64>)> {
+        let dialect = Dialect::for_pool(self.pool());
+        let mut builder = WhereBuilder::new(dialect);
+        apply_queries(&mut builder, queries);
+        let (where_clause, bindings) = builder.finish();
+        let order_by = dialect.order_by(sorting);
+        let cursor_op = if default_sort_descending(sorting) {
+            "<"
+        } else {
+            ">"
+        };
+        // Fetch one extra row to detect whether a following page exists
+        // (Python `_apply_cursor_pagination` uses `limit + 1`). A non-positive
+        // limit asks for an empty page; clamp the fetch to >= 0.
+        let fetch = limit.max(0).saturating_add(1);
+
+        let parent_present = parent_id.is_some();
+        let cursor_present = cursor.is_some();
+        let n = bindings.len();
+
+        match self.pool() {
+            DbPool::Sqlite(pool) => {
+                let parent_clause = if parent_present {
+                    "parent_id = ?"
+                } else {
+                    "parent_id IS NULL"
+                };
+                // Count of all matching rows (no cursor/limit) for `meta`.
+                let count_sql =
+                    format!("SELECT COUNT(*) FROM nodes WHERE {parent_clause} AND {where_clause}");
+                let mut count_q = sqlx::query_scalar::<_, i64>(&count_sql);
+                if parent_present {
+                    count_q = count_q.bind(parent_id);
+                }
+                count_q = bind_all_sqlite(count_q, &bindings);
+                let total: i64 = count_q.fetch_one(pool).await?;
+
+                // Keyset window: parent + filters + (optional) `id <op> cursor`.
+                let cursor_clause = if cursor_present {
+                    format!(" AND id {cursor_op} ?")
+                } else {
+                    String::new()
+                };
+                let select_sql = format!(
+                    "SELECT id, key, parent_id, ancestors, structure_family, metadata,
+                            specs, access_blob, time_created, time_updated
+                       FROM nodes WHERE {parent_clause} AND {where_clause}{cursor_clause}
+                       ORDER BY {order_by} LIMIT ?"
+                );
+                let mut q = sqlx::query(&select_sql);
+                if parent_present {
+                    q = q.bind(parent_id);
+                }
+                for b in &bindings {
+                    q = match b {
+                        Bind::Text(s) => q.bind(s.clone()),
+                        Bind::Int(i) => q.bind(*i),
+                        Bind::Real(f) => q.bind(*f),
+                    };
+                }
+                if cursor_present {
+                    q = q.bind(cursor);
+                }
+                let rows = q.bind(fetch).fetch_all(pool).await?;
+                let mut nodes: Vec<Node> = rows
+                    .iter()
+                    .map(node_from_sqlite_row)
+                    .collect::<Result<_>>()?;
+                let next_cursor = trim_to_page(&mut nodes, limit);
+                Ok((nodes, total, next_cursor))
+            }
+            DbPool::Postgres(pool) => {
+                // Placeholder numbering: WHERE binds $1..$N, then parent_id,
+                // then cursor, then limit — matching the bind order below.
+                let parent_clause = if parent_present {
+                    format!("parent_id = ${}", n + 1)
+                } else {
+                    "parent_id IS NULL".to_string()
+                };
+                let count_sql =
+                    format!("SELECT COUNT(*) FROM nodes WHERE {parent_clause} AND {where_clause}");
+                let mut count_q = sqlx::query_scalar::<_, i64>(&count_sql);
+                count_q = bind_all_postgres(count_q, &bindings);
+                if parent_present {
+                    count_q = count_q.bind(parent_id);
+                }
+                let total: i64 = count_q.fetch_one(pool).await?;
+
+                let np = n + if parent_present { 1 } else { 0 };
+                let cursor_clause = if cursor_present {
+                    format!(" AND id {cursor_op} ${}", np + 1)
+                } else {
+                    String::new()
+                };
+                let nc = np + if cursor_present { 1 } else { 0 };
+                let limit_p = format!("${}", nc + 1);
+                let select_sql = format!(
+                    "SELECT id, key, parent_id, ancestors, structure_family, metadata,
+                            specs, access_blob, time_created, time_updated
+                       FROM nodes WHERE {parent_clause} AND {where_clause}{cursor_clause}
+                       ORDER BY {order_by} LIMIT {limit_p}"
+                );
+                let mut q = sqlx::query(&select_sql);
+                for b in &bindings {
+                    q = match b {
+                        Bind::Text(s) => q.bind(s.clone()),
+                        Bind::Int(i) => q.bind(*i),
+                        Bind::Real(f) => q.bind(*f),
+                    };
+                }
+                if parent_present {
+                    q = q.bind(parent_id);
+                }
+                if cursor_present {
+                    q = q.bind(cursor);
+                }
+                let rows = q.bind(fetch).fetch_all(pool).await?;
+                let mut nodes: Vec<Node> = rows
+                    .iter()
+                    .map(node_from_postgres_row)
+                    .collect::<Result<_>>()?;
+                let next_cursor = trim_to_page(&mut nodes, limit);
+                Ok((nodes, total, next_cursor))
+            }
+        }
+    }
+
     /// Search children of `parent_id` (`None` for root) matching all
     /// queries, returning at most `limit` rows beginning at `offset` along
     /// with the total match count.
@@ -671,39 +866,7 @@ impl Catalog {
     ) -> Result<(Vec<Node>, i64)> {
         let dialect = Dialect::for_pool(self.pool());
         let mut builder = WhereBuilder::new(dialect);
-        for q in queries {
-            match q {
-                Query::Eq(eq) => builder.push_eq(&eq.key, &eq.value),
-                Query::NotEq(neq) => builder.push_neq(&neq.key, &neq.value),
-                Query::KeyPresent(kp) => builder.push_key_present(&kp.key, kp.exists),
-                Query::FullText(ft) => builder.push_full_text(&ft.text),
-                Query::StructureFamily(sf) => {
-                    let s = match sf.value {
-                        tiled_core::structures::StructureFamily::Container => "container",
-                        tiled_core::structures::StructureFamily::Array => "array",
-                        tiled_core::structures::StructureFamily::Table => "table",
-                        tiled_core::structures::StructureFamily::Sparse => "sparse",
-                        tiled_core::structures::StructureFamily::Awkward => "awkward",
-                        tiled_core::structures::StructureFamily::Ragged => "ragged",
-                    };
-                    builder.push_structure_family(s);
-                }
-                Query::KeysFilter(kf) => builder.push_keys_filter(&kf.keys),
-                Query::Lookup(l) => {
-                    builder.push_keys_filter(std::slice::from_ref(&l.key));
-                }
-                Query::Comparison(c) => builder.push_comparison(&c.key, c.operator, &c.value),
-                // Variants we don't push down still influence ranking, but
-                // we leave them as no-ops here (see header doc).
-                Query::In(in_q) => builder.push_in(&in_q.key, &in_q.value),
-                Query::NotIn(nin) => builder.push_not_in(&nin.key, &nin.value),
-                Query::Contains(c) => builder.push_contains(&c.key, &c.value),
-                Query::Like(l) => builder.push_like(&l.key, &l.pattern),
-                Query::Regex(r) => builder.push_regex(&r.key, &r.pattern, r.case_sensitive),
-                Query::Specs(s) => builder.push_specs(&s.include, &s.exclude),
-                Query::AccessBlobFilter(f) => builder.push_access_blob_filter(f),
-            }
-        }
+        apply_queries(&mut builder, queries);
         let (where_clause, bindings) = builder.finish();
         // ORDER BY is parameter-free (sanitized keys + literal direction), so
         // it does not affect the LIMIT/OFFSET placeholder numbering below.
@@ -830,6 +993,24 @@ fn bind_all_postgres<'q>(
         };
     }
     q
+}
+
+/// Trim a keyset fetch (which pulled `limit + 1` rows to peek ahead) down to
+/// the page size, returning the next-page cursor — the last kept row's id —
+/// when an extra row was present (mirrors Python popping the extra row and
+/// taking `rows[-1].id`). A non-positive `limit` yields an empty page.
+fn trim_to_page(nodes: &mut Vec<Node>, limit: i64) -> Option<i64> {
+    if limit <= 0 {
+        nodes.clear();
+        return None;
+    }
+    let limit = limit as usize;
+    if nodes.len() > limit {
+        nodes.truncate(limit);
+        nodes.last().map(|n| n.id)
+    } else {
+        None
+    }
 }
 
 fn node_from_sqlite_row(row: &sqlx::sqlite::SqliteRow) -> Result<Node> {

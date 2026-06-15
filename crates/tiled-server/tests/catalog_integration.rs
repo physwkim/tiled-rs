@@ -537,6 +537,125 @@ async fn search_pushes_filters_to_sql() {
     assert_eq!(ids, vec!["b", "c"]);
 }
 
+/// N3: real keyset cursor pagination. Under the default sort the catalog's
+/// `search_page` hands back `next_cursor` = the last row's id, and the server
+/// emits a `page[cursor]` `next` link. Following that link end-to-end must walk
+/// the whole result set exactly once (no gaps, no overlap), report the full
+/// match total in `meta.count` on *every* page, and stop (`next` absent) on the
+/// last page. Mirrors Python `keys_page`/`_apply_cursor_pagination`.
+#[tokio::test]
+async fn search_cursor_pagination_walks_keyset() {
+    let (app, _dir) = build_test_app().await;
+
+    // Seed five containers in insertion order a..e (default sort = id ASC).
+    for key in ["a", "b", "c", "d", "e"] {
+        let body = serde_json::json!({
+            "key": key,
+            "structure_family": "container",
+            "metadata": {},
+            "specs": [],
+            "data_sources": [],
+        });
+        let (status, _) = json_request(&app, Method::POST, "/api/v1/register/", body).await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+
+    // Strip the absolute base so the `next` link can be re-issued against the
+    // in-process router (which routes on the path + query only).
+    let to_relative = |link: &str| link.replace("http://localhost:8000", "");
+
+    // Page 1: an offset request with limit=2. The first window [a, b] comes
+    // back, `meta.count` is the full total (5, not the page size), and `next`
+    // is a keyset cursor link — NOT page[offset].
+    let (status, body) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/search/?page[limit]=2",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "page 1: {body}");
+    assert_eq!(body["meta"]["count"], 5);
+    let ids: Vec<&str> = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["a", "b"]);
+    let next = body["links"]["next"].as_str().expect("page 1 has next");
+    assert!(
+        next.contains("page[cursor]="),
+        "page 1 next is keyset: {next}"
+    );
+
+    // Walk every following page by chasing `next` until it is absent. Collect
+    // the visited ids to assert full, non-overlapping coverage.
+    let mut visited: Vec<String> = ids.iter().map(|s| s.to_string()).collect();
+    let mut next_uri = to_relative(next);
+    let mut pages = 1;
+    loop {
+        let (status, body) =
+            json_request(&app, Method::GET, &next_uri, serde_json::Value::Null).await;
+        assert_eq!(status, StatusCode::OK, "cursor page: {body}");
+        pages += 1;
+        // A cursor request must echo the cursor in `self` and omit last/prev
+        // (a keyset page is forward-only).
+        let self_link = body["links"]["self"].as_str().unwrap();
+        assert!(
+            self_link.contains("page[cursor]="),
+            "self is keyset: {self_link}"
+        );
+        assert!(body["links"]["last"].is_null(), "cursor page has no last");
+        assert!(body["links"]["prev"].is_null(), "cursor page has no prev");
+        // The total is the full match count on every page, not the page size.
+        assert_eq!(body["meta"]["count"], 5);
+        for r in body["data"].as_array().unwrap() {
+            visited.push(r["id"].as_str().unwrap().to_string());
+        }
+        match body["links"]["next"].as_str() {
+            Some(link) => next_uri = to_relative(link),
+            None => break,
+        }
+    }
+
+    // 5 rows at 2 per page → pages 1,2,3 (last holds the single row `e`).
+    assert_eq!(pages, 3, "three pages walked");
+    assert_eq!(
+        visited,
+        vec!["a", "b", "c", "d", "e"],
+        "keyset covers all rows once, in order"
+    );
+}
+
+/// N3: keyset cursors are valid only under the default sort (the id tiebreaker
+/// is what makes them stable). A `page[cursor]` combined with an explicit
+/// `sort` must be rejected with HTTP 400 — mirrors Python, which only mints
+/// cursors for the default ordering.
+#[tokio::test]
+async fn search_cursor_with_non_default_sort_returns_400() {
+    let (app, _dir) = build_test_app().await;
+    for key in ["a", "b"] {
+        let body = serde_json::json!({
+            "key": key,
+            "structure_family": "container",
+            "metadata": {"plan_name": key},
+            "specs": [],
+            "data_sources": [],
+        });
+        let (status, _) = json_request(&app, Method::POST, "/api/v1/register/", body).await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+
+    let (status, _) = empty_request(
+        &app,
+        Method::GET,
+        "/api/v1/search/?page[cursor]=1&page[limit]=2&sort=plan_name",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
 /// catalog-M4 Commit 2: searching a NESTED container resolves the parent via
 /// the async tree walk (one `CatalogAdapter` per hop) and runs `search_page`
 /// against that child's `node_id`. The old direct-SQL branch resolved the

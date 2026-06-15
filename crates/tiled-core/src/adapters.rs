@@ -166,6 +166,22 @@ pub struct SearchEntry {
     pub access_blob: Option<serde_json::Value>,
 }
 
+/// One page of search results plus the totals a listing response needs.
+///
+/// `next_cursor` is the keyset cursor (a catalog node id) for the page that
+/// follows this one. It is set **only** by adapters that do keyset pagination
+/// (the SQL catalog, default sort) and only when more rows remain; `None`
+/// means "no cursor available", so the server falls back to an offset `next`
+/// link. In-memory / Mongo trees page by offset and always leave it `None`.
+/// Mirrors the `(items, next_cursor)` pair Python's `keys_page`/`items_page`
+/// return (tiled/catalog/adapter.py).
+#[derive(Debug, Clone)]
+pub struct SearchPage {
+    pub entries: Vec<SearchEntry>,
+    pub total: usize,
+    pub next_cursor: Option<i64>,
+}
+
 /// A container node: a directory-like level whose children are looked up by
 /// key. Every method is async because the only non-trivial implementors are
 /// IO-backed (the SQL catalog awaits sqlx; the Mongo adapters offload the
@@ -207,28 +223,40 @@ pub trait ContainerAdapter: BaseAdapter {
         Box::pin(async move { self.keys().await })
     }
 
-    /// Paginated search: return the `[offset, offset+limit)` window of
-    /// children matching `queries` (sorted by `sorting`) as [`SearchEntry`]
-    /// rows, plus the **total** match count (not the page size). This is the
-    /// single listing primitive the server's search endpoint drives — both
-    /// the catalog and in-memory trees flow through it, so there is no
-    /// separate "direct SQL" path.
+    /// Paginated search: return a page of children matching `queries` (sorted
+    /// by `sorting`) as [`SearchEntry`] rows, plus the **total** match count
+    /// and the keyset cursor for the next page. This is the single listing
+    /// primitive the server's search endpoint drives — both the catalog and
+    /// in-memory trees flow through it, so there is no separate "direct SQL"
+    /// path.
+    ///
+    /// Pagination is selected by the caller: a `cursor` of `Some(_)` requests
+    /// the keyset page *after* that cursor; `None` requests the
+    /// `[offset, offset+limit)` window. The returned
+    /// [`SearchPage::next_cursor`] is `Some` only when the adapter did keyset
+    /// pagination (SQL catalog, default sort) and more rows remain; the server
+    /// uses it to emit a `page[cursor]` next link, falling back to a
+    /// `page[offset]` link when it is `None`. Mirrors Python
+    /// `keys_page`/`items_page`/`keys_range` (tiled/catalog/adapter.py).
     ///
     /// The default impl is the in-memory one: it runs [`search`](Self::search)
     /// (which enforces the adapter's query-support matrix → HTTP 400 on an
-    /// unevaluable variant), pages the matched keys, and builds each row from
-    /// the child adapter. `sorting` is ignored here — an in-memory tree
-    /// preserves insertion order. The SQL catalog overrides this to push
-    /// filter + sort + LIMIT/OFFSET down to the database and to carry each
+    /// unevaluable variant), pages the matched keys by offset, and builds each
+    /// row from the child adapter. `sorting` and `cursor` are ignored — an
+    /// in-memory tree preserves insertion order and cannot keyset-page, so it
+    /// always returns `next_cursor: None` (matching Python's offset slice for
+    /// trees without `keys_page`). The SQL catalog overrides this to push
+    /// filter + sort + keyset/OFFSET down to the database and to carry each
     /// node's `access_blob` and `data_source` structure without resolving the
     /// leaf adapter.
     fn search_page<'a>(
         &'a self,
         queries: &'a [crate::queries::Query],
         _sorting: &'a [(String, SortDirection)],
+        _cursor: Option<i64>,
         offset: usize,
         limit: usize,
-    ) -> BoxFuture<'a, Result<(Vec<SearchEntry>, usize)>> {
+    ) -> BoxFuture<'a, Result<SearchPage>> {
         Box::pin(async move {
             let matched = self.search(queries).await?;
             let total = matched.len();
@@ -250,7 +278,11 @@ pub trait ContainerAdapter: BaseAdapter {
                     access_blob: None,
                 });
             }
-            Ok((entries, total))
+            Ok(SearchPage {
+                entries,
+                total,
+                next_cursor: None,
+            })
         })
     }
 }

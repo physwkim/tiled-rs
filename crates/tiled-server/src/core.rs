@@ -156,22 +156,29 @@ pub async fn construct_root_resource(
 ///
 /// The single listing path for both catalog (SQL pushdown) and in-memory
 /// trees: the adapter's [`search_page`](ContainerAdapter::search_page) applies
-/// the filters, sort and `[offset, offset+limit)` window and returns the page
-/// of [`SearchEntry`] rows plus the **total** match count. An unsupported
-/// query variant surfaces as `ServerError::UnsupportedQuery` (HTTP 400),
-/// matching Python tiled's `UnsupportedQueryType`.
+/// the filters and sort and returns the page of rows plus the **total** match
+/// count and the next-page keyset cursor. A `cursor` of `Some(_)` requests the
+/// keyset page after it; `None` requests the `[offset, offset+limit)` window.
+/// The returned `next_cursor` (set by the SQL catalog under a default sort)
+/// drives a `page[cursor]` next link, falling back to `page[offset]` when
+/// absent — matching Python's cursor pagination. An unsupported query variant
+/// surfaces as `ServerError::UnsupportedQuery` (HTTP 400), matching Python
+/// tiled's `UnsupportedQueryType`.
+#[allow(clippy::too_many_arguments)]
 pub async fn construct_entries_response(
     container: &dyn ContainerAdapter,
     path: &str,
     base_url: &str,
+    cursor: Option<i64>,
     offset: usize,
     limit: usize,
     queries: &[tiled_core::queries::Query],
     sorting: &[(String, SortDirection)],
 ) -> Result<Response<Vec<Resource>>, ServerError> {
-    let (entries, total) = container
-        .search_page(queries, sorting, offset, limit)
+    let page = container
+        .search_page(queries, sorting, cursor, offset, limit)
         .await?;
+    let (entries, total, next_cursor) = (page.entries, page.total, page.next_cursor);
     let path_trimmed = path.trim_matches('/');
 
     let mut resources: Vec<Resource> = Vec::with_capacity(entries.len());
@@ -184,7 +191,16 @@ pub async fn construct_entries_response(
         resources.push(resource_from_entry(entry, &child_path, base_url));
     }
 
-    let pagination = links::pagination_links(base_url, "search", path, offset, limit, total);
+    let pagination = links::pagination_links(
+        base_url,
+        "search",
+        path,
+        cursor,
+        offset,
+        limit,
+        next_cursor,
+        total,
+    );
 
     Ok(Response {
         data: Some(resources),

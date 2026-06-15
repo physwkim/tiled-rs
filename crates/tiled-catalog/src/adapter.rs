@@ -16,7 +16,9 @@
 
 use std::sync::Arc;
 
-use tiled_core::adapters::{AnyAdapter, BaseAdapter, BoxFuture, ContainerAdapter, SearchEntry};
+use tiled_core::adapters::{
+    AnyAdapter, BaseAdapter, BoxFuture, ContainerAdapter, SearchEntry, SearchPage,
+};
 use tiled_core::queries::{Query, UnsupportedQuery};
 use tiled_core::schemas::{NodeStructure, SortDirection};
 use tiled_core::structures::{ContainerStructure, Spec, StructureFamily};
@@ -215,14 +217,57 @@ impl ContainerAdapter for CatalogAdapter {
         &'a self,
         queries: &'a [Query],
         sorting: &'a [(String, SortDirection)],
+        cursor: Option<i64>,
         offset: usize,
         limit: usize,
-    ) -> BoxFuture<'a, tiled_core::error::Result<(Vec<SearchEntry>, usize)>> {
+    ) -> BoxFuture<'a, tiled_core::error::Result<SearchPage>> {
         Box::pin(async move {
-            let (rows, total) = self
-                .catalog
-                .search_children(self.node_id, queries, sorting, offset as i64, limit as i64)
-                .await?;
+            // Default sort = no user sort key (the ORDER BY collapses to the
+            // monotonic `id`), the only order a keyset cursor can track.
+            let is_default = sorting.iter().all(|(k, _)| k.is_empty());
+            let (rows, total, next_cursor) = match cursor {
+                Some(c) => {
+                    // A cursor only addresses the default sort order; reject the
+                    // combination (Python raises ValueError → 400).
+                    if !is_default {
+                        return Err(tiled_core::error::TiledError::UnsupportedQuery(
+                            "page[cursor] is not supported with a non-default sort order".into(),
+                        ));
+                    }
+                    self.catalog
+                        .search_children_cursor(
+                            self.node_id,
+                            queries,
+                            sorting,
+                            Some(c),
+                            limit as i64,
+                        )
+                        .await?
+                }
+                None => {
+                    let (rows, total) = self
+                        .catalog
+                        .search_children(
+                            self.node_id,
+                            queries,
+                            sorting,
+                            offset as i64,
+                            limit as i64,
+                        )
+                        .await?;
+                    // Default sort: hand back a keyset cursor for the next page
+                    // so the server emits a `page[cursor]` next link (N3). The
+                    // last row's id is the cursor because the default ORDER BY
+                    // ends in the monotonic `id`; `None` when no rows remain or
+                    // the sort is non-default (offset pagination only).
+                    let next_cursor = if is_default && (offset as i64 + limit as i64) < total {
+                        rows.last().map(|n| n.id)
+                    } else {
+                        None
+                    };
+                    (rows, total, next_cursor)
+                }
+            };
             let mut entries = Vec::with_capacity(rows.len());
             for node in rows {
                 // A row with an unrecognised family defaults to Container
@@ -256,7 +301,11 @@ impl ContainerAdapter for CatalogAdapter {
                     access_blob: Some(node.access_blob),
                 });
             }
-            Ok((entries, total as usize))
+            Ok(SearchPage {
+                entries,
+                total: total as usize,
+                next_cursor,
+            })
         })
     }
 }
