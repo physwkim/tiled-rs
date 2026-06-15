@@ -32,6 +32,7 @@ console_error_panic_hook = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
+percent-encoding = "2"
 
 # wasm-opt is invoked from trunk; this profile keeps the wasm size
 # competitive without exotic flags.

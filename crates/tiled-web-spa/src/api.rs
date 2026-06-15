@@ -8,10 +8,38 @@
 
 use gloo_net::http::{Request, RequestBuilder, Response};
 use leptos::prelude::*;
+use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use serde::Deserialize;
 
 use crate::auth::types::{LoginResponse, RefreshResponse};
 use crate::auth::{AuthState, store};
+
+/// Characters to percent-encode inside a path segment (per RFC 3986
+/// `pchar` minus `unreserved` and `sub-delims`). Identical to the
+/// tiled-client `PATH_SEGMENT` set — the SPA had the same defect as old
+/// client M1.
+const PATH_SEGMENT: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'<')
+    .add(b'>')
+    .add(b'#')
+    .add(b'?')
+    .add(b'`')
+    .add(b'{')
+    .add(b'}')
+    .add(b'/')
+    .add(b'%');
+
+/// Percent-encode each `/`-separated segment of a node path so a key
+/// containing `?`, `#`, `/`, `%`, a space, etc. cannot reshape the URL.
+/// The separators between segments are preserved; an empty path stays empty.
+fn encode_path(path: &str) -> String {
+    path.split('/')
+        .map(|seg| utf8_percent_encode(seg, PATH_SEGMENT).to_string())
+        .collect::<Vec<_>>()
+        .join("/")
+}
 
 /// Single-shot bearer-attaching GET. Caller passes the auth state so we
 /// can both attach the latest token and update it on refresh.
@@ -35,10 +63,7 @@ async fn send_with_refresh<F>(state: &AuthState, make_request: F) -> Result<Resp
 where
     F: Fn() -> RequestBuilder,
 {
-    let resp = make_request()
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
+    let resp = make_request().send().await.map_err(|e| e.to_string())?;
     if resp.status() != 401 {
         return Ok(resp);
     }
@@ -122,7 +147,7 @@ pub async fn fetch_metadata(state: &AuthState, path: &str) -> Result<ResourceEnv
     let url = if path.is_empty() {
         "/api/v1/metadata/".to_string()
     } else {
-        format!("/api/v1/metadata/{path}")
+        format!("/api/v1/metadata/{}", encode_path(path))
     };
     let resp = authed_get(state, &url).await?;
     resp.json().await.map_err(|e| e.to_string())
@@ -133,16 +158,55 @@ pub struct SearchEnvelope {
     pub data: Vec<ResourceData>,
     #[serde(default)]
     pub meta: serde_json::Value,
+    #[serde(default)]
+    pub links: SearchLinks,
 }
 
+/// Pagination links from a search response. Only `next` is consumed — the
+/// SPA walks it forward until the server stops supplying one.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SearchLinks {
+    #[serde(default)]
+    pub next: Option<String>,
+}
+
+/// Fetch every child of a container. The path is percent-encoded per segment,
+/// and the server-supplied `links.next` cursor is followed until exhausted, so
+/// a container with more than one page of children is no longer silently
+/// truncated at 100 items. (Page-by-page UI navigation — upstream PR #1392 —
+/// is a separate feature; this loads the full child set into one envelope.)
 pub async fn fetch_children(state: &AuthState, path: &str) -> Result<SearchEnvelope, String> {
-    let url = if path.is_empty() {
+    let encoded = encode_path(path);
+    let mut url = if encoded.is_empty() {
         "/api/v1/search/?page[limit]=100".to_string()
     } else {
-        format!("/api/v1/search/{path}?page[limit]=100")
+        format!("/api/v1/search/{encoded}?page[limit]=100")
     };
-    let resp = authed_get(state, &url).await?;
-    resp.json().await.map_err(|e| e.to_string())
+
+    let mut all: Vec<ResourceData> = Vec::new();
+    let mut meta = serde_json::Value::Null;
+    loop {
+        let resp = authed_get(state, &url).await?;
+        let page: SearchEnvelope = resp.json().await.map_err(|e| e.to_string())?;
+        if meta.is_null() {
+            meta = page.meta;
+        }
+        let got = page.data.len();
+        all.extend(page.data);
+        // Advance only while the cursor moves forward and the last page
+        // actually returned rows — guards against a server that hands back a
+        // stuck `next` link (otherwise this would loop forever).
+        match page.links.next {
+            Some(next) if got > 0 => url = next,
+            _ => break,
+        }
+    }
+
+    Ok(SearchEnvelope {
+        data: all,
+        meta,
+        links: SearchLinks::default(),
+    })
 }
 
 /// Fetch a binary payload (raw bytes / image) with the bearer token
@@ -197,4 +261,25 @@ pub async fn logout(state: &AuthState) {
             .await;
     }
     state.clear();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // client-L1: a key with URL-significant characters must be encoded so it
+    // cannot reshape the request URL; the `/` hierarchy separators are kept.
+    #[test]
+    fn encode_path_encodes_special_chars_per_segment() {
+        assert_eq!(encode_path(""), "");
+        assert_eq!(encode_path("a/b/c"), "a/b/c");
+        // Within a key: space, ?, #, % are all encoded.
+        assert_eq!(encode_path("a b"), "a%20b");
+        assert_eq!(encode_path("scan?1"), "scan%3F1");
+        assert_eq!(encode_path("we#1"), "we%231");
+        assert_eq!(encode_path("100%"), "100%25");
+        // A `/` inside a key is encoded so it does not look like a separator,
+        // while genuine separators between segments stay literal.
+        assert_eq!(encode_path("a/b c/d#e"), "a/b%20c/d%23e");
+    }
 }
