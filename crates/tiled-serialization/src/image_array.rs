@@ -72,6 +72,14 @@ fn encode_image(
                 .collect()
         })
         .unwrap_or_default();
+    // Honor the source byte order: the array adapter may emit big-endian (`>`)
+    // buffers (zarr/numpy `>` dtypes). Without this every multi-byte decode used
+    // `from_le_bytes`, so a big-endian source rendered byte-swapped pixels.
+    let big_endian = metadata
+        .get("byteorder")
+        .and_then(|v| v.as_str())
+        .unwrap_or("<")
+        == ">";
 
     let (h, w) = match shape.len() {
         2 => (shape[0], shape[1]),
@@ -91,16 +99,16 @@ fn encode_image(
     // shifted/clamped into u8 range.
     let pixels = match (kind, itemsize) {
         ("u", 1) => data.to_vec(),
-        ("u", 2) => downscale_u16(data),
-        ("u", 4) => downscale_u32(data),
+        ("u", 2) => downscale_u16(data, big_endian),
+        ("u", 4) => downscale_u32(data, big_endian),
         ("i", 1) => data
             .iter()
             .map(|&b| b as i8 as i32 + 128)
             .map(|v| v as u8)
             .collect(),
-        ("i", 2) => downscale_i16(data),
-        ("f", 4) => normalize_f32(data),
-        ("f", 8) => normalize_f64(data),
+        ("i", 2) => downscale_i16(data, big_endian),
+        ("f", 4) => normalize_f32(data, big_endian),
+        ("f", 8) => normalize_f64(data, big_endian),
         ("b", _) => data.iter().map(|&b| if b != 0 { 255 } else { 0 }).collect(),
         _ => data.to_vec(),
     };
@@ -146,45 +154,75 @@ fn encode_image(
     Ok(Bytes::from(out.into_inner()))
 }
 
-fn downscale_u16(data: &[u8]) -> Vec<u8> {
+fn downscale_u16(data: &[u8], big_endian: bool) -> Vec<u8> {
     data.chunks_exact(2)
         .map(|c| {
-            let v = u16::from_le_bytes([c[0], c[1]]);
+            let arr = [c[0], c[1]];
+            let v = if big_endian {
+                u16::from_be_bytes(arr)
+            } else {
+                u16::from_le_bytes(arr)
+            };
             (v >> 8) as u8
         })
         .collect()
 }
 
-fn downscale_u32(data: &[u8]) -> Vec<u8> {
+fn downscale_u32(data: &[u8], big_endian: bool) -> Vec<u8> {
     data.chunks_exact(4)
         .map(|c| {
-            let v = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+            let arr = [c[0], c[1], c[2], c[3]];
+            let v = if big_endian {
+                u32::from_be_bytes(arr)
+            } else {
+                u32::from_le_bytes(arr)
+            };
             (v >> 24) as u8
         })
         .collect()
 }
 
-fn downscale_i16(data: &[u8]) -> Vec<u8> {
+fn downscale_i16(data: &[u8], big_endian: bool) -> Vec<u8> {
     data.chunks_exact(2)
         .map(|c| {
-            let v = i16::from_le_bytes([c[0], c[1]]);
+            let arr = [c[0], c[1]];
+            let v = if big_endian {
+                i16::from_be_bytes(arr)
+            } else {
+                i16::from_le_bytes(arr)
+            };
             (v.saturating_add(i16::MIN.unsigned_abs() as i16) as i32 / 257) as u8
         })
         .collect()
 }
 
-fn normalize_f32(data: &[u8]) -> Vec<u8> {
+fn normalize_f32(data: &[u8], big_endian: bool) -> Vec<u8> {
     let values: Vec<f32> = data
         .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .map(|c| {
+            let arr = [c[0], c[1], c[2], c[3]];
+            if big_endian {
+                f32::from_be_bytes(arr)
+            } else {
+                f32::from_le_bytes(arr)
+            }
+        })
         .collect();
     normalize_floats(&values)
 }
 
-fn normalize_f64(data: &[u8]) -> Vec<u8> {
+fn normalize_f64(data: &[u8], big_endian: bool) -> Vec<u8> {
     let values: Vec<f32> = data
         .chunks_exact(8)
-        .map(|c| f64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]) as f32)
+        .map(|c| {
+            let arr = [c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]];
+            let v = if big_endian {
+                f64::from_be_bytes(arr)
+            } else {
+                f64::from_le_bytes(arr)
+            };
+            v as f32
+        })
         .collect();
     normalize_floats(&values)
 }
@@ -215,4 +253,49 @@ fn normalize_floats(values: &[f32]) -> Vec<u8> {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Finding 3: a big-endian decode must read the true value, not a
+    /// byte-swapped one. 0x1234's high byte (the downscaled pixel) is 0x12.
+    #[test]
+    fn downscale_u16_honors_byteorder() {
+        let le = [0x34u8, 0x12]; // little-endian 0x1234
+        let be = [0x12u8, 0x34]; // big-endian 0x1234
+        assert_eq!(downscale_u16(&le, false), vec![0x12]);
+        assert_eq!(downscale_u16(&be, true), vec![0x12]);
+        // Ignoring byte order (the bug) reads the BE buffer as 0x3412 → 0x34.
+        assert_eq!(downscale_u16(&be, false), vec![0x34]);
+    }
+
+    #[test]
+    fn normalize_f32_honors_byteorder() {
+        let vals = [0.0f32, 1.0];
+        let le: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let be: Vec<u8> = vals.iter().flat_map(|v| v.to_be_bytes()).collect();
+        assert_eq!(normalize_f32(&le, false), vec![0, 255]);
+        assert_eq!(normalize_f32(&be, true), vec![0, 255]);
+    }
+
+    /// End-to-end: a big-endian image and its little-endian twin encode to
+    /// identical PNG bytes — proving `encode_image` threads byteorder through.
+    #[test]
+    fn encode_image_le_and_be_match() {
+        let vals = [0x0102u16, 0x0304, 0x0506, 0x0708];
+        let le: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let be: Vec<u8> = vals.iter().flat_map(|v| v.to_be_bytes()).collect();
+        let meta_le =
+            serde_json::json!({"itemsize": 2, "kind": "u", "byteorder": "<", "shape": [2, 2]});
+        let meta_be =
+            serde_json::json!({"itemsize": 2, "kind": "u", "byteorder": ">", "shape": [2, 2]});
+        let png_le = encode_image(&le, &meta_le, ImageFormat::Png).unwrap();
+        let png_be = encode_image(&be, &meta_be, ImageFormat::Png).unwrap();
+        assert_eq!(
+            png_le, png_be,
+            "BE and LE encodings of the same image must render identically"
+        );
+    }
 }
