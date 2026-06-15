@@ -82,6 +82,12 @@ pub fn build_app(state: AppState) -> Router {
     // Public auth endpoints — login/refresh/device/initiate must work
     // without prior auth (otherwise login is unreachable). Each handler
     // does its own credential check where required.
+    //
+    // `device/approve` is also public: it accepts either an existing tiled
+    // session bearer OR an external OIDC token in the request body (tiled
+    // #1377). The handler resolves the credential itself via
+    // `resolve_header_auth` / `external_oidc`, so it does not need the
+    // auth middleware to gate it.
     let public_auth = Router::new()
         .route("/api/v1/auth/{provider}/login", post(auth_router::login))
         .route("/api/v1/auth/refresh", post(auth_router::refresh))
@@ -89,17 +95,17 @@ pub fn build_app(state: AppState) -> Router {
             "/api/v1/auth/device/initiate",
             post(auth_router::device_initiate),
         )
-        .route("/api/v1/auth/device/token", post(auth_router::device_token));
+        .route("/api/v1/auth/device/token", post(auth_router::device_token))
+        .route(
+            "/api/v1/auth/device/approve",
+            post(auth_router::device_approve),
+        );
 
     // Authenticated auth endpoints — must run inside the auth middleware
     // so AuthContext is populated.
     let private_auth = Router::new()
         .route("/api/v1/auth/logout", post(auth_router::logout))
         .route("/api/v1/auth/whoami", get(auth_router::whoami))
-        .route(
-            "/api/v1/auth/device/approve",
-            post(auth_router::device_approve),
-        )
         .route(
             "/api/v1/auth/apikeys",
             get(auth_router::api_key_list).post(auth_router::api_key_create),

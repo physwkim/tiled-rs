@@ -301,18 +301,67 @@ pub async fn device_token(
 #[derive(Debug, Deserialize)]
 pub struct DeviceApproveRequest {
     pub user_code: String,
+    /// External OIDC bearer token for approving via an external IdP
+    /// (e.g. Entra, Auth0, Keycloak). When present, the server validates
+    /// this token via `state.external_oidc` before approving the device
+    /// code. Requires `external_oidc` to be configured in `AppState`.
+    ///
+    /// TRUST BOUNDARY: this field is attacker-influenceable. Full
+    /// validation (exp/iss/aud enforced; alg pinned from JWKS/config,
+    /// never from the token header) MUST complete before any principal
+    /// is created or any device code is approved.
+    #[serde(default)]
+    pub oidc_token: Option<String>,
 }
 
 pub async fn device_approve(
     State(state): State<AppState>,
-    auth: AuthContext,
+    headers: HeaderMap,
     Json(body): Json<DeviceApproveRequest>,
 ) -> Result<impl IntoResponse, ServerError> {
-    let principal = auth.principal.ok_or_else(|| {
-        ServerError::Unauthorized("login required to approve a device code".into())
-    })?;
     let (db, _) = require_auth_db(&state)?;
-    db.approve_device_code(&body.user_code, principal.id)
+
+    // TRUST BOUNDARY: the OIDC token, when present, is an
+    // attacker-influenceable input. Full validation (exp/iss/aud
+    // enforced; alg pinned from JWKS/config, never from the token
+    // header) is performed by `validate()` BEFORE `ensure_principal`
+    // or `approve_device_code` are ever called.
+    //
+    // This handler is mounted in public_auth (outside the auth
+    // middleware) so it can accept either a session bearer token
+    // (validated below via `resolve_header_auth`) or an external OIDC
+    // token in the request body. Both paths authenticate the approving
+    // principal before any DB mutation.
+    let principal_id = if let Some(ref token) = body.oidc_token {
+        let validator = state.external_oidc.as_ref().ok_or_else(|| {
+            ServerError::Validation(
+                "oidc_token submitted but no external OIDC validator is configured".into(),
+            )
+        })?;
+        let validated = validator.validate(token).await.map_err(map_auth_err)?;
+        let (principal, identity) = db
+            .ensure_principal(&validated.provider, &validated.sub)
+            .await
+            .map_err(map_auth_err)?;
+        db.touch_identity_login(identity.id).await.ok();
+        principal.id
+    } else {
+        // Session path: resolve from the Authorization header (Bearer
+        // or Apikey). `resolve_header_auth` returns None when no valid
+        // credential is supplied.
+        let auth = crate::app::resolve_header_auth(&state, &headers)
+            .await
+            .ok_or_else(|| {
+                ServerError::Unauthorized("login required to approve a device code".into())
+            })?;
+        auth.principal
+            .ok_or_else(|| {
+                ServerError::Unauthorized("login required to approve a device code".into())
+            })?
+            .id
+    };
+
+    db.approve_device_code(&body.user_code, principal_id)
         .await
         .map_err(map_auth_err)?;
     Ok(StatusCode::NO_CONTENT)
@@ -448,6 +497,11 @@ fn map_auth_err(e: tiled_auth::AuthError) -> ServerError {
         AE::Forbidden(m) => ServerError::Forbidden(m),
         AE::Expired => ServerError::Unauthorized("expired".into()),
         AE::Revoked => ServerError::Unauthorized("revoked".into()),
+        // JWT verification failures (bad signature, expired, wrong iss/aud,
+        // alg mismatch) are 401 — they indicate a forged or invalid token,
+        // not a server fault. Mapping to Internal would wrongly surface an
+        // HTTP 500 to the caller and obscure the rejection reason.
+        AE::Jwt(e) => ServerError::Unauthorized(e.to_string()),
         other => ServerError::Internal(other.to_string()),
     }
 }
