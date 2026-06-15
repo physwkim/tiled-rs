@@ -39,14 +39,18 @@ pub fn spa_router_with(dir: Option<PathBuf>) -> Router {
 }
 
 async fn serve_index(State(state): State<Arc<AssetsState>>) -> Response {
-    serve_path(&state, "index.html").await
+    // Bare routes (the SPA shell) may fall back to index.html.
+    serve_path(&state, "index.html", true).await
 }
 
 async fn serve_static(State(state): State<Arc<AssetsState>>, Path(file): Path<String>) -> Response {
-    serve_path(&state, &file).await
+    // A missing /static/<file> is a hard 404 — never the index.html shell.
+    // Falling back would return HTML+200 for a missing asset, breaking
+    // cache-busting and hiding genuine 404s.
+    serve_path(&state, &file, false).await
 }
 
-async fn serve_path(state: &AssetsState, path: &str) -> Response {
+async fn serve_path(state: &AssetsState, path: &str, allow_index_fallback: bool) -> Response {
     // Prefer disk first when an assets_dir is configured — operators
     // typically swap in the real bluesky/tiled WebUI bundle this way.
     if let Some(dir) = &state.dir {
@@ -85,10 +89,12 @@ async fn serve_path(state: &AssetsState, path: &str) -> Response {
             }
         }
 
-        // index.html fallback inside disk dir for SPA routes (hardcoded path,
-        // not subject to user input).
+        // index.html fallback inside disk dir for SPA bare routes only
+        // (hardcoded path, not subject to user input). Skipped for /static
+        // requests so a missing asset 404s instead of returning the shell.
         let fallback = dir.join("index.html");
-        if path != "index.html"
+        if allow_index_fallback
+            && path != "index.html"
             && let Ok(bytes) = tokio::fs::read(&fallback).await
         {
             return ok_response("index.html", bytes);
@@ -137,7 +143,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("app.js"), b"console.log('hi');").unwrap();
         let state = make_state(tmp.path()).await;
-        let resp = serve_path(&state, "app.js").await;
+        let resp = serve_path(&state, "app.js", false).await;
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
@@ -145,7 +151,7 @@ mod tests {
     async fn dotdot_component_returns_404() {
         let tmp = tempfile::tempdir().unwrap();
         let state = make_state(tmp.path()).await;
-        let resp = serve_path(&state, "..").await;
+        let resp = serve_path(&state, "..", false).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
@@ -153,7 +159,7 @@ mod tests {
     async fn dotdot_slash_path_returns_404() {
         let tmp = tempfile::tempdir().unwrap();
         let state = make_state(tmp.path()).await;
-        let resp = serve_path(&state, "../etc/passwd").await;
+        let resp = serve_path(&state, "../etc/passwd", false).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
@@ -161,7 +167,34 @@ mod tests {
     async fn absolute_path_returns_404() {
         let tmp = tempfile::tempdir().unwrap();
         let state = make_state(tmp.path()).await;
-        let resp = serve_path(&state, "/etc/passwd").await;
+        let resp = serve_path(&state, "/etc/passwd", false).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn missing_static_asset_returns_404_not_index() {
+        // A configured assets_dir with an index.html present, but the
+        // requested /static asset missing. Must 404 (allow_index_fallback
+        // = false), not return the index.html shell with 200.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("index.html"), b"<html>shell</html>").unwrap();
+        let state = make_state(tmp.path()).await;
+        let resp = serve_path(&state, "missing.js", false).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::NOT_FOUND,
+            "missing /static asset must 404, not fall back to index.html"
+        );
+    }
+
+    #[tokio::test]
+    async fn bare_route_falls_back_to_index() {
+        // A bare SPA route (allow_index_fallback = true) with the asset
+        // missing still serves the index.html shell — the SPA-routing case.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("index.html"), b"<html>shell</html>").unwrap();
+        let state = make_state(tmp.path()).await;
+        let resp = serve_path(&state, "some-spa-route", true).await;
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 }
