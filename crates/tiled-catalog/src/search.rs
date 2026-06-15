@@ -43,21 +43,37 @@ impl Dialect {
     }
 
     /// SQL fragment that pulls JSON value at `key` as text.
+    ///
+    /// `key` may be dotted (`a.b`) to address a nested path. SQLite uses a
+    /// `$.a.b` JSON path; Postgres splits the key and uses the `#>>` path
+    /// operator (`metadata #>> '{a,b}'`) so a dotted key is a genuine nested
+    /// lookup, not a top-level key literally named `"a.b"`. Mirrors Python
+    /// `orm.Node.metadata_[key.split(".")]` rendered as `#>>`/`.astext`
+    /// (catalog/adapter.py:1971-1972, 1990-1991, 2006-2007).
     fn json_text(self, column: &str, key: &str) -> String {
-        let safe = sanitize_json_key(key);
         match self {
-            Self::Sqlite => format!("json_extract({column}, '$.{safe}')"),
-            Self::Postgres => format!("({column} ->> '{safe}')"),
+            Self::Sqlite => {
+                let safe = sanitize_json_key(key);
+                format!("json_extract({column}, '$.{safe}')")
+            }
+            Self::Postgres => format!("({column} #>> {})", pg_path_array(key)),
         }
     }
 
     /// SQL fragment that pulls JSON value at `key` as JSON (for type-safe
-    /// array containment etc.).
+    /// array containment, presence checks, etc.).
+    ///
+    /// Same dotted-key path handling as [`Dialect::json_text`], but returns
+    /// the JSON value: SQLite `json_extract`, Postgres `#>` path operator
+    /// (`metadata #> '{a,b}'`) — mirrors Python `metadata_[keys]` rendered as
+    /// `#>` (catalog/adapter.py:2147-2149).
     fn json_value(self, column: &str, key: &str) -> String {
-        let safe = sanitize_json_key(key);
         match self {
-            Self::Sqlite => format!("json_extract({column}, '$.{safe}')"),
-            Self::Postgres => format!("({column} -> '{safe}')"),
+            Self::Sqlite => {
+                let safe = sanitize_json_key(key);
+                format!("json_extract({column}, '$.{safe}')")
+            }
+            Self::Postgres => format!("({column} #> {})", pg_path_array(key)),
         }
     }
 }
@@ -73,6 +89,15 @@ fn sanitize_json_key(key: &str) -> String {
     key.chars()
         .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
         .collect()
+}
+
+/// Render a (possibly dotted) JSON key as a Postgres text-array path literal
+/// for the `#>` / `#>>` operators: `"a.b"` → `'{a,b}'`. Each segment is
+/// sanitized like [`sanitize_json_key`] before splicing into SQL. Mirrors
+/// Python's `query.key.split(".")` path access (catalog/adapter.py).
+fn pg_path_array(key: &str) -> String {
+    let segments: Vec<String> = key.split('.').map(sanitize_json_key).collect();
+    format!("'{{{}}}'", segments.join(","))
 }
 
 impl Dialect {
@@ -895,11 +920,47 @@ mod tests {
         b.push_like("sample", "Cu%");
         let (sql, binds) = b.finish();
         assert!(
-            sql.contains("(metadata ->> 'sample') LIKE $1"),
-            "Postgres Like must use ->> + LIKE $1, got: {sql}"
+            sql.contains("(metadata #>> '{sample}') LIKE $1"),
+            "Postgres Like must use #>> path + LIKE $1, got: {sql}"
         );
         assert_eq!(binds.len(), 1);
         assert!(matches!(&binds[0], Bind::Text(s) if s == "Cu%"));
+    }
+
+    // F-D: Postgres dotted/nested metadata keys must use the `#>>` / `#>`
+    // path operators, not a single top-level key literally named "a.b".
+    #[test]
+    fn json_text_postgres_dotted_key_uses_path_operator() {
+        assert_eq!(
+            Dialect::Postgres.json_text("metadata", "instrument.detector.id"),
+            "(metadata #>> '{instrument,detector,id}')"
+        );
+    }
+
+    #[test]
+    fn json_value_postgres_dotted_key_uses_path_operator() {
+        assert_eq!(
+            Dialect::Postgres.json_value("metadata", "a.b"),
+            "(metadata #> '{a,b}')"
+        );
+    }
+
+    #[test]
+    fn json_text_postgres_single_key_uses_path_operator() {
+        // Even a non-dotted key uses the uniform path form.
+        assert_eq!(
+            Dialect::Postgres.json_text("metadata", "color"),
+            "(metadata #>> '{color}')"
+        );
+    }
+
+    #[test]
+    fn json_text_sqlite_dotted_key_uses_json_path() {
+        // SQLite path access via `$.a.b` was already correct.
+        assert_eq!(
+            Dialect::Sqlite.json_text("metadata", "a.b"),
+            "json_extract(metadata, '$.a.b')"
+        );
     }
 
     // H2: Specs SQL generation
