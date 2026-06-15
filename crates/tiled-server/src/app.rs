@@ -21,6 +21,20 @@ use crate::state::{AppState, CorsOriginPolicy};
 
 /// Build the Axum application with all routes attached.
 pub fn build_app(state: AppState) -> Router {
+    // server-C1: warn loudly, once at startup, when the server is fully open.
+    // With neither a single-user api_key nor an auth_db, the auth middleware
+    // grants anonymous callers FULL scope (read AND write). Python always mints
+    // a single-user key, so this mode has no upstream parity; the CLI now
+    // auto-generates a key, so reaching here means a library embedder wired
+    // AppState without auth. Make that impossible to miss.
+    if state.no_auth_configured() {
+        tracing::warn!(
+            "No authentication configured (no api_key, no auth_db): the server \
+             grants ANONYMOUS FULL ACCESS — any client can read and write. This \
+             is a demo/dev mode only. Set api_key or auth_db before exposing it."
+        );
+    }
+
     // Spawn the webhook dispatcher (upstream tiled #1353) when enabled
     // by config + a catalog DB is present. The dispatcher subscribes to
     // the streaming bus's root channel so it sees every event without
@@ -486,9 +500,10 @@ async fn resolve_auth_inner(
     // ---- 4. Anonymous fallback ----
     // No auth backend configured at all: behaviour matches pre-multi-user
     // tiled-rs — full access. Operators that want to lock the server down
-    // configure single-user `api_key` or wire the auth DB.
-    let no_auth_configured = state.api_key.is_none() && state.auth_db.is_none();
-    if no_auth_configured {
+    // configure single-user `api_key` or wire the auth DB. `build_app` logs a
+    // loud startup warning for this mode (server-C1); the predicate lives on
+    // AppState so the warning and this grant can never diverge.
+    if state.no_auth_configured() {
         return Ok(AuthContext {
             principal: None,
             scopes: ScopeSet::full(),

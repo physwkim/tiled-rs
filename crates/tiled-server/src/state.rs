@@ -118,6 +118,17 @@ pub struct SpecViewEntry {
 }
 
 impl AppState {
+    /// No authentication backend is configured at all — neither a single-user
+    /// `api_key` nor a multi-user `auth_db`. This is the single source of the
+    /// "no auth configured" concept that drives both the loud startup warning
+    /// ([`crate::build_app`]) and the anonymous full-scope request fallback
+    /// (the auth middleware). Python always has a single-user key, so this
+    /// fully-open mode has no upstream parity — it is a deliberate demo escape
+    /// hatch the operator is warned about at startup.
+    pub fn no_auth_configured(&self) -> bool {
+        self.api_key.is_none() && self.auth_db.is_none()
+    }
+
     pub fn resolve_base_url(&self, headers: &axum::http::HeaderMap) -> String {
         self.resolve_base_url_with_peer(headers, None)
     }

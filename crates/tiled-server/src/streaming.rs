@@ -369,12 +369,7 @@ async fn run_subscription(
     // non-browser clients usually arrive. Fall back to a first-message
     // handshake (tiled#1351) if the headers carried nothing usable.
     let auth_ctx = match header_auth {
-        Some(ctx)
-            if !matches!(ctx.kind, AuthKind::Anonymous)
-                || (state.api_key.is_none() && state.auth_db.is_none()) =>
-        {
-            ctx
-        }
+        Some(ctx) if !matches!(ctx.kind, AuthKind::Anonymous) || state.no_auth_configured() => ctx,
         _ => match handshake_auth(&state, &mut tx, &mut rx).await {
             Ok(ctx) => ctx,
             Err(close_reason) => {
@@ -552,7 +547,7 @@ async fn handshake_auth(
     // Anonymous mode: no auth backend at all → grant full scopes
     // immediately, matching the HTTP middleware policy. Skip the
     // handshake to keep latency down for unprotected demos.
-    if state.api_key.is_none() && state.auth_db.is_none() {
+    if state.no_auth_configured() {
         return Ok(AuthContext {
             principal: None,
             scopes: tiled_auth::ScopeSet::full(),
