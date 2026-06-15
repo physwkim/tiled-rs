@@ -4,13 +4,14 @@
 //! Lists BlueskyRuns from the `run_start` collection.
 
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use indexmap::IndexMap;
 use mongodb::bson::{Document, doc};
 use mongodb::sync::Database;
+use tokio::sync::OnceCell;
 
-use tiled_core::adapters::{AnyAdapter, BaseAdapter, ContainerAdapter};
+use tiled_core::adapters::{AnyAdapter, BaseAdapter, BoxFuture, ContainerAdapter};
 use tiled_core::queries::{Query, UnsupportedQuery};
 use tiled_core::structures::{ContainerStructure, Spec, StructureFamily};
 
@@ -21,11 +22,11 @@ pub struct MongoCatalog {
     db: Database,
     metadata: serde_json::Value,
     specs: Vec<Spec>,
-    /// Cached mapping of uid → BlueskyRunAdapter (populated on first access).
-    runs: OnceLock<IndexMap<String, AnyAdapter>>,
-    /// Cached structure (keys list) — kept in stable storage so `structure()`
-    /// can return `&ContainerStructure` without `Box::leak`.
-    structure_cache: OnceLock<ContainerStructure>,
+    /// Cached mapping of uid → BlueskyRunAdapter, populated once on first
+    /// access. An async [`OnceCell`] (not `OnceLock`) so the population can
+    /// run the synchronous MongoDB driver on `spawn_blocking` and `.await`
+    /// the result without blocking the executor.
+    runs: OnceCell<IndexMap<String, AnyAdapter>>,
 }
 
 impl MongoCatalog {
@@ -35,8 +36,7 @@ impl MongoCatalog {
             db,
             metadata,
             specs: vec![Spec::with_version("CatalogOfBlueskyRuns", "1")],
-            runs: OnceLock::new(),
-            structure_cache: OnceLock::new(),
+            runs: OnceCell::new(),
         }
     }
 
@@ -58,96 +58,120 @@ impl MongoCatalog {
         Ok(Self::new(db, serde_json::json!({})))
     }
 
-    fn load_runs(&self) -> &IndexMap<String, AnyAdapter> {
-        self.runs.get_or_init(|| {
-            let mut mapping = IndexMap::new();
-            let collection = self.db.collection::<Document>("run_start");
+    /// Load the run mapping once, offloading the synchronous MongoDB driver
+    /// to `spawn_blocking` so the executor is never blocked. Subsequent calls
+    /// return the cached map. A failed *load task* (panic/join error) surfaces
+    /// as `Err`; per-document query/decode failures are logged inside the
+    /// blocking loader (it returns a possibly-empty map, mirroring the prior
+    /// behaviour) so a transient hiccup does not poison the cache forever.
+    async fn runs(&self) -> tiled_core::error::Result<&IndexMap<String, AnyAdapter>> {
+        self.runs
+            .get_or_try_init(|| async {
+                let db = self.db.clone();
+                tokio::task::spawn_blocking(move || load_runs_blocking(&db))
+                    .await
+                    .map_err(|e| {
+                        tiled_core::error::TiledError::Internal(format!(
+                            "mongo run-load task failed: {e}"
+                        ))
+                    })
+            })
+            .await
+    }
+}
 
-            // Find all run_start docs, sorted by time descending (newest first).
-            let opts = mongodb::options::FindOptions::builder()
-                .sort(doc! { "time": -1 })
-                .build();
+/// Synchronous run loader — runs entirely on a `spawn_blocking` thread. Lists
+/// every `run_start` (time-descending), batches the `run_stop` lookup into one
+/// `$in` query, and pairs them into BlueskyRun adapters. Query/decode errors
+/// are logged (parity with the previous design): a failure yields a
+/// possibly-empty map rather than an `Err`, so the catalog appears empty/partial
+/// but the request still completes.
+fn load_runs_blocking(db: &Database) -> IndexMap<String, AnyAdapter> {
+    let mut mapping = IndexMap::new();
+    let collection = db.collection::<Document>("run_start");
 
-            // M5: a connection/query failure must be observable — log it
-            // rather than silently returning an empty catalog, which a client
-            // cannot distinguish from "this database has no runs".
-            let cursor = match collection.find(doc! {}).with_options(opts).run() {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::error!(
-                        target: "tiled.mongo",
-                        error = %e,
-                        "run_start query failed; catalog will appear empty"
-                    );
-                    return mapping;
-                }
-            };
+    // Find all run_start docs, sorted by time descending (newest first).
+    let opts = mongodb::options::FindOptions::builder()
+        .sort(doc! { "time": -1 })
+        .build();
 
-            // Collect every run_start first (the in-memory catalog design
-            // materialises all runs anyway), preserving the cursor's
-            // time-descending order. Per-doc decode errors are logged, not
-            // silently dropped.
-            let mut starts: Vec<(String, Document)> = Vec::new();
-            for result in cursor {
-                match result {
-                    Ok(start_doc) => {
-                        let uid = start_doc.get_str("uid").unwrap_or_default().to_string();
-                        if !uid.is_empty() {
-                            starts.push((uid, start_doc));
-                        }
-                    }
-                    Err(e) => tracing::error!(
-                        target: "tiled.mongo",
-                        error = %e,
-                        "run_start document decode failed; run skipped"
-                    ),
+    // M5: a connection/query failure must be observable — log it
+    // rather than silently returning an empty catalog, which a client
+    // cannot distinguish from "this database has no runs".
+    let cursor = match collection.find(doc! {}).with_options(opts).run() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(
+                target: "tiled.mongo",
+                error = %e,
+                "run_start query failed; catalog will appear empty"
+            );
+            return mapping;
+        }
+    };
+
+    // Collect every run_start first (the in-memory catalog design
+    // materialises all runs anyway), preserving the cursor's
+    // time-descending order. Per-doc decode errors are logged, not
+    // silently dropped.
+    let mut starts: Vec<(String, Document)> = Vec::new();
+    for result in cursor {
+        match result {
+            Ok(start_doc) => {
+                let uid = start_doc.get_str("uid").unwrap_or_default().to_string();
+                if !uid.is_empty() {
+                    starts.push((uid, start_doc));
                 }
             }
+            Err(e) => tracing::error!(
+                target: "tiled.mongo",
+                error = %e,
+                "run_start document decode failed; run skipped"
+            ),
+        }
+    }
 
-            // Batch the run_stop lookup into ONE find({run_start: {$in: [...]}})
-            // keyed by run_start, instead of an N+1 find_one per run. A run with
-            // no stop doc is left as `None`. A failed stop query is logged but
-            // not fatal — the runs are still listed, just without stop metadata.
-            let uids: Vec<String> = starts.iter().map(|(u, _)| u.clone()).collect();
-            let mut stops: HashMap<String, Document> = HashMap::new();
-            if !uids.is_empty() {
-                match self
-                    .db
-                    .collection::<Document>("run_stop")
-                    .find(doc! { "run_start": { "$in": uids } })
-                    .run()
-                {
-                    Ok(stop_cursor) => {
-                        for result in stop_cursor {
-                            match result {
-                                Ok(stop_doc) => {
-                                    if let Ok(rs) = stop_doc.get_str("run_start") {
-                                        stops.insert(rs.to_string(), stop_doc);
-                                    }
-                                }
-                                Err(e) => tracing::error!(
-                                    target: "tiled.mongo",
-                                    error = %e,
-                                    "run_stop document decode failed; run will show no stop"
-                                ),
+    // Batch the run_stop lookup into ONE find({run_start: {$in: [...]}})
+    // keyed by run_start, instead of an N+1 find_one per run. A run with
+    // no stop doc is left as `None`. A failed stop query is logged but
+    // not fatal — the runs are still listed, just without stop metadata.
+    let uids: Vec<String> = starts.iter().map(|(u, _)| u.clone()).collect();
+    let mut stops: HashMap<String, Document> = HashMap::new();
+    if !uids.is_empty() {
+        match db
+            .collection::<Document>("run_stop")
+            .find(doc! { "run_start": { "$in": uids } })
+            .run()
+        {
+            Ok(stop_cursor) => {
+                for result in stop_cursor {
+                    match result {
+                        Ok(stop_doc) => {
+                            if let Ok(rs) = stop_doc.get_str("run_start") {
+                                stops.insert(rs.to_string(), stop_doc);
                             }
                         }
+                        Err(e) => tracing::error!(
+                            target: "tiled.mongo",
+                            error = %e,
+                            "run_stop document decode failed; run will show no stop"
+                        ),
                     }
-                    Err(e) => tracing::error!(
-                        target: "tiled.mongo",
-                        error = %e,
-                        "run_stop batch query failed; runs will show no stop metadata"
-                    ),
                 }
             }
-
-            for (uid, start_doc, stop_doc) in pair_starts_with_stops(starts, stops) {
-                let run = BlueskyRunAdapter::new(self.db.clone(), start_doc, stop_doc);
-                mapping.insert(uid, AnyAdapter::Container(Arc::new(run)));
-            }
-            mapping
-        })
+            Err(e) => tracing::error!(
+                target: "tiled.mongo",
+                error = %e,
+                "run_stop batch query failed; runs will show no stop metadata"
+            ),
+        }
     }
+
+    for (uid, start_doc, stop_doc) in pair_starts_with_stops(starts, stops) {
+        let run = BlueskyRunAdapter::new(db.clone(), start_doc, stop_doc);
+        mapping.insert(uid, AnyAdapter::Container(Arc::new(run)));
+    }
+    mapping
 }
 
 /// Pair each run_start (in cursor order) with its run_stop from the batched
@@ -183,41 +207,52 @@ impl BaseAdapter for MongoCatalog {
 }
 
 impl ContainerAdapter for MongoCatalog {
-    fn structure(&self) -> &ContainerStructure {
-        self.structure_cache.get_or_init(|| ContainerStructure {
-            keys: self.load_runs().keys().cloned().collect(),
+    fn structure(&self) -> BoxFuture<'_, tiled_core::error::Result<ContainerStructure>> {
+        Box::pin(async move {
+            Ok(ContainerStructure {
+                keys: self.runs().await?.keys().cloned().collect(),
+            })
         })
     }
 
-    fn get(&self, key: &str) -> Option<&AnyAdapter> {
-        self.load_runs().get(key)
+    fn get<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> BoxFuture<'a, tiled_core::error::Result<Option<AnyAdapter>>> {
+        Box::pin(async move { Ok(self.runs().await?.get(key).cloned()) })
     }
 
-    fn keys(&self) -> Vec<String> {
-        self.load_runs().keys().cloned().collect()
+    fn keys(&self) -> BoxFuture<'_, tiled_core::error::Result<Vec<String>>> {
+        Box::pin(async move { Ok(self.runs().await?.keys().cloned().collect()) })
     }
 
-    fn len(&self) -> usize {
-        self.load_runs().len()
+    fn len(&self) -> BoxFuture<'_, tiled_core::error::Result<usize>> {
+        Box::pin(async move { Ok(self.runs().await?.len()) })
     }
 
-    fn search(&self, queries: &[Query]) -> Result<Vec<String>, UnsupportedQuery> {
-        // Validate every query type up front (before the empty-container
-        // shortcut and per-run filtering) so an unsupported variant yields
-        // HTTP 400 regardless of run count or query order — parity with
-        // Python tiled, which raises UnsupportedQueryType at query dispatch.
-        for q in queries {
-            ensure_supported(q)?;
-        }
-        if queries.is_empty() {
-            return Ok(self.keys());
-        }
-        Ok(self
-            .load_runs()
-            .iter()
-            .filter(|(_, adapter)| queries.iter().all(|q| matches_run_query(adapter, q)))
-            .map(|(k, _)| k.clone())
-            .collect())
+    fn search<'a>(
+        &'a self,
+        queries: &'a [Query],
+    ) -> BoxFuture<'a, tiled_core::error::Result<Vec<String>>> {
+        Box::pin(async move {
+            // Validate every query type up front (before the empty-container
+            // shortcut and per-run filtering) so an unsupported variant yields
+            // HTTP 400 regardless of run count or query order — parity with
+            // Python tiled, which raises UnsupportedQueryType at query dispatch.
+            // `?` converts UnsupportedQuery → TiledError::UnsupportedQuery.
+            for q in queries {
+                ensure_supported(q)?;
+            }
+            let runs = self.runs().await?;
+            if queries.is_empty() {
+                return Ok(runs.keys().cloned().collect());
+            }
+            Ok(runs
+                .iter()
+                .filter(|(_, adapter)| queries.iter().all(|q| matches_run_query(adapter, q)))
+                .map(|(k, _)| k.clone())
+                .collect())
+        })
     }
 }
 
@@ -301,7 +336,7 @@ mod tests {
     use std::sync::Arc;
 
     use serde_json::json;
-    use tiled_core::adapters::{AnyAdapter, BaseAdapter, ContainerAdapter};
+    use tiled_core::adapters::{AnyAdapter, BaseAdapter, BoxFuture, ContainerAdapter};
     use tiled_core::queries::{AccessBlobFilter, KeyLookup, KeysFilter, Like, Query, Regex};
     use tiled_core::structures::{ContainerStructure, Spec, StructureFamily};
 
@@ -326,18 +361,20 @@ mod tests {
     }
 
     impl ContainerAdapter for StubRun {
-        fn structure(&self) -> &ContainerStructure {
-            static S: ContainerStructure = ContainerStructure { keys: vec![] };
-            &S
+        fn structure(&self) -> BoxFuture<'_, tiled_core::error::Result<ContainerStructure>> {
+            Box::pin(async { Ok(ContainerStructure { keys: vec![] }) })
         }
-        fn get(&self, _key: &str) -> Option<&AnyAdapter> {
-            None
+        fn get<'a>(
+            &'a self,
+            _key: &'a str,
+        ) -> BoxFuture<'a, tiled_core::error::Result<Option<AnyAdapter>>> {
+            Box::pin(async { Ok(None) })
         }
-        fn keys(&self) -> Vec<String> {
-            vec![]
+        fn keys(&self) -> BoxFuture<'_, tiled_core::error::Result<Vec<String>>> {
+            Box::pin(async { Ok(vec![]) })
         }
-        fn len(&self) -> usize {
-            0
+        fn len(&self) -> BoxFuture<'_, tiled_core::error::Result<usize>> {
+            Box::pin(async { Ok(0) })
         }
     }
 

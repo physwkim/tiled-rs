@@ -14,37 +14,46 @@ use crate::error::ServerError;
 ///
 /// Takes pre-split segments (already percent-decoded by the extractor) so
 /// keys containing literal `/` (sent as `%2F`) reach `get()` intact.
+///
+/// Returns an **owned** [`AnyAdapter`] (a cheap `Arc` bump): the async
+/// `ContainerAdapter::get` hands back owned children, so each hop resolves one
+/// key lazily (one `fetch_child` for the SQL catalog) instead of materialising
+/// a whole level just to borrow into it. A `get` that fails (DB error) is an
+/// `Err`, never silently "not found".
 #[tracing::instrument(skip(root))]
-pub fn walk_tree<'a>(
-    root: &'a dyn ContainerAdapter,
+pub async fn walk_tree(
+    root: &dyn ContainerAdapter,
     segments: &[String],
-) -> Result<&'a AnyAdapter, ServerError> {
+) -> Result<AnyAdapter, ServerError> {
     if segments.is_empty() {
         return Err(ServerError::NotFound("Use root directly".into()));
     }
 
-    let mut current_container: &dyn ContainerAdapter = root;
     let last = segments.len() - 1;
-    for (i, segment) in segments.iter().enumerate() {
-        let adapter = current_container
-            .get(segment)
-            .ok_or_else(|| ServerError::NotFound(format!("Key not found: {segment}")))?;
+    // First hop from the borrowed root; every later hop descends into the
+    // owned container returned by the previous `get`.
+    let mut current = root
+        .get(&segments[0])
+        .await?
+        .ok_or_else(|| ServerError::NotFound(format!("Key not found: {}", segments[0])))?;
 
-        if i == last {
-            return Ok(adapter);
-        }
-
-        match adapter {
-            AnyAdapter::Container(c) => current_container = c.as_ref(),
+    for j in 1..=last {
+        let parent = match current {
+            AnyAdapter::Container(c) => c,
             _ => {
                 return Err(ServerError::NotFound(format!(
-                    "'{segment}' is not a container, cannot descend further"
+                    "'{}' is not a container, cannot descend further",
+                    segments[j - 1]
                 )));
             }
-        }
+        };
+        current = parent
+            .get(&segments[j])
+            .await?
+            .ok_or_else(|| ServerError::NotFound(format!("Key not found: {}", segments[j])))?;
     }
 
-    Err(ServerError::NotFound("Path not found".into()))
+    Ok(current)
 }
 
 /// Compute ancestors list from a segment list.
@@ -80,7 +89,15 @@ fn default_sorting() -> Vec<SortingItem> {
 }
 
 /// Construct a Resource for a given adapter.
-pub fn construct_resource(adapter: &AnyAdapter, id: &str, path: &str, base_url: &str) -> Resource {
+///
+/// Async because a container node's `structure_json` now awaits a child count
+/// (a DB `count_children` for the SQL catalog).
+pub async fn construct_resource(
+    adapter: &AnyAdapter,
+    id: &str,
+    path: &str,
+    base_url: &str,
+) -> Result<Resource, ServerError> {
     let family = adapter.structure_family();
     let node_links = links::links_for_node(family, base_url, path);
 
@@ -89,31 +106,34 @@ pub fn construct_resource(adapter: &AnyAdapter, id: &str, path: &str, base_url: 
         _ => None,
     };
 
-    Resource {
+    Ok(Resource {
         id: id.to_string(),
         attributes: NodeAttributes {
             ancestors: ancestors_from_path(path),
             structure_family: Some(family),
             specs: Some(adapter.specs().to_vec()),
             metadata: Some(adapter.metadata().clone()),
-            structure: adapter.structure_json(),
+            structure: adapter.structure_json().await?,
             access_blob: None,
             sorting,
             data_sources: None,
         },
         links: node_links,
-    }
+    })
 }
 
 /// Construct a Resource for the root container.
-pub fn construct_root_resource(root: &dyn ContainerAdapter, base_url: &str) -> Resource {
+pub async fn construct_root_resource(
+    root: &dyn ContainerAdapter,
+    base_url: &str,
+) -> Result<Resource, ServerError> {
     let node_links = links::links_for_node(root.structure_family(), base_url, "");
     let ns = NodeStructure {
         contents: None,
-        count: root.len(),
+        count: root.len().await?,
     };
 
-    Resource {
+    Ok(Resource {
         id: String::new(),
         attributes: NodeAttributes {
             ancestors: vec![],
@@ -128,11 +148,11 @@ pub fn construct_root_resource(root: &dyn ContainerAdapter, base_url: &str) -> R
             data_sources: None,
         },
         links: node_links,
-    }
+    })
 }
 
 /// Construct a paginated entries response for a container.
-pub fn construct_entries_response(
+pub async fn construct_entries_response(
     container: &dyn ContainerAdapter,
     path: &str,
     base_url: &str,
@@ -143,24 +163,25 @@ pub fn construct_entries_response(
     // Apply search filters to get matching keys, then paginate. An unsupported
     // query variant surfaces as ServerError::UnsupportedQuery (HTTP 400),
     // matching Python tiled's UnsupportedQueryType handling.
-    let matched_keys = container.search(queries)?;
+    let matched_keys = container.search(queries).await?;
     let count = matched_keys.len();
     let path_trimmed = path.trim_matches('/');
 
-    let entries: Vec<Resource> = matched_keys
-        .iter()
-        .skip(offset)
-        .take(limit)
-        .filter_map(|key| {
-            let adapter = container.get(key)?;
-            let child_path = if path_trimmed.is_empty() {
-                key.clone()
-            } else {
-                format!("{path_trimmed}/{key}")
-            };
-            Some(construct_resource(adapter, key, &child_path, base_url))
-        })
-        .collect();
+    // Lazily resolve only the page's keys (one `get` each). A key that
+    // vanished between `search` and `get` (concurrent delete) is skipped; a
+    // `get` that errors propagates rather than silently dropping the entry.
+    let mut entries: Vec<Resource> = Vec::new();
+    for key in matched_keys.iter().skip(offset).take(limit) {
+        let Some(adapter) = container.get(key).await? else {
+            continue;
+        };
+        let child_path = if path_trimmed.is_empty() {
+            key.clone()
+        } else {
+            format!("{path_trimmed}/{key}")
+        };
+        entries.push(construct_resource(&adapter, key, &child_path, base_url).await?);
+    }
 
     let pagination = links::pagination_links(base_url, "search", path, offset, limit, count);
 

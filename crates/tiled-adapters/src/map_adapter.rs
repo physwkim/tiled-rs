@@ -2,11 +2,11 @@
 //!
 //! Corresponds to `tiled/adapters/mapping.py:MapAdapter`.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use indexmap::IndexMap;
 
-use tiled_core::adapters::{AnyAdapter, BaseAdapter, ContainerAdapter};
+use tiled_core::adapters::{AnyAdapter, BaseAdapter, BoxFuture, ContainerAdapter};
 use tiled_core::queries::{Query, UnsupportedQuery};
 use tiled_core::schemas::{SortDirection, SortingItem};
 use tiled_core::structures::{ContainerStructure, Spec, StructureFamily};
@@ -18,8 +18,6 @@ pub struct MapAdapter {
     specs: Vec<Spec>,
     sorting: Vec<SortingItem>,
     must_revalidate: bool,
-    /// Cached structure, lazily initialized.
-    structure_cache: OnceLock<ContainerStructure>,
 }
 
 impl MapAdapter {
@@ -37,7 +35,6 @@ impl MapAdapter {
                 direction: SortDirection::Ascending,
             }],
             must_revalidate: true,
-            structure_cache: OnceLock::new(),
         }
     }
 
@@ -93,43 +90,53 @@ impl BaseAdapter for MapAdapter {
 }
 
 impl ContainerAdapter for MapAdapter {
-    fn structure(&self) -> &ContainerStructure {
-        self.structure_cache.get_or_init(|| ContainerStructure {
-            keys: self.mapping.keys().cloned().collect(),
+    fn structure(&self) -> BoxFuture<'_, tiled_core::error::Result<ContainerStructure>> {
+        Box::pin(async move {
+            Ok(ContainerStructure {
+                keys: self.mapping.keys().cloned().collect(),
+            })
         })
     }
 
-    #[inline]
-    fn get(&self, key: &str) -> Option<&AnyAdapter> {
-        self.mapping.get(key)
+    fn get<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> BoxFuture<'a, tiled_core::error::Result<Option<AnyAdapter>>> {
+        // In-memory: an owned clone is a cheap `Arc` refcount bump.
+        Box::pin(async move { Ok(self.mapping.get(key).cloned()) })
     }
 
-    fn keys(&self) -> Vec<String> {
-        self.mapping.keys().cloned().collect()
+    fn keys(&self) -> BoxFuture<'_, tiled_core::error::Result<Vec<String>>> {
+        Box::pin(async move { Ok(self.mapping.keys().cloned().collect()) })
     }
 
-    #[inline]
-    fn len(&self) -> usize {
-        self.mapping.len()
+    fn len(&self) -> BoxFuture<'_, tiled_core::error::Result<usize>> {
+        Box::pin(async move { Ok(self.mapping.len()) })
     }
 
-    fn search(&self, queries: &[Query]) -> Result<Vec<String>, UnsupportedQuery> {
-        // Validate every query type up front (before the empty-container
-        // shortcut and per-node filtering) so an unsupported variant yields
-        // HTTP 400 regardless of node count or query order — parity with
-        // Python tiled, which raises UnsupportedQueryType at query dispatch.
-        for q in queries {
-            ensure_supported(q)?;
-        }
-        if queries.is_empty() {
-            return Ok(self.keys());
-        }
-        Ok(self
-            .mapping
-            .iter()
-            .filter(|(_, adapter)| queries.iter().all(|q| matches_query(adapter, q)))
-            .map(|(k, _)| k.clone())
-            .collect())
+    fn search<'a>(
+        &'a self,
+        queries: &'a [Query],
+    ) -> BoxFuture<'a, tiled_core::error::Result<Vec<String>>> {
+        Box::pin(async move {
+            // Validate every query type up front (before the empty-container
+            // shortcut and per-node filtering) so an unsupported variant yields
+            // HTTP 400 regardless of node count or query order — parity with
+            // Python tiled, which raises UnsupportedQueryType at query dispatch.
+            // `?` converts UnsupportedQuery → TiledError::UnsupportedQuery.
+            for q in queries {
+                ensure_supported(q)?;
+            }
+            if queries.is_empty() {
+                return Ok(self.mapping.keys().cloned().collect());
+            }
+            Ok(self
+                .mapping
+                .iter()
+                .filter(|(_, adapter)| queries.iter().all(|q| matches_query(adapter, q)))
+                .map(|(k, _)| k.clone())
+                .collect())
+        })
     }
 }
 
@@ -291,8 +298,8 @@ mod tests {
     // An unsupported query variant must surface as UnsupportedQuery
     // (→ HTTP 400), not silently pass every node through.
 
-    #[test]
-    fn search_unsupported_variant_errors() {
+    #[tokio::test]
+    async fn search_unsupported_variant_errors() {
         let mut mapping = IndexMap::new();
         mapping.insert(
             "a".to_string(),
@@ -304,30 +311,34 @@ mod tests {
         );
         let map = MapAdapter::new(mapping, serde_json::json!({}), vec![]);
         let q = Query::Lookup(tiled_core::queries::KeyLookup { key: "x".into() });
-        let err = map.search(std::slice::from_ref(&q)).unwrap_err();
-        assert_eq!(err.0, "KeyLookup");
+        let err = map.search(std::slice::from_ref(&q)).await.unwrap_err();
+        assert!(
+            matches!(err, tiled_core::error::TiledError::UnsupportedQuery(ref s) if s == "The query type 'KeyLookup' is not supported on this node."),
+            "expected UnsupportedQuery for KeyLookup, got {err:?}"
+        );
     }
 
-    #[test]
-    fn search_empty_container_still_errors_on_unsupported() {
+    #[tokio::test]
+    async fn search_empty_container_still_errors_on_unsupported() {
         // Up-front validation must fire even with no nodes to filter.
         let map = MapAdapter::new(IndexMap::new(), serde_json::json!({}), vec![]);
         let q = Query::KeysFilter(tiled_core::queries::KeysFilter {
             keys: vec!["k".into()],
         });
-        assert_eq!(
-            map.search(std::slice::from_ref(&q)).unwrap_err().0,
-            "KeysFilter"
+        let err = map.search(std::slice::from_ref(&q)).await.unwrap_err();
+        assert!(
+            matches!(err, tiled_core::error::TiledError::UnsupportedQuery(ref s) if s == "The query type 'KeysFilter' is not supported on this node."),
+            "expected UnsupportedQuery for KeysFilter, got {err:?}"
         );
     }
 
-    #[test]
-    fn test_map_adapter_basic() {
+    #[tokio::test]
+    async fn test_map_adapter_basic() {
         let mapping = IndexMap::new();
         let adapter = MapAdapter::new(mapping, serde_json::json!({}), vec![]);
         assert_eq!(adapter.structure_family(), StructureFamily::Container);
-        assert_eq!(adapter.len(), 0);
-        assert!(adapter.is_empty());
+        assert_eq!(adapter.len().await.unwrap(), 0);
+        assert!(adapter.is_empty().await.unwrap());
     }
 
     #[test]
@@ -337,15 +348,15 @@ mod tests {
         assert_eq!(adapter.metadata()["name"], "root");
     }
 
-    #[test]
-    fn test_items_range() {
+    #[tokio::test]
+    async fn test_items_range() {
         let mut mapping = IndexMap::new();
         for i in 0..10 {
             let child = MapAdapter::new(IndexMap::new(), serde_json::json!({}), vec![]);
             mapping.insert(format!("item_{i}"), AnyAdapter::Container(Arc::new(child)));
         }
         let adapter = MapAdapter::new(mapping, serde_json::json!({}), vec![]);
-        assert_eq!(adapter.len(), 10);
+        assert_eq!(adapter.len().await.unwrap(), 10);
 
         let page: Vec<&str> = adapter.items_range(2, 3).map(|(k, _)| k).collect();
         assert_eq!(page, vec!["item_2", "item_3", "item_4"]);
@@ -354,8 +365,8 @@ mod tests {
         assert_eq!(page, vec!["item_8", "item_9"]);
     }
 
-    #[test]
-    fn test_structure_cached() {
+    #[tokio::test]
+    async fn test_structure_reports_keys() {
         let mut mapping = IndexMap::new();
         mapping.insert(
             "a".to_string(),
@@ -367,10 +378,9 @@ mod tests {
         );
         let adapter = MapAdapter::new(mapping, serde_json::json!({}), vec![]);
 
-        let s1 = adapter.structure();
-        let s2 = adapter.structure();
-        // Same pointer — OnceLock caches it.
-        assert!(std::ptr::eq(s1, s2));
-        assert_eq!(s1.keys, vec!["a"]);
+        // structure() now returns an owned ContainerStructure (the OnceLock
+        // borrow cache is gone with the async trait); it must report the keys.
+        let s = adapter.structure().await.unwrap();
+        assert_eq!(s.keys, vec!["a"]);
     }
 }

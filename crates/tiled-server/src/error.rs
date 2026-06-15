@@ -133,6 +133,10 @@ impl From<tiled_core::TiledError> for ServerError {
         match err {
             tiled_core::TiledError::NotFound(msg) => Self::NotFound(msg),
             tiled_core::TiledError::Validation(msg) => Self::Validation(msg),
+            // A query variant the node's search path can't evaluate → 400,
+            // parity with Python tiled's UnsupportedQueryType. The async
+            // ContainerAdapter::search carries this in its TiledError Result.
+            tiled_core::TiledError::UnsupportedQuery(msg) => Self::UnsupportedQuery(msg),
             tiled_core::TiledError::UnsupportedMediaType(msg) => Self::UnsupportedMediaType(msg),
             tiled_core::TiledError::Internal(msg) => Self::Internal(msg),
             other => Self::Internal(other.to_string()),

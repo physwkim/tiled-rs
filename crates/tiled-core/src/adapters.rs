@@ -139,33 +139,48 @@ pub trait AwkwardAdapterWrite: AwkwardAdapterRead {
 }
 
 // ---------------------------------------------------------------------------
-// Container (sync — no async methods)
+// Container (async — IO-backed: SQL catalog, MongoDB, etc.)
 // ---------------------------------------------------------------------------
 
+/// A container node: a directory-like level whose children are looked up by
+/// key. Every method is async because the only non-trivial implementors are
+/// IO-backed (the SQL catalog awaits sqlx; the Mongo adapters offload the
+/// sync driver to `spawn_blocking`). This mirrors the leaf adapter traits
+/// above, which already return [`BoxFuture`].
+///
+/// `get` returns an **owned** `Option<AnyAdapter>` rather than a borrow:
+/// `AnyAdapter` is `Arc`-backed (see below), so an owned value is a cheap
+/// refcount bump for in-memory adapters and a freshly-resolved node for
+/// DB-backed ones — which is what lets a DB adapter look a single key up
+/// lazily instead of materialising every child to hand back a reference.
 pub trait ContainerAdapter: BaseAdapter {
-    fn structure(&self) -> &ContainerStructure;
-    fn get(&self, key: &str) -> Option<&AnyAdapter>;
-    fn keys(&self) -> Vec<String>;
-    fn len(&self) -> usize;
+    fn structure(&self) -> BoxFuture<'_, Result<ContainerStructure>>;
 
-    fn is_empty(&self) -> bool {
-        self.len() == 0
+    /// Look up one child by key. `Ok(None)` ⇒ no such key; `Err` ⇒ the
+    /// lookup itself failed (DB error, etc.) — never collapse a failure into
+    /// "absent".
+    fn get<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<Option<AnyAdapter>>>;
+
+    fn keys(&self) -> BoxFuture<'_, Result<Vec<String>>>;
+    fn len(&self) -> BoxFuture<'_, Result<usize>>;
+
+    fn is_empty(&self) -> BoxFuture<'_, Result<bool>> {
+        Box::pin(async move { Ok(self.len().await? == 0) })
     }
 
     /// Search/filter children. Default: return all keys (no filtering).
     ///
-    /// Returns `Err(UnsupportedQuery)` for a query variant this adapter's
-    /// search path cannot evaluate, so the server can answer HTTP 400 instead
-    /// of silently returning a filtered subset (parity with Python tiled's
-    /// `UnsupportedQueryType`). The default impl supports no filtering, so it
-    /// simply returns every key.
-    // Note: `Result` here is `std::result::Result`, not the crate's
-    // `error::Result<T>` alias (which fixes the error type to `TiledError`).
-    fn search(
-        &self,
-        _queries: &[crate::queries::Query],
-    ) -> std::result::Result<Vec<String>, crate::queries::UnsupportedQuery> {
-        Ok(self.keys())
+    /// Returns `Err(TiledError::UnsupportedQuery)` for a query variant this
+    /// adapter's search path cannot evaluate, so the server can answer HTTP
+    /// 400 instead of silently returning a filtered subset (parity with
+    /// Python tiled's `UnsupportedQueryType`); any other `Err` is a real IO
+    /// failure (→ 500). The default impl supports no filtering, so it simply
+    /// returns every key.
+    fn search<'a>(
+        &'a self,
+        _queries: &'a [crate::queries::Query],
+    ) -> BoxFuture<'a, Result<Vec<String>>> {
+        Box::pin(async move { self.keys().await })
     }
 }
 
@@ -182,6 +197,11 @@ pub trait ContainerAdapter: BaseAdapter {
 /// exhausts the blocking pool and deadlocks. Arc storage lets the read run on
 /// the executor with exactly one pool thread per read (the adapter's own
 /// inner offload).
+///
+/// `Clone` is a per-variant `Arc` refcount bump (every variant wraps an
+/// `Arc<dyn …>`), which is what lets `ContainerAdapter::get` hand back an
+/// owned, `'static` child without materialising anything.
+#[derive(Clone)]
 pub enum AnyAdapter {
     Array(Arc<dyn ArrayAdapterRead>),
     Table(Arc<dyn TableAdapterRead>),
@@ -224,16 +244,22 @@ impl AnyAdapter {
         }
     }
 
-    pub fn structure_json(&self) -> Option<serde_json::Value> {
+    /// Async because the container arm needs `len()`, which is now an async
+    /// (DB-backed) call. Returns `Result` so a count failure propagates
+    /// instead of being swallowed. Leaf arms are infallible.
+    pub async fn structure_json(&self) -> Result<Option<serde_json::Value>> {
         match self {
-            Self::Array(a) => serde_json::to_value(a.structure()).ok(),
-            Self::Table(t) => serde_json::to_value(t.structure()).ok(),
-            Self::Sparse(s) => serde_json::to_value(s.structure()).ok(),
-            Self::Awkward(a) => serde_json::to_value(a.structure()).ok(),
-            Self::Container(c) => Some(serde_json::json!({
-                "contents": null,
-                "count": c.len(),
-            })),
+            Self::Array(a) => Ok(serde_json::to_value(a.structure()).ok()),
+            Self::Table(t) => Ok(serde_json::to_value(t.structure()).ok()),
+            Self::Sparse(s) => Ok(serde_json::to_value(s.structure()).ok()),
+            Self::Awkward(a) => Ok(serde_json::to_value(a.structure()).ok()),
+            Self::Container(c) => {
+                let count = c.len().await?;
+                Ok(Some(serde_json::json!({
+                    "contents": null,
+                    "count": count,
+                })))
+            }
         }
     }
 

@@ -9,7 +9,7 @@ use indexmap::IndexMap;
 use mongodb::bson::Document;
 use mongodb::sync::Database;
 
-use tiled_core::adapters::{AnyAdapter, BaseAdapter, ContainerAdapter};
+use tiled_core::adapters::{AnyAdapter, BaseAdapter, BoxFuture, ContainerAdapter};
 use tiled_core::structures::{ContainerStructure, Spec, StructureFamily};
 
 use crate::array_col::{ArrayColumnAdapter, DataColumnConfig};
@@ -24,8 +24,11 @@ pub struct EventStreamAdapter {
     metadata: serde_json::Value,
     specs: Vec<Spec>,
     filler: Option<Arc<Filler>>,
+    /// Cached column mapping. Building it is pure CPU (it assembles
+    /// `ArrayColumnAdapter`s from the already-loaded descriptors; each
+    /// column defers its own MongoDB query to `read`), so a synchronous
+    /// `OnceLock` is enough — no `spawn_blocking` is needed here.
     columns: OnceLock<IndexMap<String, AnyAdapter>>,
-    structure_cache: OnceLock<ContainerStructure>,
 }
 
 impl EventStreamAdapter {
@@ -54,7 +57,6 @@ impl EventStreamAdapter {
             specs: vec![Spec::new("xarray_dataset")],
             filler,
             columns: OnceLock::new(),
-            structure_cache: OnceLock::new(),
         }
     }
 
@@ -151,21 +153,26 @@ impl BaseAdapter for EventStreamAdapter {
 }
 
 impl ContainerAdapter for EventStreamAdapter {
-    fn structure(&self) -> &ContainerStructure {
-        self.structure_cache.get_or_init(|| ContainerStructure {
-            keys: self.load_columns().keys().cloned().collect(),
+    fn structure(&self) -> BoxFuture<'_, tiled_core::error::Result<ContainerStructure>> {
+        Box::pin(async move {
+            Ok(ContainerStructure {
+                keys: self.load_columns().keys().cloned().collect(),
+            })
         })
     }
 
-    fn get(&self, key: &str) -> Option<&AnyAdapter> {
-        self.load_columns().get(key)
+    fn get<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> BoxFuture<'a, tiled_core::error::Result<Option<AnyAdapter>>> {
+        Box::pin(async move { Ok(self.load_columns().get(key).cloned()) })
     }
 
-    fn keys(&self) -> Vec<String> {
-        self.load_columns().keys().cloned().collect()
+    fn keys(&self) -> BoxFuture<'_, tiled_core::error::Result<Vec<String>>> {
+        Box::pin(async move { Ok(self.load_columns().keys().cloned().collect()) })
     }
 
-    fn len(&self) -> usize {
-        self.load_columns().len()
+    fn len(&self) -> BoxFuture<'_, tiled_core::error::Result<usize>> {
+        Box::pin(async move { Ok(self.load_columns().len()) })
     }
 }

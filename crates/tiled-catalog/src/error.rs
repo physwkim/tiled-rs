@@ -33,3 +33,24 @@ pub enum CatalogError {
 }
 
 pub type Result<T> = std::result::Result<T, CatalogError>;
+
+/// Bridge catalog errors into the core error type so the async
+/// [`ContainerAdapter`](tiled_core::adapters::ContainerAdapter) methods (which
+/// return [`tiled_core::error::Result`]) can `?` on SQL calls. The server then
+/// maps the resulting `TiledError` to an HTTP status via its own
+/// `From<TiledError> for ServerError`.
+impl From<CatalogError> for tiled_core::TiledError {
+    fn from(err: CatalogError) -> Self {
+        use tiled_core::TiledError as TE;
+        match err {
+            CatalogError::Database(e) => TE::Database(e.to_string()),
+            CatalogError::Migration(m) => TE::Internal(m),
+            CatalogError::NotFound(m) => TE::NotFound(m),
+            CatalogError::Conflict(m) => TE::Validation(m),
+            CatalogError::WouldDeleteData(m) => TE::Validation(m),
+            CatalogError::Validation(m) => TE::Validation(m),
+            CatalogError::Json(e) => TE::Json(e),
+            CatalogError::Io(e) => TE::Io(e),
+        }
+    }
+}

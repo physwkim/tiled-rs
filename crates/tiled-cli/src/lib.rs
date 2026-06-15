@@ -414,7 +414,12 @@ pub async fn run(command: Command) -> Result<()> {
                 tracing::info!("Connecting to MongoDB: {}", redact_mongo_uri(uri));
                 let catalog = tiled_mongo::MongoCatalog::from_uri(uri)
                     .map_err(|e| anyhow::anyhow!("MongoDB connection failed: {e}"))?;
-                tracing::info!("MongoDB catalog loaded ({} runs)", catalog.len());
+                match catalog.len().await {
+                    Ok(n) => tracing::info!("MongoDB catalog loaded ({n} runs)"),
+                    Err(e) => {
+                        tracing::warn!("MongoDB catalog loaded (run count unavailable: {e})")
+                    }
+                }
                 Arc::new(catalog)
             } else if let Some(ref cat) = catalog_handle {
                 // Wire the file-format adapters so leaves backed by

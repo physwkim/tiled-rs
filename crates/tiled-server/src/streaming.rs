@@ -325,35 +325,30 @@ async fn build_schema_payload(state: &AppState, segments: &[String]) -> serde_js
             });
         }
     }
-    // Fall back to walking the in-memory tree on the blocking pool — the
-    // adapter trait is sync, so we can't do this on the async runtime.
-    let segments = segments.to_vec();
-    let state = state.clone();
-    tokio::task::spawn_blocking(move || -> serde_json::Value {
-        if segments.is_empty() {
-            return serde_json::json!({
-                "structure_family": "container",
-                "path": "",
-            });
-        }
-        match crate::core::walk_tree(state.root_tree.as_ref(), &segments) {
-            Ok(adapter) => serde_json::json!({
+    // Fall back to walking the in-memory tree. The async walk resolves each
+    // hop on the executor and any blocking backend offloads internally.
+    if segments.is_empty() {
+        return serde_json::json!({
+            "structure_family": "container",
+            "path": "",
+        });
+    }
+    match crate::core::walk_tree(state.root_tree.as_ref(), segments).await {
+        Ok(adapter) => {
+            let structure = adapter.structure_json().await.ok().flatten();
+            serde_json::json!({
                 "structure_family": adapter.structure_family().to_string(),
                 "specs": adapter.specs(),
                 "path": segments.join("/"),
-                "structure": adapter.structure_json(),
-            }),
-            Err(_) => serde_json::json!({
-                "type": "subscription-error",
-                "message": "node not found",
-                "path": segments.join("/"),
-            }),
+                "structure": structure,
+            })
         }
-    })
-    .await
-    .unwrap_or_else(
-        |_| serde_json::json!({"type": "subscription-error", "message": "blocking task failed"}),
-    )
+        Err(_) => serde_json::json!({
+            "type": "subscription-error",
+            "message": "node not found",
+            "path": segments.join("/"),
+        }),
+    }
 }
 
 async fn run_subscription(
