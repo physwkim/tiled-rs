@@ -211,6 +211,24 @@ impl ScopeSet {
     pub fn intersect(&self, other: &Self) -> Self {
         Self(self.0.intersection(&other.0).copied().collect())
     }
+
+    /// Expand the [`Scope::Inherit`] metascope. `inherit` is not a real
+    /// permission: it means "dynamically receive the principal's *current*
+    /// role scopes at access time" (Python parity: `inherit` confers all
+    /// principal scopes, `authentication.py:372-381`). When `self` contains
+    /// `Inherit`, it is replaced by `role_scopes`; otherwise `self` is
+    /// returned unchanged. The result is canonicalized like any other
+    /// `ScopeSet`. This is the single owner of `inherit` meaning — without
+    /// it `Inherit` grants nothing, leaving a dead permission.
+    pub fn expand_inherit(&self, role_scopes: &Self) -> Self {
+        if !self.0.contains(&Scope::Inherit) {
+            return self.clone();
+        }
+        let mut out = self.0.clone();
+        out.remove(&Scope::Inherit);
+        out.extend(role_scopes.0.iter().copied());
+        Self(Self::canonicalize(out))
+    }
 }
 
 impl FromIterator<Scope> for ScopeSet {
@@ -268,6 +286,42 @@ mod tests {
         );
         // full ∩ x == x — capping by an admin set never drops a real scope.
         assert_eq!(admin.intersect(&x), x);
+    }
+
+    /// Finding 1: the `inherit` metascope must expand to the principal's
+    /// current role scopes (Python dynamic inheritance), not stay a dead
+    /// permission. This mirrors the composition `resolve_api_key_scopes`
+    /// performs: `expand_inherit(role)` then cap by `role ∩ default_login`.
+    #[test]
+    fn inherit_expands_to_current_role_scopes() {
+        let role = ScopeSet::for_role("user");
+        let default_login = ScopeSet::full();
+        let cap = role.intersect(&default_login);
+
+        // A key granted only `inherit` resolves to the current role scopes.
+        let inherit_key = ScopeSet::from_iter([Scope::Inherit]);
+        let resolved = inherit_key.expand_inherit(&role).intersect(&cap);
+        assert_eq!(resolved, role, "inherit resolves to the role's scopes");
+        assert!(
+            resolved.contains(Scope::ReadData),
+            "an inherit key is not a dead, permission-less credential"
+        );
+        assert!(
+            !resolved.contains(Scope::Inherit),
+            "the metascope is dropped — it is not a real permission"
+        );
+
+        // A non-inherit key is unchanged by expansion.
+        let plain = ScopeSet::from_iter([Scope::ReadData]);
+        assert_eq!(plain.expand_inherit(&role), plain);
+
+        // Role downgrade takes effect: the same inherit key resolves to the
+        // narrower set when the role narrows. user lacks Register; admin has it.
+        let admin_resolved = inherit_key
+            .expand_inherit(&ScopeSet::for_role("admin"))
+            .intersect(&ScopeSet::for_role("admin").intersect(&default_login));
+        assert!(admin_resolved.contains(Scope::Register));
+        assert!(!resolved.contains(Scope::Register));
     }
 
     /// Canonicalization holds at every construction boundary, including the

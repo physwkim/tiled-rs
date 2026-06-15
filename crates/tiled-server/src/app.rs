@@ -377,11 +377,7 @@ pub async fn validate_apikey(state: &AppState, key: &str) -> Result<AuthContext,
             .await
             .map_err(|_| "principal lookup failed".to_string())?
             .ok_or_else(|| "principal vanished".to_string())?;
-        // Intersect with the principal's current role cap so a downgraded
-        // principal's existing keys lose the elevated scopes immediately.
-        let scopes = record
-            .scopes
-            .intersect(&mint_session_scopes(&principal, state));
+        let scopes = resolve_api_key_scopes(&record.scopes, &principal, state);
         return Ok(AuthContext {
             principal: Some(Arc::new(principal)),
             scopes,
@@ -432,11 +428,7 @@ async fn resolve_auth_inner(
                 Ok(Some(p)) => Arc::new(p),
                 _ => return Err(unauthorized("principal vanished")),
             };
-            // Intersect with the principal's current role cap so a downgraded
-            // principal's existing keys lose the elevated scopes immediately.
-            let scopes = record
-                .scopes
-                .intersect(&mint_session_scopes(&principal, state));
+            let scopes = resolve_api_key_scopes(&record.scopes, &principal, state);
             return Ok(AuthContext {
                 principal: Some(principal),
                 scopes,
@@ -498,8 +490,26 @@ async fn resolve_auth_inner(
 /// Derive session scopes for a principal using the same formula as
 /// `auth_router::login` and `device_token`: role-based scope cap
 /// intersected with the operator's `default_login_scopes`.
-fn mint_session_scopes(principal: &tiled_auth::Principal, state: &AppState) -> ScopeSet {
+pub(crate) fn mint_session_scopes(principal: &tiled_auth::Principal, state: &AppState) -> ScopeSet {
     tiled_auth::ScopeSet::for_role(&principal.role).intersect(&state.default_login_scopes)
+}
+
+/// Resolve the effective scopes for an authenticated API key. The `inherit`
+/// metascope is expanded to the principal's *current* role scopes (Python
+/// dynamic inheritance, `authentication.py:372-381`), then the result is
+/// capped by the principal's role and the operator's `default_login_scopes`,
+/// so a downgraded principal's keys lose elevated scopes immediately. Single
+/// owner for both the middleware (`resolve_auth_inner`) and the WS handshake
+/// (`validate_apikey`) api-key paths.
+fn resolve_api_key_scopes(
+    key_scopes: &ScopeSet,
+    principal: &tiled_auth::Principal,
+    state: &AppState,
+) -> ScopeSet {
+    let role_scopes = tiled_auth::ScopeSet::for_role(&principal.role);
+    key_scopes
+        .expand_inherit(&role_scopes)
+        .intersect(&mint_session_scopes(principal, state))
 }
 
 fn extract_api_key(headers: &axum::http::HeaderMap, query: &str) -> Option<String> {

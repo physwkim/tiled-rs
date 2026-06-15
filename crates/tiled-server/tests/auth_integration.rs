@@ -256,6 +256,127 @@ async fn api_key_via_db_grants_scope_subset() {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
+/// Finding 1: a key granted the `inherit` metascope must dynamically inherit
+/// the principal's *current* role scopes at access time (Python parity), not
+/// be a dead, permission-less credential. A role downgrade must take effect
+/// on the next request without re-issuing the key.
+#[tokio::test]
+async fn inherit_api_key_dynamically_inherits_current_role() {
+    let (app, _dir, _cat, auth_db) = build_test_app().await;
+
+    // Bootstrap alice, then promote to admin (only a holder of `inherit` —
+    // i.e. an admin whose role set includes it — may grant it on a key).
+    let (_, body) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/auth/dummy/login",
+        &[],
+        Some(json!({"username": "alice", "password": "wonderland"})),
+    )
+    .await;
+    let alice_sub = body["identity"]["id"].as_str().unwrap().to_string();
+    let (alice, _) = auth_db.ensure_principal("dummy", &alice_sub).await.unwrap();
+    auth_db
+        .update_principal_role(alice.id, "admin")
+        .await
+        .unwrap();
+
+    // Re-login so the session reflects admin scopes, then mint an `inherit` key.
+    let (_, body) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/auth/dummy/login",
+        &[],
+        Some(json!({"username": "alice", "password": "wonderland"})),
+    )
+    .await;
+    let bearer = format!("Bearer {}", body["access_token"].as_str().unwrap());
+
+    let (status, body) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/auth/apikeys",
+        &[("authorization", &bearer)],
+        Some(json!({ "note": "inherit", "scopes": ["inherit"] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let apikey = format!("Apikey {}", body["secret"].as_str().unwrap());
+
+    // While alice is admin, the inherit key carries admin scopes: it can read
+    // AND register. (On the unfixed code the key resolves to nothing → 403.)
+    let (status, _) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/metadata/",
+        &[("authorization", &apikey)],
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "inherit key must inherit read scope"
+    );
+
+    let (status, _) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/register/",
+        &[("authorization", &apikey)],
+        Some(json!({
+            "key": "inh_admin",
+            "structure_family": "container",
+            "metadata": {},
+            "specs": [],
+            "data_sources": [],
+        })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "inherit key must inherit admin's register scope"
+    );
+
+    // Downgrade alice to 'user'. The SAME key must now resolve to the narrower
+    // role: read still works, but register (admin-only) is forbidden.
+    auth_db
+        .update_principal_role(alice.id, "user")
+        .await
+        .unwrap();
+
+    let (status, _) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/metadata/",
+        &[("authorization", &apikey)],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "user role still has read scope");
+
+    let (status, _) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/register/",
+        &[("authorization", &apikey)],
+        Some(json!({
+            "key": "inh_user",
+            "structure_family": "container",
+            "metadata": {},
+            "specs": [],
+            "data_sources": [],
+        })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "role downgrade must revoke register on the next request"
+    );
+}
+
 #[tokio::test]
 async fn refresh_rotates_token_and_returns_full_response() {
     let (app, _dir, _cat, _auth_db) = build_test_app().await;
