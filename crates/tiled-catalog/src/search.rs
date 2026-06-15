@@ -100,6 +100,20 @@ fn pg_path_array(key: &str) -> String {
     format!("'{{{}}}'", segments.join(","))
 }
 
+/// Build the nested JSON document Python's `key_array_to_json` produces for a
+/// (possibly dotted) key: `"x.y" , 1` → `{"x": {"y": 1}}`. The result is bound
+/// as a JSONB parameter for the `@>` containment operator, so the key segments
+/// are not spliced into SQL and need no sanitizing (adapter.py:2349-2369).
+fn key_path_to_json(key: &str, value: &Value) -> Value {
+    let mut acc = value.clone();
+    for segment in key.split('.').rev() {
+        let mut obj = serde_json::Map::new();
+        obj.insert(segment.to_string(), acc);
+        acc = Value::Object(obj);
+    }
+    acc
+}
+
 impl Dialect {
     fn metadata_full_text(self) -> &'static str {
         match self {
@@ -133,19 +147,53 @@ impl WhereBuilder {
     }
 
     fn push_eq(&mut self, key: &str, value: &Value) {
-        let lhs = self.dialect.json_text("metadata", key);
-        let p = self.dialect.placeholder(self.bindings.len());
-        self.pieces.push(format!("{lhs} = {p}"));
-        self.bindings.push(value_to_bind(value));
+        match self.dialect {
+            Dialect::Sqlite => {
+                // `json_extract` returns the native storage class, and
+                // `value_to_bind` binds a matching type, so `lhs = ?` works
+                // for any JSON scalar.
+                let lhs = self.dialect.json_text("metadata", key);
+                let p = self.dialect.placeholder(self.bindings.len());
+                self.pieces.push(format!("{lhs} = {p}"));
+                self.bindings.push(value_to_bind(value));
+            }
+            Dialect::Postgres => {
+                // `(metadata ->> 'k') = $1::int8` has no operator (text vs
+                // int8) and the query fails. Use JSONB containment instead —
+                // type-safe and GIN-indexable, matching Python
+                // (adapter.py:1976-1982).
+                let pred = self.pg_containment(key, value);
+                self.pieces.push(pred);
+            }
+        }
     }
 
     fn push_neq(&mut self, key: &str, value: &Value) {
-        let lhs = self.dialect.json_text("metadata", key);
-        let p = self.dialect.placeholder(self.bindings.len());
-        // Treat NULL as "not equal" too — without `IS DISTINCT FROM`/COALESCE,
-        // a JSON key that's missing would otherwise drop out of the result.
-        self.pieces.push(format!("({lhs} IS NULL OR {lhs} != {p})"));
-        self.bindings.push(value_to_bind(value));
+        match self.dialect {
+            Dialect::Sqlite => {
+                let lhs = self.dialect.json_text("metadata", key);
+                let p = self.dialect.placeholder(self.bindings.len());
+                // Treat NULL as "not equal" too — without `IS DISTINCT
+                // FROM`/COALESCE, a JSON key that's missing would otherwise
+                // drop out of the result.
+                self.pieces.push(format!("({lhs} IS NULL OR {lhs} != {p})"));
+                self.bindings.push(value_to_bind(value));
+            }
+            Dialect::Postgres => {
+                // Compare jsonb-to-jsonb (`#> ... != $1::jsonb`); a text `#>>`
+                // against a typed int8/float8 bind has no operator. Mirrors
+                // Python `ne(metadata_[keys], type_coerce(value, JSONB))`
+                // (adapter.py:1983-1984). Missing key (NULL) stays "not equal"
+                // per the SQLite arm's semantics above.
+                let lhs = self.dialect.json_value("metadata", key);
+                let p = self.dialect.placeholder(self.bindings.len());
+                self.pieces
+                    .push(format!("({lhs} IS NULL OR {lhs} != {p}::jsonb)"));
+                self.bindings.push(Bind::Text(
+                    serde_json::to_string(value).expect("json serialization"),
+                ));
+            }
+        }
     }
 
     fn push_key_present(&mut self, key: &str, exists: bool) {
@@ -202,6 +250,19 @@ impl WhereBuilder {
         }
     }
 
+    /// Bind one nested-key JSON document and return the Postgres containment
+    /// predicate `metadata @> $N::jsonb` (no surrounding parens). Mirrors
+    /// Python `metadata_.op("@>")(key_array_to_json(keys, value))`
+    /// (adapter.py:1977-1982, 2109, 2120).
+    fn pg_containment(&mut self, key: &str, value: &Value) -> String {
+        let p = self.dialect.placeholder(self.bindings.len());
+        let doc = key_path_to_json(key, value);
+        self.bindings.push(Bind::Text(
+            serde_json::to_string(&doc).expect("json serialization"),
+        ));
+        format!("metadata @> {p}::jsonb")
+    }
+
     /// `In(key, [v1, v2, ...])` — match rows whose metadata.key equals
     /// any of the listed values. Empty list → match nothing (always
     /// false), matching upstream tiled #746's empty-list semantics.
@@ -212,15 +273,29 @@ impl WhereBuilder {
             self.pieces.push("FALSE".into());
             return;
         }
-        let lhs = self.dialect.json_text("metadata", key);
-        let mut placeholders = Vec::with_capacity(values.len());
-        for v in values {
-            let p = self.dialect.placeholder(self.bindings.len());
-            placeholders.push(p);
-            self.bindings.push(value_to_bind(v));
+        match self.dialect {
+            Dialect::Sqlite => {
+                let lhs = self.dialect.json_text("metadata", key);
+                let mut placeholders = Vec::with_capacity(values.len());
+                for v in values {
+                    let p = self.dialect.placeholder(self.bindings.len());
+                    placeholders.push(p);
+                    self.bindings.push(value_to_bind(v));
+                }
+                self.pieces
+                    .push(format!("{lhs} IN ({})", placeholders.join(", ")));
+            }
+            Dialect::Postgres => {
+                // `(metadata ->> 'k') IN ($1::int8, ...)` has no operator
+                // (text vs int8). Use an OR of JSONB containments — type-safe,
+                // GIN-indexable, matching Python (adapter.py:2107-2112).
+                let mut preds = Vec::with_capacity(values.len());
+                for v in values {
+                    preds.push(self.pg_containment(key, v));
+                }
+                self.pieces.push(format!("({})", preds.join(" OR ")));
+            }
         }
-        self.pieces
-            .push(format!("{lhs} IN ({})", placeholders.join(", ")));
     }
 
     /// `NotIn(key, [v1, v2, ...])` — inverse of `push_in`. Empty list
@@ -230,17 +305,31 @@ impl WhereBuilder {
             self.pieces.push("TRUE".into());
             return;
         }
-        let lhs = self.dialect.json_text("metadata", key);
-        let mut placeholders = Vec::with_capacity(values.len());
-        for v in values {
-            let p = self.dialect.placeholder(self.bindings.len());
-            placeholders.push(p);
-            self.bindings.push(value_to_bind(v));
+        match self.dialect {
+            Dialect::Sqlite => {
+                let lhs = self.dialect.json_text("metadata", key);
+                let mut placeholders = Vec::with_capacity(values.len());
+                for v in values {
+                    let p = self.dialect.placeholder(self.bindings.len());
+                    placeholders.push(p);
+                    self.bindings.push(value_to_bind(v));
+                }
+                self.pieces.push(format!(
+                    "({lhs} IS NULL OR {lhs} NOT IN ({}))",
+                    placeholders.join(", ")
+                ));
+            }
+            Dialect::Postgres => {
+                // `NOT (OR of JSONB containments)` — type-safe and includes
+                // missing-key rows (containment is false → NOT is true),
+                // matching Python (adapter.py:2117-2124).
+                let mut preds = Vec::with_capacity(values.len());
+                for v in values {
+                    preds.push(self.pg_containment(key, v));
+                }
+                self.pieces.push(format!("NOT ({})", preds.join(" OR ")));
+            }
         }
-        self.pieces.push(format!(
-            "({lhs} IS NULL OR {lhs} NOT IN ({}))",
-            placeholders.join(", ")
-        ));
     }
 
     /// `Contains(key, value)` — substring match on the text rendering
@@ -961,6 +1050,78 @@ mod tests {
             Dialect::Sqlite.json_text("metadata", "a.b"),
             "json_extract(metadata, '$.a.b')"
         );
+    }
+
+    // F-E: Postgres non-string Eq/In/NotIn/NotEq must avoid the
+    // text-vs-typed-bind type error (`(metadata ->> 'k') = $1::int8` has no
+    // operator) via JSONB containment / jsonb comparison.
+    #[test]
+    fn push_eq_postgres_uses_containment() {
+        let mut b = WhereBuilder::new(Dialect::Postgres);
+        b.push_eq("count", &json!(5));
+        let (sql, binds) = b.finish();
+        assert_eq!(sql, "metadata @> $1::jsonb");
+        assert_eq!(binds.len(), 1);
+        assert!(matches!(&binds[0], Bind::Text(s) if s == r#"{"count":5}"#));
+    }
+
+    #[test]
+    fn push_eq_postgres_string_uses_containment() {
+        let mut b = WhereBuilder::new(Dialect::Postgres);
+        b.push_eq("material", &json!("Cu"));
+        let (sql, binds) = b.finish();
+        assert_eq!(sql, "metadata @> $1::jsonb");
+        assert!(matches!(&binds[0], Bind::Text(s) if s == r#"{"material":"Cu"}"#));
+    }
+
+    #[test]
+    fn push_eq_postgres_dotted_key_nests_containment_json() {
+        let mut b = WhereBuilder::new(Dialect::Postgres);
+        b.push_eq("a.b", &json!("red"));
+        let (_, binds) = b.finish();
+        assert!(matches!(&binds[0], Bind::Text(s) if s == r#"{"a":{"b":"red"}}"#));
+    }
+
+    #[test]
+    fn push_in_postgres_uses_containment_or() {
+        let mut b = WhereBuilder::new(Dialect::Postgres);
+        b.push_in("scan_id", &[json!(1), json!(2)]);
+        let (sql, binds) = b.finish();
+        assert_eq!(sql, "(metadata @> $1::jsonb OR metadata @> $2::jsonb)");
+        assert_eq!(binds.len(), 2);
+        assert!(matches!(&binds[0], Bind::Text(s) if s == r#"{"scan_id":1}"#));
+        assert!(matches!(&binds[1], Bind::Text(s) if s == r#"{"scan_id":2}"#));
+    }
+
+    #[test]
+    fn push_not_in_postgres_uses_not_containment_or() {
+        let mut b = WhereBuilder::new(Dialect::Postgres);
+        b.push_not_in("scan_id", &[json!(1), json!(2)]);
+        let (sql, binds) = b.finish();
+        assert_eq!(sql, "NOT (metadata @> $1::jsonb OR metadata @> $2::jsonb)");
+        assert_eq!(binds.len(), 2);
+    }
+
+    #[test]
+    fn push_neq_postgres_uses_jsonb_comparison() {
+        let mut b = WhereBuilder::new(Dialect::Postgres);
+        b.push_neq("count", &json!(5));
+        let (sql, binds) = b.finish();
+        assert_eq!(
+            sql,
+            "((metadata #> '{count}') IS NULL OR (metadata #> '{count}') != $1::jsonb)"
+        );
+        assert_eq!(binds.len(), 1);
+        assert!(matches!(&binds[0], Bind::Text(s) if s == "5"));
+    }
+
+    // SQLite arms keep type-aware native comparison (regression guard).
+    #[test]
+    fn push_eq_sqlite_still_uses_json_extract_equality() {
+        let mut b = WhereBuilder::new(Dialect::Sqlite);
+        b.push_eq("count", &json!(5));
+        let (sql, _) = b.finish();
+        assert_eq!(sql, "json_extract(metadata, '$.count') = ?");
     }
 
     // H2: Specs SQL generation
