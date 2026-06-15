@@ -4,6 +4,8 @@
 //! `handle_error`) — but uses idiomatic `Result<T, ClientError>` instead of
 //! Python's `raise_for_status` pattern.
 
+use std::time::Duration;
+
 use thiserror::Error;
 
 /// Errors that can occur when calling the Tiled HTTP API.
@@ -29,6 +31,10 @@ pub enum ClientError {
         status: u16,
         detail: String,
         correlation_id: Option<String>,
+        /// Parsed `Retry-After` delay (delta-seconds), populated only for 429
+        /// so the retry loop can honor it instead of the default backoff
+        /// schedule (parity with Python `should_retry`).
+        retry_after: Option<Duration>,
     },
 
     #[error("authentication required: {0}")]

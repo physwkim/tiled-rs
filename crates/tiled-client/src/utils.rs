@@ -84,6 +84,13 @@ pub async fn handle_error(resp: Response) -> Result<Response> {
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
+    // Capture `Retry-After` before the body read consumes `resp`. Only
+    // meaningful for 429 (see below); parsed lazily there.
+    let retry_after_header = resp
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
     let body = resp.text().await.unwrap_or_default();
 
     if status == 410 {
@@ -114,11 +121,30 @@ pub async fn handle_error(resp: Response) -> Result<Response> {
             "server error"
         );
     }
+    // Honor `Retry-After` only for 429, matching Python `should_retry`, which
+    // reads the header for `TOO_MANY_REQUESTS` and ignores it for 5xx.
+    let retry_after = if status == 429 {
+        parse_retry_after(retry_after_header.as_deref())
+    } else {
+        None
+    };
     Err(ClientError::Server {
         status,
         detail,
         correlation_id,
+        retry_after,
     })
+}
+
+/// Parse a `Retry-After` header value into a delay.
+///
+/// Matches Python's `float(retry_after)`: only the delta-seconds form is
+/// honored. A non-numeric value (e.g. the HTTP-date form) or a negative /
+/// non-finite value yields `None`, so the caller falls back to the default
+/// backoff schedule.
+fn parse_retry_after(raw: Option<&str>) -> Option<Duration> {
+    let secs: f64 = raw?.trim().parse().ok()?;
+    (secs.is_finite() && secs >= 0.0).then(|| Duration::from_secs_f64(secs))
 }
 
 /// Retry on transient errors (connection refused, timeout, 5xx).
@@ -141,11 +167,25 @@ where
             Err(e) if !is_transient(&e) => return Err(e),
             Err(e) => {
                 attempt += 1;
-                if attempt >= DEFAULT_RETRY_ATTEMPTS || tokio::time::Instant::now() >= deadline {
+                let now = tokio::time::Instant::now();
+                if attempt >= DEFAULT_RETRY_ATTEMPTS || now >= deadline {
                     return Err(e);
                 }
+                // A 429 carries a parsed `Retry-After`; honor it as this
+                // attempt's wait (Python returns the float to stamina as the
+                // backoff), else use the default exponential schedule. Bound a
+                // server-controlled `Retry-After` to the remaining retry budget
+                // so a large value can't park the client past the timeout.
+                let retry_after = match &e {
+                    ClientError::Server { retry_after, .. } => *retry_after,
+                    _ => None,
+                };
+                let delay = match retry_after {
+                    Some(d) => d.min(deadline.saturating_duration_since(now)),
+                    None => Duration::from_millis(delay_ms),
+                };
                 tracing::warn!(target: "tiled.client", attempt, %e, "retrying");
-                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                tokio::time::sleep(delay).await;
                 delay_ms = (delay_ms.saturating_mul(2)).min(8_000);
             }
         }
@@ -155,7 +195,86 @@ where
 fn is_transient(err: &ClientError) -> bool {
     match err {
         ClientError::Http(e) => e.is_timeout() || e.is_connect() || e.is_request(),
-        ClientError::Server { status, .. } => *status >= 500,
+        // 429 is transient too (Python `should_retry`): a rate limiter / load
+        // balancer expects the client to back off and retry, honoring
+        // `Retry-After`. Without this, the client fails fast where Python
+        // recovers.
+        ClientError::Server { status, .. } => *status == 429 || *status >= 500,
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    fn server(status: u16, retry_after: Option<Duration>) -> ClientError {
+        ClientError::Server {
+            status,
+            detail: String::new(),
+            correlation_id: None,
+            retry_after,
+        }
+    }
+
+    #[test]
+    fn transient_classification_includes_429() {
+        assert!(is_transient(&server(429, None)));
+        assert!(is_transient(&server(500, None)));
+        assert!(is_transient(&server(503, None)));
+        assert!(!is_transient(&server(400, None)));
+        assert!(!is_transient(&server(404, None)));
+        assert!(!is_transient(&server(409, None)));
+    }
+
+    #[test]
+    fn parse_retry_after_numeric_only() {
+        assert_eq!(parse_retry_after(Some("2")), Some(Duration::from_secs(2)));
+        assert_eq!(
+            parse_retry_after(Some(" 2.5 ")),
+            Some(Duration::from_secs_f64(2.5))
+        );
+        assert_eq!(parse_retry_after(Some("0")), Some(Duration::ZERO));
+        // HTTP-date form is not honored (matches Python's `float()`), and a
+        // negative / garbage value falls back to default backoff.
+        assert_eq!(
+            parse_retry_after(Some("Wed, 21 Oct 2015 07:28:00 GMT")),
+            None
+        );
+        assert_eq!(parse_retry_after(Some("-1")), None);
+        assert_eq!(parse_retry_after(Some("abc")), None);
+        assert_eq!(parse_retry_after(None), None);
+    }
+
+    #[tokio::test]
+    async fn retry_retries_429_then_succeeds() {
+        let calls = AtomicU32::new(0);
+        let out: i32 = retry(|| async {
+            let n = calls.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                // First attempt is rate-limited with a Retry-After.
+                Err(server(429, Some(Duration::from_millis(5))))
+            } else {
+                Ok(42)
+            }
+        })
+        .await
+        .expect("a 429 with Retry-After must be retried, not failed fast");
+        assert_eq!(out, 42);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn retry_does_not_retry_non_transient() {
+        let calls = AtomicU32::new(0);
+        let err = retry(|| async {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err::<i32, _>(server(400, None))
+        })
+        .await
+        .expect_err("a 400 is not transient");
+        assert!(matches!(err, ClientError::Server { status: 400, .. }));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }
