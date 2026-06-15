@@ -130,6 +130,15 @@ impl Issuer {
         // defaults to 60s; pin it to 0 so a token Python would reject as
         // expired is not accepted here.
         v.leeway = 0;
+        // auth-L1: `iat` is intentionally NOT validated and `validate_nbf`
+        // stays false. Python tiled's `create_access_token`/`create_refresh_token`
+        // (authentication.py) set only `exp` + `type` — never `iat` or `nbf` —
+        // so python-jose's "verify when present" never fires for tiled tokens.
+        // This Issuer only ever verifies tokens it signed itself (always a past
+        // `iat`, no `nbf`); external IdP tokens go through ExternalOidcValidator.
+        // Adding an iat/nbf gate here would diverge from Python and guard an
+        // input this path cannot legitimately receive. The signature + `exp`
+        // are the security boundary.
         let data = decode::<AccessClaims>(token, &self.decoding, &v)?;
         if data.claims.typ != "access" {
             return Err(AuthError::Unauthorized("not an access token".into()));
@@ -142,7 +151,8 @@ impl Issuer {
         // Parity with Python tiled: `jose.jwt.decode` is called with no
         // leeway, so exp is checked exactly (default leeway 0). jsonwebtoken
         // defaults to 60s; pin it to 0 so a token Python would reject as
-        // expired is not accepted here.
+        // expired is not accepted here. `iat`/`nbf` are intentionally not
+        // validated here for the same reason as `verify_access` (auth-L1).
         v.leeway = 0;
         let data = decode::<RefreshClaims>(token, &self.decoding, &v)?;
         if data.claims.typ != "refresh" {
