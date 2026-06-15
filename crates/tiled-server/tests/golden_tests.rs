@@ -1138,12 +1138,14 @@ async fn test_response_bytesize_limit_array_returns_400() {
     let (status, body) = get_json(&app, "/api/v1/array/full/some_array").await;
     assert_eq!(status, 400, "array_full over the byte limit must be 400");
     assert_eq!(body["error"]["code"], 400);
+    let msg = body["error"]["message"].as_str().unwrap_or("");
     assert!(
-        body["error"]["message"]
-            .as_str()
-            .unwrap_or("")
-            .contains("Response would exceed"),
-        "got: {body:?}"
+        msg.contains("Response would exceed"),
+        "must contain prefix; got: {body:?}"
+    );
+    assert!(
+        msg.contains("?slice="),
+        "array 400 must carry slice hint (Python router.py:626); got: {msg:?}"
     );
 
     let (status, _) = get(&app, "/api/v1/array/block/some_array?block=0").await;
@@ -1176,12 +1178,14 @@ async fn test_response_bytesize_limit_table_returns_400() {
     let (status, body) = get_json(&app, "/api/v1/table/full/some_table").await;
     assert_eq!(status, 400, "table_full over the byte limit must be 400");
     assert_eq!(body["error"]["code"], 400);
+    let msg = body["error"]["message"].as_str().unwrap_or("");
     assert!(
-        body["error"]["message"]
-            .as_str()
-            .unwrap_or("")
-            .contains("Response would exceed"),
-        "got: {body:?}"
+        msg.contains("Response would exceed"),
+        "must contain prefix; got: {body:?}"
+    );
+    assert!(
+        msg.contains("columns"),
+        "table 400 must carry column-subset hint (Python router.py:1320); got: {msg:?}"
     );
 
     // Generous limit → 200.

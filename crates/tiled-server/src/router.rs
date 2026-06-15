@@ -506,10 +506,12 @@ pub async fn search(
 // `settings.response_bytesize_limit` BEFORE packing and raises
 // HTTP 400 on exceed (router.py:621/701/1185/1315/...). `nbytes` is the
 // decoded in-memory size of the payload about to be serialized.
-fn check_response_size(nbytes: usize, limit: usize) -> Result<(), ServerError> {
+// `hint` is a family-specific suffix appended after the fixed prefix
+// (array: router.py:626; table: router.py:1320).
+fn check_response_size(nbytes: usize, limit: usize, hint: &str) -> Result<(), ServerError> {
     if nbytes > limit {
         return Err(ServerError::ResponseTooLarge(format!(
-            "Response would exceed {limit}. Select a subset of the data to request a smaller chunk."
+            "Response would exceed {limit}. {hint}"
         )));
     }
     Ok(())
@@ -526,7 +528,11 @@ async fn build_array_response(
     state: &AppState,
 ) -> Result<axum::response::Response, ServerError> {
     // Cap the decoded array size before serialization (Python: array.nbytes).
-    check_response_size(data.data.len(), state.response_bytesize_limit)?;
+    check_response_size(
+        data.data.len(),
+        state.response_bytesize_limit,
+        "Use slicing (\"?slice=...\") to request smaller chunks.",
+    )?;
 
     let accept = headers
         .get("accept")
@@ -582,7 +588,11 @@ async fn build_table_response(
         .iter()
         .map(|b| b.get_array_memory_size())
         .sum();
-    check_response_size(nbytes, state.response_bytesize_limit)?;
+    check_response_size(
+        nbytes,
+        state.response_bytesize_limit,
+        "Select a subset of the columns to request a smaller chunk.",
+    )?;
 
     let accept = headers
         .get(axum::http::header::ACCEPT)
@@ -1162,7 +1172,11 @@ pub async fn container_full(
                     let slice = tiled_core::ndslice::NDSlice::empty();
                     let data = arc.read(&slice).await.map_err(ServerError::from)?;
                     cumulative_bytes += data.data.len();
-                    check_response_size(cumulative_bytes, state.response_bytesize_limit)?;
+                    check_response_size(
+                        cumulative_bytes,
+                        state.response_bytesize_limit,
+                        "Select a subset of the data to request a smaller chunk.",
+                    )?;
                     writer = tokio::task::spawn_blocking(move || -> Result<ZipBuf, ServerError> {
                         writer
                             .start_file(name, opts)
@@ -1183,7 +1197,11 @@ pub async fn container_full(
                         .map(|b| b.get_array_memory_size())
                         .sum();
                     cumulative_bytes += leaf_bytes;
-                    check_response_size(cumulative_bytes, state.response_bytesize_limit)?;
+                    check_response_size(
+                        cumulative_bytes,
+                        state.response_bytesize_limit,
+                        "Select a subset of the data to request a smaller chunk.",
+                    )?;
                     writer = tokio::task::spawn_blocking(move || -> Result<ZipBuf, ServerError> {
                         let mut ipc_bytes = Vec::new();
                         {
