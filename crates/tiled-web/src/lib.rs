@@ -27,7 +27,7 @@ use std::sync::Arc;
 
 use axum::Router;
 
-use tiled_auth::{AuthDb, Issuer, ScopeSet};
+use tiled_auth::{AuthDb, Authenticator, Issuer, ScopeSet};
 
 /// Minimal slice of server state the web layer needs. Constructed by
 /// the host (`tiled-server::AppState`) and passed in. Avoids the
@@ -56,6 +56,9 @@ pub struct WebState {
     /// for specific tag specs (e.g. {"BlueskyRunV1": "https://…"}).
     /// Mirrors upstream tiled PR #1349's `spec_views` settings entry.
     pub spec_views: Vec<SpecViewEntry>,
+    /// Authenticator for the `/admin/login` form. `None` disables the
+    /// admin login — every attempt returns auth-failed.
+    pub authenticator: Option<Arc<dyn Authenticator>>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -77,6 +80,10 @@ impl std::fmt::Debug for WebState {
             .field("issuer", &self.issuer.as_ref().map(|_| "<set>"))
             .field("login_provider", &self.login_provider)
             .field("secure_cookies", &self.secure_cookies)
+            .field(
+                "authenticator",
+                &self.authenticator.as_ref().map(|_| "<set>"),
+            )
             .finish()
     }
 }

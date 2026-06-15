@@ -198,6 +198,11 @@ pub fn build_app(state: AppState) -> Router {
                         label: s.label.clone(),
                     })
                     .collect(),
+                authenticator: state
+                    .authenticators
+                    .iter()
+                    .find(|a| a.name() == "dummy")
+                    .cloned(),
             };
             return api_app.merge(tiled_web::build_router(web_state));
         }

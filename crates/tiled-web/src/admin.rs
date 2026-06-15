@@ -12,9 +12,7 @@ use chrono::{Duration, Utc};
 use serde::Deserialize;
 use sqlx::Row;
 
-use tiled_auth::{
-    ApiKeyCreate, AuthDb, Authenticator, DummyAuthenticator, Issuer, Principal, Scope, ScopeSet,
-};
+use tiled_auth::{ApiKeyCreate, AuthDb, Principal, Scope, ScopeSet};
 
 use crate::WebState;
 use crate::cookie::{build_session_cookie, clear_session_cookie, read_session_cookie};
@@ -140,22 +138,14 @@ async fn login_submit(State(state): State<Arc<WebState>>, Form(form): Form<Login
             form.provider, state.login_provider
         ));
     }
-    // The admin shell's login fast-path is the dummy authenticator —
-    // matches what the CLI exposes via `--user name:password`. Real
-    // OIDC / Entra deployments hit the SPA login flow + JWT directly.
-    let mut auth = DummyAuthenticator::new(&state.login_provider);
-    // Build a single-shot authenticator from the supplied credentials —
-    // we don't have access to the configured user list here, so we
-    // delegate to the DB instead: the username must already exist as
-    // a Principal/Identity, and password verification falls through to
-    // the auth DB once we wire in real authenticators. For now the
-    // admin shell only works with explicit (username, password) pairs
-    // matching the deployed `DummyAuthenticator` configuration.
-    let _ = (&form.password, &mut auth);
-    // Dispatch through the same code path the API exposes by looking
-    // up the principal directly. Treat the supplied `username` as the
-    // identity sub.
-    let (principal, identity) = match db.ensure_principal(&form.provider, &form.username).await {
+    let Some(auth) = state.authenticator.as_ref() else {
+        return error_login("no authenticator configured");
+    };
+    let subject = match auth.authenticate(&form.username, &form.password).await {
+        Ok(s) => s,
+        Err(_) => return error_login("invalid username or password"),
+    };
+    let (principal, identity) = match db.ensure_principal(&subject.provider, &subject.sub).await {
         Ok(p) => p,
         Err(e) => return error_login(&format!("auth failed: {e}")),
     };
@@ -585,9 +575,3 @@ async fn resolve_session(
         scopes: claims.scopes.intersect(&session.scopes),
     })
 }
-
-// Silence unused-imports warnings on alternate feature paths.
-const _: fn() = || {
-    let _: Option<&dyn Authenticator> = None;
-    let _: Option<&Issuer> = None;
-};
