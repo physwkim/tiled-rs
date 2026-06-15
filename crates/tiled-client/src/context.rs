@@ -22,6 +22,16 @@ use crate::cache::HttpCache;
 use crate::error::{ClientError, Result};
 use crate::utils::{decode_response, default_headers, handle_error, retry};
 
+/// Cap on idle keep-alive connections retained per host. Mirrors Python
+/// tiled's `MAX_CONCURRENT_CONNECTIONS = 16` (`tiled/client/context.py:39`),
+/// which it feeds to `httpx.Limits(max_connections=16,
+/// max_keepalive_connections=16)`. reqwest's builder exposes only the
+/// keep-alive idle pool (`pool_max_idle_per_host`), not httpx's hard
+/// total-`max_connections` cap — Python enforces that hard cap with a separate
+/// application-level `threading.Semaphore`, which this transport-pool setting
+/// does not replace.
+pub(crate) const MAX_CONCURRENT_CONNECTIONS: usize = 16;
+
 /// Connection context: HTTP client + base URL + auth state.
 ///
 /// `Context` is cheap to clone (`Arc`-wrapped internal state) so client objects
@@ -184,6 +194,7 @@ impl Context {
             None => Client::builder()
                 .user_agent(crate::utils::USER_AGENT_VALUE)
                 .cookie_store(true)
+                .pool_max_idle_per_host(MAX_CONCURRENT_CONNECTIONS)
                 .build()?,
         };
 
