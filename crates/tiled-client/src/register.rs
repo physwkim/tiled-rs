@@ -487,11 +487,17 @@ async fn walk_and_register(node: &ContainerClient, path: &Path, settings: &Setti
     // Group image sequences first.
     let (sequences, files) = group_image_sequences(files);
     for (name, seq) in sequences {
-        let _ = register_image_sequence(node, &name, &seq, settings).await;
+        // Propagate a real server/transport write failure (401/409/5xx/network)
+        // so the walk aborts like Python's `_walk` instead of reporting false
+        // success; adapter/mimetype skips are handled inside the helper.
+        register_image_sequence(node, &name, &seq, settings).await?;
     }
 
     for file in files {
-        let _ = try_register_single(node, &file, false, settings).await;
+        // Same: `try_register_single` returns `Ok(None)` for legitimate skips
+        // (no mimetype / no adapter / inspect failure) and only `Err`s on a POST
+        // write failure, which must abort the walk rather than be swallowed.
+        try_register_single(node, &file, false, settings).await?;
     }
     for dir in directories {
         let key = (settings.key_from_filename)(
@@ -530,7 +536,22 @@ async fn try_register_single(
 
     let uri =
         Url::from_file_path(path).map_err(|_| ClientError::Invalid("path to file URI".into()))?;
-    let spec = adapter.inspect(&uri, is_directory).await?;
+    // Mirror Python's `register_single_item`: a failure constructing/inspecting
+    // the adapter for this file is logged and SKIPPED (return), not propagated,
+    // so one unreadable file does not abort a bulk directory walk
+    // (tiled/client/register.py:316-321 `except Exception: ... return`). Only the
+    // server write below (`post_json`) is allowed to propagate an `Err`.
+    let spec = match adapter.inspect(&uri, is_directory).await {
+        Ok(spec) => spec,
+        Err(e) => {
+            tracing::warn!(
+                target: "tiled.register",
+                "SKIPPED: error constructing adapter for {}: {e}",
+                path.display()
+            );
+            return Ok(None);
+        }
+    };
 
     let key = (settings.key_from_filename)(
         path.file_name()
@@ -821,5 +842,118 @@ mod tests {
     fn default_filter_drops_hidden() {
         assert!(default_filter(Path::new("/tmp/visible.txt")));
         assert!(!default_filter(Path::new("/tmp/.hidden")));
+    }
+
+    // -----------------------------------------------------------------------
+    // F3 — the register walk must propagate a real server/transport write
+    // failure (not swallow it and report false success), while still skipping
+    // files whose adapter cannot be constructed/inspected.
+    // -----------------------------------------------------------------------
+
+    use crate::base::Item;
+    use crate::context::Context;
+
+    /// Spawn an axum app on an ephemeral port and return its base URL.
+    async fn spawn(app: axum::Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        format!("http://{addr}")
+    }
+
+    /// Build a root container client whose `self` link points at `base`.
+    fn container_at(base: &str) -> ContainerClient {
+        let (ctx, _) = Context::from_uri(base).unwrap();
+        let item: Item = serde_json::from_value(serde_json::json!({
+            "id": "mydir",
+            "attributes": { "ancestors": [], "structure_family": "container" },
+            "links": { "self": format!("{base}/api/v1/metadata/mydir") },
+        }))
+        .unwrap();
+        ContainerClient::from_item(ctx, item, false).unwrap()
+    }
+
+    /// Settings that map `.stub` to the given adapter and nothing else.
+    fn stub_settings(adapter: Arc<dyn RegistrationAdapter>) -> Settings {
+        let mut settings = Settings::default();
+        settings.adapters.clear();
+        settings
+            .adapters
+            .insert("application/x-stub".into(), adapter);
+        settings
+            .mimetypes_by_ext
+            .insert(".stub".into(), "application/x-stub".into());
+        settings
+    }
+
+    #[tokio::test]
+    async fn walk_propagates_post_write_failure() {
+        async fn always_500() -> axum::http::StatusCode {
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        }
+        let app =
+            axum::Router::new().route("/api/v1/register/{*path}", axum::routing::post(always_500));
+        let base = spawn(app).await;
+        let node = container_at(&base);
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.stub"), b"x").unwrap();
+
+        // PassthroughAdapter inspects without touching the file, so the only
+        // failure left is the server POST — which must abort the walk.
+        let settings = stub_settings(Arc::new(PassthroughAdapter {
+            mimetype: "application/x-stub".into(),
+            family: StructureFamily::Container,
+        }));
+
+        let err = walk_and_register(&node, dir.path(), &settings)
+            .await
+            .expect_err("a 500 on the register POST must abort the walk");
+        match err {
+            ClientError::Server { status, .. } => assert_eq!(status, 500),
+            other => panic!("expected Server 500, got {other:?}"),
+        }
+    }
+
+    /// Adapter whose `inspect` always fails — stands in for Python's
+    /// "Error constructing adapter" case, which is skipped, not propagated.
+    struct FailingInspectAdapter;
+
+    #[async_trait]
+    impl RegistrationAdapter for FailingInspectAdapter {
+        fn structure_family(&self) -> StructureFamily {
+            StructureFamily::Container
+        }
+        fn mimetype(&self) -> &str {
+            "application/x-stub"
+        }
+        async fn inspect(&self, _uri: &Url, _is_directory: bool) -> Result<DataSourceSpec> {
+            Err(ClientError::Invalid("boom: corrupt file".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn walk_skips_inspect_failure_without_aborting() {
+        // The POST endpoint 500s if ever reached; a skipped file must never
+        // reach it, so the walk should still return Ok.
+        async fn always_500() -> axum::http::StatusCode {
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        }
+        let app =
+            axum::Router::new().route("/api/v1/register/{*path}", axum::routing::post(always_500));
+        let base = spawn(app).await;
+        let node = container_at(&base);
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.stub"), b"x").unwrap();
+
+        let settings = stub_settings(Arc::new(FailingInspectAdapter));
+
+        walk_and_register(&node, dir.path(), &settings)
+            .await
+            .expect("an inspect failure is a logged skip, not a walk abort");
     }
 }
