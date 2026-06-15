@@ -21,20 +21,41 @@ use tiled_core::adapters::{AnyAdapter, BoxFuture};
 /// only paths whose canonicalised location lives under one of those
 /// directories are accepted; everything else fails with a
 /// `Validation` error so a registered `file:///etc/passwd` can't be
-/// served back as a CSV. An empty list means "no restriction" (legacy
-/// behaviour for tests / loose deployments).
+/// served back as a CSV. An empty list means "no restriction" (for tests /
+/// trusted single-user deployments); constructing one that way through
+/// [`new`](Self::new) or [`Default`] logs a `warn!` so the unrestricted
+/// state is never silent — see [`unrestricted`](Self::unrestricted) for the
+/// explicit, un-warned opt-in.
 pub struct FileLeafResolver {
     allowed_data_dirs: Vec<PathBuf>,
 }
 
 impl FileLeafResolver {
+    /// Construct a resolver restricted to `allowed_data_dirs`.
+    ///
+    /// An **empty** list means "no restriction" — every `file:` path a
+    /// registered `data_uri` points at is served. That is convenient for a
+    /// trusted single-user deployment but unsafe once untrusted writers can
+    /// register nodes (N2), so an empty list is logged as a `warn!` at
+    /// construction: the dangerous state is no longer silent. Callers that
+    /// *intend* no restriction should use [`FileLeafResolver::unrestricted`],
+    /// which is the explicit, un-warned opt-in.
     pub fn new(allowed_data_dirs: Vec<PathBuf>) -> Self {
+        if allowed_data_dirs.is_empty() {
+            tracing::warn!(
+                "FileLeafResolver has no allowed-data-dir restriction: the server will \
+                 serve any local file referenced by a registered data_uri. Pass \
+                 --allowed-data-dir (repeatable) to confine reads to specific directories."
+            );
+        }
         Self { allowed_data_dirs }
     }
 
-    /// Convenience constructor matching the legacy unrestricted shape.
-    /// New deployments should prefer [`FileLeafResolver::new`] with an
-    /// explicit allow-list.
+    /// Explicit, un-warned constructor for a deliberately unrestricted
+    /// resolver (tests, trusted single-user deployments). Unlike
+    /// [`FileLeafResolver::new`] with an empty list, this does not log a
+    /// warning, because the lack of restriction is the caller's stated
+    /// intent rather than a forgotten `--allowed-data-dir`.
     pub fn unrestricted() -> Self {
         Self {
             allowed_data_dirs: Vec::new(),
@@ -69,8 +90,12 @@ fn check_allowed(
 }
 
 impl Default for FileLeafResolver {
+    /// The implicit default is unrestricted, but — unlike
+    /// [`FileLeafResolver::unrestricted`] — routes through
+    /// [`new`](FileLeafResolver::new) so a defaulted (i.e. unconsidered)
+    /// resolver still warns that reads are not path-restricted.
     fn default() -> Self {
-        Self::unrestricted()
+        Self::new(Vec::new())
     }
 }
 
@@ -272,5 +297,49 @@ mod tests {
     fn uri_to_path_rejects_malformed_file_uri() {
         assert!(uri_to_path("file://").is_err());
         assert!(uri_to_path("file://relative-no-slash").is_err());
+    }
+
+    #[test]
+    fn empty_allow_list_permits_any_path() {
+        // N2: an empty allow-list is "no restriction" (now warned at
+        // construction). The gate short-circuits without touching the
+        // filesystem, so a non-existent path is still permitted.
+        assert!(check_allowed(&[], Path::new("/etc/passwd")).is_ok());
+    }
+
+    #[test]
+    fn non_empty_allow_list_contains_reads() {
+        let inside = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let inside_file = inside.path().join("data.csv");
+        let outside_file = outside.path().join("secret.csv");
+        std::fs::write(&inside_file, b"x").unwrap();
+        std::fs::write(&outside_file, b"x").unwrap();
+
+        let allowed = vec![inside.path().to_path_buf()];
+        assert!(check_allowed(&allowed, &inside_file).is_ok());
+        assert!(check_allowed(&allowed, &outside_file).is_err());
+    }
+
+    #[test]
+    fn permissive_constructors_leave_allow_list_empty() {
+        // new([]), unrestricted(), and default() differ only in whether they
+        // warn; all three leave reads unrestricted (the non-breaking N2
+        // contract). new([dir]) stores the restriction.
+        assert!(
+            FileLeafResolver::new(Vec::new())
+                .allowed_data_dirs
+                .is_empty()
+        );
+        assert!(
+            FileLeafResolver::unrestricted()
+                .allowed_data_dirs
+                .is_empty()
+        );
+        assert!(FileLeafResolver::default().allowed_data_dirs.is_empty());
+        assert_eq!(
+            FileLeafResolver::new(vec![PathBuf::from("/data")]).allowed_data_dirs,
+            vec![PathBuf::from("/data")]
+        );
     }
 }
