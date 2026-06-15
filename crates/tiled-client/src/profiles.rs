@@ -19,29 +19,55 @@ use crate::error::{ClientError, Result};
 /// Search path. Listed lowest-precedence to highest. The user-config dir is
 /// last so it overrides everything else.
 pub fn paths() -> Vec<PathBuf> {
+    build_paths(
+        std::env::var("TILED_SITE_PROFILES").ok(),
+        std::env::var("TILED_PROFILES").ok(),
+        env_prefix(),
+        dirs::home_dir(),
+        dirs::config_dir(),
+    )
+}
+
+/// Pure precedence builder behind [`paths`]. Parameterized on the
+/// environment/platform inputs so the ordering can be tested deterministically
+/// across platforms (e.g. macOS `config_dir` = `~/Library/Application Support`
+/// vs Linux `~/.config`).
+///
+/// Mirrors `tiled/profiles.py::_all_paths` (lowest → highest precedence):
+/// system → env-prefix → user. The OS user-config dir is appended **last** so
+/// it has the highest precedence, matching Python's `platformdirs.user_config_dir`
+/// entry. It is intentionally NOT pushed in the system branch — doing so pinned
+/// it at system precedence and inverted the order on macOS (F4).
+fn build_paths(
+    site_profiles_env: Option<String>,
+    profiles_env: Option<String>,
+    env_prefix: Option<PathBuf>,
+    home_dir: Option<PathBuf>,
+    config_dir: Option<PathBuf>,
+) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
 
-    if let Ok(custom) = std::env::var("TILED_SITE_PROFILES") {
+    if let Some(custom) = site_profiles_env {
         out.push(PathBuf::from(custom));
     } else {
         out.push(PathBuf::from("/etc/tiled/profiles"));
-        if let Some(p) = dirs::config_dir() {
-            out.push(p.join("tiled").join("profiles"));
-        }
     }
 
-    if let Some(prefix) = env_prefix() {
+    if let Some(prefix) = env_prefix {
         out.push(prefix.join("etc").join("tiled").join("profiles"));
     }
 
-    if let Ok(custom) = std::env::var("TILED_PROFILES") {
+    if let Some(custom) = profiles_env {
         out.push(PathBuf::from(custom));
-    } else if let Some(home) = dirs::home_dir() {
+    } else if let Some(home) = home_dir {
         out.push(home.join(".config").join("tiled").join("profiles"));
     }
 
-    if let Some(p) = dirs::config_dir() {
+    if let Some(p) = config_dir {
         let user = p.join("tiled").join("profiles");
+        // Guard against the Linux case where `config_dir` == `~/.config`, so the
+        // hard-coded user path above already covers it; otherwise append it as
+        // the highest-precedence entry.
         if !out.contains(&user) {
             out.push(user);
         }
@@ -383,6 +409,82 @@ mod tests {
     fn paths_includes_user_config() {
         let ps = paths();
         assert!(!ps.is_empty(), "expected at least one search path");
+    }
+
+    // F4: the OS user-config dir must be the highest-precedence (last) entry,
+    // not demoted to system precedence. Exercised via the pure builder so the
+    // macOS layout (config_dir != ~/.config) is deterministic on any platform.
+    #[test]
+    fn user_config_dir_is_highest_precedence_macos_layout() {
+        let home = PathBuf::from("/Users/me");
+        let config_dir = PathBuf::from("/Users/me/Library/Application Support");
+        let ps = build_paths(
+            None,
+            None,
+            None,
+            Some(home.clone()),
+            Some(config_dir.clone()),
+        );
+
+        let user = config_dir.join("tiled").join("profiles");
+        assert_eq!(
+            ps.last(),
+            Some(&user),
+            "user_config_dir/tiled/profiles must be last (highest precedence): {ps:?}"
+        );
+        // It must NOT also appear at a lower (system) position.
+        let first = ps.iter().position(|p| p == &user).unwrap();
+        assert_eq!(first, ps.len() - 1, "user dir must not be demoted: {ps:?}");
+        // The hard-coded ~/.config user path stays strictly below it.
+        let xdg = home.join(".config").join("tiled").join("profiles");
+        let xdg_idx = ps.iter().position(|p| p == &xdg).unwrap();
+        assert!(
+            xdg_idx < first,
+            "~/.config must rank below user_config_dir: {ps:?}"
+        );
+        // The system path is below the user dirs.
+        assert_eq!(ps.first(), Some(&PathBuf::from("/etc/tiled/profiles")));
+    }
+
+    #[test]
+    fn user_config_dir_collapses_on_linux_layout() {
+        let home = PathBuf::from("/home/me");
+        // Linux: dirs::config_dir() == ~/.config, so it coincides with the
+        // hard-coded user path and must appear exactly once, last.
+        let config_dir = PathBuf::from("/home/me/.config");
+        let ps = build_paths(
+            None,
+            None,
+            None,
+            Some(home.clone()),
+            Some(config_dir.clone()),
+        );
+
+        let user = config_dir.join("tiled").join("profiles");
+        assert_eq!(ps.last(), Some(&user));
+        assert_eq!(
+            ps.iter().filter(|p| **p == user).count(),
+            1,
+            "no duplicate user dir on Linux: {ps:?}"
+        );
+    }
+
+    #[test]
+    fn site_env_overrides_system_entry_user_dir_still_last() {
+        let home = PathBuf::from("/Users/me");
+        let config_dir = PathBuf::from("/Users/me/Library/Application Support");
+        let ps = build_paths(
+            Some("/custom/site/profiles".into()),
+            None,
+            None,
+            Some(home),
+            Some(config_dir.clone()),
+        );
+        // TILED_SITE_PROFILES replaces the hard-coded /etc entry.
+        assert_eq!(ps.first(), Some(&PathBuf::from("/custom/site/profiles")));
+        assert!(!ps.contains(&PathBuf::from("/etc/tiled/profiles")));
+        // And the user config dir is still last.
+        assert_eq!(ps.last(), Some(&config_dir.join("tiled").join("profiles")));
     }
 
     #[test]
