@@ -212,6 +212,16 @@ impl ScopeSet {
         Self(self.0.intersection(&other.0).copied().collect())
     }
 
+    /// Subset test: every scope in `self` is also in `other`. The access
+    /// policy uses it for the NO_ACCESS gate (requested scopes must be
+    /// grantable) and the read-only check (untagged/public rows only for
+    /// read-scoped listings). Like [`Self::intersect`], canonicalization
+    /// (no operand is a bare `{Admin}`) keeps this in agreement with
+    /// [`Self::contains`].
+    pub fn is_subset(&self, other: &Self) -> bool {
+        self.0.is_subset(&other.0)
+    }
+
     /// Expand the [`Scope::Inherit`] metascope. `inherit` is not a real
     /// permission: it means "dynamically receive the principal's *current*
     /// role scopes at access time" (Python parity: `inherit` confers all

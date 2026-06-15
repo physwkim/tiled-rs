@@ -243,7 +243,7 @@ impl AccessPolicy for TagBasedPolicy {
         // Mirrors Python filters() line 378-379
         // (`if not scopes.issubset(self.scopes): return NO_ACCESS`).
         // ALL_ACCESS is `None`; NO_ACCESS is an all-false filter (deny-all).
-        if !requested_scopes.0.is_subset(&self.default_scopes.0) {
+        if !requested_scopes.is_subset(&self.default_scopes) {
             return Some(AccessBlobFilter::default());
         }
 
@@ -278,7 +278,7 @@ impl AccessPolicy for TagBasedPolicy {
         // consistent with the per-node "public"-tag read grant — a
         // "public"-tagged node is both listable and readable by everyone. A
         // write-scoped listing exposes neither.
-        let include_untagged = requested_scopes.0.is_subset(&ScopeSet::read_only().0);
+        let include_untagged = requested_scopes.is_subset(&ScopeSet::read_only());
         if include_untagged && !tags.iter().any(|t| t == PUBLIC_TAG) {
             tags.push(PUBLIC_TAG.to_string());
         }
