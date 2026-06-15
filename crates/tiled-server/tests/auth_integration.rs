@@ -54,6 +54,7 @@ async fn build_test_app() -> (axum::Router, tempfile::TempDir, Catalog, AuthDb) 
         external_oidc: None,
         forwarded_allow_ips: None,
         max_request_body_bytes: 10 * 1024 * 1024,
+        response_bytesize_limit: 300_000_000,
         streaming_bus: tiled_server::streaming::StreamingBus::new(),
         access_policy: None,
         default_login_scopes: tiled_auth::ScopeSet::full(),

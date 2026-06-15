@@ -14,6 +14,10 @@ pub enum ServerError {
     UnsupportedMediaType(String),
     Unauthorized(String),
     Forbidden(String),
+    /// Decoded response payload exceeds the configured
+    /// `response_bytesize_limit`. Maps to 400 to match Python tiled
+    /// (router.py raises HTTP_400_BAD_REQUEST before serialization).
+    ResponseTooLarge(String),
 }
 
 impl std::fmt::Display for ServerError {
@@ -25,6 +29,7 @@ impl std::fmt::Display for ServerError {
             Self::UnsupportedMediaType(msg) => write!(f, "Unsupported media type: {msg}"),
             Self::Unauthorized(msg) => write!(f, "Unauthorized: {msg}"),
             Self::Forbidden(msg) => write!(f, "Forbidden: {msg}"),
+            Self::ResponseTooLarge(msg) => write!(f, "Response too large: {msg}"),
         }
     }
 }
@@ -50,6 +55,7 @@ impl IntoResponse for ServerError {
             Self::UnsupportedMediaType(msg) => (StatusCode::UNSUPPORTED_MEDIA_TYPE, 415, msg),
             Self::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, 401, msg),
             Self::Forbidden(msg) => (StatusCode::FORBIDDEN, 403, msg),
+            Self::ResponseTooLarge(msg) => (StatusCode::BAD_REQUEST, 400, msg),
         };
 
         let body = schemas::Response::<()> {

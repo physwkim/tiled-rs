@@ -501,6 +501,20 @@ pub async fn search(
     Ok(Json(resp))
 }
 
+// Enforce the configured `response_bytesize_limit` (parity gap L4). Mirrors
+// Python tiled, which compares the decoded data size against
+// `settings.response_bytesize_limit` BEFORE packing and raises
+// HTTP 400 on exceed (router.py:621/701/1185/1315/...). `nbytes` is the
+// decoded in-memory size of the payload about to be serialized.
+fn check_response_size(nbytes: usize, limit: usize) -> Result<(), ServerError> {
+    if nbytes > limit {
+        return Err(ServerError::ResponseTooLarge(format!(
+            "Response would exceed {limit}. Select a subset of the data to request a smaller chunk."
+        )));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Shared array response builder (used by array_block and array_full)
 // ---------------------------------------------------------------------------
@@ -511,6 +525,9 @@ async fn build_array_response(
     headers: &HeaderMap,
     state: &AppState,
 ) -> Result<axum::response::Response, ServerError> {
+    // Cap the decoded array size before serialization (Python: array.nbytes).
+    check_response_size(data.data.len(), state.response_bytesize_limit)?;
+
     let accept = headers
         .get("accept")
         .and_then(|v| v.to_str().ok())
@@ -558,6 +575,15 @@ async fn build_table_response(
     headers: &HeaderMap,
     state: &AppState,
 ) -> Result<axum::response::Response, ServerError> {
+    // Cap the decoded table size before serialization (Python:
+    // df.memory_usage().sum()).
+    let nbytes: usize = table
+        .batches
+        .iter()
+        .map(|b| b.get_array_memory_size())
+        .sum();
+    check_response_size(nbytes, state.response_bytesize_limit)?;
+
     let accept = headers
         .get(axum::http::header::ACCEPT)
         .and_then(|v| v.to_str().ok())

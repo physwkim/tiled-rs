@@ -508,6 +508,10 @@ pub async fn run(command: Command) -> Result<()> {
                 external_oidc: None,
                 forwarded_allow_ips: None,
                 max_request_body_bytes: 10 * 1024 * 1024,
+                response_bytesize_limit: file_config
+                    .as_ref()
+                    .map(|c| c.response_bytesize_limit)
+                    .unwrap_or_else(config::default_response_bytesize_limit),
                 streaming_bus: tiled_server::streaming::StreamingBus::new(),
                 access_policy: access_policy_value,
                 default_login_scopes: tiled_auth::ScopeSet::read_only(),

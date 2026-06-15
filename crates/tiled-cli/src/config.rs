@@ -11,7 +11,7 @@ use tiled_access::{AccessPolicy, PassthroughPolicy, TagBasedPolicy};
 use tiled_auth::ScopeSet;
 
 /// Top-level configuration.
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize)]
 pub struct TiledConfig {
     #[serde(default)]
     pub trees: Vec<TreeConfig>,
@@ -28,6 +28,33 @@ pub struct TiledConfig {
     /// auth DB is configured, no policy otherwise).
     #[serde(default)]
     pub access_control: Option<AccessControlConfig>,
+    /// Maximum decoded size (bytes) of a single array/table data response.
+    /// Mirrors Python tiled's top-level `response_bytesize_limit:` setting
+    /// (config.py:279, default 300_000_000). Read handlers return 400 when
+    /// the decoded payload would exceed this.
+    #[serde(default = "default_response_bytesize_limit")]
+    pub response_bytesize_limit: usize,
+}
+
+/// Default for [`TiledConfig::response_bytesize_limit`] — 300 MB, matching
+/// Python tiled (`settings.py:40`).
+pub fn default_response_bytesize_limit() -> usize {
+    300_000_000
+}
+
+// `Default` is hand-written (not derived) so `response_bytesize_limit` agrees
+// with its serde default (300 MB) instead of `usize::default()` (0), which
+// would otherwise make every response "exceed" the limit.
+impl Default for TiledConfig {
+    fn default() -> Self {
+        Self {
+            trees: Vec::new(),
+            authentication: None,
+            web: None,
+            access_control: None,
+            response_bytesize_limit: default_response_bytesize_limit(),
+        }
+    }
 }
 
 /// `access_control:` block.
@@ -200,5 +227,22 @@ impl TiledConfig {
             .as_ref()
             .and_then(|a| a.single_user_api_key.clone())
             .or_else(|| std::env::var("TILED_SINGLE_USER_API_KEY").ok())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn response_bytesize_limit_defaults_and_overrides() {
+        // Absent in YAML → 300 MB (serde default).
+        let cfg: TiledConfig = serde_yaml::from_str("trees: []").unwrap();
+        assert_eq!(cfg.response_bytesize_limit, 300_000_000);
+        // `Default` agrees with the serde default (not usize::default() == 0).
+        assert_eq!(TiledConfig::default().response_bytesize_limit, 300_000_000);
+        // Explicit value is honored.
+        let cfg: TiledConfig = serde_yaml::from_str("response_bytesize_limit: 42").unwrap();
+        assert_eq!(cfg.response_bytesize_limit, 42);
     }
 }

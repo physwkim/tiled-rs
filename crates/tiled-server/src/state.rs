@@ -61,6 +61,11 @@ pub struct AppState {
     /// are rejected with 413. Default 10 MiB matches the metadata size
     /// limit in tiled-catalog so a too-large catalog payload fails fast.
     pub max_request_body_bytes: usize,
+    /// Maximum decoded size (bytes) of a single array/table data response.
+    /// Read handlers measure the decoded payload BEFORE serialization and
+    /// return 400 when it exceeds this. Default 300_000_000 matches Python
+    /// tiled's `response_bytesize_limit` (config.py / settings.py).
+    pub response_bytesize_limit: usize,
 
     /// In-process pub/sub bus for WebSocket subscribers. Write handlers
     /// publish to it after a successful catalog write; subscribers

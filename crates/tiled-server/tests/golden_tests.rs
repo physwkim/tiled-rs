@@ -45,6 +45,12 @@ fn build_test_tree() -> MapAdapter {
 }
 
 fn build_app() -> axum::Router {
+    build_app_with_limit(300_000_000)
+}
+
+/// Like `build_app` but with a caller-chosen `response_bytesize_limit`, so the
+/// L4 size-cap behavior can be exercised with a tiny limit.
+fn build_app_with_limit(response_bytesize_limit: usize) -> axum::Router {
     let root_tree: Arc<dyn tiled_core::adapters::ContainerAdapter> = Arc::new(build_test_tree());
     let registry = Arc::new(tiled_serialization::default_registry());
 
@@ -67,6 +73,7 @@ fn build_app() -> axum::Router {
         external_oidc: None,
         forwarded_allow_ips: None,
         max_request_body_bytes: 10 * 1024 * 1024,
+        response_bytesize_limit,
         streaming_bus: tiled_server::streaming::StreamingBus::new(),
         access_policy: None,
         default_login_scopes: tiled_auth::ScopeSet::full(),
@@ -103,6 +110,7 @@ fn build_app_dynamic(trust_forwarded: bool) -> axum::Router {
         external_oidc: None,
         forwarded_allow_ips: None,
         max_request_body_bytes: 10 * 1024 * 1024,
+        response_bytesize_limit: 300_000_000,
         streaming_bus: tiled_server::streaming::StreamingBus::new(),
         access_policy: None,
         default_login_scopes: tiled_auth::ScopeSet::full(),
@@ -494,6 +502,7 @@ async fn test_empty_container() {
         external_oidc: None,
         forwarded_allow_ips: None,
         max_request_body_bytes: 10 * 1024 * 1024,
+        response_bytesize_limit: 300_000_000,
         streaming_bus: tiled_server::streaming::StreamingBus::new(),
         access_policy: None,
         default_login_scopes: tiled_auth::ScopeSet::full(),
@@ -589,6 +598,7 @@ fn build_app_with_api_key(key: &str) -> axum::Router {
         external_oidc: None,
         forwarded_allow_ips: None,
         max_request_body_bytes: 10 * 1024 * 1024,
+        response_bytesize_limit: 300_000_000,
         streaming_bus: tiled_server::streaming::StreamingBus::new(),
         access_policy: None,
         default_login_scopes: tiled_auth::ScopeSet::full(),
@@ -731,6 +741,7 @@ async fn test_metadata_handles_percent_encoded_slash_in_key() {
         external_oidc: None,
         forwarded_allow_ips: None,
         max_request_body_bytes: 10 * 1024 * 1024,
+        response_bytesize_limit: 300_000_000,
         streaming_bus: tiled_server::streaming::StreamingBus::new(),
         access_policy: None,
         default_login_scopes: tiled_auth::ScopeSet::full(),
@@ -814,6 +825,7 @@ async fn array_full_returns_all_chunks_not_just_first() {
         external_oidc: None,
         forwarded_allow_ips: None,
         max_request_body_bytes: 10 * 1024 * 1024,
+        response_bytesize_limit: 300_000_000,
         streaming_bus: tiled_server::streaming::StreamingBus::new(),
         access_policy: None,
         default_login_scopes: tiled_auth::ScopeSet::full(),
@@ -921,7 +933,7 @@ async fn array_full_format_param_beats_accept_header() {
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "csv-adapter")]
-fn build_table_app(csv_path: std::path::PathBuf) -> axum::Router {
+fn build_table_app(csv_path: std::path::PathBuf, response_bytesize_limit: usize) -> axum::Router {
     let csv = tiled_adapters::CsvAdapter::from_path(csv_path, serde_json::json!({"kind": "demo"}))
         .expect("build CsvAdapter");
     let mut mapping = IndexMap::new();
@@ -945,6 +957,7 @@ fn build_table_app(csv_path: std::path::PathBuf) -> axum::Router {
         external_oidc: None,
         forwarded_allow_ips: None,
         max_request_body_bytes: 10 * 1024 * 1024,
+        response_bytesize_limit,
         streaming_bus: tiled_server::streaming::StreamingBus::new(),
         access_policy: None,
         default_login_scopes: tiled_auth::ScopeSet::full(),
@@ -1002,7 +1015,7 @@ async fn test_table_full_endpoint() {
     writeln!(f, "3,30").unwrap();
     f.flush().unwrap();
 
-    let app = build_table_app(path);
+    let app = build_table_app(path, 300_000_000);
 
     // (1) Full read → Arrow IPC, all 3 rows, both columns.
     let (status, headers, body) =
@@ -1093,4 +1106,74 @@ async fn test_table_full_endpoint() {
     );
     let (cols, _) = decode_arrow(&body);
     assert_eq!(cols, vec!["x", "y"]);
+}
+
+// ---------------------------------------------------------------------------
+// L4 — response_bytesize_limit: a data response whose decoded size exceeds the
+// configured limit returns 400 BEFORE serialization; under the limit it works.
+// Mirrors Python tiled (router.py:621/701/1185/1315) which raises HTTP 400.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_response_bytesize_limit_array_returns_400() {
+    // some_array is 10 f64 = 80 decoded bytes.
+    // Over the cap (limit = 10) → 400 on both array_full and array_block.
+    let app = build_app_with_limit(10);
+
+    let (status, body) = get_json(&app, "/api/v1/array/full/some_array").await;
+    assert_eq!(status, 400, "array_full over the byte limit must be 400");
+    assert_eq!(body["error"]["code"], 400);
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Response would exceed"),
+        "got: {body:?}"
+    );
+
+    let (status, _) = get(&app, "/api/v1/array/block/some_array?block=0").await;
+    assert_eq!(status, 400, "array_block over the byte limit must be 400");
+
+    // Under the cap (limit = 1 MiB) → the same requests serve 200.
+    let app = build_app_with_limit(1024 * 1024);
+    let (status, body) = get(&app, "/api/v1/array/full/some_array").await;
+    assert_eq!(
+        status, 200,
+        "array_full under the limit must still serve 200"
+    );
+    assert_eq!(body.len(), 80, "10 f64 = 80 bytes");
+}
+
+#[cfg(feature = "csv-adapter")]
+#[tokio::test]
+async fn test_response_bytesize_limit_table_returns_400() {
+    use std::io::Write;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.csv");
+    let mut f = std::fs::File::create(&path).unwrap();
+    writeln!(f, "x,y").unwrap();
+    writeln!(f, "1,10").unwrap();
+    writeln!(f, "2,20").unwrap();
+    f.flush().unwrap();
+
+    // limit = 1 byte → the table's in-memory size exceeds it → 400 before encode.
+    let app = build_table_app(path.clone(), 1);
+    let (status, body) = get_json(&app, "/api/v1/table/full/some_table").await;
+    assert_eq!(status, 400, "table_full over the byte limit must be 400");
+    assert_eq!(body["error"]["code"], 400);
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Response would exceed"),
+        "got: {body:?}"
+    );
+
+    // Generous limit → 200.
+    let app = build_table_app(path, 1024 * 1024);
+    let (status, _, _) = get_with_headers(&app, "/api/v1/table/full/some_table", &[]).await;
+    assert_eq!(
+        status, 200,
+        "table_full under the limit must still serve 200"
+    );
 }
