@@ -282,8 +282,11 @@ fn matches_access_blob_filter(
         .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
         .unwrap_or_default();
 
-    // include_untagged: rows with absent or empty tags are public.
-    if f.include_untagged && node_tags.is_empty() {
+    // include_untagged: rows with absent/empty tags AND no `user` key are
+    // genuinely public. A user-owned blob `{"user": id}` carries no `tags`
+    // key but must NOT be treated as public here — it reaches the caller only
+    // through the user-ownership arm below, so it never leaks to non-owners.
+    if f.include_untagged && node_tags.is_empty() && access_blob.get("user").is_none() {
         return true;
     }
     // Tag intersection.
@@ -468,6 +471,44 @@ mod tests {
             ..Default::default()
         });
         assert!(!matches_query(&a, &blob, &q));
+    }
+
+    /// Regression (fail-open leak): include_untagged must NOT match a
+    /// user-owned blob `{"user": id}` (which has no `tags` key). Such a node
+    /// is reachable only by its owner via the user-ownership arm.
+    #[test]
+    fn access_blob_filter_untagged_excludes_user_owned() {
+        let a = adapter(json!({}));
+        let blob = json!({"user": "bob-uuid"});
+        // Anonymous-style filter: no user_id, no tags, only include_untagged.
+        let anon = Query::AccessBlobFilter(AccessBlobFilter {
+            include_untagged: true,
+            ..Default::default()
+        });
+        assert!(
+            !matches_query(&a, &blob, &anon),
+            "user-owned node must not be visible via the untagged-public arm"
+        );
+        // Cross-user filter: alice's grant must not surface bob's owned node.
+        let alice = Query::AccessBlobFilter(AccessBlobFilter {
+            user_id: Some("alice-uuid".into()),
+            include_untagged: true,
+            ..Default::default()
+        });
+        assert!(
+            !matches_query(&a, &blob, &alice),
+            "another user's owned node must not be visible to alice"
+        );
+        // The owner still sees their own node via the user arm.
+        let owner = Query::AccessBlobFilter(AccessBlobFilter {
+            user_id: Some("bob-uuid".into()),
+            include_untagged: true,
+            ..Default::default()
+        });
+        assert!(
+            matches_query(&a, &blob, &owner),
+            "owner must still see their own node"
+        );
     }
 
     // Supported metadata variants (Eq, NotEq) must continue to work.

@@ -130,12 +130,28 @@ impl TagBasedPolicy {
             })
             .unwrap_or_default()
     }
+
+    /// The owning principal UUID if this node carries a `{"user": "..."}`
+    /// claim. A user-owned node is private to that owner: it has no `tags`
+    /// key, so it must be gated on ownership rather than treated as an
+    /// untagged-public node (otherwise every caller could read it).
+    fn node_owner<'a>(ctx: &NodeContext<'a>) -> Option<&'a str> {
+        ctx.access_blob.get("user").and_then(|v| v.as_str())
+    }
 }
 
 #[async_trait]
 impl AccessPolicy for TagBasedPolicy {
     async fn anonymous_decision(&self, ctx: NodeContext<'_>) -> Decision {
-        // Anonymous sees only "public" nodes (no tags).
+        // A user-owned node ({"user": id}) is private to its owner. Anonymous
+        // never owns a node, so even though such a blob carries no `tags` key
+        // it must NOT be treated as untagged-public and exposed anonymously.
+        if Self::node_owner(&ctx).is_some() {
+            return Decision {
+                scopes: ScopeSet::default(),
+            };
+        }
+        // Anonymous otherwise sees only public nodes (no tags).
         if Self::node_tags(&ctx).is_empty() {
             Decision {
                 scopes: ScopeSet::from_iter([Scope::ReadMetadata, Scope::ReadData]),
@@ -153,6 +169,17 @@ impl AccessPolicy for TagBasedPolicy {
         session_scopes: &ScopeSet,
         ctx: NodeContext<'_>,
     ) -> Decision {
+        // User-owned nodes are private to their owner. A {"user": id} blob has
+        // no `tags` key, so the tags path below would otherwise treat it as
+        // untagged-public and leak it to every principal.
+        if let Some(owner) = Self::node_owner(&ctx) {
+            let scopes = if owner == principal.uuid {
+                session_scopes.intersect(&self.default_scopes)
+            } else {
+                ScopeSet::default()
+            };
+            return Decision { scopes };
+        }
         let node_tags = Self::node_tags(&ctx);
         let granted = self
             .principal_tags

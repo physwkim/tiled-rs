@@ -357,7 +357,9 @@ impl WhereBuilder {
     /// - Tags present → EXISTS subquery over `access_blob.tags`.
     /// - `user_id` present → `access_blob.user` text equality.
     /// - `include_untagged` → OR arm for rows with absent/empty tags array
-    ///   (these are treated as "public" — visible to everyone).
+    ///   AND no `user` key — genuinely public, visible to everyone. A
+    ///   user-owned blob `{"user": id}` carries no `tags` key but is NOT
+    ///   public; it reaches a caller only through the `user_id` arm.
     /// - Multiple conditions → `(cond1 OR cond2 …)`.
     fn push_access_blob_filter(&mut self, filter: &tiled_core::queries::AccessBlobFilter) {
         if filter.user_id.is_none() && filter.tags.is_empty() && !filter.include_untagged {
@@ -400,15 +402,23 @@ impl WhereBuilder {
             }
         }
         if filter.include_untagged {
+            // "Untagged-public" must exclude user-owned rows: a blob like
+            // `{"user": "<uuid>"}` has no `tags` key, so the tags-absent test
+            // alone would match — and leak — every user-owned node to every
+            // caller. Require the row to carry no `user` key as well, so this
+            // arm means strictly "no tags AND no owner" (genuinely public).
+            // User-owned rows reach the caller only through the `user_id` arm.
             match self.dialect {
                 Dialect::Sqlite => conds.push(
-                    "(json_extract(access_blob, '$.tags') IS NULL \
-                     OR json_array_length(json_extract(access_blob, '$.tags')) = 0)"
+                    "((json_extract(access_blob, '$.tags') IS NULL \
+                     OR json_array_length(json_extract(access_blob, '$.tags')) = 0) \
+                     AND json_extract(access_blob, '$.user') IS NULL)"
                         .into(),
                 ),
                 Dialect::Postgres => conds.push(
-                    "(access_blob->'tags' IS NULL \
-                     OR jsonb_array_length(access_blob->'tags') = 0)"
+                    "((access_blob->'tags' IS NULL \
+                     OR jsonb_array_length(access_blob->'tags') = 0) \
+                     AND access_blob->'user' IS NULL)"
                         .into(),
                 ),
             }
@@ -1105,5 +1115,40 @@ mod tests {
             "include_untagged alone must yield empty-tags check, got: {sql}"
         );
         assert_eq!(binds.len(), 0);
+    }
+
+    /// Regression (fail-open leak): the untagged-public arm must also require
+    /// the row to carry no `user` key, so a user-owned blob `{"user": id}` —
+    /// which has no `tags` key — is NOT matched as "public" for everyone.
+    #[test]
+    fn access_blob_filter_untagged_excludes_user_owned_sqlite() {
+        use tiled_core::queries::AccessBlobFilter;
+        let f = AccessBlobFilter {
+            include_untagged: true,
+            ..Default::default()
+        };
+        let mut b = WhereBuilder::new(Dialect::Sqlite);
+        b.push_access_blob_filter(&f);
+        let (sql, _) = b.finish();
+        assert!(
+            sql.contains("json_extract(access_blob, '$.user') IS NULL"),
+            "untagged arm must exclude user-owned rows, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn access_blob_filter_untagged_excludes_user_owned_postgres() {
+        use tiled_core::queries::AccessBlobFilter;
+        let f = AccessBlobFilter {
+            include_untagged: true,
+            ..Default::default()
+        };
+        let mut b = WhereBuilder::new(Dialect::Postgres);
+        b.push_access_blob_filter(&f);
+        let (sql, _) = b.finish();
+        assert!(
+            sql.contains("access_blob->'user' IS NULL"),
+            "untagged arm must exclude user-owned rows, got: {sql}"
+        );
     }
 }

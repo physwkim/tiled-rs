@@ -150,7 +150,8 @@ pub struct SpecsQuery {
 /// A row matches when ANY of the following is true:
 /// * `user_id` is `Some(id)` and `access_blob.user == id`
 /// * `access_blob.tags` contains any tag in `tags`
-/// * `include_untagged` is `true` and `access_blob.tags` is absent or empty
+/// * `include_untagged` is `true` and `access_blob.tags` is absent/empty AND
+///   `access_blob` has no `user` key (genuinely public)
 ///
 /// When all three conditions are vacuously false the row is excluded.
 /// (Empty `tags`, no `user_id`, and `include_untagged = false` → deny all.)
@@ -159,8 +160,10 @@ pub struct AccessBlobFilter {
     pub user_id: Option<String>,
     #[serde(default)]
     pub tags: Vec<String>,
-    /// When `true` rows whose `access_blob.tags` is absent or empty are
-    /// treated as "public" and always match regardless of `user_id`/`tags`.
+    /// When `true`, rows whose `access_blob.tags` is absent or empty AND that
+    /// carry no `user` key are treated as "public" and match for everyone. A
+    /// user-owned blob `{"user": id}` is excluded from this arm — it matches
+    /// only its owner via `user_id`, so the flag never leaks owned rows.
     #[serde(default)]
     pub include_untagged: bool,
 }
