@@ -42,6 +42,15 @@ pub enum ServerError {
     /// [`Self::UnsupportedQuery`] (query *type* not evaluable on this node);
     /// this is a malformed *value* for a recognised query type.
     InvalidQuery(String),
+    /// The path resolved to a real node, but its structure family does not
+    /// match the one this route requires (e.g. `GET /array/full/<a-table>`).
+    /// Maps to HTTP 404 to match Python tiled, which resolves the node with a
+    /// `structure_families` filter and answers `HTTP_404_NOT_FOUND` on a
+    /// mismatch (tiled/server/dependencies.py:138-149), and likewise maps
+    /// `WrongTypeForRoute` → 404 (tiled/server/router.py:393-394). Distinct
+    /// from [`Self::Validation`] (422): a wrong-type-for-route is "no such
+    /// thing at this route", not "your request body/params are invalid".
+    WrongType(String),
 }
 
 impl std::fmt::Display for ServerError {
@@ -58,6 +67,7 @@ impl std::fmt::Display for ServerError {
             Self::ResponseTooLarge(msg) => write!(f, "Response too large: {msg}"),
             Self::UnsupportedQuery(msg) => write!(f, "Unsupported query: {msg}"),
             Self::InvalidQuery(msg) => write!(f, "Invalid query: {msg}"),
+            Self::WrongType(msg) => write!(f, "Wrong type for route: {msg}"),
         }
     }
 }
@@ -88,6 +98,7 @@ impl IntoResponse for ServerError {
             Self::ResponseTooLarge(msg) => (StatusCode::BAD_REQUEST, 400, msg),
             Self::UnsupportedQuery(msg) => (StatusCode::BAD_REQUEST, 400, msg),
             Self::InvalidQuery(msg) => (StatusCode::BAD_REQUEST, 400, msg),
+            Self::WrongType(msg) => (StatusCode::NOT_FOUND, 404, msg),
         };
 
         let body = schemas::Response::<()> {

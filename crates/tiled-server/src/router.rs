@@ -515,7 +515,7 @@ pub async fn search(
             match adapter {
                 AnyAdapter::Container(c) => c.as_ref(),
                 _ => {
-                    return Err(ServerError::Validation(format!(
+                    return Err(ServerError::WrongType(format!(
                         "'{}' is not a container",
                         segments.join("/")
                     )));
@@ -781,7 +781,7 @@ pub async fn array_block(
             move || -> Result<Arc<dyn tiled_core::adapters::ArrayAdapterRead>, ServerError> {
                 let adapter = core::walk_tree(state_c.root_tree.as_ref(), &segs)?;
                 adapter.as_array_arc().ok_or_else(|| {
-                    ServerError::Validation(format!("'{}' is not an array", segs.join("/")))
+                    ServerError::WrongType(format!("'{}' is not an array", segs.join("/")))
                 })
             },
         )
@@ -976,7 +976,7 @@ pub async fn array_append(
             move || -> Result<Arc<dyn tiled_core::adapters::ArrayAdapterRead>, ServerError> {
                 let adapter = core::walk_tree(state_c.root_tree.as_ref(), &segs)?;
                 adapter.as_array_arc().ok_or_else(|| {
-                    ServerError::Validation(format!("'{}' is not an array", segs.join("/")))
+                    ServerError::WrongType(format!("'{}' is not an array", segs.join("/")))
                 })
             },
         )
@@ -1240,7 +1240,7 @@ pub async fn container_full(
                 core::walk_tree(root_arc.as_ref(), &segs)?
                     .as_container()
                     .ok_or_else(|| {
-                        ServerError::Validation(format!("'{}' is not a container", segs.join("/")))
+                        ServerError::WrongType(format!("'{}' is not a container", segs.join("/")))
                     })?
             };
             let mut out = Vec::new();
@@ -1368,7 +1368,7 @@ pub async fn container_full(
             core::walk_tree(root_arc.as_ref(), &segs)?
                 .as_container()
                 .ok_or_else(|| {
-                    ServerError::Validation(format!("'{}' is not a container", segs.join("/")))
+                    ServerError::WrongType(format!("'{}' is not a container", segs.join("/")))
                 })?
         };
         // H3: apply access filter to listing.
@@ -1748,7 +1748,7 @@ pub async fn array_full(
             move || -> Result<Arc<dyn tiled_core::adapters::ArrayAdapterRead>, ServerError> {
                 let adapter = core::walk_tree(state_c.root_tree.as_ref(), &segs)?;
                 adapter.as_array_arc().ok_or_else(|| {
-                    ServerError::Validation(format!("'{}' is not an array", segs.join("/")))
+                    ServerError::WrongType(format!("'{}' is not an array", segs.join("/")))
                 })
             },
         )
@@ -1823,7 +1823,7 @@ pub async fn table_partition(
             move || -> Result<Arc<dyn tiled_core::adapters::TableAdapterRead>, ServerError> {
                 let adapter = core::walk_tree(state_c.root_tree.as_ref(), &segs)?;
                 adapter.as_table_arc().ok_or_else(|| {
-                    ServerError::Validation(format!("'{}' is not a table", segs.join("/")))
+                    ServerError::WrongType(format!("'{}' is not a table", segs.join("/")))
                 })
             },
         )
@@ -1889,7 +1889,7 @@ pub async fn table_full(
             move || -> Result<Arc<dyn tiled_core::adapters::TableAdapterRead>, ServerError> {
                 let adapter = core::walk_tree(state_c.root_tree.as_ref(), &segs)?;
                 adapter.as_table_arc().ok_or_else(|| {
-                    ServerError::Validation(format!("'{}' is not a table", segs.join("/")))
+                    ServerError::WrongType(format!("'{}' is not a table", segs.join("/")))
                 })
             },
         )
@@ -1982,7 +1982,7 @@ pub async fn get_documents(
         // The run must be a container (BlueskyRun).
         let run: &dyn ContainerAdapter = adapter
             .as_container()
-            .ok_or_else(|| ServerError::Validation("This is not a BlueskyRun".into()))?;
+            .ok_or_else(|| ServerError::WrongType("This is not a BlueskyRun".into()))?;
 
         // Build a JSON-seq response with the run's metadata as documents.
         // Format: {"name": "start", "doc": {...}}\n{"name": "stop", "doc": {...}}\n

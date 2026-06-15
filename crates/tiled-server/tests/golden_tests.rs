@@ -537,9 +537,11 @@ async fn test_empty_container() {
 #[tokio::test]
 async fn test_search_on_non_container() {
     let app = build_app();
-    // some_array is an array, not a container — search should fail
+    // some_array is an array, not a container. Searching it is a
+    // wrong-type-for-route: Python answers 404 (structure_families dependency,
+    // dependencies.py:138-149), not 422. (server-H4)
     let (status, body) = get_json(&app, "/api/v1/search/some_array").await;
-    assert_eq!(status, 422);
+    assert_eq!(status, 404);
     assert!(
         body["error"]["message"]
             .as_str()
@@ -1462,4 +1464,43 @@ async fn test_zip_deep_export_cumulative_bytesize_limit() {
     let app2 = build_app_for_root(root, 400);
     let (status2, _, _) = get_with_headers(&app2, "/api/v1/container/full/?format=zip", &[]).await;
     assert_eq!(status2, 200, "under limit must succeed");
+}
+
+// ---------------------------------------------------------------------------
+// server-H4: a path that resolves to a real node whose structure family does
+// not match the route must return 404 (not 422), matching Python tiled's
+// structure_families dependency (dependencies.py:138-149) and WrongTypeForRoute
+// handler (router.py:393-394). `subgroup` is a Container in build_test_tree().
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn array_route_on_a_container_returns_404_not_422() {
+    let app = build_app();
+    let (status, _) = get(&app, "/api/v1/array/full/subgroup").await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "requesting the array route on a container is a wrong-type-for-route \
+         (404 in Python), not a 422 validation error"
+    );
+}
+
+#[tokio::test]
+async fn table_route_on_a_container_returns_404_not_422() {
+    let app = build_app();
+    let (status, _) = get(&app, "/api/v1/table/full/subgroup").await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "requesting the table route on a container is a wrong-type-for-route (404)"
+    );
+}
+
+#[tokio::test]
+async fn array_route_on_a_missing_path_still_returns_404() {
+    // Guard the distinct case: a genuinely-absent path is already 404 via
+    // walk_tree's NotFound — the H4 change must not regress it.
+    let app = build_app();
+    let (status, _) = get(&app, "/api/v1/array/full/does_not_exist").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }
