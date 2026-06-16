@@ -740,6 +740,9 @@ async fn build_array_response(
         "itemsize": data.dtype.element_size(),
         "kind": String::from(data.dtype.kind.to_numpy_char()),
         "byteorder": String::from(data.dtype.endianness.to_numpy_char()),
+        // datetime64/timedelta64 unit, e.g. "[ns]"; needed by the JSON
+        // serializer to decode datetime64 ticks into ISO-8601 strings.
+        "dt_units": data.dtype.dt_units,
         "shape": data.shape,
     });
     // Serializers run CPU-bound encode work (and, for HDF5, blocking file

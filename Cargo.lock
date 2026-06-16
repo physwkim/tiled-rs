@@ -5194,6 +5194,7 @@ dependencies = [
  "arrow",
  "base64",
  "bytes",
+ "chrono",
  "csv",
  "dashmap",
  "flate2",

@@ -320,9 +320,11 @@ fn serialize_array_html(
 /// JSON `null` (orjson's float rule, mirrored by `serde_json::From<f64>`).
 ///
 /// Scope: the numeric and boolean dtypes the array adapters emit (`f`/`i`/`u`/
-/// `b`). A complex/datetime/string array is a hard error rather than a silent
-/// mis-encode — Python's orjson numpy fast-path likewise rejects the dtypes it
-/// cannot represent natively.
+/// `b`), plus `datetime64` (`M`) which orjson renders as ISO-8601 strings (see
+/// `datetime64_to_json`). A complex/timedelta/string array is a hard error
+/// rather than a silent mis-encode — orjson's numpy fast-path likewise rejects
+/// those dtypes (timedelta64/complex are not in its `OPT_SERIALIZE_NUMPY` set),
+/// so Python also fails on them.
 fn serialize_array_json(
     data: &[u8],
     metadata: &serde_json::Value,
@@ -349,6 +351,11 @@ fn serialize_array_json(
         .and_then(|v| v.as_str())
         .unwrap_or("<")
         == ">";
+    // datetime64 unit, e.g. "[ns]" → "ns"; only consulted for kind 'M'.
+    let dt_unit: Option<&str> = metadata
+        .get("dt_units")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim_start_matches('[').trim_end_matches(']'));
 
     let decode = |bytes: &[u8]| -> Result<serde_json::Value, crate::registry::SerializeError> {
         macro_rules! le {
@@ -375,6 +382,8 @@ fn serialize_array_json(
             ("u", 2) => serde_json::Value::from(le!(u16, 2)),
             ("u", 1) => serde_json::Value::from(bytes.first().copied().unwrap_or(0)),
             ("b", _) => serde_json::Value::from(bytes.iter().any(|&b| b != 0)),
+            // datetime64 is always an 8-byte int64 tick count; render ISO-8601.
+            ("M", 8) => datetime64_to_json(le!(i64, 8), dt_unit)?,
             _ => {
                 return Err(format!(
                     "application/json array serializer does not support dtype {kind}{itemsize}"
@@ -405,6 +414,99 @@ fn serialize_array_json(
     let nested = nest_array(&flat, &shape);
     let body = serde_json::to_vec(&nested).map_err(|e| format!("json encode: {e}"))?;
     Ok(bytes::Bytes::from(body))
+}
+
+/// Out-of-representable-range error for a `datetime64` tick count.
+fn dt_oor(value: i64, unit: &str) -> crate::registry::SerializeError {
+    format!("datetime64 value {value} ({unit}) is out of the representable range").into()
+}
+
+/// Render a numpy `datetime64` tick count as the JSON value orjson produces for
+/// it under `OPT_SERIALIZE_NUMPY` (the array `application/json` path is
+/// `safe_json_dump(array)`, array.py:33-38). `value` is the count of `unit`s
+/// since the naive `1970-01-01T00:00:00` epoch.
+///
+/// Format — verified byte-for-byte against orjson 3.11.5: a full RFC 3339
+/// datetime `YYYY-MM-DDTHH:MM:SS` for every unit (orjson does NOT truncate to
+/// the unit's resolution the way `str(numpy.datetime64)` does — e.g. a `[D]`
+/// value still renders `...T00:00:00`), with a fractional part only when the
+/// microsecond component is non-zero, then exactly 6 digits. orjson formats at
+/// microsecond resolution, so a `[ns]` sub-microsecond remainder is TRUNCATED
+/// (`.123456789` → `.123456`). No timezone suffix (datetime64 is naive).
+///
+/// NaT (the `i64::MIN` sentinel) → JSON `null`. This is a deliberate, documented
+/// deviation from orjson, whose NaT handling is broken and unit-dependent (for
+/// ns/us where the sentinel lands in datetime's range it emits a garbage
+/// in-range instant, e.g. `1677-09-21T00:12:43.145224`; for s/ms it raises →
+/// HTTP 500). `null` matches the table path's `_series_to_json_safe`
+/// (NaT → None, table.py:113-139) and the numeric arms' missing→null rule.
+///
+/// A missing or unrecognised unit (including finer-than-nanosecond units chrono
+/// cannot represent) is an error so the caller falls through to the
+/// unsupported-dtype path rather than emitting wrong data.
+fn datetime64_to_json(
+    value: i64,
+    unit: Option<&str>,
+) -> Result<serde_json::Value, crate::registry::SerializeError> {
+    use chrono::{Duration, NaiveDate, NaiveDateTime, Timelike};
+
+    // numpy NaT → null (see doc: deliberate deviation from orjson).
+    if value == i64::MIN {
+        return Ok(serde_json::Value::Null);
+    }
+    let unit = unit.ok_or_else(|| -> crate::registry::SerializeError {
+        "datetime64 array is missing its dt_units; cannot decode".into()
+    })?;
+    let epoch: NaiveDateTime = NaiveDate::from_ymd_opt(1970, 1, 1)
+        .and_then(|d| d.and_hms_opt(0, 0, 0))
+        .expect("1970-01-01T00:00:00 is a valid datetime");
+
+    // The unit only affects how `value` maps to an instant; the output FORMAT is
+    // uniform across units (full datetime + optional µs), so each arm yields a
+    // NaiveDateTime and the formatting below is shared.
+    let from_delta = |d: Option<Duration>| {
+        d.and_then(|d| epoch.checked_add_signed(d))
+            .ok_or_else(|| dt_oor(value, unit))
+    };
+    let from_ym = |year: i64, month: u32| {
+        i32::try_from(year)
+            .ok()
+            .and_then(|y| NaiveDate::from_ymd_opt(y, month, 1))
+            .and_then(|d| d.and_hms_opt(0, 0, 0))
+            .ok_or_else(|| dt_oor(value, unit))
+    };
+    let dt: NaiveDateTime = match unit {
+        // Calendar units are not fixed-duration; offset the epoch's Y/M fields.
+        "Y" => from_ym(1970 + value, 1)?,
+        "M" => from_ym(1970 + value.div_euclid(12), value.rem_euclid(12) as u32 + 1)?,
+        "W" => from_delta(Duration::try_weeks(value))?,
+        "D" => from_delta(Duration::try_days(value))?,
+        "h" => from_delta(Duration::try_hours(value))?,
+        "m" => from_delta(Duration::try_minutes(value))?,
+        "s" => from_delta(Duration::try_seconds(value))?,
+        "ms" => from_delta(Duration::try_milliseconds(value))?,
+        // µs/ns constructors are infallible for any i64 (within TimeDelta range);
+        // only the epoch addition can overflow.
+        "us" => from_delta(Some(Duration::microseconds(value)))?,
+        "ns" => from_delta(Some(Duration::nanoseconds(value)))?,
+        other => {
+            return Err(format!(
+                "application/json array serializer does not support datetime64 unit '{other}'"
+            )
+            .into());
+        }
+    };
+
+    // orjson: omit the fractional part when the microsecond component is zero,
+    // else exactly 6 digits (ns remainder truncated, matching orjson's µs cap).
+    let base = dt.format("%Y-%m-%dT%H:%M:%S").to_string();
+    let micros = dt.nanosecond() / 1000;
+    let s = if micros == 0 {
+        base
+    } else {
+        format!("{base}.{micros:06}")
+    };
+    Ok(serde_json::Value::String(s))
 }
 
 /// Nest a flat, row-major value list into the JSON shape numpy/orjson produce:
@@ -635,6 +737,132 @@ mod tests {
         assert!(
             err.to_string().contains("does not support"),
             "error must name the unsupported dtype: {err}"
+        );
+    }
+
+    /// orjson renders numpy `datetime64` arrays as ISO-8601 strings (array.py:33-38
+    /// → `safe_json_dump` → `OPT_SERIALIZE_NUMPY`); the array JSON serializer must
+    /// too, not 500. datetime64[ns]: epoch → fixed 9-digit fraction, a real
+    /// instant, and NaT (`i64::MIN`) → JSON null.
+    #[test]
+    fn json_array_datetime64_ns_renders_iso() {
+        let ser = json_array_serializer();
+        // 0 = epoch; 1_609_459_200_000_000_000 ns = 2021-01-01T00:00:00; i64::MIN = NaT.
+        let vals: [i64; 3] = [0, 1_609_459_200_000_000_000, i64::MIN];
+        let data: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let meta = serde_json::json!({
+            "itemsize": 8, "kind": "M", "byteorder": "<", "dt_units": "[ns]", "shape": [3]
+        });
+        let out = ser(&data, &meta).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        // orjson emits a full datetime with NO fractional part when the µs
+        // component is zero (verified against orjson 3.11.5).
+        assert_eq!(parsed[0], "1970-01-01T00:00:00");
+        assert_eq!(parsed[1], "2021-01-01T00:00:00");
+        assert_eq!(
+            parsed[2],
+            serde_json::Value::Null,
+            "NaT must serialize to null"
+        );
+    }
+
+    /// Fractional seconds: orjson formats datetime64 at MICROSECOND resolution,
+    /// 6 digits, present only when non-zero; a nanosecond remainder is truncated
+    /// (verified against orjson 3.11.5: `[ms].123`→`.123000`, `[us].123456`→
+    /// `.123456`, `[ns].123456789`→`.123456`).
+    #[test]
+    fn json_array_datetime64_microsecond_fraction() {
+        let ser = json_array_serializer();
+        let cases: &[(&str, i64, &str)] = &[
+            ("[ms]", 1_609_459_200_123, "2021-01-01T00:00:00.123000"),
+            ("[us]", 1_609_459_200_123_456, "2021-01-01T00:00:00.123456"),
+            (
+                "[ns]",
+                1_609_459_200_123_456_789,
+                "2021-01-01T00:00:00.123456",
+            ),
+        ];
+        for (unit, value, expected) in cases {
+            let data: Vec<u8> = value.to_le_bytes().to_vec();
+            let meta = serde_json::json!({
+                "itemsize": 8, "kind": "M", "byteorder": "<", "dt_units": unit, "shape": [1]
+            });
+            let out = ser(&data, &meta).unwrap();
+            let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+            assert_eq!(parsed, serde_json::json!([expected]), "unit {unit}");
+        }
+    }
+
+    /// datetime64[s]: second resolution has no fractional part.
+    #[test]
+    fn json_array_datetime64_seconds_no_fraction() {
+        let ser = json_array_serializer();
+        let data: Vec<u8> = 1_609_459_200_i64.to_le_bytes().to_vec();
+        let meta = serde_json::json!({
+            "itemsize": 8, "kind": "M", "byteorder": "<", "dt_units": "[s]", "shape": [1]
+        });
+        let out = ser(&data, &meta).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(parsed, serde_json::json!(["2021-01-01T00:00:00"]));
+    }
+
+    /// datetime64[D] (a numpy date): day count since the epoch → midnight of
+    /// that calendar date.
+    #[test]
+    fn json_array_datetime64_days() {
+        let ser = json_array_serializer();
+        // 18628 days after 1970-01-01 is 2021-01-01.
+        let data: Vec<u8> = 18_628_i64.to_le_bytes().to_vec();
+        let meta = serde_json::json!({
+            "itemsize": 8, "kind": "M", "byteorder": "<", "dt_units": "[D]", "shape": [1]
+        });
+        let out = ser(&data, &meta).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(parsed, serde_json::json!(["2021-01-01T00:00:00"]));
+    }
+
+    /// datetime64 columns nest row-major exactly like the numeric arms (ms, 2×1).
+    #[test]
+    fn json_array_datetime64_nests_row_major() {
+        let ser = json_array_serializer();
+        let vals: [i64; 2] = [0, 1_609_459_200_000];
+        let data: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let meta = serde_json::json!({
+            "itemsize": 8, "kind": "M", "byteorder": "<", "dt_units": "[ms]", "shape": [2, 1]
+        });
+        let out = ser(&data, &meta).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(
+            parsed,
+            serde_json::json!([["1970-01-01T00:00:00"], ["2021-01-01T00:00:00"]])
+        );
+    }
+
+    /// A datetime64 array with no dt_units cannot be decoded → error, never a
+    /// wrong instant.
+    #[test]
+    fn json_array_datetime64_missing_units_errors() {
+        let ser = json_array_serializer();
+        let data: Vec<u8> = 0_i64.to_le_bytes().to_vec();
+        let meta = serde_json::json!({"itemsize": 8, "kind": "M", "shape": [1]});
+        let err = ser(&data, &meta).expect_err("datetime64 without units must error");
+        assert!(
+            err.to_string().contains("dt_units"),
+            "error must name the missing units: {err}"
+        );
+    }
+
+    /// timedelta64 ('m') stays a hard error: orjson's `OPT_SERIALIZE_NUMPY` does
+    /// not serialize timedelta64, so Python also fails on such an array.
+    #[test]
+    fn json_array_timedelta_still_errors() {
+        let ser = json_array_serializer();
+        let data: Vec<u8> = 5_i64.to_le_bytes().to_vec();
+        let meta = serde_json::json!({"itemsize": 8, "kind": "m", "dt_units": "[s]", "shape": [1]});
+        let err = ser(&data, &meta).expect_err("timedelta64 must error");
+        assert!(
+            err.to_string().contains("does not support"),
+            "timedelta64 must remain unsupported: {err}"
         );
     }
 
