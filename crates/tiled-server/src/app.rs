@@ -107,6 +107,10 @@ pub fn build_app(state: AppState) -> Router {
         .route(
             "/api/v1/auth/apikeys/{first_eight}",
             delete(auth_router::api_key_revoke),
+        )
+        .route(
+            "/api/v1/auth/principal",
+            post(auth_router::create_service_principal),
         );
 
     // WebSocket subscribe routes are intentionally OUTSIDE the auth

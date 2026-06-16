@@ -664,3 +664,99 @@ async fn write_endpoint_demands_write_scope() {
     .await;
     assert_eq!(status, StatusCode::CREATED);
 }
+
+/// Security gate: POST /api/v1/auth/principal requires `write:principals`
+/// scope. A regular user (role="user") lacks that scope and must be rejected
+/// with 403, not 401, because they ARE authenticated — they just don't hold
+/// the required scope.
+#[tokio::test]
+async fn create_service_principal_non_admin_rejected() {
+    let (app, _dir, _cat, _auth_db) = build_test_app().await;
+
+    // Login as alice (role="user" by default, no write:principals scope).
+    let (_, body) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/auth/dummy/login",
+        &[],
+        Some(json!({"username": "alice", "password": "wonderland"})),
+    )
+    .await;
+    let access = body["access_token"].as_str().unwrap().to_string();
+    let bearer = format!("Bearer {access}");
+
+    // POST /auth/principal — must be 403 (authenticated but missing scope).
+    let (status, _) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/auth/principal?role=user",
+        &[("authorization", &bearer)],
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "non-admin must be rejected with 403"
+    );
+}
+
+/// Admin path: POST /api/v1/auth/principal succeeds for a principal holding
+/// `write:principals` scope and the response contains type="service" and the
+/// requested role.
+#[tokio::test]
+async fn create_service_principal_admin_succeeds() {
+    let (app, _dir, _cat, auth_db) = build_test_app().await;
+
+    // Login as alice and promote to admin.
+    let (_, body) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/auth/dummy/login",
+        &[],
+        Some(json!({"username": "alice", "password": "wonderland"})),
+    )
+    .await;
+    let alice_sub = body["identity"]["id"].as_str().unwrap().to_string();
+    let (alice, _) = auth_db.ensure_principal("dummy", &alice_sub).await.unwrap();
+    auth_db
+        .update_principal_role(alice.id, "admin")
+        .await
+        .unwrap();
+
+    // Re-login so the session carries admin scopes.
+    let (_, body) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/auth/dummy/login",
+        &[],
+        Some(json!({"username": "alice", "password": "wonderland"})),
+    )
+    .await;
+    let access = body["access_token"].as_str().unwrap().to_string();
+    let bearer = format!("Bearer {access}");
+
+    // POST /auth/principal?role=user — must succeed.
+    let (status, body) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/auth/principal?role=user",
+        &[("authorization", &bearer)],
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "admin must be able to create a service principal: {body}"
+    );
+    assert_eq!(body["type"], "service", "response must carry type=service");
+    assert_eq!(
+        body["role"], "user",
+        "response must carry the requested role"
+    );
+    assert!(
+        body["uuid"].is_string() && !body["uuid"].as_str().unwrap().is_empty(),
+        "response must carry a uuid"
+    );
+}

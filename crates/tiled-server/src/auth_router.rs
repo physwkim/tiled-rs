@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
@@ -436,6 +436,43 @@ pub async fn api_key_revoke(
         .await
         .map_err(map_auth_err)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------------------------------------------------------------------------
+// Principal CRUD (multi-user mode, admin-gated)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct CreateServicePrincipalQuery {
+    #[serde(default = "default_role")]
+    pub role: String,
+}
+
+fn default_role() -> String {
+    "user".into()
+}
+
+/// `POST /api/v1/auth/principal?role=<role>`
+///
+/// Create a new service principal. Requires `write:principals` scope —
+/// mirrors Python's `Security(check_scopes, scopes=["write:principals"])`
+/// on the same endpoint (authentication.py:1295).
+pub async fn create_service_principal(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Query(q): Query<CreateServicePrincipalQuery>,
+) -> Result<impl IntoResponse, ServerError> {
+    auth.require(tiled_auth::Scope::WritePrincipals)?;
+    let (db, _) = require_auth_db(&state)?;
+    let principal = db
+        .create_service_principal(&q.role)
+        .await
+        .map_err(map_auth_err)?;
+    Ok(Json(serde_json::json!({
+        "uuid": principal.uuid,
+        "type": principal.r#type,
+        "role": principal.role,
+    })))
 }
 
 fn map_auth_err(e: tiled_auth::AuthError) -> ServerError {
