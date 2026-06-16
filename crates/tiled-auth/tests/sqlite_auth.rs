@@ -14,6 +14,72 @@ async fn fresh_db() -> (AuthDb, tempfile::TempDir) {
     (db, dir)
 }
 
+/// auth H2 (#1360 family): a principal exposes its full identity set, and the
+/// serialized view mirrors Python `schemas.Principal`/`schemas.Identity`
+/// (`schemas.py:315,403`) — each identity's public `id` is the upstream
+/// subject (`sub`), and the internal row id / `principal_id` FK never leak.
+#[tokio::test]
+async fn principal_detail_lists_all_identities() {
+    let (db, _dir) = fresh_db().await;
+
+    // One principal linked to two providers (e.g. password + OIDC).
+    let (principal, _) = db.ensure_principal("dummy", "alice").await.unwrap();
+    db.create_identity(principal.id, "entra", "alice@contoso")
+        .await
+        .unwrap();
+
+    // list_identities (the selectinload equivalent) returns both, ordered.
+    let identities = db.list_identities(principal.id).await.unwrap();
+    assert_eq!(
+        identities.len(),
+        2,
+        "both linked identities must be returned"
+    );
+    assert_eq!(identities[0].provider, "dummy"); // ordered by (provider, sub)
+    assert_eq!(identities[1].provider, "entra");
+
+    // get_principal_detail loads the principal + identities by uuid.
+    let detail = db
+        .get_principal_detail(&principal.uuid)
+        .await
+        .unwrap()
+        .expect("principal exists");
+    assert_eq!(detail.uuid, principal.uuid);
+    assert_eq!(detail.identities.len(), 2);
+    // Public `id` is the subject (sub), not the internal row PK.
+    let entra = detail
+        .identities
+        .iter()
+        .find(|i| i.provider == "entra")
+        .unwrap();
+    assert_eq!(entra.id, "alice@contoso");
+
+    // Serialized shape: only id/provider/latest_login — no internal row id,
+    // no principal_id, no `sub` key.
+    let json = serde_json::to_value(&detail).unwrap();
+    let id0 = json["identities"][0].as_object().unwrap();
+    let mut keys: Vec<&str> = id0.keys().map(|s| s.as_str()).collect();
+    keys.sort_unstable();
+    assert_eq!(keys, vec!["id", "latest_login", "provider"]);
+    assert!(
+        !id0.contains_key("principal_id"),
+        "internal principal_id FK must not leak"
+    );
+    assert!(!id0.contains_key("sub"), "raw `sub` key must not leak");
+    assert!(
+        json.get("id").is_none(),
+        "internal principal row id must not leak at the top level"
+    );
+
+    // Unknown uuid → None.
+    assert!(
+        db.get_principal_detail("no-such-uuid")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
 #[tokio::test]
 async fn migrate_and_principal_lifecycle() {
     let (db, _dir) = fresh_db().await;

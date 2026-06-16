@@ -33,6 +33,6 @@ pub use error::{AuthError, Result};
 #[cfg(feature = "oidc")]
 pub use external_oidc::{ExternalOidcValidator, OidcProvider, ValidatedToken};
 pub use jwt::{AccessClaims, Issuer, RefreshClaims};
-pub use principal::{Identity, Principal};
+pub use principal::{Identity, IdentityView, Principal, PrincipalDetail};
 pub use scopes::{Scope, ScopeSet};
 pub use session::{SessionRecord, SessionStore};

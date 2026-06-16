@@ -1250,3 +1250,86 @@ async fn device_approve_session_bearer_still_works() {
     assert_eq!(status, StatusCode::OK, "token: {body}");
     assert!(body["access_token"].is_string(), "missing access_token");
 }
+
+/// auth H2: `GET /api/v1/auth/principal/{uuid}` returns the principal with its
+/// linked identities (Python `schemas.Principal.identities` via
+/// `selectinload`, authentication.py:1325-1361). The identity `id` is the
+/// upstream subject and the internal row id / `principal_id` never leak. The
+/// endpoint is `read:principals`-gated, so a `user`-role caller is forbidden.
+#[tokio::test]
+async fn get_principal_returns_identities_admin_only() {
+    let (app, _dir, _cat, auth_db) = build_test_app().await;
+
+    // alice logs in (this creates her principal + a "dummy"/alice identity).
+    let (_, body) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/auth/dummy/login",
+        &[],
+        Some(json!({"username": "alice", "password": "wonderland"})),
+    )
+    .await;
+    let alice_sub = body["identity"]["id"].as_str().unwrap().to_string();
+    let user_bearer = format!("Bearer {}", body["access_token"].as_str().unwrap());
+    let (alice, _) = auth_db.ensure_principal("dummy", &alice_sub).await.unwrap();
+
+    // A user-role caller lacks read:principals → 403.
+    let (status, _) = json_request(
+        &app,
+        Method::GET,
+        &format!("/api/v1/auth/principal/{}", alice.uuid),
+        &[("authorization", &user_bearer)],
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "read:principals is required to read a principal"
+    );
+
+    // Promote alice to admin and re-login for an admin session.
+    auth_db
+        .update_principal_role(alice.id, "admin")
+        .await
+        .unwrap();
+    let (_, body) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/auth/dummy/login",
+        &[],
+        Some(json!({"username": "alice", "password": "wonderland"})),
+    )
+    .await;
+    let admin_bearer = format!("Bearer {}", body["access_token"].as_str().unwrap());
+
+    let (status, body) = json_request(
+        &app,
+        Method::GET,
+        &format!("/api/v1/auth/principal/{}", alice.uuid),
+        &[("authorization", &admin_bearer)],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["uuid"], alice.uuid);
+    let identities = body["identities"].as_array().expect("identities array");
+    assert_eq!(identities.len(), 1, "alice has one linked identity");
+    assert_eq!(identities[0]["id"], alice_sub, "identity id is the subject");
+    assert_eq!(identities[0]["provider"], "dummy");
+    assert!(
+        identities[0].get("principal_id").is_none(),
+        "internal principal_id FK must not leak"
+    );
+
+    // Unknown uuid → 404.
+    let (status, _) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/auth/principal/00000000-0000-0000-0000-000000000000",
+        &[("authorization", &admin_bearer)],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}

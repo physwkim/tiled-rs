@@ -517,11 +517,35 @@ pub async fn create_service_principal(
         .create_service_principal(&q.role)
         .await
         .map_err(map_auth_err)?;
-    Ok(Json(serde_json::json!({
-        "uuid": principal.uuid,
-        "type": principal.r#type,
-        "role": principal.role,
-    })))
+    // Return the full principal view. A freshly created service principal has
+    // no linked identities, matching Python's POST which reloads the principal
+    // with `selectinload(Principal.identities)` and serializes the empty list
+    // (authentication.py:1307-1320).
+    Ok(Json(tiled_auth::PrincipalDetail::new(
+        principal,
+        Vec::new(),
+    )))
+}
+
+/// `GET /api/v1/auth/principal/{uuid}`
+///
+/// Return one principal together with its linked identities. Requires the
+/// `read:principals` scope — mirrors Python's
+/// `Security(check_scopes, scopes=["read:principals"])` on the same endpoint
+/// (authentication.py:1332). 404 when no principal has the given uuid.
+pub async fn get_principal(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Path(uuid): Path<String>,
+) -> Result<impl IntoResponse, ServerError> {
+    auth.require(tiled_auth::Scope::ReadPrincipals)?;
+    let (db, _) = require_auth_db(&state)?;
+    let detail = db
+        .get_principal_detail(&uuid)
+        .await
+        .map_err(map_auth_err)?
+        .ok_or_else(|| ServerError::NotFound(format!("No such Principal {uuid}")))?;
+    Ok(Json(detail))
 }
 
 fn map_auth_err(e: tiled_auth::AuthError) -> ServerError {

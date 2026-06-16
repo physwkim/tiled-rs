@@ -31,6 +31,54 @@ pub struct Identity {
     pub latest_login: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// API-facing view of one identity. Mirrors Python `schemas.Identity`
+/// (`schemas.py:315`): the public `id` is the upstream **subject** (`sub`),
+/// not the internal row primary key, and `(provider, id)` is the unique pair
+/// (`orm.py:154`). The internal integer row id and the `principal_id`
+/// foreign key are deliberately not exposed.
+#[derive(Debug, Clone, Serialize)]
+pub struct IdentityView {
+    pub id: String,
+    pub provider: String,
+    pub latest_login: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl From<Identity> for IdentityView {
+    fn from(identity: Identity) -> Self {
+        Self {
+            id: identity.sub,
+            provider: identity.provider,
+            latest_login: identity.latest_login,
+        }
+    }
+}
+
+/// API-facing view of a principal together with all of its linked
+/// identities. Mirrors the subset of Python `schemas.Principal`
+/// (`schemas.py:403`) that tiled-rs models — the internal integer row id is
+/// not exposed; the public handle is the `uuid`. The `identities` array is
+/// the multi-provider mapping populated via [`AuthDb::get_principal_detail`]
+/// (the `selectinload(Principal.identities)` equivalent,
+/// `authentication.py:1345`).
+#[derive(Debug, Clone, Serialize)]
+pub struct PrincipalDetail {
+    pub uuid: String,
+    pub r#type: String,
+    pub role: String,
+    pub identities: Vec<IdentityView>,
+}
+
+impl PrincipalDetail {
+    pub fn new(principal: Principal, identities: Vec<Identity>) -> Self {
+        Self {
+            uuid: principal.uuid,
+            r#type: principal.r#type,
+            role: principal.role,
+            identities: identities.into_iter().map(IdentityView::from).collect(),
+        }
+    }
+}
+
 impl AuthDb {
     /// Find or create a principal keyed by `(provider, sub)`. Used by every
     /// authenticator path: each successful login reaches here so we never
@@ -155,6 +203,68 @@ impl AuthDb {
                 row.map(|r| principal_from_postgres(&r)).transpose()
             }
         }
+    }
+
+    /// List every identity linked to a principal — the
+    /// `selectinload(Principal.identities)` equivalent
+    /// (`authentication.py:1345`). Ordered by `(provider, sub)` for a stable
+    /// response.
+    pub async fn list_identities(&self, principal_id: i64) -> Result<Vec<Identity>> {
+        match self.pool() {
+            AuthPool::Sqlite(pool) => {
+                let rows = sqlx::query(
+                    "SELECT id, principal_id, provider, sub, latest_login
+                       FROM identities WHERE principal_id = ? ORDER BY provider, sub",
+                )
+                .bind(principal_id)
+                .fetch_all(pool)
+                .await?;
+                rows.iter().map(identity_from_sqlite).collect()
+            }
+            AuthPool::Postgres(pool) => {
+                let rows = sqlx::query(
+                    "SELECT id, principal_id, provider, sub, latest_login
+                       FROM identities WHERE principal_id = $1 ORDER BY provider, sub",
+                )
+                .bind(principal_id)
+                .fetch_all(pool)
+                .await?;
+                rows.iter().map(identity_from_postgres).collect()
+            }
+        }
+    }
+
+    /// Load a principal by its public `uuid` together with all of its linked
+    /// identities (two queries — the `selectinload` equivalent,
+    /// `authentication.py:1340-1351`). Returns `None` when no principal has
+    /// the given uuid. Backs the admin-gated `GET /auth/principal/{uuid}`
+    /// endpoint.
+    pub async fn get_principal_detail(&self, uuid: &str) -> Result<Option<PrincipalDetail>> {
+        let principal = match self.pool() {
+            AuthPool::Sqlite(pool) => {
+                let row = sqlx::query(
+                    "SELECT id, uuid, type, role, time_created FROM principals WHERE uuid = ?",
+                )
+                .bind(uuid)
+                .fetch_optional(pool)
+                .await?;
+                row.map(|r| principal_from_sqlite(&r)).transpose()?
+            }
+            AuthPool::Postgres(pool) => {
+                let row = sqlx::query(
+                    "SELECT id, uuid, type, role, time_created FROM principals WHERE uuid = $1",
+                )
+                .bind(uuid)
+                .fetch_optional(pool)
+                .await?;
+                row.map(|r| principal_from_postgres(&r)).transpose()?
+            }
+        };
+        let Some(principal) = principal else {
+            return Ok(None);
+        };
+        let identities = self.list_identities(principal.id).await?;
+        Ok(Some(PrincipalDetail::new(principal, identities)))
     }
 
     pub async fn create_identity(

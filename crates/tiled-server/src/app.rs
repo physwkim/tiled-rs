@@ -117,6 +117,10 @@ pub fn build_app(state: AppState) -> Router {
         .route(
             "/api/v1/auth/principal",
             post(auth_router::create_service_principal),
+        )
+        .route(
+            "/api/v1/auth/principal/{uuid}",
+            get(auth_router::get_principal),
         );
 
     // WebSocket subscribe routes are intentionally OUTSIDE the auth
