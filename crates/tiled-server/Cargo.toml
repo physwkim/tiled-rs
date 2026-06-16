@@ -46,6 +46,7 @@ rand = "0.8"
 url = "2"
 # RFC 6902 json-patch (upstream tiled #688).
 json-patch = "3"
+jmespath = { workspace = true }
 # Container deep-export bundling (upstream tiled #660).
 zip = { version = "2", default-features = false, features = ["deflate"] }
 

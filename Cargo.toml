@@ -120,6 +120,9 @@ csv = "1"
 # Ordered maps
 indexmap = { version = "2", features = ["serde"] }
 
+# JMESPath (select_metadata filtering — M1)
+jmespath = "0.3"
+
 # MongoDB
 mongodb = { version = "3", features = ["sync"] }
 

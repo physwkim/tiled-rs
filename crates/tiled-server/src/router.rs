@@ -231,6 +231,45 @@ pub async fn metadata_root(
     .await
 }
 
+/// Apply a JMESPath expression to node metadata, mirroring Python `core.py:480-485`.
+///
+/// When `select_metadata` is `Some(expr)`, compiles and evaluates the expression
+/// against the metadata JSON and returns `{"selected": <result>}`.
+/// On compile or evaluation error → `BadRequest` (HTTP 400), matching Python's
+/// `JMESPathError → HTTP_400_BAD_REQUEST` in `router.py:395-399 / 503-507`.
+/// When `select_metadata` is `None`, returns `metadata` unchanged.
+fn apply_select_metadata(
+    select_metadata: Option<&str>,
+    metadata: Option<serde_json::Value>,
+) -> Result<Option<serde_json::Value>, ServerError> {
+    let expr_str = match select_metadata {
+        None => return Ok(metadata),
+        Some(e) => e,
+    };
+    let expr = jmespath::compile(expr_str).map_err(|e| {
+        ServerError::BadRequest(format!(
+            "Malformed 'select_metadata' parameter raised JMESPathError: {e}"
+        ))
+    })?;
+    let meta = metadata.unwrap_or(serde_json::Value::Null);
+    // Round-trip through JSON string: serde_json::Value → &str → jmespath::Variable.
+    // serde_json::to_string on a Value never fails; from_json on its output
+    // also never fails, so both conversions are infallible here.
+    let json_str =
+        serde_json::to_string(&meta).expect("serde_json::Value always serializes to JSON");
+    let var = jmespath::Variable::from_json(&json_str)
+        .expect("JSON produced by serde_json::to_string always parses");
+    let result = expr.search(var).map_err(|e| {
+        ServerError::BadRequest(format!(
+            "Malformed 'select_metadata' parameter raised JMESPathError: {e}"
+        ))
+    })?;
+    // Variable: Display renders JSON; parse back to serde_json::Value.
+    let selected: serde_json::Value =
+        serde_json::from_str(&result.to_string()).unwrap_or(serde_json::Value::Null);
+    Ok(Some(serde_json::json!({"selected": selected})))
+}
+
 pub async fn metadata(
     State(state): State<AppState>,
     OriginalUri(uri): OriginalUri,
@@ -257,12 +296,13 @@ pub async fn metadata(
         .get("include_data_sources")
         .map(|v| matches!(v.as_str(), "true" | "True" | "1"))
         .unwrap_or(false);
+    let select_metadata = params.get("select_metadata").map(String::as_str);
     // When a SQL catalog is wired, read directly through it: the
     // CatalogAdapter caches children eagerly to satisfy the sync trait,
     // and PATCH/DELETE write past that cache, so a same-request read after
     // a write would otherwise see stale data. Direct DB lookup keeps
     // metadata responses consistent with the latest committed write.
-    let resource = if let Some(ref catalog) = state.catalog {
+    let mut resource = if let Some(ref catalog) = state.catalog {
         catalog_metadata_resource(catalog, &segments, &base_url, include_data_sources).await?
     } else if segments.is_empty() {
         core::construct_root_resource(state.root_tree.as_ref(), &base_url).await?
@@ -275,6 +315,9 @@ pub async fn metadata(
         let path = segments.join("/");
         core::construct_resource(&adapter, &id, &path, &base_url).await?
     };
+
+    resource.attributes.metadata =
+        apply_select_metadata(select_metadata, resource.attributes.metadata)?;
 
     Ok(Json(Response {
         data: Some(resource),
@@ -363,6 +406,11 @@ pub async fn search(
     // Parse `sort` before consuming `params`: comma-separated keys, leading
     // `-` descending. Threaded into the catalog ORDER BY below.
     let sorting = parse_sort(&params);
+    // Extract select_metadata before params is moved by into_iter() below.
+    let select_metadata: Option<String> = params
+        .iter()
+        .find(|(k, _)| k == "select_metadata")
+        .map(|(_, v)| v.clone());
 
     let filter_params: Vec<(String, String)> = params
         .into_iter()
@@ -415,7 +463,7 @@ pub async fn search(
         })?
     };
     // An unsupported query variant propagates as HTTP 400.
-    let resp = core::construct_entries_response(
+    let mut resp = core::construct_entries_response(
         container,
         &logical_path,
         &base_url,
@@ -426,6 +474,14 @@ pub async fn search(
         &sorting,
     )
     .await?;
+    if let Some(ref expr_str) = select_metadata
+        && let Some(ref mut items) = resp.data
+    {
+        for item in items.iter_mut() {
+            item.attributes.metadata =
+                apply_select_metadata(Some(expr_str), item.attributes.metadata.take())?;
+        }
+    }
     Ok(Json(resp))
 }
 

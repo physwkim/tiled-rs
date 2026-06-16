@@ -721,3 +721,118 @@ async fn delete_root_rejected() {
         StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
     ));
 }
+
+// ---------------------------------------------------------------------------
+// M1: select_metadata (JMESPath filtering)
+// ---------------------------------------------------------------------------
+
+/// select_metadata on /metadata: returns {"selected": <value>} for the matched field.
+#[tokio::test]
+async fn select_metadata_extracts_sub_field() {
+    let (app, _dir) = build_test_app().await;
+
+    let (status, _) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/register/",
+        serde_json::json!({
+            "key": "run1",
+            "structure_family": "container",
+            "metadata": {"plan_name": "count", "num_points": 5},
+            "specs": [],
+            "data_sources": [],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/metadata/run1?select_metadata=plan_name",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "select_metadata GET: {body}");
+    assert_eq!(
+        body["data"]["attributes"]["metadata"],
+        serde_json::json!({"selected": "count"}),
+        "metadata field: {body}"
+    );
+}
+
+/// select_metadata on /metadata: a malformed JMESPath expression → 400.
+#[tokio::test]
+async fn select_metadata_malformed_expression_returns_400() {
+    let (app, _dir) = build_test_app().await;
+
+    let (status, _) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/register/",
+        serde_json::json!({
+            "key": "run2",
+            "structure_family": "container",
+            "metadata": {"plan_name": "count"},
+            "specs": [],
+            "data_sources": [],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // "foo[" is an unclosed bracket — always a JMESPath parse error.
+    let (status, body) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/metadata/run2?select_metadata=foo%5B",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "expected 400 for malformed expression: {body}"
+    );
+}
+
+/// select_metadata on /search: each item's metadata is filtered.
+#[tokio::test]
+async fn select_metadata_on_search_filters_each_item() {
+    let (app, _dir) = build_test_app().await;
+
+    for (key, plan) in [("scan1", "count"), ("scan2", "rel_scan")] {
+        let (status, _) = json_request(
+            &app,
+            Method::POST,
+            "/api/v1/register/",
+            serde_json::json!({
+                "key": key,
+                "structure_family": "container",
+                "metadata": {"plan_name": plan},
+                "specs": [],
+                "data_sources": [],
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+
+    let (status, body) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/search/?select_metadata=plan_name",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "search select_metadata: {body}");
+    let items = body["data"].as_array().expect("data is array");
+    assert_eq!(items.len(), 2, "expected 2 items: {body}");
+    for item in items {
+        let meta = &item["attributes"]["metadata"];
+        assert!(
+            meta.is_object() && meta["selected"].is_string(),
+            "expected {{\"selected\": <string>}}, got {meta}"
+        );
+    }
+}
