@@ -1586,3 +1586,44 @@ async fn cors_preflight_advertises_patch_in_allow_methods() {
          got Access-Control-Allow-Methods: {allow_methods}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// M3: OOB block-range and partition index → HTTP 400 (parity with Python
+// tiled which catches IndexError from read_block/read_partition and returns
+// HTTP_400_BAD_REQUEST; router.py:609-613, 1176-1179).
+// ---------------------------------------------------------------------------
+
+/// Block range with stop > chunk count must be HTTP 400.
+/// `some_array` has 1 chunk on axis 0; `?block=0:2` requests stop=2 > 1.
+#[tokio::test]
+async fn test_block_range_oob_is_400() {
+    let app = build_app();
+    let (status, body) = get_json(&app, "/api/v1/array/block/some_array?block=0:2").await;
+    assert_eq!(
+        status, 400,
+        "OOB block range stop must be HTTP 400 (parity with Python IndexError→400): {body}"
+    );
+    assert_eq!(body["error"]["code"], 400);
+}
+
+/// Partition index >= npartitions must be HTTP 400.
+/// CsvAdapter has npartitions=1; `?partition=1` is out of range.
+#[cfg(feature = "csv-adapter")]
+#[tokio::test]
+async fn test_partition_oob_is_400() {
+    use std::io::Write;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.csv");
+    let mut f = std::fs::File::create(&path).unwrap();
+    writeln!(f, "x").unwrap();
+    writeln!(f, "1").unwrap();
+    f.flush().unwrap();
+
+    let app = build_table_app(path, 300_000_000);
+    let (status, body) = get_json(&app, "/api/v1/table/partition/some_table?partition=1").await;
+    assert_eq!(
+        status, 400,
+        "OOB partition index must be HTTP 400 (parity with Python IndexError→400): {body}"
+    );
+    assert_eq!(body["error"]["code"], 400);
+}

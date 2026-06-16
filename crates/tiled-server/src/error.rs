@@ -51,6 +51,12 @@ pub enum ServerError {
     /// from [`Self::Validation`] (422): a wrong-type-for-route is "no such
     /// thing at this route", not "your request body/params are invalid".
     WrongType(String),
+    /// An index (block index, partition number) was out of the valid range.
+    /// Maps to HTTP 400 to match Python tiled, which catches `IndexError` from
+    /// `read_block` / `read_partition` and answers `HTTP_400_BAD_REQUEST`
+    /// (router.py:609-613, 1176-1179). Distinct from [`Self::Validation`]
+    /// (422): the request is structurally valid but names a non-existent slot.
+    BadRequest(String),
 }
 
 impl std::fmt::Display for ServerError {
@@ -68,6 +74,7 @@ impl std::fmt::Display for ServerError {
             Self::UnsupportedQuery(msg) => write!(f, "Unsupported query: {msg}"),
             Self::InvalidQuery(msg) => write!(f, "Invalid query: {msg}"),
             Self::WrongType(msg) => write!(f, "Wrong type for route: {msg}"),
+            Self::BadRequest(msg) => write!(f, "Bad request: {msg}"),
         }
     }
 }
@@ -99,6 +106,7 @@ impl IntoResponse for ServerError {
             Self::UnsupportedQuery(msg) => (StatusCode::BAD_REQUEST, 400, msg),
             Self::InvalidQuery(msg) => (StatusCode::BAD_REQUEST, 400, msg),
             Self::WrongType(msg) => (StatusCode::NOT_FOUND, 404, msg),
+            Self::BadRequest(msg) => (StatusCode::BAD_REQUEST, 400, msg),
         };
 
         let body = schemas::Response::<()> {

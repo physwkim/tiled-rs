@@ -1414,7 +1414,7 @@ async fn read_block_range(
     for (axis, spec) in block_specs.iter().enumerate() {
         let (start, stop) = spec.range();
         if stop > chunks[axis].len() {
-            return Err(ServerError::Validation(format!(
+            return Err(ServerError::BadRequest(format!(
                 "Block range axis {axis}: stop {stop} exceeds chunk count {}",
                 chunks[axis].len()
             )));
@@ -1657,6 +1657,13 @@ pub async fn table_partition(
         adapter.as_table_arc().ok_or_else(|| {
             ServerError::WrongType(format!("'{}' is not a table", segments.join("/")))
         })?;
+
+    let npartitions = table_adapter.structure().npartitions;
+    if partition >= npartitions {
+        return Err(ServerError::BadRequest(format!(
+            "Partition index {partition} out of range (table has {npartitions} partitions)"
+        )));
+    }
 
     let table = table_adapter
         .read_partition(partition, fields.as_deref())
