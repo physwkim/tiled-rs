@@ -46,15 +46,6 @@ pub fn links_for_node(family: StructureFamily, base_url: &str, path: &str) -> No
                 .extra
                 .insert("block".into(), format!("{base}/api/v1/array/block/{p}"));
         }
-        StructureFamily::Ragged => {
-            // Mirrors Python `links_for_ragged` (tiled/links.py:40-45): a ragged
-            // node exposes `full` and `block`, like an array but on the
-            // `/ragged/` route.
-            links.full = Some(format!("{base}/api/v1/ragged/full/{p}"));
-            links
-                .extra
-                .insert("block".into(), format!("{base}/api/v1/ragged/block/{p}"));
-        }
         StructureFamily::Table => {
             links.full = Some(format!("{base}/api/v1/table/full/{p}"));
             links.extra.insert(
@@ -62,13 +53,19 @@ pub fn links_for_node(family: StructureFamily, base_url: &str, path: &str) -> No
                 format!("{base}/api/v1/table/partition/{p}"),
             );
         }
-        StructureFamily::Awkward => {
-            links.full = Some(format!("{base}/api/v1/awkward/full/{p}"));
-            links.extra.insert(
-                "buffers".into(),
-                format!("{base}/api/v1/awkward/buffers/{p}"),
-            );
-        }
+        // Ragged and Awkward are NOT servable end-to-end in this workspace:
+        // no resolver (catalog/file/mongo) builds a ragged or awkward leaf
+        // adapter, `AnyAdapter` has no `Ragged` variant, and no serializer is
+        // registered for the Awkward family. Python's `links_for_ragged` /
+        // `links_for_awkward` (tiled/links.py:40-46,26-30) advertise
+        // `/ragged/full`, `/ragged/block`, `/awkward/full`, `/awkward/buffers`,
+        // but the Rust server registers no such routes — advertising them
+        // would hand a client a link that 404s when followed. Until the family
+        // is servable, advertise only the metadata `self` link (set above):
+        // an honest contract is better than a dead link. (Parity gap tracked
+        // as server H1; restore these links when the read routes — and the
+        // adapter/resolver/serializer they need — exist.)
+        StructureFamily::Ragged | StructureFamily::Awkward => {}
     }
 
     links
@@ -187,6 +184,46 @@ mod tests {
             links.extra.get("partition").map(|s| s.as_str()),
             Some("http://localhost:8000/api/v1/table/partition/my_table")
         );
+    }
+
+    #[test]
+    fn test_links_for_ragged_advertises_no_dead_read_links() {
+        // Ragged is not servable end-to-end (no resolver/adapter/route), so the
+        // node must advertise only the metadata `self` link — never `/ragged/full`
+        // or `/ragged/block`, which would 404 when followed (server H1).
+        let links = links_for_node(
+            StructureFamily::Ragged,
+            "http://localhost:8000",
+            "my_ragged",
+        );
+        assert_eq!(
+            links.self_link.as_deref(),
+            Some("http://localhost:8000/api/v1/metadata/my_ragged")
+        );
+        assert!(links.full.is_none());
+        assert!(links.search.is_none());
+        assert!(!links.extra.contains_key("block"));
+        assert!(links.extra.is_empty());
+    }
+
+    #[test]
+    fn test_links_for_awkward_advertises_no_dead_read_links() {
+        // Awkward is not servable end-to-end (no concrete adapter, no registered
+        // serializer, no route), so the node must advertise only the metadata
+        // `self` link — never `/awkward/full` or `/awkward/buffers` (server H1).
+        let links = links_for_node(
+            StructureFamily::Awkward,
+            "http://localhost:8000",
+            "my_awkward",
+        );
+        assert_eq!(
+            links.self_link.as_deref(),
+            Some("http://localhost:8000/api/v1/metadata/my_awkward")
+        );
+        assert!(links.full.is_none());
+        assert!(links.search.is_none());
+        assert!(!links.extra.contains_key("buffers"));
+        assert!(links.extra.is_empty());
     }
 
     #[test]
