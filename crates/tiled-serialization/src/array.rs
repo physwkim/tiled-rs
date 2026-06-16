@@ -45,6 +45,21 @@ pub fn register_array_serializers(registry: &SerializationRegistry) {
     );
 }
 
+/// Format a float as a string, preserving a trailing ".0" for whole-number
+/// values so the output matches `numpy.savetxt(fmt="%s")`.
+///
+/// `f64::to_string()` (Rust Display/Ryu) emits "1" for 1.0; Python's
+/// `str(numpy.float64(1.0))` emits "1.0".  Append ".0" when the Ryu
+/// output contains no '.', 'e'/'E', or any letter (NaN/inf already have
+/// letters and must NOT be modified).
+fn ensure_decimal(s: String) -> String {
+    if s.bytes().all(|b| b == b'-' || b.is_ascii_digit()) {
+        format!("{s}.0")
+    } else {
+        s
+    }
+}
+
 /// CSV serializer for 1-D/2-D arrays (Python `serialize_csv`, array.py:41-46).
 fn serialize_array_csv(
     data: &[u8],
@@ -92,14 +107,14 @@ fn serialize_array_csv(
                 if big_endian {
                     b.reverse();
                 }
-                f64::from_le_bytes(b).to_string()
+                ensure_decimal(f64::from_le_bytes(b).to_string())
             }
             ("f", 4) => {
                 let mut b: [u8; 4] = bytes.try_into().unwrap_or([0u8; 4]);
                 if big_endian {
                     b.reverse();
                 }
-                f32::from_le_bytes(b).to_string()
+                ensure_decimal(f32::from_le_bytes(b).to_string())
             }
             ("i", 8) => {
                 let mut b: [u8; 8] = bytes.try_into().unwrap_or([0u8; 8]);
@@ -267,6 +282,38 @@ mod tests {
         reg.dispatch(StructureFamily::Array, mime::CSV).unwrap()
     }
 
+    /// L1: `numpy.savetxt(fmt="%s")` emits "1.0" for 1.0_f64, not "1".
+    /// Rust Display (Ryu) emits "1"; the fix appends ".0" when the output
+    /// contains no decimal point, 'e', or letter (NaN/inf excluded).
+    #[test]
+    fn csv_float_whole_number_gets_decimal_point() {
+        let ser = csv_serializer();
+        // f64: 0.0, 1.0, -2.0 must have decimal point.
+        let values_f64: &[f64] = &[0.0, 1.0, -2.0, 1e10];
+        let data: Vec<u8> = values_f64.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let meta = serde_json::json!({"itemsize": 8, "kind": "f", "shape": [4]});
+        let out = ser(&data, &meta).unwrap();
+        let lines: Vec<&str> = std::str::from_utf8(&out).unwrap().lines().collect();
+        assert_eq!(lines, vec!["0.0", "1.0", "-2.0", "10000000000.0"]);
+
+        // f32: same rule.
+        let values_f32: &[f32] = &[0.0, 1.0, -3.0];
+        let data32: Vec<u8> = values_f32.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let meta32 = serde_json::json!({"itemsize": 4, "kind": "f", "shape": [3]});
+        let out32 = ser(&data32, &meta32).unwrap();
+        let lines32: Vec<&str> = std::str::from_utf8(&out32).unwrap().lines().collect();
+        assert_eq!(lines32, vec!["0.0", "1.0", "-3.0"]);
+
+        // Non-whole values must NOT get an extra ".0".
+        let frac: Vec<u8> = 1.5f64.to_le_bytes().to_vec();
+        let out_frac = ser(
+            &frac,
+            &serde_json::json!({"itemsize": 8, "kind": "f", "shape": [1]}),
+        )
+        .unwrap();
+        assert_eq!(std::str::from_utf8(&out_frac).unwrap(), "1.5");
+    }
+
     /// Finding 4: a >2-D array must error like Python `serialize_csv`
     /// (UnsupportedShape, array.py:42-43), not silently flatten to one column.
     #[test]
@@ -321,8 +368,8 @@ mod tests {
                     .unwrap()
                     .lines()
                     .collect::<Vec<_>>(),
-                vec!["0", "1", "2"],
-                "{mt} must serialize as CSV"
+                vec!["0.0", "1.0", "2.0"],
+                "{mt} must serialize as CSV with numpy-style float formatting"
             );
         }
     }
