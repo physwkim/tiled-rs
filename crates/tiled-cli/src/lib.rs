@@ -2,7 +2,7 @@ pub mod config;
 
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Subcommand;
 use indexmap::IndexMap;
 
@@ -227,6 +227,41 @@ pub enum AdminCommand {
         /// service account.
         #[arg(long, default_value = "user")]
         role: String,
+    },
+    /// Validate a configuration file (or directory of config files) for
+    /// syntax and validation errors without starting the server. Mirrors
+    /// Python `tiled admin check-config` (_admin.py:141): exits non-zero with
+    /// the parse error on failure, prints a success line otherwise.
+    CheckConfig {
+        /// Path to a config file or directory. If omitted, uses $TILED_CONFIG,
+        /// then `./config.yml` (Python parity).
+        config_path: Option<String>,
+    },
+    /// List principals (users and services) with their linked identities.
+    /// DB-direct (no running server required); the equivalent of Python
+    /// `tiled admin list-principals` (_admin.py:166), which reaches a server's
+    /// admin API — tiled-rs queries the auth DB directly, consistent with the
+    /// other `tiled admin` subcommands.
+    ListPrincipals {
+        /// Auth DB URI (e.g. sqlite:///var/lib/tiled-auth.db).
+        #[arg(long, env = "TILED_AUTH_DB_URI")]
+        auth_db_uri: String,
+        /// Page offset (Python `page_offset`).
+        #[arg(long, default_value_t = 0)]
+        offset: i64,
+        /// Max items to show (Python `page_limit`).
+        #[arg(long, default_value_t = 100)]
+        limit: i64,
+    },
+    /// Show one principal (user or service) by UUID, with its linked
+    /// identities. DB-direct; the equivalent of Python
+    /// `tiled admin show-principal` (_admin.py:184).
+    ShowPrincipal {
+        /// Auth DB URI (e.g. sqlite:///var/lib/tiled-auth.db).
+        #[arg(long, env = "TILED_AUTH_DB_URI")]
+        auth_db_uri: String,
+        /// UUID identifying the principal of interest.
+        uuid: String,
     },
 }
 
@@ -840,6 +875,52 @@ pub async fn run(command: Command) -> Result<()> {
                 println!("uuid: {}", principal.uuid);
                 println!("type: {}", principal.r#type);
                 println!("role: {}", principal.role);
+                Ok(())
+            }
+            AdminCommand::CheckConfig { config_path } => {
+                let path = config_path
+                    .or_else(|| std::env::var("TILED_CONFIG").ok())
+                    .unwrap_or_else(|| "config.yml".to_string());
+                // Parsing is the validation: `from_file` surfaces I/O, YAML,
+                // and reconciliation errors. Propagate on failure (the binary
+                // prints it and exits non-zero, mirroring Python's
+                // `typer.Exit(1)`); confirm on success.
+                config::TiledConfig::from_file(&path)
+                    .with_context(|| format!("configuration check failed for {path}"))?;
+                println!("No errors found in configuration.");
+                Ok(())
+            }
+            AdminCommand::ListPrincipals {
+                auth_db_uri,
+                offset,
+                limit,
+            } => {
+                let db = tiled_auth::AuthDb::connect(&auth_db_uri)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("auth db: {e}"))?;
+                db.migrate()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("auth migrate: {e}"))?;
+                let principals = db
+                    .list_principals(offset, limit)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("list principals: {e}"))?;
+                println!("{}", serde_json::to_string_pretty(&principals)?);
+                Ok(())
+            }
+            AdminCommand::ShowPrincipal { auth_db_uri, uuid } => {
+                let db = tiled_auth::AuthDb::connect(&auth_db_uri)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("auth db: {e}"))?;
+                db.migrate()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("auth migrate: {e}"))?;
+                let detail = db
+                    .get_principal_detail(&uuid)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("show principal: {e}"))?
+                    .ok_or_else(|| anyhow::anyhow!("No such Principal {uuid}"))?;
+                println!("{}", serde_json::to_string_pretty(&detail)?);
                 Ok(())
             }
         },

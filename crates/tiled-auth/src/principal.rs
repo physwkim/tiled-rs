@@ -267,6 +267,48 @@ impl AuthDb {
         Ok(Some(PrincipalDetail::new(principal, identities)))
     }
 
+    /// List principals (paginated, ordered by id) together with each one's
+    /// linked identities — the DB-direct equivalent of the admin
+    /// `GET /auth/principal` list endpoint (`authentication.py:1247-1286`,
+    /// which uses `selectinload(Principal.identities)`). Backs the
+    /// `tiled admin list-principals` CLI command.
+    pub async fn list_principals(&self, offset: i64, limit: i64) -> Result<Vec<PrincipalDetail>> {
+        let principals: Vec<Principal> = match self.pool() {
+            AuthPool::Sqlite(pool) => {
+                let rows = sqlx::query(
+                    "SELECT id, uuid, type, role, time_created FROM principals
+                       ORDER BY id LIMIT ? OFFSET ?",
+                )
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(pool)
+                .await?;
+                rows.iter()
+                    .map(principal_from_sqlite)
+                    .collect::<Result<Vec<_>>>()?
+            }
+            AuthPool::Postgres(pool) => {
+                let rows = sqlx::query(
+                    "SELECT id, uuid, type, role, time_created FROM principals
+                       ORDER BY id LIMIT $1 OFFSET $2",
+                )
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(pool)
+                .await?;
+                rows.iter()
+                    .map(principal_from_postgres)
+                    .collect::<Result<Vec<_>>>()?
+            }
+        };
+        let mut out = Vec::with_capacity(principals.len());
+        for principal in principals {
+            let identities = self.list_identities(principal.id).await?;
+            out.push(PrincipalDetail::new(principal, identities));
+        }
+        Ok(out)
+    }
+
     pub async fn create_identity(
         &self,
         principal_id: i64,
