@@ -367,7 +367,8 @@ fn serialize_array_json(
         .and_then(|v| v.as_str())
         .unwrap_or("<")
         == ">";
-    // datetime64 unit, e.g. "[ns]" → "ns"; only consulted for kind 'M'.
+    // datetime64/timedelta64 unit, e.g. "[ns]" → "ns"; consulted for kinds 'M'
+    // (datetime64) and 'm' (timedelta64).
     let dt_unit: Option<&str> = metadata
         .get("dt_units")
         .and_then(|v| v.as_str())
@@ -400,6 +401,9 @@ fn serialize_array_json(
             ("b", _) => serde_json::Value::from(bytes.iter().any(|&b| b != 0)),
             // datetime64 is always an 8-byte int64 tick count; render ISO-8601.
             ("M", 8) => datetime64_to_json(le!(i64, 8), dt_unit)?,
+            // timedelta64 is an 8-byte int64 tick count; orjson can't serialize
+            // it, so tiled falls back to tolist() — see timedelta64_to_json.
+            ("m", 8) => timedelta64_to_json(le!(i64, 8), dt_unit)?,
             _ => {
                 return Err(format!(
                     "application/json array serializer does not support dtype {kind}{itemsize}"
@@ -538,6 +542,44 @@ fn datetime64_to_json(
         format!("{base}.{micros:06}")
     };
     Ok(serde_json::Value::String(s))
+}
+
+/// Render a numpy `timedelta64` tick as the JSON value tiled's `safe_json_dump`
+/// produces. orjson's `OPT_SERIALIZE_NUMPY` does NOT serialize timedelta64, so
+/// `default()` (utils.py:558-578) returns `array.tolist()` and orjson then
+/// serializes that Python list. The result is unit-dependent (verified against
+/// orjson 3.11.5 + numpy 2.0.2):
+///   * NaT (`i64::MIN`) → `None` → JSON `null`, for EVERY unit (numpy's
+///     `NaT.tolist()` is `None` regardless of unit).
+///   * `Y`/`M`/`ns` → a Python `int` (calendar units have no fixed duration, and
+///     `datetime.timedelta` has only microsecond resolution so `ns` cannot be
+///     one) → orjson emits the raw tick count.
+///   * `W`/`D`/`h`/`m`/`s`/`ms`/`us` → a `datetime.timedelta`, which orjson
+///     cannot serialize → it raises → HTTP 500. We mirror this by erroring;
+///     because serialization aborts on the first such element, an array with any
+///     non-NaT duration-unit value 500s exactly as Python does, while an all-NaT
+///     duration-unit array still yields `[null, …]`.
+fn timedelta64_to_json(
+    value: i64,
+    unit: Option<&str>,
+) -> Result<serde_json::Value, crate::registry::SerializeError> {
+    // NaT → null regardless of unit (numpy NaT.tolist() is None for every unit).
+    if value == i64::MIN {
+        return Ok(serde_json::Value::Null);
+    }
+    let unit = unit.ok_or_else(|| -> crate::registry::SerializeError {
+        "timedelta64 array is missing its dt_units; cannot decode".into()
+    })?;
+    match unit {
+        // tolist() → Python int → orjson emits the raw tick count.
+        "Y" | "M" | "ns" => Ok(serde_json::Value::from(value)),
+        // tolist() → datetime.timedelta → orjson raises → HTTP 500.
+        _ => Err(format!(
+            "timedelta64[{unit}] is not JSON-serializable (orjson raises on the \
+             datetime.timedelta that numpy's tolist() produces)"
+        )
+        .into()),
+    }
 }
 
 /// Render a numpy `datetime64` tick count as the CSV cell `numpy.savetxt(fmt=
@@ -951,18 +993,68 @@ mod tests {
         );
     }
 
-    /// timedelta64 ('m') stays a hard error: orjson's `OPT_SERIALIZE_NUMPY` does
-    /// not serialize timedelta64, so Python also fails on such an array.
+    /// timedelta64 ('m') JSON path mirrors tiled's `safe_json_dump` tolist()
+    /// fallback exactly (verified against orjson 3.11.5 + numpy 2.0.2):
+    ///   * NaT (`i64::MIN`) → `null` for EVERY unit;
+    ///   * `Y`/`M`/`ns` non-NaT → the raw integer tick (tolist() → int);
+    ///   * `W`/`D`/`h`/`m`/`s`/`ms`/`us` non-NaT → error (tolist() →
+    ///     datetime.timedelta → orjson raises → HTTP 500).
     #[test]
-    fn json_array_timedelta_still_errors() {
+    fn json_array_timedelta64_matches_orjson_tolist() {
         let ser = json_array_serializer();
-        let data: Vec<u8> = 5_i64.to_le_bytes().to_vec();
-        let meta = serde_json::json!({"itemsize": 8, "kind": "m", "dt_units": "[s]", "shape": [1]});
-        let err = ser(&data, &meta).expect_err("timedelta64 must error");
+        let one = |unit: &str, v: i64| -> Result<serde_json::Value, _> {
+            let data: Vec<u8> = v.to_le_bytes().to_vec();
+            let meta = serde_json::json!({
+                "itemsize": 8, "kind": "m", "dt_units": unit, "shape": [1]
+            });
+            ser(&data, &meta).map(|out| serde_json::from_slice::<serde_json::Value>(&out).unwrap())
+        };
+        // Y/M/ns non-NaT → raw integer tick.
+        for unit in ["[Y]", "[M]", "[ns]"] {
+            assert_eq!(
+                one(unit, 5).unwrap(),
+                serde_json::json!([5]),
+                "timedelta64{unit} must emit the raw integer tick"
+            );
+        }
+        // Duration units non-NaT → error (orjson raises on datetime.timedelta).
+        for unit in ["[W]", "[D]", "[h]", "[m]", "[s]", "[ms]", "[us]"] {
+            one(unit, 5).expect_err(&format!("timedelta64{unit} non-NaT must 500"));
+        }
+        // NaT → null for EVERY unit, including the otherwise-erroring duration ones.
+        for unit in [
+            "[Y]", "[M]", "[W]", "[D]", "[h]", "[m]", "[s]", "[ms]", "[us]", "[ns]",
+        ] {
+            assert_eq!(
+                one(unit, i64::MIN).unwrap(),
+                serde_json::json!([serde_json::Value::Null]),
+                "timedelta64{unit} NaT must be null"
+            );
+        }
+    }
+
+    /// A timedelta64 array with no dt_units cannot pick the int-vs-error branch,
+    /// so a non-NaT value errors rather than guess; NaT is still null (it needs
+    /// no unit).
+    #[test]
+    fn json_array_timedelta64_missing_units() {
+        let ser = json_array_serializer();
+        let meta_for = |v: i64| {
+            (
+                v.to_le_bytes().to_vec(),
+                serde_json::json!({"itemsize": 8, "kind": "m", "shape": [1]}),
+            )
+        };
+        let (data, meta) = meta_for(5);
+        let err = ser(&data, &meta).expect_err("timedelta64 without units must error on a value");
         assert!(
-            err.to_string().contains("does not support"),
-            "timedelta64 must remain unsupported: {err}"
+            err.to_string().contains("dt_units"),
+            "error must name the missing units: {err}"
         );
+        let (data, meta) = meta_for(i64::MIN);
+        let out = ser(&data, &meta).expect("NaT needs no unit");
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(parsed, serde_json::json!([serde_json::Value::Null]));
     }
 
     /// Finding 5: the array CSV serializer is registered under all four media
