@@ -332,12 +332,7 @@ impl ArrayColumnAdapter {
         for result in cursor {
             let doc = result.map_err(|e| TiledError::Internal(e.to_string()))?;
             if let Ok(arr) = doc.get_array("column") {
-                for v in arr {
-                    match v {
-                        Bson::String(s) => datum_ids.push(s.clone()),
-                        _ => datum_ids.push(v.to_string()),
-                    }
-                }
+                collect_datum_ids(arr, &mut datum_ids)?;
             }
         }
 
@@ -452,6 +447,26 @@ impl ArrayAdapterRead for ArrayColumnAdapter {
             DynNDArray::new(bytes::Bytes::from(raw), dtype, block_shape).apply_slice(slice)
         })
     }
+}
+
+/// Collect datum_id strings from a BSON array returned by the aggregate.
+///
+/// Every element must be a `Bson::String`; any other type means the datum_id
+/// stored in MongoDB is not a plain string (e.g. an ObjectId rendered as
+/// `{"$oid":"…"}`), which would never match a datum document and silently yield
+/// NotFound.  Reject those up front with a Validation error.
+fn collect_datum_ids(arr: &[Bson], out: &mut Vec<String>) -> Result<()> {
+    for v in arr {
+        match v {
+            Bson::String(s) => out.push(s.clone()),
+            other => {
+                return Err(TiledError::Validation(format!(
+                    "datum_id is not a string: {other:?}"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Build a chunk-size list for `num_events` along axis 0.
@@ -636,5 +651,48 @@ mod tests {
             .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
             .collect();
         assert_eq!(got, vec![20.0, 30.0, 40.0]);
+    }
+
+    // ---- L3: collect_datum_ids must reject non-String BSON ----
+
+    #[test]
+    fn collect_datum_ids_accepts_strings() {
+        let arr = vec![Bson::String("id-1".into()), Bson::String("id-2".into())];
+        let mut out = Vec::new();
+        collect_datum_ids(&arr, &mut out).unwrap();
+        assert_eq!(out, vec!["id-1", "id-2"]);
+    }
+
+    #[test]
+    fn collect_datum_ids_rejects_oid() {
+        use mongodb::bson::oid::ObjectId;
+        let arr = vec![Bson::ObjectId(ObjectId::new())];
+        let mut out = Vec::new();
+        let err = collect_datum_ids(&arr, &mut out).unwrap_err();
+        match err {
+            TiledError::Validation(msg) => {
+                assert!(
+                    msg.contains("datum_id is not a string"),
+                    "expected validation message, got: {msg}"
+                );
+            }
+            other => panic!("expected Validation error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn collect_datum_ids_rejects_int32() {
+        let arr = vec![Bson::Int32(42)];
+        let mut out = Vec::new();
+        let err = collect_datum_ids(&arr, &mut out).unwrap_err();
+        assert!(matches!(err, TiledError::Validation(_)));
+    }
+
+    #[test]
+    fn collect_datum_ids_empty_array_is_ok() {
+        let arr: Vec<Bson> = vec![];
+        let mut out = Vec::new();
+        collect_datum_ids(&arr, &mut out).unwrap();
+        assert!(out.is_empty());
     }
 }
