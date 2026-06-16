@@ -49,7 +49,7 @@ pub fn register_csv_table_serializer(reg: &SerializationRegistry) {
     reg.register_alias(".csv", mime::CSV);
 }
 
-fn csv_table_serializer(with_header: bool) -> SerializerFn {
+pub(crate) fn csv_table_serializer(with_header: bool) -> SerializerFn {
     Box::new(
         move |data, _meta| -> Result<Bytes, crate::registry::SerializeError> {
             let cursor = Cursor::new(data.to_vec());

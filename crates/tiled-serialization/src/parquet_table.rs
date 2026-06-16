@@ -27,7 +27,7 @@ pub fn register_parquet_serializer(reg: &SerializationRegistry) {
     reg.register_alias(".pq", mime::PARQUET);
 }
 
-fn parquet_serializer() -> SerializerFn {
+pub(crate) fn parquet_serializer() -> SerializerFn {
     Box::new(
         |data, _meta| -> Result<Bytes, crate::registry::SerializeError> {
             // Stream-style: read one batch from the IPC reader, write to

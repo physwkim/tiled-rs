@@ -263,12 +263,12 @@ pub fn resolve_media_type(
     default_media_type(family)
 }
 
-fn default_media_type(family: StructureFamily) -> Option<String> {
+pub(crate) fn default_media_type(family: StructureFamily) -> Option<String> {
     match family {
-        StructureFamily::Array | StructureFamily::Sparse => {
-            Some(tiled_core::media_type::mime::OCTET_STREAM.to_string())
+        StructureFamily::Array => Some(tiled_core::media_type::mime::OCTET_STREAM.to_string()),
+        StructureFamily::Sparse | StructureFamily::Table => {
+            Some(tiled_core::media_type::mime::ARROW_FILE.to_string())
         }
-        StructureFamily::Table => Some(tiled_core::media_type::mime::ARROW_FILE.to_string()),
         _ => None,
     }
 }
