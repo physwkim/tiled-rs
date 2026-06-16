@@ -970,6 +970,105 @@ async fn keys_sends_empty_fields_projection_and_parses_id_only_entries() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// (14) AwkwardClient.read_buffers() POSTs the sorted form-key set as a JSON
+//      array body with Accept: application/zip (client M1). Python
+//      awkward.py:63-71 POSTs `json=sorted(form_keys)` to links["buffers"];
+//      the server switched the GET `?form_key=...` route to POST to dodge
+//      URL-length limits (router.py:1611-1639). The Rust client has no
+//      typetracer and reads the whole array, so it sends every form key
+//      declared in the structure form.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn awkward_read_buffers_posts_sorted_form_keys() {
+    use tiled_client::{AwkwardClient, Context, Item};
+
+    #[derive(Default)]
+    struct ServerState {
+        last_body: Mutex<Option<serde_json::Value>>,
+        last_accept: Mutex<Option<String>>,
+    }
+    let state: Arc<ServerState> = Arc::new(ServerState::default());
+
+    async fn handle_buffers(
+        State(state): State<Arc<ServerState>>,
+        Path(_path): Path<String>,
+        headers: HeaderMap,
+        Json(body): Json<serde_json::Value>,
+    ) -> impl IntoResponse {
+        *state.last_body.lock().await = Some(body);
+        *state.last_accept.lock().await = headers
+            .get("accept")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        // read_buffers() returns these raw bytes without unzipping, so the
+        // body need not be a real zip archive for this request-shape test.
+        (
+            [(axum::http::header::CONTENT_TYPE, "application/zip")],
+            b"ZIPPED".to_vec(),
+        )
+    }
+
+    // Only a POST route is registered: a GET (the old behavior) would 404,
+    // so a successful read also proves the method switched to POST.
+    let app = Router::new()
+        .route("/api/v1/", get(|| async { Json(about_payload()) }))
+        .route("/api/v1/awkward/buffers/{*path}", post(handle_buffers))
+        .with_state(state.clone());
+    let base = spawn(app).await;
+
+    let (ctx, _) = Context::from_uri(&base).unwrap();
+    let item: Item = serde_json::from_value(serde_json::json!({
+        "id": "ak",
+        "attributes": {
+            "ancestors": [],
+            "structure_family": "awkward",
+            "structure": {
+                "length": 3,
+                "form": {
+                    "class": "RecordArray",
+                    "fields": ["x", "y"],
+                    "contents": [
+                        {"class": "NumpyArray", "primitive": "float64", "form_key": "node1"},
+                        {"class": "ListOffsetArray", "offsets": "i64", "form_key": "node2",
+                         "content": {"class": "NumpyArray", "primitive": "int64", "form_key": "node3"}}
+                    ],
+                    "form_key": "node0"
+                }
+            },
+            "metadata": {}
+        },
+        "links": {
+            "self": format!("{base}/api/v1/metadata/ak"),
+            "buffers": format!("{base}/api/v1/awkward/buffers/ak"),
+        }
+    }))
+    .unwrap();
+
+    let client = AwkwardClient::from_item(ctx, item, false).unwrap();
+    let bytes = client.read_buffers().await.unwrap();
+    assert_eq!(&bytes[..], b"ZIPPED");
+
+    // A POST recorded a JSON body → the method is POST (the GET route is absent).
+    let body = state
+        .last_body
+        .lock()
+        .await
+        .clone()
+        .expect("body recorded → request was a POST with a JSON array body");
+    assert_eq!(
+        body,
+        serde_json::json!(["node0", "node1", "node2", "node3"]),
+        "must POST the complete, sorted, deduplicated form-key set"
+    );
+    assert_eq!(
+        state.last_accept.lock().await.as_deref(),
+        Some("application/zip"),
+        "must request Accept: application/zip"
+    );
+}
+
 #[allow(dead_code)]
 const _: fn() = || {
     let _ = HashMap::<String, String>::new();
