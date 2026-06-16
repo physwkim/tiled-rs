@@ -66,7 +66,7 @@ pub use register::{
     RegistrationAdapter, Settings as RegisterSettings, WatchHandle, default_filter,
     default_mimetypes, list_files, register, resolve_mimetype, strip_suffixes, watch,
 };
-pub use sparse::SparseClient;
+pub use sparse::{SparseBlock, SparseClient};
 pub use stream::{
     ArrayData, ArrayPatch, ArrayRef, ChildCreated, ChildMetadataUpdated, Schema, Subscription,
     SubscriptionStream, TableData, Update,
