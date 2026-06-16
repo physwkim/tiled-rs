@@ -492,6 +492,365 @@ fn parse_slice_part(s: &str) -> Result<SliceDim> {
 pub const SLICE_REGEX: &str =
     r"^(?:(?:-?\d+)?:){0,2}(?:-?\d+)?(?:,(?:(?:-?\d+)?:){0,2}(?:-?\d+)?)*$";
 
+// ---- NDBlock ---------------------------------------------------------------
+
+/// A slice over the *chunk grid* (block indices), not element indices.
+///
+/// Corresponds to Python `NDBlock(NDSlice)` in `tiled/ndslice.py:595`.
+///
+/// Invariant: every `SliceDim::Slice` must have `step == None` or `step == Some(1)`
+/// (only contiguous block ranges are representable).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct NDBlock(pub Vec<SliceDim>);
+
+impl NDBlock {
+    /// Construct and validate: all slice steps must be 1 or None.
+    pub fn new(dims: Vec<SliceDim>) -> Result<Self> {
+        for dim in &dims {
+            if let SliceDim::Slice { step: Some(s), .. } = dim
+                && *s != 1
+            {
+                return Err(TiledError::InvalidSlice(format!(
+                    "NDBlock can only contain slices with step 1; got step={s}"
+                )));
+            }
+        }
+        Ok(Self(dims))
+    }
+
+    /// Returns the `NDSlice` over the full array that covers the region this
+    /// block occupies.
+    ///
+    /// Corresponds to `NDBlock.slice_from_chunks` in `tiled/ndslice.py:619`.
+    pub fn slice_from_chunks(&self, chunks: &[Vec<usize>]) -> NDSlice {
+        let mut dims = Vec::with_capacity(self.0.len());
+        for (dim_spec, dim_chunks) in self.0.iter().zip(chunks.iter()) {
+            let cumsum = prefix_sums(dim_chunks);
+            let n = dim_chunks.len();
+            match dim_spec {
+                SliceDim::Index(i) => {
+                    let i = norm_chunk_idx(*i, n);
+                    dims.push(SliceDim::Slice {
+                        start: Some(cumsum[i] as isize),
+                        stop: Some((cumsum[i] + dim_chunks[i]) as isize),
+                        step: None,
+                    });
+                }
+                SliceDim::Slice { start, stop, .. } => {
+                    // clamp chunk indices into [0, n]
+                    let clamp_chunk = |v: isize| -> usize {
+                        let v = if v < 0 { v + n as isize } else { v };
+                        (v.max(0) as usize).min(n)
+                    };
+                    let array_start = start.map(|s| cumsum[clamp_chunk(s)] as isize);
+                    let array_stop = stop.map(|s| cumsum[clamp_chunk(s)] as isize);
+                    dims.push(SliceDim::Slice {
+                        start: array_start,
+                        stop: array_stop,
+                        step: None,
+                    });
+                }
+                // Treat Ellipsis as a full-range slice (full array region).
+                SliceDim::Ellipsis => {
+                    dims.push(SliceDim::Slice {
+                        start: None,
+                        stop: None,
+                        step: None,
+                    });
+                }
+            }
+        }
+        NDSlice(dims)
+    }
+
+    /// Returns every n-dimensional chunk-index tuple inside this block, sorted.
+    ///
+    /// Each element of the returned `Vec` is a `Vec<usize>` of length `ndim`.
+    ///
+    /// Corresponds to `NDBlock.chunk_indices` in `tiled/ndslice.py:634`.
+    pub fn chunk_indices(&self, chunks: &[Vec<usize>]) -> Vec<Vec<usize>> {
+        let mut per_dim: Vec<Vec<usize>> = Vec::with_capacity(self.0.len());
+
+        for (dim_spec, dim_chunks) in self.0.iter().zip(chunks.iter()) {
+            let n = dim_chunks.len();
+            match dim_spec {
+                SliceDim::Index(i) => {
+                    per_dim.push(vec![norm_chunk_idx(*i, n)]);
+                }
+                SliceDim::Slice { start, stop, .. } => {
+                    let start = start
+                        .map(|s| {
+                            let s = if s < 0 { s + n as isize } else { s };
+                            s.max(0) as usize
+                        })
+                        .unwrap_or(0);
+                    let stop = stop
+                        .map(|s| {
+                            let s = if s < 0 { s + n as isize } else { s };
+                            (s.max(0) as usize).min(n)
+                        })
+                        .unwrap_or(n);
+                    per_dim.push((start..stop).collect());
+                }
+                SliceDim::Ellipsis => {
+                    per_dim.push((0..n).collect());
+                }
+            }
+        }
+
+        if per_dim.is_empty() {
+            return vec![];
+        }
+
+        // Cartesian product of per-dim index lists.
+        let mut result: Vec<Vec<usize>> = vec![vec![]];
+        for indices in per_dim {
+            if indices.is_empty() {
+                return vec![]; // Empty dim → no chunks intersected
+            }
+            result = result
+                .into_iter()
+                .flat_map(|prefix| {
+                    indices.iter().map(move |&i| {
+                        let mut row = prefix.clone();
+                        row.push(i);
+                        row
+                    })
+                })
+                .collect();
+        }
+        result.sort();
+        result
+    }
+}
+
+// ---- block_for_slice -------------------------------------------------------
+
+/// Compute which block of chunks an `NDSlice` touches, and the adjusted slice
+/// within the concatenated block to recover the final result.
+///
+/// Returns `(block, slice_within_block)` where:
+/// * `block` is an `NDBlock` selecting the contiguous range of chunks touched.
+/// * `slice_within_block` is the `NDSlice` to apply to `np.block(read_chunks(block))`
+///   to obtain `array[slice]`.
+///
+/// Corresponds to `block_for_slice` in `tiled/ndslice.py:669`.
+pub fn block_for_slice(
+    chunks: &[Vec<usize>],
+    slice: Option<&NDSlice>,
+) -> Result<(NDBlock, NDSlice)> {
+    let ndim = chunks.len();
+
+    // Empty (no-dims) slice → all blocks, identity adjusted slice.
+    // Mirrors: `if not slice: return (NDBlock(*all_ranges), NDSlice())`
+    let is_nodim = slice.map(|s| s.0.is_empty()).unwrap_or(true);
+    if is_nodim {
+        let block_dims = chunks
+            .iter()
+            .map(|dim| SliceDim::Slice {
+                start: Some(0),
+                stop: Some(dim.len() as isize),
+                step: None,
+            })
+            .collect();
+        return Ok((NDBlock(block_dims), NDSlice::empty()));
+    }
+
+    let slice = slice.unwrap();
+
+    // Per-dim shape from chunks.
+    let shape: Vec<usize> = chunks.iter().map(|dim| dim.iter().sum()).collect();
+
+    // Expand Ellipsis to full slices, pad trailing dims.
+    let expanded = expand_slice_for_shape(slice, &shape)?;
+
+    let mut block_dims = Vec::with_capacity(ndim);
+    let mut adjusted_dims = Vec::with_capacity(ndim);
+
+    for (dim_idx, (slc, dim_chunks)) in expanded.iter().zip(chunks.iter()).enumerate() {
+        let bounds = prefix_sums(dim_chunks); // [0, c0, c0+c1, ...]
+        let dim_len = shape[dim_idx];
+
+        match slc {
+            SliceDim::Index(i) => {
+                let n = dim_len as isize;
+                let i_norm = if *i < 0 { *i + n } else { *i };
+                if i_norm < 0 || i_norm >= n {
+                    return Err(TiledError::InvalidSlice(format!(
+                        "Index {i} out of bounds for dimension {dim_idx} with shape {n}"
+                    )));
+                }
+                let chunk_idx = bisect_right(&bounds, i_norm as usize) - 1;
+                block_dims.push(SliceDim::Index(chunk_idx as isize));
+                adjusted_dims.push(SliceDim::Index(i_norm - bounds[chunk_idx] as isize));
+            }
+
+            SliceDim::Slice { start, stop, step } => {
+                let (start, stop, step) = py_slice_indices(*start, *stop, *step, dim_len)?;
+
+                if step > 0 {
+                    if start >= stop {
+                        // Empty slice — no chunks touched.
+                        block_dims.push(empty_range());
+                        adjusted_dims.push(empty_range());
+                        continue;
+                    }
+                    let first = bisect_right(&bounds, start as usize) - 1;
+                    let last = bisect_right(&bounds, (stop - 1) as usize) - 1;
+                    block_dims.push(make_block_range(first, last));
+
+                    let first_start = bounds[first] as isize;
+                    let norm_step = if step == 1 { None } else { Some(step) };
+                    adjusted_dims.push(SliceDim::Slice {
+                        start: Some(start - first_start),
+                        stop: Some(stop - first_start),
+                        step: norm_step,
+                    });
+                } else {
+                    // step < 0
+                    if start <= stop {
+                        // Empty slice.
+                        block_dims.push(empty_range());
+                        adjusted_dims.push(empty_range());
+                        continue;
+                    }
+                    let first_raw = bisect_right(&bounds, start as usize) - 1;
+                    // stop+1 >= 0 always (py_slice_indices clamps stop >= -1 for neg step)
+                    let last_raw = bisect_right(&bounds, (stop + 1) as usize) - 1;
+                    let (first, last) = (first_raw.min(last_raw), first_raw.max(last_raw));
+                    block_dims.push(make_block_range(first, last));
+
+                    let first_start = bounds[first] as isize;
+                    // If stop falls before the start of the first_chunk, adjusted stop is None
+                    // (means "go all the way to the beginning of the block").
+                    let adj_stop = if stop < first_start {
+                        None
+                    } else {
+                        Some(stop - first_start)
+                    };
+                    adjusted_dims.push(SliceDim::Slice {
+                        start: Some(start - first_start),
+                        stop: adj_stop,
+                        step: Some(step),
+                    });
+                }
+            }
+
+            SliceDim::Ellipsis => {
+                unreachable!("Ellipsis should have been expanded by expand_slice_for_shape");
+            }
+        }
+    }
+
+    Ok((NDBlock(block_dims), NDSlice(adjusted_dims)))
+}
+
+// ---- private helpers -------------------------------------------------------
+
+/// Prefix sums (chunk boundaries): `[0, c0, c0+c1, …, total]`.
+fn prefix_sums(dim_chunks: &[usize]) -> Vec<usize> {
+    let mut sums = Vec::with_capacity(dim_chunks.len() + 1);
+    sums.push(0usize);
+    let mut acc = 0usize;
+    for &c in dim_chunks {
+        acc += c;
+        sums.push(acc);
+    }
+    sums
+}
+
+/// Right-biased binary search: first index `i` s.t. `sorted[i] > val`.
+/// Mirrors `bisect.bisect_right(sorted, val)`.
+fn bisect_right(sorted: &[usize], val: usize) -> usize {
+    sorted.partition_point(|&x| x <= val)
+}
+
+/// Normalise a possibly-negative chunk index into `[0, n)` as a `usize`.
+fn norm_chunk_idx(i: isize, n: usize) -> usize {
+    (if i < 0 { i + n as isize } else { i }) as usize
+}
+
+/// Produce a `SliceDim` for a contiguous inclusive range `[first, last]` of
+/// chunk indices.  Single-chunk ranges become `Index` variants.
+fn make_block_range(first: usize, last: usize) -> SliceDim {
+    if first == last {
+        SliceDim::Index(first as isize)
+    } else {
+        SliceDim::Slice {
+            start: Some(first as isize),
+            stop: Some((last + 1) as isize),
+            step: None,
+        }
+    }
+}
+
+/// `SliceDim` representing an empty range `[0, 0)`.
+fn empty_range() -> SliceDim {
+    SliceDim::Slice {
+        start: Some(0),
+        stop: Some(0),
+        step: None,
+    }
+}
+
+/// Expand an `NDSlice` to `shape.len()` dims, replacing Ellipsis with full
+/// slices and padding trailing dims.  Mirrors `NDSlice.expand_for_shape`.
+fn expand_slice_for_shape(slice: &NDSlice, shape: &[usize]) -> Result<Vec<SliceDim>> {
+    let ndim = shape.len();
+    let non_ellipsis = slice
+        .0
+        .iter()
+        .filter(|d| !matches!(d, SliceDim::Ellipsis))
+        .count();
+    if non_ellipsis > ndim {
+        return Err(TiledError::InvalidSlice(format!(
+            "Slice has {non_ellipsis} dims but array has {ndim} dims"
+        )));
+    }
+    let fill = ndim - non_ellipsis;
+    let mut result = Vec::with_capacity(ndim);
+    for dim in &slice.0 {
+        if matches!(dim, SliceDim::Ellipsis) {
+            for _ in 0..fill {
+                result.push(SliceDim::full());
+            }
+        } else {
+            result.push(dim.clone());
+        }
+    }
+    // Pad if slice has fewer dims than ndim and no ellipsis.
+    while result.len() < ndim {
+        result.push(SliceDim::full());
+    }
+    Ok(result)
+}
+
+/// Mirror Python's `slice.indices(length)`: normalise start/stop/step for a
+/// sequence of `length` elements.  Returns `(start, stop, step)`.
+fn py_slice_indices(
+    start: Option<isize>,
+    stop: Option<isize>,
+    step: Option<isize>,
+    length: usize,
+) -> Result<(isize, isize, isize)> {
+    let step = step.unwrap_or(1);
+    if step == 0 {
+        return Err(TiledError::InvalidSlice("slice step cannot be zero".into()));
+    }
+    let n = length as isize;
+    let (lo, hi, start_def, stop_def) = if step > 0 {
+        (0isize, n, 0isize, n)
+    } else {
+        (-1isize, n - 1, n - 1, -1isize)
+    };
+    let clamp = |v: isize| v.max(lo).min(hi);
+    let norm = |v: Option<isize>, default: isize| match v {
+        None => default,
+        Some(x) => clamp(if x < 0 { x + n } else { x }),
+    };
+    Ok((norm(start, start_def), norm(stop, stop_def), step))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -726,5 +1085,456 @@ mod tests {
             }
             .is_full()
         );
+    }
+
+    // ---- NDBlock / block_for_slice tests ------------------------------------
+    // Tests are organised by boundary, not by narrative scenario.
+
+    fn chunks_2d() -> Vec<Vec<usize>> {
+        vec![vec![10, 10], vec![20, 20]]
+    }
+
+    // boundary: None / empty slice → all blocks returned, identity adjusted
+    #[test]
+    fn block_for_slice_full_array_none() {
+        let chunks = chunks_2d();
+        let (block, adj) = block_for_slice(&chunks, None).unwrap();
+        assert_eq!(
+            block.0,
+            vec![
+                SliceDim::Slice {
+                    start: Some(0),
+                    stop: Some(2),
+                    step: None
+                },
+                SliceDim::Slice {
+                    start: Some(0),
+                    stop: Some(2),
+                    step: None
+                },
+            ]
+        );
+        assert!(adj.is_empty());
+    }
+
+    // boundary: empty NDSlice (no dims) behaves identically to None
+    #[test]
+    fn block_for_slice_full_array_empty_slice() {
+        let chunks = chunks_2d();
+        let empty = NDSlice::empty();
+        let (block, adj) = block_for_slice(&chunks, Some(&empty)).unwrap();
+        assert_eq!(
+            block.0[0],
+            SliceDim::Slice {
+                start: Some(0),
+                stop: Some(2),
+                step: None
+            }
+        );
+        assert!(adj.is_empty());
+    }
+
+    // boundary: slice stays fully inside a single chunk on every dimension
+    #[test]
+    fn block_for_slice_fully_inside_one_chunk() {
+        let chunks = chunks_2d(); // shape (20, 40)
+        let slice = NDSlice(vec![
+            SliceDim::Slice {
+                start: Some(2),
+                stop: Some(8),
+                step: None,
+            },
+            SliceDim::Slice {
+                start: Some(5),
+                stop: Some(15),
+                step: None,
+            },
+        ]);
+        let (block, adj) = block_for_slice(&chunks, Some(&slice)).unwrap();
+        // Both dims are entirely within chunk 0
+        assert_eq!(block.0, vec![SliceDim::Index(0), SliceDim::Index(0)]);
+        // Adjusted start equals slice start (first_chunk_start == 0)
+        assert_eq!(
+            adj.0[0],
+            SliceDim::Slice {
+                start: Some(2),
+                stop: Some(8),
+                step: None
+            }
+        );
+        assert_eq!(
+            adj.0[1],
+            SliceDim::Slice {
+                start: Some(5),
+                stop: Some(15),
+                step: None
+            }
+        );
+    }
+
+    // boundary: slice crosses a chunk boundary on both dimensions
+    #[test]
+    fn block_for_slice_spans_chunk_boundary() {
+        let chunks = chunks_2d(); // shape (20, 40)
+        let slice = NDSlice(vec![
+            SliceDim::Slice {
+                start: Some(5),
+                stop: Some(15),
+                step: None,
+            },
+            SliceDim::Slice {
+                start: Some(15),
+                stop: Some(35),
+                step: None,
+            },
+        ]);
+        let (block, adj) = block_for_slice(&chunks, Some(&slice)).unwrap();
+        assert_eq!(
+            block.0,
+            vec![
+                SliceDim::Slice {
+                    start: Some(0),
+                    stop: Some(2),
+                    step: None
+                },
+                SliceDim::Slice {
+                    start: Some(0),
+                    stop: Some(2),
+                    step: None
+                },
+            ]
+        );
+        // Adjusted: start relative to first chunk (chunk 0 starts at 0)
+        assert_eq!(
+            adj.0[0],
+            SliceDim::Slice {
+                start: Some(5),
+                stop: Some(15),
+                step: None
+            }
+        );
+        assert_eq!(
+            adj.0[1],
+            SliceDim::Slice {
+                start: Some(15),
+                stop: Some(35),
+                step: None
+            }
+        );
+    }
+
+    // boundary: integer index selects a single element (and hence a single chunk)
+    #[test]
+    fn block_for_slice_integer_index() {
+        let chunks = chunks_2d(); // shape (20, 40), 2×2 blocks of 10×20
+        // indices (15, 25): dim0 → chunk 1 (10..20), dim1 → chunk 1 (20..40)
+        let slice = NDSlice(vec![SliceDim::Index(15), SliceDim::Index(25)]);
+        let (block, adj) = block_for_slice(&chunks, Some(&slice)).unwrap();
+        assert_eq!(block.0, vec![SliceDim::Index(1), SliceDim::Index(1)]);
+        // Adjusted: offset within chunk → 15-10=5, 25-20=5
+        assert_eq!(adj.0, vec![SliceDim::Index(5), SliceDim::Index(5)]);
+    }
+
+    // boundary: step > 1 crosses chunk boundary — step preserved in adjusted
+    #[test]
+    fn block_for_slice_with_step() {
+        let chunks = chunks_2d(); // shape (20, 40)
+        let slice = NDSlice(vec![
+            SliceDim::Slice {
+                start: Some(5),
+                stop: Some(25),
+                step: Some(2),
+            },
+            SliceDim::Slice {
+                start: Some(10),
+                stop: Some(30),
+                step: None,
+            },
+        ]);
+        let (block, adj) = block_for_slice(&chunks, Some(&slice)).unwrap();
+        // dim0 spans chunks 0 and 1
+        assert_eq!(
+            block.0[0],
+            SliceDim::Slice {
+                start: Some(0),
+                stop: Some(2),
+                step: None
+            }
+        );
+        // Adjusted start relative to first chunk (start=0)
+        assert_eq!(
+            adj.0[0],
+            SliceDim::Slice {
+                start: Some(5),
+                stop: Some(20),
+                step: Some(2)
+            }
+        );
+    }
+
+    // boundary: step=-1 crossing a chunk boundary
+    #[test]
+    fn block_for_slice_negative_step_crossing_boundary() {
+        let chunks = chunks_2d(); // shape (20, 40)
+        let slice = NDSlice(vec![
+            SliceDim::Slice {
+                start: Some(15),
+                stop: Some(5),
+                step: Some(-1),
+            },
+            SliceDim::Slice {
+                start: Some(10),
+                stop: Some(30),
+                step: None,
+            },
+        ]);
+        let (block, adj) = block_for_slice(&chunks, Some(&slice)).unwrap();
+        // dim0: traverses 15..6, spans chunks 0 and 1
+        assert_eq!(
+            block.0[0],
+            SliceDim::Slice {
+                start: Some(0),
+                stop: Some(2),
+                step: None
+            }
+        );
+        assert_eq!(
+            adj.0[0],
+            SliceDim::Slice {
+                start: Some(15),
+                stop: Some(5),
+                step: Some(-1)
+            }
+        );
+    }
+
+    // boundary: step=-1 traversing to the very beginning of the array (stop=None in adjusted)
+    #[test]
+    fn block_for_slice_negative_step_to_beginning() {
+        let chunks = chunks_2d(); // shape (20, 40)
+        // slice(None, None, -1) on dim0: Python normalises to start=19, stop=-1 (sentinel)
+        let slice = NDSlice(vec![
+            SliceDim::Slice {
+                start: None,
+                stop: None,
+                step: Some(-1),
+            },
+            SliceDim::Slice {
+                start: Some(10),
+                stop: Some(30),
+                step: None,
+            },
+        ]);
+        let (block, adj) = block_for_slice(&chunks, Some(&slice)).unwrap();
+        assert_eq!(
+            block.0[0],
+            SliceDim::Slice {
+                start: Some(0),
+                stop: Some(2),
+                step: None
+            }
+        );
+        // adjusted stop must be None (goes past the start of the first chunk)
+        match &adj.0[0] {
+            SliceDim::Slice { start, stop, step } => {
+                assert_eq!(*start, Some(19));
+                assert_eq!(*stop, None); // sentinel: before index 0 in the block
+                assert_eq!(*step, Some(-1));
+            }
+            other => panic!("Expected Slice, got {other:?}"),
+        }
+    }
+
+    // boundary: empty slice (start >= stop for positive step) → empty block range
+    #[test]
+    fn block_for_slice_empty_slice_positive_step() {
+        let chunks = chunks_2d();
+        let slice = NDSlice(vec![
+            // start=8 >= stop=5 with positive step → empty
+            SliceDim::Slice {
+                start: Some(8),
+                stop: Some(5),
+                step: None,
+            },
+            SliceDim::Slice {
+                start: Some(0),
+                stop: Some(10),
+                step: None,
+            },
+        ]);
+        let (block, adj) = block_for_slice(&chunks, Some(&slice)).unwrap();
+        assert_eq!(
+            block.0[0],
+            SliceDim::Slice {
+                start: Some(0),
+                stop: Some(0),
+                step: None
+            }
+        );
+        assert_eq!(
+            adj.0[0],
+            SliceDim::Slice {
+                start: Some(0),
+                stop: Some(0),
+                step: None
+            }
+        );
+    }
+
+    // boundary: partial final chunk (slice ends mid-last-chunk)
+    #[test]
+    fn block_for_slice_partial_final_chunk() {
+        // shape (30,): three chunks of 10 each
+        let chunks = vec![vec![10usize, 10, 10]];
+        let slice = NDSlice(vec![SliceDim::Slice {
+            start: Some(5),
+            stop: Some(25),
+            step: None,
+        }]);
+        let (block, adj) = block_for_slice(&chunks, Some(&slice)).unwrap();
+        // touches chunks 0 (0..10) and 1 (10..20) and 2 (20..30), but stop=25 is inside chunk 2
+        assert_eq!(
+            block.0[0],
+            SliceDim::Slice {
+                start: Some(0),
+                stop: Some(3),
+                step: None
+            }
+        );
+        // adjusted: first_chunk_start=0, adj_start=5, adj_stop=25
+        assert_eq!(
+            adj.0[0],
+            SliceDim::Slice {
+                start: Some(5),
+                stop: Some(25),
+                step: None
+            }
+        );
+    }
+
+    // boundary: out-of-bounds integer index → error
+    #[test]
+    fn block_for_slice_out_of_bounds() {
+        let chunks = chunks_2d(); // shape (20, 40)
+        let slice = NDSlice(vec![SliceDim::Index(50), SliceDim::Index(10)]);
+        assert!(block_for_slice(&chunks, Some(&slice)).is_err());
+    }
+
+    // boundary: NDBlock::chunk_indices — single integer dims only
+    #[test]
+    fn chunk_indices_single_chunk() {
+        let chunks = vec![vec![10usize, 10, 10], vec![20, 20]];
+        let block = NDBlock(vec![SliceDim::Index(1), SliceDim::Index(0)]);
+        assert_eq!(block.chunk_indices(&chunks), vec![vec![1usize, 0]]);
+    }
+
+    // boundary: NDBlock::chunk_indices — mix of int and range dims
+    #[test]
+    fn chunk_indices_mixed_dims() {
+        let chunks = vec![vec![10usize, 10, 10], vec![20, 20]];
+        // slice over dim0=[0,1], int dim1=1
+        let block = NDBlock(vec![
+            SliceDim::Slice {
+                start: Some(0),
+                stop: Some(2),
+                step: None,
+            },
+            SliceDim::Index(1),
+        ]);
+        let mut expected = vec![vec![0usize, 1], vec![1, 1]];
+        expected.sort();
+        assert_eq!(block.chunk_indices(&chunks), expected);
+    }
+
+    // boundary: NDBlock::chunk_indices — 2D Cartesian product
+    #[test]
+    fn chunk_indices_2d_cartesian_product() {
+        let chunks = vec![vec![10usize, 10, 10], vec![20, 20]];
+        let block = NDBlock(vec![
+            SliceDim::Slice {
+                start: Some(0),
+                stop: Some(2),
+                step: None,
+            },
+            SliceDim::Slice {
+                start: Some(0),
+                stop: Some(2),
+                step: None,
+            },
+        ]);
+        let expected = vec![vec![0usize, 0], vec![0, 1], vec![1, 0], vec![1, 1]];
+        assert_eq!(block.chunk_indices(&chunks), expected);
+    }
+
+    // boundary: NDBlock::slice_from_chunks — integer dim → precise element slice
+    #[test]
+    fn slice_from_chunks_integer_dim() {
+        // chunks shape (30,): three chunks of 10
+        let chunks = vec![vec![10usize, 10, 10]];
+        // block selects chunk 1 (element range 10..20)
+        let block = NDBlock(vec![SliceDim::Index(1)]);
+        let s = block.slice_from_chunks(&chunks);
+        assert_eq!(
+            s.0,
+            vec![SliceDim::Slice {
+                start: Some(10),
+                stop: Some(20),
+                step: None
+            }]
+        );
+    }
+
+    // boundary: NDBlock::slice_from_chunks — range dim → element range
+    #[test]
+    fn slice_from_chunks_range_dim() {
+        let chunks = vec![vec![10usize, 10, 10]];
+        // block selects chunks [0, 2) → element range 0..20
+        let block = NDBlock(vec![SliceDim::Slice {
+            start: Some(0),
+            stop: Some(2),
+            step: None,
+        }]);
+        let s = block.slice_from_chunks(&chunks);
+        assert_eq!(
+            s.0,
+            vec![SliceDim::Slice {
+                start: Some(0),
+                stop: Some(20),
+                step: None
+            }]
+        );
+    }
+
+    // boundary: NDBlock::slice_from_chunks — None start/stop pass through as None
+    #[test]
+    fn slice_from_chunks_none_start_stop() {
+        let chunks = vec![vec![10usize, 10]];
+        let block = NDBlock(vec![SliceDim::Slice {
+            start: None,
+            stop: None,
+            step: None,
+        }]);
+        let s = block.slice_from_chunks(&chunks);
+        // None start/stop → cumsum[0] = 0 is used for start; cumsum[n] = total for stop —
+        // but since original is None, they stay None.
+        assert_eq!(
+            s.0,
+            vec![SliceDim::Slice {
+                start: None,
+                stop: None,
+                step: None
+            }]
+        );
+    }
+
+    // boundary: NDBlock::new validates step constraint
+    #[test]
+    fn ndblock_new_rejects_nonunit_step() {
+        let bad = vec![SliceDim::Slice {
+            start: Some(0),
+            stop: Some(4),
+            step: Some(2),
+        }];
+        assert!(NDBlock::new(bad).is_err());
     }
 }
