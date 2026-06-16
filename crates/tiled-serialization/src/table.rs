@@ -35,6 +35,14 @@ pub fn register_table_serializers(registry: &SerializationRegistry) {
     // (table.py:141-147), which is effectively always present; orjson is not
     // optional in practice, so register unconditionally.
     registry.register(StructureFamily::Table, mime::JSON, json_table_serializer());
+
+    // application/json-seq: row-oriented NDJSON, one JSON object per row
+    // (table.py:158-173). Same orjson guard as above → register unconditionally.
+    registry.register(
+        StructureFamily::Table,
+        mime::JSON_SEQ,
+        json_seq_table_serializer(),
+    );
 }
 
 /// Column-dict JSON serializer for the table family (Python `table.py:141-147`).
@@ -63,6 +71,43 @@ pub(crate) fn json_table_serializer() -> SerializerFn {
                 .map_err(|e| format!("json encode: {e}"))?;
         }
         out.push(b'}');
+        Ok(Bytes::from(out))
+    })
+}
+
+/// NDJSON serializer for the table family (Python `table.py:158-173`).
+///
+/// Despite the `application/json-seq` mimetype, Python tiled emits PLAIN
+/// newline-delimited JSON: one `{column: value, ...}` object per row, joined by
+/// `\n`, with no leading/trailing newline and no RFC 7464 RS framing (the
+/// table.py comment calls it "the official mimetype for newline-delimited
+/// JSON"). An empty table yields empty bytes. Row objects keep schema column
+/// order, built by hand for the same `preserve_order` reason as the column-dict.
+///
+/// Note: the container `application/json-seq` serializer (`json_seq.rs`) uses
+/// RS-framed RFC 7464 output instead — same mimetype, different format per
+/// family — so this is a distinct registration, not shared code.
+pub(crate) fn json_seq_table_serializer() -> SerializerFn {
+    Box::new(move |data, _meta| -> Result<Bytes, SerializeError> {
+        let columns = table_ipc_to_safe_columns(data)?;
+        let nrows = columns.first().map(|(_, vals)| vals.len()).unwrap_or(0);
+        let mut out = Vec::new();
+        for row in 0..nrows {
+            if row > 0 {
+                out.push(b'\n');
+            }
+            out.push(b'{');
+            for (idx, (name, vals)) in columns.iter().enumerate() {
+                if idx > 0 {
+                    out.push(b',');
+                }
+                serde_json::to_writer(&mut out, name).map_err(|e| format!("json encode: {e}"))?;
+                out.push(b':');
+                serde_json::to_writer(&mut out, &vals[row])
+                    .map_err(|e| format!("json encode: {e}"))?;
+            }
+            out.push(b'}');
+        }
         Ok(Bytes::from(out))
     })
 }
@@ -273,6 +318,69 @@ mod tests {
         let parsed: Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(parsed["s"], serde_json::json!(["alpha", "beta"]));
         assert_eq!(parsed["flag"], serde_json::json!([true, false]));
+    }
+
+    fn json_seq_serializer() -> Arc<SerializerFn> {
+        let reg = SerializationRegistry::new();
+        register_table_serializers(&reg);
+        reg.dispatch(StructureFamily::Table, mime::JSON_SEQ)
+            .expect("table application/json-seq must be registered")
+    }
+
+    /// H2: `application/json-seq` is registered for the table family.
+    #[test]
+    fn json_seq_registered_for_table() {
+        let reg = SerializationRegistry::new();
+        register_table_serializers(&reg);
+        assert!(
+            reg.dispatch(StructureFamily::Table, mime::JSON_SEQ)
+                .is_some(),
+            "table application/json-seq must be registered (Python table.py:158-173)"
+        );
+    }
+
+    /// H2: output is plain newline-delimited JSON — one `{col: value}` object
+    /// per row in schema order, joined by `\n`, no RFC 7464 RS framing, no
+    /// trailing newline (Python `json_sequence`, table.py:162-173).
+    #[test]
+    fn json_seq_table_emits_ndjson_rows() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("b", DataType::Int64, false),
+            Field::new("a", DataType::Float64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(Float64Array::from(vec![4.0, 5.0, 6.0])),
+            ],
+        )
+        .unwrap();
+        let out = json_seq_serializer()(&ipc_bytes(&batch), &serde_json::Value::Null).unwrap();
+        let text = String::from_utf8(out.to_vec()).unwrap();
+        assert_eq!(
+            text, "{\"b\":1,\"a\":4.0}\n{\"b\":2,\"a\":5.0}\n{\"b\":3,\"a\":6.0}",
+            "rows must be NDJSON in schema column order, no RS framing, no trailing newline"
+        );
+        // No record-separator byte (0x1E) — distinguishes from the container
+        // RFC 7464 serializer.
+        assert!(
+            !out.contains(&0x1E),
+            "table json-seq must not use RS framing"
+        );
+    }
+
+    /// H2: an empty table serializes to empty bytes (Python `n == 0: yield b""`).
+    #[test]
+    fn json_seq_table_empty_is_empty_bytes() {
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(Vec::<i64>::new()))],
+        )
+        .unwrap();
+        let out = json_seq_serializer()(&ipc_bytes(&batch), &serde_json::Value::Null).unwrap();
+        assert!(out.is_empty(), "empty table must yield empty json-seq body");
     }
 
     /// H1: an unsupported Arrow column type is a hard error (→ HTTP 500), never
