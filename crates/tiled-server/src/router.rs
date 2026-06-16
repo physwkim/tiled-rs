@@ -2745,6 +2745,132 @@ pub async fn patch_metadata(
 }
 
 // ---------------------------------------------------------------------------
+// PUT /api/v1/metadata/{*path} — wholesale replace metadata / specs / access_blob
+// ---------------------------------------------------------------------------
+//
+// Distinct from PATCH (a partial JSON-patch / merge-patch): PUT takes a full
+// `{metadata, specs, access_blob}` document and replaces the stored values
+// wholesale. Each field is optional; an absent / null field means "no change"
+// (Python `PutMetadataRequest`, server/schemas.py:515-519). Mirrors Python
+// `put_metadata` (server/router.py:2420-2494): resolve the entry, 405 if it
+// has no `replace_metadata`, then `entry.replace_metadata(metadata, specs,
+// access_blob, drop_revision)`.
+pub async fn put_metadata(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+    Query(params): Query<HashMap<String, String>>,
+    auth: crate::AuthContext,
+    Json(req): Json<serde_json::Value>,
+) -> Result<impl IntoResponse, ServerError> {
+    // Optional `?drop_revision=true` (upstream tiled #972): discard the prior
+    // version instead of pushing it onto the revisions table.
+    let drop_revision = params
+        .get("drop_revision")
+        .map(|v| matches!(v.as_str(), "true" | "True" | "1" | "yes"))
+        .unwrap_or(false);
+    let segments = segments_from_uri(&uri, "/api/v1/metadata/");
+    // A node that cannot persist metadata (no catalog → in-memory tree) does
+    // not support `replace_metadata` → 405, matching Python's "This node does
+    // not support update of metadata." (router.py:2446-2450).
+    let Some(catalog) = state.catalog.as_ref() else {
+        return Err(ServerError::MethodNotAllowed(
+            "This node does not support update of metadata.".into(),
+        ));
+    };
+    if segments.is_empty() {
+        return Err(ServerError::Validation(
+            "cannot PUT the catalog root".into(),
+        ));
+    }
+    // Per-ancestor auth gate: narrows at every prefix and requires
+    // WriteMetadata on the narrowed set — same invariant as PATCH.
+    resolve_entry(&state, auth, &segments, tiled_auth::Scope::WriteMetadata).await?;
+    let node = catalog
+        .lookup(&segments)
+        .await
+        .map_err(map_catalog_err)?
+        .ok_or_else(|| ServerError::NotFound(format!("'{}' not found", segments.join("/"))))?;
+
+    // Each field: a present, non-null value REPLACES the stored document;
+    // absent / null means keep the current value (Python: `body.X if body.X is
+    // not None else entry.X`). Python treats `entry.specs or []`: a null specs
+    // column is an empty array.
+    let metadata = match req.get("metadata") {
+        Some(v) if !v.is_null() => v.clone(),
+        _ => node.metadata.clone(),
+    };
+    let specs = match req.get("specs") {
+        Some(v) if !v.is_null() => v.clone(),
+        _ if node.specs.is_null() => serde_json::Value::Array(Vec::new()),
+        _ => node.specs.clone(),
+    };
+
+    // Validate the FINAL specs (count ≤ 20, uniqueness) before writing — the
+    // same limits the PATCH handler and Python `validate_specs` enforce (422).
+    if let Some(arr) = specs.as_array() {
+        if arr.len() > MAX_ALLOWED_SPECS {
+            return Err(ServerError::Validation(format!(
+                "Update cannot result in more than {MAX_ALLOWED_SPECS} specs"
+            )));
+        }
+        let mut seen: Vec<serde_json::Value> = Vec::with_capacity(arr.len());
+        for spec in arr {
+            let identity = spec_identity(spec);
+            if seen.contains(&identity) {
+                return Err(ServerError::Validation(
+                    "Update cannot result in non-unique specs".into(),
+                ));
+            }
+            seen.push(identity);
+        }
+    }
+
+    let updated = catalog
+        .update_metadata(node.id, metadata, specs, drop_revision)
+        .await
+        .map_err(map_catalog_err)?;
+
+    // access_blob: this crate has no access policy that exposes `modify_node`,
+    // so the stored access_blob is never changed (Python's `else` branch,
+    // router.py:2484-2487). `access_blob_modified` is true only when the client
+    // SENT an access_blob differing from the (unchanged) stored one; the
+    // response then echoes the unchanged value to signal the change was not
+    // applied. `update_metadata` preserves access_blob, so `updated.access_blob`
+    // is the current value.
+    let access_blob_modified = req
+        .get("access_blob")
+        .filter(|v| !v.is_null())
+        .map(|v| v != &updated.access_blob)
+        .unwrap_or(false);
+
+    let path = segments.join("/");
+    state.streaming_bus.publish(
+        &path,
+        crate::streaming::UpdateKind::MetadataUpdated {
+            metadata: updated.metadata.clone(),
+            specs: updated.specs.clone(),
+        },
+    );
+
+    // Response mirrors Python `json_or_msgpack(response_data)`: `{id}` plus
+    // `access_blob` only when modified. Python includes `metadata` only when a
+    // spec validator mutated it; this crate runs no spec validators, so metadata
+    // is never modified here and is omitted. No `links` / `data_sources` (the
+    // Python handler's response dict sets neither).
+    Ok(Json(tiled_core::schemas::PostMetadataResponse {
+        id: updated.key,
+        links: None,
+        metadata: None,
+        data_sources: None,
+        access_blob: if access_blob_modified {
+            Some(updated.access_blob)
+        } else {
+            None
+        },
+    }))
+}
+
+// ---------------------------------------------------------------------------
 // PUT /api/v1/data_source/{*path} — replace structure / parameters
 // ---------------------------------------------------------------------------
 //

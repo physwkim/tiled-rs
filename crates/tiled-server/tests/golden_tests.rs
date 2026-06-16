@@ -1878,3 +1878,19 @@ async fn test_sparse_array_full_applies_partial_slice() {
     assert_eq!(dim1, vec![1], "its column coordinate is preserved");
     assert_eq!(data, vec![5.0], "its value is preserved");
 }
+
+/// Server M1: an in-memory (no-catalog) node does not support `replace_metadata`,
+/// so `PUT /metadata/{path}` answers 405 — matching Python's "This node does not
+/// support update of metadata." (router.py:2446-2450), not a generic 404/422.
+#[tokio::test]
+async fn test_put_metadata_405_without_catalog() {
+    let app = build_app();
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/v1/metadata/some_array")
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"metadata":{"x":1}}"#))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+}

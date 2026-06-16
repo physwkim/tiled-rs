@@ -1082,3 +1082,120 @@ async fn select_metadata_on_search_filters_each_item() {
         );
     }
 }
+
+/// Server M1: `PUT /api/v1/metadata/{path}` wholesale-replaces metadata + specs
+/// (distinct from PATCH's partial json-patch/merge-patch), unblocking the Python
+/// client's `replace_metadata()` (405 today). Mirrors Python `put_metadata`
+/// (server/router.py:2420-2494): a present field replaces wholesale, an absent /
+/// null field keeps the current value, and — since this crate has no access
+/// policy exposing `modify_node` — a sent access_blob is NOT applied but is
+/// echoed back to signal the rejection (router.py:2484-2487).
+#[tokio::test]
+async fn put_metadata_replaces_wholesale_and_signals_unapplied_access_blob() {
+    let (app, _dir) = build_test_app().await;
+
+    // Create a container carrying two metadata keys and one spec.
+    let (status, body) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/metadata/",
+        serde_json::json!({
+            "key": "n1",
+            "structure_family": "container",
+            "metadata": {"a": 1, "old": 2},
+            "specs": [{"name": "s1"}],
+            "data_sources": [],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create: {body}");
+
+    // (a) PUT replaces metadata + specs wholesale. No access_blob in the body →
+    // the response is just `{id}` (no access_blob key).
+    let (status, body) = json_request(
+        &app,
+        Method::PUT,
+        "/api/v1/metadata/n1",
+        serde_json::json!({"metadata": {"a": 9}, "specs": [{"name": "s2"}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "put replace: {body}");
+    assert_eq!(body["id"], "n1");
+    assert!(
+        body.get("access_blob").is_none(),
+        "no access_blob was sent → response must omit it, got {body}"
+    );
+
+    // The replacement is wholesale: the dropped key "old" is gone, and the spec
+    // list is the new one.
+    let (status, body) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/metadata/n1",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["data"]["attributes"]["metadata"],
+        serde_json::json!({"a": 9})
+    );
+    let specs = body["data"]["attributes"]["specs"].as_array().unwrap();
+    assert_eq!(specs.len(), 1);
+    assert_eq!(specs[0]["name"], "s2");
+
+    // (b) PUT with ONLY access_blob: metadata/specs are absent → kept; the sent
+    // access_blob is not applied but IS echoed back (key present) to signal the
+    // rejection.
+    let (status, body) = json_request(
+        &app,
+        Method::PUT,
+        "/api/v1/metadata/n1",
+        serde_json::json!({"access_blob": {"role": "secret"}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "put access_blob: {body}");
+    assert_eq!(body["id"], "n1");
+    assert!(
+        body.as_object().unwrap().contains_key("access_blob"),
+        "a differing access_blob was sent → response must echo the unchanged value, got {body}"
+    );
+    assert_ne!(
+        body["access_blob"],
+        serde_json::json!({"role": "secret"}),
+        "the sent access_blob must NOT have been applied"
+    );
+
+    // metadata/specs untouched by the access_blob-only PUT.
+    let (status, body) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/metadata/n1",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["data"]["attributes"]["metadata"],
+        serde_json::json!({"a": 9})
+    );
+
+    // (c) Too many specs → 422, never written.
+    let many: Vec<serde_json::Value> = (0..21)
+        .map(|i| serde_json::json!({"name": format!("s{i}")}))
+        .collect();
+    let (status, _body) = json_request(
+        &app,
+        Method::PUT,
+        "/api/v1/metadata/n1",
+        serde_json::json!({"specs": many}),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "21 specs must be 422"
+    );
+
+    let _ = empty_request(&app, Method::DELETE, "/api/v1/metadata/n1").await;
+}

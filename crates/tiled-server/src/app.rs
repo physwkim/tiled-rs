@@ -173,6 +173,9 @@ pub fn build_app(state: AppState) -> Router {
         .route("/api/v1/register/", post(router::register_root))
         .route("/api/v1/register/{*path}", post(router::register))
         .route("/api/v1/metadata/{*path}", patch(router::patch_metadata))
+        // PUT /metadata wholesale-replaces metadata/specs/access_blob, distinct
+        // from PATCH's partial json-patch/merge-patch (Python router.py:2420).
+        .route("/api/v1/metadata/{*path}", put(router::put_metadata))
         .route("/api/v1/metadata/{*path}", delete(router::delete_metadata))
         // POST /metadata is the client's common (asset-free) write path; it
         // shares the create core with /register but rejects externally-managed
