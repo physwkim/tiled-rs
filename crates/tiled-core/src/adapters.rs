@@ -411,4 +411,13 @@ impl AnyAdapter {
             _ => None,
         }
     }
+
+    /// Owned, `'static` clone of the sparse leaf. See [`AnyAdapter::as_array_arc`].
+    #[inline]
+    pub fn as_sparse_arc(&self) -> Option<Arc<dyn SparseAdapterRead>> {
+        match self {
+            Self::Sparse(s) => Some(Arc::clone(s)),
+            _ => None,
+        }
+    }
 }

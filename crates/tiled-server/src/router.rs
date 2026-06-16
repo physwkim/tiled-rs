@@ -686,6 +686,144 @@ async fn build_table_response(
     Ok(serve_with_range(headers, &media_type, body))
 }
 
+/// Convert a `DynNDArray` (raw little-endian element bytes + dtype) into an
+/// Arrow array, dispatching on the dtype class — the inverse of the array
+/// adapters' `to_le_bytes` emission. Used to assemble the COO columns of a
+/// sparse response.
+fn dyn_ndarray_to_arrow(
+    arr: &tiled_core::dtype::DynNDArray,
+) -> Result<arrow::array::ArrayRef, ServerError> {
+    use arrow::array::{
+        Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, UInt8Array,
+        UInt16Array, UInt32Array, UInt64Array,
+    };
+    use tiled_core::dtype::Kind;
+    let bytes: &[u8] = &arr.data;
+    macro_rules! build {
+        ($t:ty, $arrow:ty) => {{
+            const ES: usize = std::mem::size_of::<$t>();
+            let vals: Vec<$t> = bytes
+                .chunks_exact(ES)
+                .map(|c| <$t>::from_le_bytes(c.try_into().expect("chunks_exact yields ES bytes")))
+                .collect();
+            Ok(Arc::new(<$arrow>::from(vals)) as arrow::array::ArrayRef)
+        }};
+    }
+    match (arr.dtype.kind, arr.dtype.element_size()) {
+        (Kind::Float, 8) => build!(f64, Float64Array),
+        (Kind::Float, 4) => build!(f32, Float32Array),
+        (Kind::Integer, 8) => build!(i64, Int64Array),
+        (Kind::Integer, 4) => build!(i32, Int32Array),
+        (Kind::Integer, 2) => build!(i16, Int16Array),
+        (Kind::Integer, 1) => build!(i8, Int8Array),
+        (Kind::UnsignedInteger, 8) => build!(u64, UInt64Array),
+        (Kind::UnsignedInteger, 4) => build!(u32, UInt32Array),
+        (Kind::UnsignedInteger, 2) => build!(u16, UInt16Array),
+        (Kind::UnsignedInteger, 1) => build!(u8, UInt8Array),
+        (kind, size) => Err(ServerError::Internal(format!(
+            "sparse: unsupported element dtype {kind:?} of {size} bytes"
+        ))),
+    }
+}
+
+// Shared by the sparse branches of `array_block` and `array_full`: encode a
+// `SparseData` (COO coordinates + values) as a table with columns
+// `dim0..dim{ndim-1}` and `data`, then route it through the serialization
+// registry under the `Sparse` family — mirroring Python `serialization/sparse.py`
+// (`to_dataframe`: one `dim{i}` column per coordinate axis plus `data`). The
+// default `application/vnd.apache.arrow.file` serializer emits the Arrow IPC
+// bytes verbatim; `?format=`/`Accept` can re-encode to CSV/parquet/etc.
+async fn build_sparse_response(
+    sparse: tiled_core::adapters::SparseData,
+    format_param: Option<&str>,
+    headers: &HeaderMap,
+    state: &AppState,
+) -> Result<axum::response::Response, ServerError> {
+    // Cap the decoded size before serialization: coords (ndim * nnz) + data.
+    let nbytes: usize =
+        sparse.coords.iter().map(|c| c.data.len()).sum::<usize>() + sparse.data.data.len();
+    check_response_size(
+        nbytes,
+        state.response_bytesize_limit,
+        "Use slicing (\"?slice=...\") to request a smaller selection.",
+    )?;
+
+    // One `dim{i}` column per coordinate axis, then the `data` column.
+    let mut fields: Vec<arrow::datatypes::Field> = Vec::with_capacity(sparse.coords.len() + 1);
+    let mut columns: Vec<arrow::array::ArrayRef> = Vec::with_capacity(sparse.coords.len() + 1);
+    for (i, coord) in sparse.coords.iter().enumerate() {
+        let col = dyn_ndarray_to_arrow(coord)?;
+        fields.push(arrow::datatypes::Field::new(
+            format!("dim{i}"),
+            col.data_type().clone(),
+            false,
+        ));
+        columns.push(col);
+    }
+    let data_col = dyn_ndarray_to_arrow(&sparse.data)?;
+    fields.push(arrow::datatypes::Field::new(
+        "data",
+        data_col.data_type().clone(),
+        false,
+    ));
+    columns.push(data_col);
+
+    let schema = Arc::new(arrow::datatypes::Schema::new(fields));
+    let batch = arrow::array::RecordBatch::try_new(Arc::clone(&schema), columns)
+        .map_err(|e| ServerError::Internal(format!("sparse RecordBatch error: {e}")))?;
+
+    let family = tiled_core::structures::StructureFamily::Sparse;
+    let accept = headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let media_type = tiled_serialization::negotiate_media_type(
+        format_param,
+        accept,
+        family,
+        &state.serialization_registry,
+    )
+    .ok_or_else(|| {
+        unsupported_media_type(
+            family,
+            format_param.unwrap_or_default(),
+            &state.serialization_registry,
+        )
+    })?;
+
+    // Arrow IPC encode is CPU-bound with no inner async — offload it.
+    let ipc_bytes = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, ServerError> {
+        let mut buf = Vec::new();
+        {
+            let mut writer = arrow::ipc::writer::FileWriter::try_new(&mut buf, &schema)
+                .map_err(|e| ServerError::Internal(format!("Arrow IPC write error: {e}")))?;
+            writer
+                .write(&batch)
+                .map_err(|e| ServerError::Internal(format!("Arrow IPC write error: {e}")))?;
+            writer
+                .finish()
+                .map_err(|e| ServerError::Internal(format!("Arrow IPC write error: {e}")))?;
+        }
+        Ok(buf)
+    })
+    .await
+    .map_err(|e| ServerError::Internal(format!("blocking task failed: {e}")))??;
+
+    let serializer = state
+        .serialization_registry
+        .dispatch(family, &media_type)
+        .ok_or_else(|| {
+            unsupported_media_type(family, &media_type, &state.serialization_registry)
+        })?;
+    let body =
+        tokio::task::spawn_blocking(move || serializer(&ipc_bytes, &serde_json::Value::Null))
+            .await
+            .map_err(|e| ServerError::Internal(format!("serialize task failed: {e}")))?
+            .map_err(map_serialize_error)?;
+
+    Ok(serve_with_range(headers, &media_type, body))
+}
+
 // ---------------------------------------------------------------------------
 // GET /api/v1/array/block/{*path}
 // ---------------------------------------------------------------------------
@@ -716,6 +854,30 @@ pub async fn array_block(
     // `Arc` clone of the leaf; the read itself is a `Send` future that
     // offloads its own blocking, so it is awaited on the executor below.
     let adapter = core::walk_tree(state.root_tree.as_ref(), &segments).await?;
+
+    // Sparse leaf: serve the COO table (Python serialization/sparse.py). The
+    // `SparseAdapterRead::read_block` contract takes only a block index (no
+    // slice), so `?slice=` is honored on `/array/full`, not on a block read.
+    if let Some(sparse) = adapter.as_sparse_arc() {
+        let ndim = sparse.structure().shape.len();
+        let block: Vec<usize> = if block_str.is_empty() {
+            vec![0; ndim]
+        } else {
+            block_str
+                .split(',')
+                .map(|s| {
+                    s.trim().parse::<usize>().map_err(|_| {
+                        ServerError::Validation(format!(
+                            "sparse block index must be a non-negative integer, got '{s}'"
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let data = sparse.read_block(&block).await.map_err(ServerError::from)?;
+        return build_sparse_response(data, format_str.as_deref(), &headers, &state).await;
+    }
+
     let array_adapter: Arc<dyn tiled_core::adapters::ArrayAdapterRead> =
         adapter.as_array_arc().ok_or_else(|| {
             ServerError::WrongType(format!("'{}' is not an array", segments.join("/")))
@@ -1691,16 +1853,25 @@ pub async fn array_full(
     // owned `Arc` clone of the leaf; the read future offloads its own blocking
     // and is awaited on the executor below.
     let adapter = core::walk_tree(state.root_tree.as_ref(), &segments).await?;
-    let array_adapter: Arc<dyn tiled_core::adapters::ArrayAdapterRead> =
-        adapter.as_array_arc().ok_or_else(|| {
-            ServerError::WrongType(format!("'{}' is not an array", segments.join("/")))
-        })?;
 
     let slice = match slice_str.as_str() {
         "" => tiled_core::ndslice::NDSlice::empty(),
         s => tiled_core::ndslice::NDSlice::from_numpy_str(s)
             .map_err(|e| ServerError::Validation(format!("Invalid slice '{s}': {e}")))?,
     };
+
+    // Sparse leaf: serve the full COO table (Python serialization/sparse.py),
+    // applying the optional `?slice=` via the adapter's `read`.
+    if let Some(sparse) = adapter.as_sparse_arc() {
+        let data = sparse.read(&slice).await.map_err(ServerError::from)?;
+        return build_sparse_response(data, format_str.as_deref(), &headers, &state).await;
+    }
+
+    let array_adapter: Arc<dyn tiled_core::adapters::ArrayAdapterRead> =
+        adapter.as_array_arc().ok_or_else(|| {
+            ServerError::WrongType(format!("'{}' is not an array", segments.join("/")))
+        })?;
+
     let data = array_adapter
         .read(&slice)
         .await
@@ -2972,5 +3143,99 @@ mod range_tests {
     #[test]
     fn multi_range_not_supported() {
         assert_eq!(parse_range("bytes=0-1,3-4", 10), None);
+    }
+}
+
+#[cfg(test)]
+mod sparse_response_tests {
+    //! Unit tests for the COO→Arrow column conversion that backs the sparse
+    //! read route (`build_sparse_response`). The full HTTP round-trip
+    //! (CooAdapter → `/array/block` → client decode) is covered by an
+    //! integration test once the sparse data source is wired in.
+    use super::*;
+    use tiled_core::dtype::{BuiltinDType, DynNDArray, Endianness, Kind};
+
+    fn le_dyn<T: Copy>(
+        vals: &[T],
+        dtype: BuiltinDType,
+        to_le: impl Fn(T) -> Vec<u8>,
+    ) -> DynNDArray {
+        let mut bytes = Vec::new();
+        for v in vals {
+            bytes.extend_from_slice(&to_le(*v));
+        }
+        DynNDArray::new(bytes::Bytes::from(bytes), dtype, vec![vals.len()])
+    }
+
+    #[test]
+    fn dyn_ndarray_to_arrow_decodes_int64_coords_and_float64_data() {
+        use arrow::array::{Float64Array, Int64Array};
+        let coords = le_dyn(
+            &[0i64, 2, 1],
+            BuiltinDType::new(Endianness::Little, Kind::Integer, 8),
+            |v| v.to_le_bytes().to_vec(),
+        );
+        let arr = dyn_ndarray_to_arrow(&coords).unwrap();
+        let int = arr
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("Int64Array");
+        assert_eq!(int.values(), &[0i64, 2, 1]);
+
+        let data = le_dyn(
+            &[1.5f64, 2.5, 3.5],
+            BuiltinDType::new(Endianness::Little, Kind::Float, 8),
+            |v| v.to_le_bytes().to_vec(),
+        );
+        let arr = dyn_ndarray_to_arrow(&data).unwrap();
+        let f = arr
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("Float64Array");
+        assert_eq!(f.values(), &[1.5f64, 2.5, 3.5]);
+    }
+
+    #[test]
+    fn dyn_ndarray_to_arrow_decodes_unsigned_and_narrow_ints() {
+        use arrow::array::{Int32Array, UInt16Array};
+        let u16s = le_dyn(
+            &[7u16, 9],
+            BuiltinDType::new(Endianness::Little, Kind::UnsignedInteger, 2),
+            |v| v.to_le_bytes().to_vec(),
+        );
+        let arr = dyn_ndarray_to_arrow(&u16s).unwrap();
+        assert_eq!(
+            arr.as_any()
+                .downcast_ref::<UInt16Array>()
+                .expect("UInt16Array")
+                .values(),
+            &[7u16, 9]
+        );
+
+        let i32s = le_dyn(
+            &[-3i32, 4],
+            BuiltinDType::new(Endianness::Little, Kind::Integer, 4),
+            |v| v.to_le_bytes().to_vec(),
+        );
+        let arr = dyn_ndarray_to_arrow(&i32s).unwrap();
+        assert_eq!(
+            arr.as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("Int32Array")
+                .values(),
+            &[-3i32, 4]
+        );
+    }
+
+    /// An element class with no Arrow scalar mapping (e.g. boolean) is rejected
+    /// with an internal error rather than panicking or emitting wrong bytes.
+    #[test]
+    fn dyn_ndarray_to_arrow_rejects_unsupported_dtype() {
+        let weird = DynNDArray::new(
+            bytes::Bytes::from(vec![1u8]),
+            BuiltinDType::new(Endianness::NotApplicable, Kind::Boolean, 1),
+            vec![1],
+        );
+        assert!(dyn_ndarray_to_arrow(&weird).is_err());
     }
 }
