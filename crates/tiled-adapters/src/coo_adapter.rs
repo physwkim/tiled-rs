@@ -11,7 +11,7 @@ use bytes::Bytes;
 use tiled_core::adapters::{BaseAdapter, BoxFuture, SparseAdapterRead, SparseData};
 use tiled_core::dtype::{BuiltinDType, DType, DynNDArray, Endianness, Kind};
 use tiled_core::error::{Result, TiledError};
-use tiled_core::ndslice::NDSlice;
+use tiled_core::ndslice::{NDSlice, SliceDim};
 use tiled_core::structures::{SparseLayout, SparseStructure, Spec, StructureFamily};
 
 /// In-memory COO sparse adapter.
@@ -186,28 +186,243 @@ impl SparseAdapterRead for CooAdapter {
         })
     }
 
-    /// Return the full COO data optionally filtered by `slice`.
+    /// Return the COO data selected by `slice`.
     ///
-    /// Empty (full) slices return all non-zeros unchanged. Partial slices are
-    /// not supported — Python does `sparse.COO[slice]` which filters non-zeros
-    /// by coordinate bounds; reproducing that here would require a full
-    /// coordinate scan. Callers should use `read_block` for sub-block access.
+    /// A full slice returns all non-zeros unchanged. A partial slice applies
+    /// numpy *basic* indexing to the sparse array, exactly as Python
+    /// `COOAdapter.read` does `arr[slice]` (`tiled/adapters/sparse.py:175-191`):
+    /// non-zeros whose coordinates fall outside the selected region are
+    /// dropped, surviving coordinates are remapped into the sliced frame
+    /// (`(coord - start) / step`), and `Index` dimensions are removed from the
+    /// result. `NDSlice` carries only `Index`/`Slice`/`Ellipsis`, so this is
+    /// numpy basic indexing — no boolean or advanced indexing.
+    ///
+    /// The returned [`SparseData`] holds the surviving coordinates and data;
+    /// the grid shape of the sliced result is derived by the caller from the
+    /// slice it supplied (`SparseData` carries no shape), the same way the
+    /// array read path pairs a slice with its computed shape.
     fn read<'a>(&'a self, slice: &'a NDSlice) -> BoxFuture<'a, Result<SparseData>> {
         Box::pin(async move {
-            if !slice.is_empty() {
-                // Partial COO slicing (sparse.COO[slice] in Python) filters
-                // non-zeros by their coordinates, which requires iterating
-                // all nnz entries. Not implemented — return an explicit error
-                // rather than silently returning wrong data.
-                return Err(TiledError::InvalidSlice(
-                    "partial slicing of sparse COO arrays is not supported; \
-                     use read_block with block=[0,...,0] and apply slicing client-side"
-                        .into(),
-                ));
+            if slice.is_empty() {
+                return Ok(self.full_block_data());
             }
-            Ok(self.full_block_data())
+
+            let ndim = self.structure.shape.len();
+            let dims = expand_ellipsis(&slice.0, ndim)?;
+
+            // Resolve each dimension into a selection: an `Index` (drops the
+            // dim, keeps only matching non-zeros) or a normalised `Slice`
+            // (keeps the dim, remaps coordinates into the sliced frame).
+            let mut sels: Vec<DimSel> = Vec::with_capacity(ndim);
+            for (d, sd) in dims.iter().enumerate() {
+                let len = self.structure.shape[d];
+                match sd {
+                    SliceDim::Index(i) => {
+                        sels.push(DimSel::Index(normalize_index(*i, len)? as i64))
+                    }
+                    SliceDim::Slice { start, stop, step } => {
+                        let (s, t, st) = normalize_slice(*start, *stop, *step, len)?;
+                        sels.push(DimSel::Slice {
+                            start: s,
+                            stop: t,
+                            step: st,
+                        });
+                    }
+                    SliceDim::Ellipsis => {
+                        return Err(TiledError::InvalidSlice(
+                            "unexpected Ellipsis after expansion".into(),
+                        ));
+                    }
+                }
+            }
+
+            let kept_dims = sels
+                .iter()
+                .filter(|s| matches!(s, DimSel::Slice { .. }))
+                .count();
+
+            // Scan every non-zero, keeping those selected on all axes and
+            // remapping their coordinates into the sliced frame.
+            let nnz = self.nnz();
+            let mut new_coords: Vec<Vec<i64>> = vec![Vec::new(); kept_dims];
+            let mut kept: Vec<usize> = Vec::new();
+            'nz: for i in 0..nnz {
+                let mut projected: Vec<i64> = Vec::with_capacity(kept_dims);
+                for (d, sel) in sels.iter().enumerate() {
+                    let c = self.coords[d][i];
+                    match sel {
+                        DimSel::Index(idx) => {
+                            if c != *idx {
+                                continue 'nz;
+                            }
+                        }
+                        DimSel::Slice { start, stop, step } => {
+                            match project_coord(c, *start, *stop, *step) {
+                                Some(nc) => projected.push(nc),
+                                None => continue 'nz,
+                            }
+                        }
+                    }
+                }
+                for (k, nc) in projected.into_iter().enumerate() {
+                    new_coords[k].push(nc);
+                }
+                kept.push(i);
+            }
+
+            // Materialise filtered coordinate buffers (int64 LE) ...
+            let coord_dtype = self
+                .structure
+                .coord_data_type
+                .clone()
+                .expect("coord_data_type always set by from_arrays");
+            let new_nnz = kept.len();
+            let coords: Vec<DynNDArray> = new_coords
+                .iter()
+                .map(|dim_coords| {
+                    let bytes: Vec<u8> = dim_coords.iter().flat_map(|&v| v.to_le_bytes()).collect();
+                    DynNDArray::new(Bytes::from(bytes), coord_dtype.clone(), vec![new_nnz])
+                })
+                .collect();
+
+            // ... and the filtered data buffer (preserving element order).
+            let elem = self.data.dtype.element_size();
+            let mut data_bytes: Vec<u8> = Vec::with_capacity(new_nnz * elem);
+            for &i in &kept {
+                data_bytes.extend_from_slice(&self.data.data[i * elem..(i + 1) * elem]);
+            }
+            let data = DynNDArray::new(
+                Bytes::from(data_bytes),
+                self.data.dtype.clone(),
+                vec![new_nnz],
+            );
+
+            Ok(SparseData { coords, data })
         })
     }
+}
+
+// ---------------------------------------------------------------------------
+// Slicing — numpy basic indexing over COO coordinates
+// ---------------------------------------------------------------------------
+
+/// Per-dimension selection resolved from an [`NDSlice`] dim.
+enum DimSel {
+    /// Integer index: keep non-zeros whose coordinate equals this, drop the dim.
+    Index(i64),
+    /// Strided range (normalised via `slice.indices`): keep the dim, remapping
+    /// surviving coordinates into the sliced frame.
+    Slice {
+        start: isize,
+        stop: isize,
+        step: isize,
+    },
+}
+
+/// Expand `dims` to exactly `ndim` per-axis selections: a single `Ellipsis`
+/// becomes as many full slices as needed, and any *missing trailing* axes are
+/// filled with full slices (numpy treats `arr[0:2]` on a 2-D array as
+/// `arr[0:2, :]`). The COO scan addresses axes by index, so every axis must be
+/// present. Errors on >1 ellipsis or too many dims.
+fn expand_ellipsis(dims: &[SliceDim], ndim: usize) -> Result<Vec<SliceDim>> {
+    let ellipsis = dims
+        .iter()
+        .filter(|d| matches!(d, SliceDim::Ellipsis))
+        .count();
+    if ellipsis > 1 {
+        return Err(TiledError::InvalidSlice(
+            "NDSlice can only contain one Ellipsis".into(),
+        ));
+    }
+    let provided = dims.len() - ellipsis;
+    if provided > ndim {
+        return Err(TiledError::InvalidSlice(format!(
+            "slice specifies {provided} dimensions but the sparse array has {ndim}"
+        )));
+    }
+    let mut out = Vec::with_capacity(ndim);
+    for d in dims {
+        match d {
+            SliceDim::Ellipsis => {
+                for _ in 0..(ndim - provided) {
+                    out.push(SliceDim::full());
+                }
+            }
+            other => out.push(other.clone()),
+        }
+    }
+    // Missing trailing axes (no ellipsis present) default to full slices.
+    while out.len() < ndim {
+        out.push(SliceDim::full());
+    }
+    Ok(out)
+}
+
+/// Normalize a possibly-negative index into `[0, len)`, erroring out of bounds.
+fn normalize_index(i: isize, len: usize) -> Result<usize> {
+    let n = len as isize;
+    let idx = if i < 0 { i + n } else { i };
+    if idx < 0 || idx >= n {
+        return Err(TiledError::InvalidSlice(format!(
+            "index {i} is out of bounds for an axis of length {len}"
+        )));
+    }
+    Ok(idx as usize)
+}
+
+/// Normalize `start:stop:step` over `len` elements, mirroring Python
+/// `slice(start, stop, step).indices(len)`. Returns `(start, stop, step)`.
+fn normalize_slice(
+    start: Option<isize>,
+    stop: Option<isize>,
+    step: Option<isize>,
+    len: usize,
+) -> Result<(isize, isize, isize)> {
+    let step = step.unwrap_or(1);
+    if step == 0 {
+        return Err(TiledError::InvalidSlice("slice step cannot be zero".into()));
+    }
+    let n = len as isize;
+    let (lo, hi, start_def, stop_def) = if step > 0 {
+        (0isize, n, 0isize, n)
+    } else {
+        (-1isize, n - 1, n - 1, -1isize)
+    };
+    let clamp = |v: isize| v.max(lo).min(hi);
+    let norm = |v: Option<isize>, default: isize| match v {
+        None => default,
+        Some(x) => clamp(if x < 0 { x + n } else { x }),
+    };
+    Ok((norm(start, start_def), norm(stop, stop_def), step))
+}
+
+/// Project a coordinate into the sliced frame, returning `Some(new_index)` if
+/// `c` is selected by the normalised `start:stop:step` and `None` otherwise.
+/// `new_index = (c - start) / step` (the position of `c` within the slice).
+fn project_coord(c: i64, start: isize, stop: isize, step: isize) -> Option<i64> {
+    let c = c as isize;
+    let projected = if step > 0 {
+        if c < start || c >= stop {
+            return None;
+        }
+        let off = c - start;
+        if off % step != 0 {
+            return None;
+        }
+        off / step
+    } else {
+        // step < 0: selected coords run start, start+step, … while > stop.
+        if c > start || c <= stop {
+            return None;
+        }
+        let nstep = -step;
+        let off = start - c;
+        if off % nstep != 0 {
+            return None;
+        }
+        off / nstep
+    };
+    Some(projected as i64)
 }
 
 // ---------------------------------------------------------------------------
@@ -365,11 +580,131 @@ mod tests {
         assert!(err.to_string().contains("out of range"));
     }
 
+    // ------------------------------------------------------------------
+    // read() partial slicing — numpy basic indexing over COO coordinates.
+    // Fixture (3x3): (0,1)->1.5, (2,0)->3.7.
+    // Tests are organised by invariant boundary, not narrative scenario.
+    // ------------------------------------------------------------------
+
+    // boundary: row range filters out-of-range non-zeros, remaps survivors
     #[tokio::test]
-    async fn test_read_partial_slice_errors() {
+    async fn test_read_row_range_filters_and_remaps() {
         let adapter = make_3x3_adapter();
-        let slice = NDSlice::from_numpy_str("0:2,0:2").unwrap();
-        let err = adapter.read(&slice).await.unwrap_err();
+        // rows [0,2): keeps (0,1)->1.5, drops (2,0)
+        let sd = adapter
+            .read(&NDSlice::from_numpy_str("0:2,:").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(sd.coords.len(), 2);
+        assert_eq!(sd.data.shape, vec![1]);
+        let row = i64::from_le_bytes(sd.coords[0].data[0..8].try_into().unwrap());
+        let col = i64::from_le_bytes(sd.coords[1].data[0..8].try_into().unwrap());
+        assert_eq!((row, col), (0, 1));
+        let v = f64::from_le_bytes(sd.data.data[0..8].try_into().unwrap());
+        assert!((v - 1.5).abs() < f64::EPSILON);
+    }
+
+    // boundary: integer index on an axis drops that axis from the result
+    #[tokio::test]
+    async fn test_read_column_index_drops_dimension() {
+        let adapter = make_3x3_adapter();
+        // [:, 0]: keeps (2,0)->3.7, drops (0,1); column dim removed
+        let sd = adapter
+            .read(&NDSlice::from_numpy_str(":,0").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(sd.coords.len(), 1); // one dim remaining
+        assert_eq!(sd.data.shape, vec![1]);
+        let row = i64::from_le_bytes(sd.coords[0].data[0..8].try_into().unwrap());
+        assert_eq!(row, 2);
+        let v = f64::from_le_bytes(sd.data.data[0..8].try_into().unwrap());
+        assert!((v - 3.7).abs() < f64::EPSILON);
+    }
+
+    // boundary: stepped range remaps coordinates by (coord - start) / step
+    #[tokio::test]
+    async fn test_read_stepped_rows_remaps_indices() {
+        let adapter = make_3x3_adapter();
+        // [::2, :]: rows 0 and 2 -> remapped to 0 and 1
+        let sd = adapter
+            .read(&NDSlice::from_numpy_str("::2,:").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(sd.data.shape, vec![2]);
+        let r0 = i64::from_le_bytes(sd.coords[0].data[0..8].try_into().unwrap());
+        let r1 = i64::from_le_bytes(sd.coords[0].data[8..16].try_into().unwrap());
+        // (0,1) row 0 -> 0 ; (2,0) row 2 -> 1
+        assert_eq!((r0, r1), (0, 1));
+    }
+
+    // boundary: full integer indexing leaves no coordinate dims (a scalar cell)
+    #[tokio::test]
+    async fn test_read_full_index_returns_scalar_nonzero() {
+        let adapter = make_3x3_adapter();
+        // [0,1] selects the stored value at (0,1); no coordinate dims remain
+        let sd = adapter
+            .read(&NDSlice::from_numpy_str("0,1").unwrap())
+            .await
+            .unwrap();
+        assert!(sd.coords.is_empty());
+        assert_eq!(sd.data.shape, vec![1]);
+        let v = f64::from_le_bytes(sd.data.data[0..8].try_into().unwrap());
+        assert!((v - 1.5).abs() < f64::EPSILON);
+    }
+
+    // boundary: indexing an implicit-zero cell yields zero non-zeros
+    #[tokio::test]
+    async fn test_read_index_at_zero_cell_yields_no_nonzeros() {
+        let adapter = make_3x3_adapter();
+        // (1,1) is an implicit zero -> no stored non-zero survives
+        let sd = adapter
+            .read(&NDSlice::from_numpy_str("1,1").unwrap())
+            .await
+            .unwrap();
+        assert!(sd.coords.is_empty());
+        assert_eq!(sd.data.shape, vec![0]);
+    }
+
+    // boundary: negative index wraps relative to the axis length
+    #[tokio::test]
+    async fn test_read_negative_index_wraps() {
+        let adapter = make_3x3_adapter();
+        // [-1, :] -> row 2: keeps (2,0)->3.7, drops dim 0
+        let sd = adapter
+            .read(&NDSlice::from_numpy_str("-1,:").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(sd.coords.len(), 1);
+        assert_eq!(sd.data.shape, vec![1]);
+        let col = i64::from_le_bytes(sd.coords[0].data[0..8].try_into().unwrap());
+        assert_eq!(col, 0);
+    }
+
+    // boundary: a slice with fewer dims than ndim keeps trailing axes whole
+    // (numpy `arr[0:2]` == `arr[0:2, :]`)
+    #[tokio::test]
+    async fn test_read_short_slice_keeps_trailing_axes() {
+        let adapter = make_3x3_adapter();
+        // "0:2" addresses only dim0; dim1 must stay a full axis (kept + remapped)
+        let sd = adapter
+            .read(&NDSlice::from_numpy_str("0:2").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(sd.coords.len(), 2, "trailing column axis must be kept");
+        assert_eq!(sd.data.shape, vec![1]);
+        let row = i64::from_le_bytes(sd.coords[0].data[0..8].try_into().unwrap());
+        let col = i64::from_le_bytes(sd.coords[1].data[0..8].try_into().unwrap());
+        assert_eq!((row, col), (0, 1)); // (0,1)->5.0 kept, (2,0) dropped
+    }
+
+    // boundary: out-of-bounds index errors
+    #[tokio::test]
+    async fn test_read_out_of_bounds_index_errors() {
+        let adapter = make_3x3_adapter();
+        let err = adapter
+            .read(&NDSlice::from_numpy_str("5,:").unwrap())
+            .await
+            .unwrap_err();
         assert!(matches!(err, TiledError::InvalidSlice(_)));
     }
 

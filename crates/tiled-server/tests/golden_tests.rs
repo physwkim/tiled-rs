@@ -1855,3 +1855,26 @@ async fn test_sparse_array_block_returns_coo_arrow_table() {
     assert_eq!(dim1, vec![1, 0], "dim1 coordinates");
     assert_eq!(data, vec![5.0, 7.0], "data values");
 }
+
+#[tokio::test]
+async fn test_sparse_array_full_applies_partial_slice() {
+    // Regression for the formerly-rejected partial sparse slice path: a
+    // `?slice=0:2` over the [3,3] fixture selects rows [0,2), so only the
+    // non-zero at (0,1)=5.0 survives; (2,0)=7.0 is dropped. The trailing
+    // column axis is kept whole (numpy `arr[0:2]` == `arr[0:2, :]`).
+    let app = build_sparse_app();
+    let (status, headers, body) =
+        get_with_headers(&app, "/api/v1/array/full/sparse_arr?slice=0:2", &[]).await;
+
+    assert_eq!(status, StatusCode::OK, "body: {body:?}");
+    let ct = headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(ct.contains("arrow"), "unexpected content-type: {ct}");
+
+    let (dim0, dim1, data) = decode_coo_arrow(&body);
+    assert_eq!(dim0, vec![0], "only the row-0 non-zero survives");
+    assert_eq!(dim1, vec![1], "its column coordinate is preserved");
+    assert_eq!(data, vec![5.0], "its value is preserved");
+}
