@@ -1,74 +1,15 @@
 //! In-memory ragged (variable-length row) array adapter.
 //!
 //! Corresponds to Python `RaggedAdapter` (`tiled/adapters/ragged.py:39-78`).
-//! The full adapter trait (`RaggedAdapterRead`) is defined here because
-//! tiled-core does not yet expose one; a future tiled-core edit will hoist it
-//! there alongside `AnyAdapter::Ragged`.
+//! The adapter trait [`RaggedAdapterRead`] and its [`RaggedData`] return type
+//! live in `tiled-core::adapters` (alongside `AnyAdapter::Ragged`); this module
+//! provides the concrete in-memory implementation.
 
-use bytes::Bytes;
-
-use tiled_core::adapters::{BaseAdapter, BoxFuture};
+use tiled_core::adapters::{BaseAdapter, BoxFuture, RaggedAdapterRead, RaggedData};
 use tiled_core::dtype::{BuiltinDType, DType, Endianness, Kind};
 use tiled_core::error::{Result, TiledError};
 use tiled_core::ndslice::{NDSlice, SliceDim};
 use tiled_core::structures::{RaggedStructure, Resizable, Spec, StructureFamily};
-
-// ---------------------------------------------------------------------------
-// RaggedData — data returned by read()
-// ---------------------------------------------------------------------------
-
-/// Data returned by [`RaggedAdapterRead::read`].
-///
-/// `json_value` is a JSON-encoded list-of-lists, matching Python's
-/// `array.tolist()` (`tiled/adapters/ragged.py:73`).  `structure` is
-/// included so serializers that need buffer-level detail (e.g. the ZIP
-/// serializer) can compute the Awkward form without re-parsing the shape.
-#[derive(Debug, Clone)]
-pub struct RaggedData {
-    /// JSON list-of-lists, e.g. `[[1.0, 2.0], [3.0]]`.
-    pub json_value: serde_json::Value,
-    /// Structural description: shape, dtype, chunks.
-    pub structure: RaggedStructure,
-}
-
-impl RaggedData {
-    /// Serialize `json_value` to raw bytes (UTF-8 JSON).
-    ///
-    /// The bytes are what the JSON and ZIP serializers in
-    /// `tiled-serialization` consume as their `&[u8]` data argument.
-    pub fn to_json_bytes(&self) -> std::result::Result<Bytes, serde_json::Error> {
-        serde_json::to_vec(&self.json_value).map(Bytes::from)
-    }
-
-    /// Serialize `structure` to a `serde_json::Value` for use as the
-    /// metadata argument to the ragged serializers.
-    pub fn structure_as_metadata(
-        &self,
-    ) -> std::result::Result<serde_json::Value, serde_json::Error> {
-        serde_json::to_value(&self.structure)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// RaggedAdapterRead trait
-// ---------------------------------------------------------------------------
-
-/// Trait for adapters that serve ragged (variable-length row) arrays.
-///
-/// Mirrors the existing per-family adapter traits in `tiled-core::adapters`
-/// (`ArrayAdapterRead`, `AwkwardAdapterRead`, etc.).  Defined here until
-/// tiled-core exposes a `RaggedAdapterRead` and `AnyAdapter::Ragged`.
-pub trait RaggedAdapterRead: BaseAdapter {
-    fn structure(&self) -> &RaggedStructure;
-
-    /// Read the whole array, or a slice of it, as [`RaggedData`].
-    ///
-    /// A non-full `slice` is applied with numpy/awkward *basic* indexing
-    /// semantics, matching Python `RaggedAdapter.read`, which returns
-    /// `make_ragged_array(self._array, slice=slice)` — i.e. `array[slice]`
-    /// (`tiled/adapters/ragged.py:73-75`, `tiled/structures/ragged.py:388-401`).
-    fn read<'a>(&'a self, slice: &'a NDSlice) -> BoxFuture<'a, Result<RaggedData>>;
-}
 
 // ---------------------------------------------------------------------------
 // RaggedAdapter — in-memory implementation

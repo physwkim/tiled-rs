@@ -53,19 +53,26 @@ pub fn links_for_node(family: StructureFamily, base_url: &str, path: &str) -> No
                 format!("{base}/api/v1/table/partition/{p}"),
             );
         }
-        // Ragged and Awkward are NOT servable end-to-end in this workspace:
-        // no resolver (catalog/file/mongo) builds a ragged or awkward leaf
-        // adapter, `AnyAdapter` has no `Ragged` variant, and no serializer is
-        // registered for the Awkward family. Python's `links_for_ragged` /
-        // `links_for_awkward` (tiled/links.py:40-46,26-30) advertise
-        // `/ragged/full`, `/ragged/block`, `/awkward/full`, `/awkward/buffers`,
-        // but the Rust server registers no such routes — advertising them
-        // would hand a client a link that 404s when followed. Until the family
-        // is servable, advertise only the metadata `self` link (set above):
-        // an honest contract is better than a dead link. (Parity gap tracked
-        // as server H1; restore these links when the read routes — and the
-        // adapter/resolver/serializer they need — exist.)
-        StructureFamily::Ragged | StructureFamily::Awkward => {}
+        StructureFamily::Ragged => {
+            // Ragged IS servable end-to-end: `AnyAdapter::Ragged` wraps the
+            // concrete `RaggedAdapter`, the `/ragged/full` route reads it, and
+            // the registry serializes it (JSON/zip/Arrow/Parquet). Mirrors
+            // Python `links_for_ragged` (tiled/links.py:40-45): `full` + `block`.
+            links.full = Some(format!("{base}/api/v1/ragged/full/{p}"));
+            links
+                .extra
+                .insert("block".into(), format!("{base}/api/v1/ragged/block/{p}"));
+        }
+        // Awkward is NOT servable end-to-end in this workspace: there is no
+        // concrete awkward adapter (only the `AwkwardAdapterRead` trait, with
+        // no extractor on `AnyAdapter`), no resolver builds one, and no
+        // serializer is registered for the Awkward family. Python's
+        // `links_for_awkward` (tiled/links.py:26-30) advertises `/awkward/full`
+        // and `/awkward/buffers`, but the Rust server registers no such routes —
+        // advertising them would hand a client a link that 404s when followed.
+        // Advertise only the metadata `self` link (set above) until the family
+        // is servable. (Parity gap tracked as server H1.)
+        StructureFamily::Awkward => {}
     }
 
     links
@@ -187,10 +194,10 @@ mod tests {
     }
 
     #[test]
-    fn test_links_for_ragged_advertises_no_dead_read_links() {
-        // Ragged is not servable end-to-end (no resolver/adapter/route), so the
-        // node must advertise only the metadata `self` link — never `/ragged/full`
-        // or `/ragged/block`, which would 404 when followed (server H1).
+    fn test_links_for_ragged_advertises_full_and_block() {
+        // Ragged is servable end-to-end (AnyAdapter::Ragged + /ragged/full +
+        // serializers), so it advertises full + block like an array, on the
+        // /ragged/ route (parity with Python links_for_ragged).
         let links = links_for_node(
             StructureFamily::Ragged,
             "http://localhost:8000",
@@ -200,10 +207,14 @@ mod tests {
             links.self_link.as_deref(),
             Some("http://localhost:8000/api/v1/metadata/my_ragged")
         );
-        assert!(links.full.is_none());
-        assert!(links.search.is_none());
-        assert!(!links.extra.contains_key("block"));
-        assert!(links.extra.is_empty());
+        assert_eq!(
+            links.full.as_deref(),
+            Some("http://localhost:8000/api/v1/ragged/full/my_ragged")
+        );
+        assert_eq!(
+            links.extra.get("block").map(|s| s.as_str()),
+            Some("http://localhost:8000/api/v1/ragged/block/my_ragged")
+        );
     }
 
     #[test]

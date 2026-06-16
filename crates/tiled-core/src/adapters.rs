@@ -15,8 +15,8 @@ use crate::error::Result;
 use crate::ndslice::NDSlice;
 use crate::schemas::SortDirection;
 use crate::structures::{
-    ArrayStructure, AwkwardStructure, ContainerStructure, SparseStructure, Spec, StructureFamily,
-    TableStructure,
+    ArrayStructure, AwkwardStructure, ContainerStructure, RaggedStructure, SparseStructure, Spec,
+    StructureFamily, TableStructure,
 };
 
 /// Boxed future type alias for async trait methods (dyn-safe).
@@ -137,6 +137,59 @@ pub trait AwkwardAdapterWrite: AwkwardAdapterRead {
         &self,
         buffers: HashMap<String, bytes::Bytes>,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>>;
+}
+
+// ---------------------------------------------------------------------------
+// Ragged (dyn-used) — the Rust analog of Python's awkward family.
+// ---------------------------------------------------------------------------
+
+/// Data returned by [`RaggedAdapterRead::read`].
+///
+/// `json_value` is a JSON-encoded list-of-lists, matching Python's
+/// `array.tolist()` (`tiled/adapters/ragged.py:73`). `structure` is included
+/// so serializers that need buffer-level detail (the ZIP serializer) can
+/// compute the Awkward form without re-parsing the shape.
+///
+/// Lives in tiled-core (not tiled-adapters) so [`AnyAdapter::Ragged`] can name
+/// the trait that returns it; the concrete `RaggedAdapter` in tiled-adapters
+/// implements [`RaggedAdapterRead`] over this type.
+#[derive(Debug, Clone)]
+pub struct RaggedData {
+    /// JSON list-of-lists, e.g. `[[1.0, 2.0], [3.0]]`.
+    pub json_value: serde_json::Value,
+    /// Structural description: shape, dtype, chunks.
+    pub structure: RaggedStructure,
+}
+
+impl RaggedData {
+    /// Serialize `json_value` to raw bytes (UTF-8 JSON) — what the JSON and
+    /// ZIP serializers in `tiled-serialization` consume as their `&[u8]` data
+    /// argument.
+    pub fn to_json_bytes(&self) -> std::result::Result<bytes::Bytes, serde_json::Error> {
+        serde_json::to_vec(&self.json_value).map(bytes::Bytes::from)
+    }
+
+    /// Serialize `structure` to a `serde_json::Value` for use as the metadata
+    /// argument to the ragged serializers.
+    pub fn structure_as_metadata(
+        &self,
+    ) -> std::result::Result<serde_json::Value, serde_json::Error> {
+        serde_json::to_value(&self.structure)
+    }
+}
+
+/// Trait for adapters that serve ragged (variable-length row) arrays.
+///
+/// Mirrors the per-family adapter traits above (`ArrayAdapterRead`, etc.).
+pub trait RaggedAdapterRead: BaseAdapter {
+    fn structure(&self) -> &RaggedStructure;
+
+    /// Read the whole array, or a slice of it, as [`RaggedData`].
+    ///
+    /// A non-full `slice` is applied with numpy/awkward *basic* indexing
+    /// semantics, matching Python `RaggedAdapter.read`
+    /// (`tiled/adapters/ragged.py:73-75`).
+    fn read<'a>(&'a self, slice: &'a NDSlice) -> BoxFuture<'a, Result<RaggedData>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -310,6 +363,7 @@ pub enum AnyAdapter {
     Table(Arc<dyn TableAdapterRead>),
     Sparse(Arc<dyn SparseAdapterRead>),
     Awkward(Arc<dyn AwkwardAdapterRead>),
+    Ragged(Arc<dyn RaggedAdapterRead>),
     Container(Arc<dyn ContainerAdapter>),
 }
 
@@ -321,6 +375,7 @@ impl AnyAdapter {
             Self::Table(a) => a.structure_family(),
             Self::Sparse(a) => a.structure_family(),
             Self::Awkward(a) => a.structure_family(),
+            Self::Ragged(a) => a.structure_family(),
             Self::Container(a) => a.structure_family(),
         }
     }
@@ -332,6 +387,7 @@ impl AnyAdapter {
             Self::Table(a) => a.metadata(),
             Self::Sparse(a) => a.metadata(),
             Self::Awkward(a) => a.metadata(),
+            Self::Ragged(a) => a.metadata(),
             Self::Container(a) => a.metadata(),
         }
     }
@@ -343,6 +399,7 @@ impl AnyAdapter {
             Self::Table(a) => a.specs(),
             Self::Sparse(a) => a.specs(),
             Self::Awkward(a) => a.specs(),
+            Self::Ragged(a) => a.specs(),
             Self::Container(a) => a.specs(),
         }
     }
@@ -356,6 +413,7 @@ impl AnyAdapter {
             Self::Table(t) => Ok(serde_json::to_value(t.structure()).ok()),
             Self::Sparse(s) => Ok(serde_json::to_value(s.structure()).ok()),
             Self::Awkward(a) => Ok(serde_json::to_value(a.structure()).ok()),
+            Self::Ragged(r) => Ok(serde_json::to_value(r.structure()).ok()),
             Self::Container(c) => {
                 let count = c.len().await?;
                 Ok(Some(serde_json::json!({
@@ -417,6 +475,15 @@ impl AnyAdapter {
     pub fn as_sparse_arc(&self) -> Option<Arc<dyn SparseAdapterRead>> {
         match self {
             Self::Sparse(s) => Some(Arc::clone(s)),
+            _ => None,
+        }
+    }
+
+    /// Owned, `'static` clone of the ragged leaf. See [`AnyAdapter::as_array_arc`].
+    #[inline]
+    pub fn as_ragged_arc(&self) -> Option<Arc<dyn RaggedAdapterRead>> {
+        match self {
+            Self::Ragged(r) => Some(Arc::clone(r)),
             _ => None,
         }
     }

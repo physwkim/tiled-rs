@@ -21,8 +21,11 @@ pub use array_adapter::ArrayAdapter;
 pub use coo_adapter::CooAdapter;
 pub use map_adapter::MapAdapter;
 pub use npy_adapter::NpyAdapter;
-pub use ragged_adapter::{RaggedAdapter, RaggedAdapterRead, RaggedData};
+pub use ragged_adapter::RaggedAdapter;
+// `RaggedAdapterRead` and `RaggedData` now live in tiled-core (alongside
+// `AnyAdapter::Ragged`); re-export them here for source compatibility.
 pub use sequence_adapter::{FrameOpener, NpyFrameOpener, SequenceAdapter};
+pub use tiled_core::adapters::{RaggedAdapterRead, RaggedData};
 
 #[cfg(feature = "csv-adapter")]
 pub use csv_adapter::CsvAdapter;
