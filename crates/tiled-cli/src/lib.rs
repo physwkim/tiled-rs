@@ -622,6 +622,10 @@ pub async fn run(command: Command) -> Result<()> {
                 // Move catalog_handle's presence check before AppState consumes
                 // it; otherwise the borrow-after-move check fires.
                 webhook_config: webhook_config_value,
+                request_timeout_secs: file_config
+                    .as_ref()
+                    .map(|c| c.request_timeout_secs)
+                    .unwrap_or(30),
             };
 
             let app = tiled_server::build_app(state);

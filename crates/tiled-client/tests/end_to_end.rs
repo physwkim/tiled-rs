@@ -69,6 +69,7 @@ async fn spawn_server(api_key: Option<String>) -> String {
         web_assets_dir: None,
         spec_views: Vec::new(),
         webhook_config: None,
+        request_timeout_secs: 30,
     };
 
     let app = tiled_server::build_app(state);

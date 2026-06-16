@@ -105,6 +105,11 @@ pub struct AppState {
     /// `Some(_)` enables them with the per-field overrides in
     /// `WebhookConfig`.
     pub webhook_config: Option<crate::webhook_dispatch::WebhookConfig>,
+    /// Per-request timeout in seconds.  Requests that do not complete within
+    /// this window receive HTTP 408.  Default: 30.  Python tiled delegates
+    /// timeouts to the ASGI server (uvicorn) and has no in-app default;
+    /// 30 s matches the common uvicorn keepalive default.
+    pub request_timeout_secs: u64,
 }
 
 /// One `spec_views` entry. Wire-compatible with tiled-web's

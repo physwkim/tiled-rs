@@ -62,6 +62,7 @@ async fn build_test_app() -> (axum::Router, tempfile::TempDir, Catalog, AuthDb) 
         web_assets_dir: None,
         spec_views: Vec::new(),
         webhook_config: None,
+        request_timeout_secs: 30,
     };
     (tiled_server::build_app(state), dir, catalog, auth_db)
 }
@@ -837,6 +838,7 @@ async fn build_oidc_app() -> (axum::Router, AuthDb, Arc<tiled_auth::ExternalOidc
         web_assets_dir: None,
         spec_views: vec![],
         webhook_config: None,
+        request_timeout_secs: 30,
     };
     (tiled_server::build_app(state), auth_db, validator)
 }

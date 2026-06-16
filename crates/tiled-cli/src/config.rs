@@ -42,12 +42,20 @@ pub struct TiledConfig {
     /// the decoded payload would exceed this.
     #[serde(default = "default_response_bytesize_limit")]
     pub response_bytesize_limit: usize,
+    /// Per-request timeout in seconds (L5). Default: 30.
+    #[serde(default = "default_request_timeout_secs")]
+    pub request_timeout_secs: u64,
 }
 
 /// Default for [`TiledConfig::response_bytesize_limit`] — 300 MB, matching
 /// Python tiled (`settings.py:40`).
 pub fn default_response_bytesize_limit() -> usize {
     300_000_000
+}
+
+/// Default for [`TiledConfig::request_timeout_secs`] — 30 s.
+pub fn default_request_timeout_secs() -> u64 {
+    30
 }
 
 // `Default` is hand-written (not derived) so `response_bytesize_limit` agrees
@@ -62,6 +70,7 @@ impl Default for TiledConfig {
             web: None,
             access_control: None,
             response_bytesize_limit: default_response_bytesize_limit(),
+            request_timeout_secs: default_request_timeout_secs(),
         }
     }
 }

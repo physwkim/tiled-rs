@@ -157,6 +157,7 @@ async fn search_respects_tag_based_access_policy() {
         web_assets_dir: None,
         spec_views: Vec::new(),
         webhook_config: None,
+        request_timeout_secs: 30,
     };
     let app = tiled_server::build_app(state);
 
@@ -276,6 +277,7 @@ async fn admin_search_sees_all_nodes() {
         web_assets_dir: None,
         spec_views: Vec::new(),
         webhook_config: None,
+        request_timeout_secs: 30,
     };
     let app = tiled_server::build_app(state);
 
@@ -399,6 +401,7 @@ async fn array_append_denied_by_tag_policy_returns_404() {
         web_assets_dir: None,
         spec_views: Vec::new(),
         webhook_config: None,
+        request_timeout_secs: 30,
     };
     let app = tiled_server::build_app(state);
 
@@ -487,6 +490,7 @@ async fn anonymous_search_shows_only_public_nodes() {
         web_assets_dir: None,
         spec_views: Vec::new(),
         webhook_config: None,
+        request_timeout_secs: 30,
     };
     let app = tiled_server::build_app(state);
 
@@ -579,6 +583,7 @@ async fn public_tagged_node_is_listable_and_readable_by_anonymous() {
         web_assets_dir: None,
         spec_views: Vec::new(),
         webhook_config: None,
+        request_timeout_secs: 30,
     };
     let app = tiled_server::build_app(state);
 
@@ -684,6 +689,7 @@ async fn anonymous_search_excludes_user_owned_nodes() {
         web_assets_dir: None,
         spec_views: Vec::new(),
         webhook_config: None,
+        request_timeout_secs: 30,
     };
     let app = tiled_server::build_app(state);
 
@@ -788,6 +794,7 @@ async fn cross_user_search_excludes_other_users_owned_nodes() {
         web_assets_dir: None,
         spec_views: Vec::new(),
         webhook_config: None,
+        request_timeout_secs: 30,
     };
     let app = tiled_server::build_app(state);
 
@@ -899,6 +906,7 @@ async fn metadata_read_excludes_other_users_owned_node() {
         web_assets_dir: None,
         spec_views: Vec::new(),
         webhook_config: None,
+        request_timeout_secs: 30,
     };
     let app = tiled_server::build_app(state);
 

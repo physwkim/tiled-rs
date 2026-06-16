@@ -196,7 +196,10 @@ pub fn build_app(state: AppState) -> Router {
     let api_app = app
         .layer(axum::extract::DefaultBodyLimit::max(body_limit))
         .layer(axum::middleware::from_fn(correlation_id_middleware))
-        .layer(axum::middleware::from_fn(timeout_middleware))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            timeout_middleware,
+        ))
         .layer(CompressionLayer::new())
         .layer(TraceLayer::new_for_http())
         .layer(cors)
@@ -568,10 +571,12 @@ fn unauthorized(msg: &str) -> axum::response::Response {
 
 /// Request timeout middleware.
 async fn timeout_middleware(
+    State(state): State<AppState>,
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    match tokio::time::timeout(Duration::from_secs(30), next.run(request)).await {
+    let limit = Duration::from_secs(state.request_timeout_secs);
+    match tokio::time::timeout(limit, next.run(request)).await {
         Ok(response) => response,
         Err(_) => (StatusCode::REQUEST_TIMEOUT, "Request timed out").into_response(),
     }

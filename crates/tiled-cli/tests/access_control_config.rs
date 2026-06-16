@@ -172,6 +172,7 @@ async fn tag_based_config_narrows_forbidden_node() {
         web_assets_dir: None,
         spec_views: Vec::new(),
         webhook_config: None,
+        request_timeout_secs: 30,
     };
     let app = tiled_server::build_app(state);
 
