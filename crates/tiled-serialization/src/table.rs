@@ -216,12 +216,16 @@ pub(crate) fn table_ipc_to_safe_columns(
 
 /// Convert one Arrow array into a list of JSON-safe values (one per row).
 ///
-/// Handles the column types the table adapters emit (numeric, boolean, UTF-8
-/// strings) plus the Null type. `serde_json`'s `From<f32>`/`From<f64>` map NaN
-/// and infinities to `Value::Null`, matching Python's NaN→`None` rule; an
-/// explicit Arrow null at any index is also `null`. An unsupported Arrow type
-/// (e.g. timestamp, binary, nested) is a hard error — Python's orjson path
-/// likewise fails on a non-JSON-native column rather than emitting garbage.
+/// Numeric/boolean/UTF-8 columns map to their JSON-native forms; `serde_json`'s
+/// `From<f32>`/`From<f64>` map NaN and infinities to `Value::Null`, matching
+/// Python's NaN→`None` rule, and an explicit Arrow null at any index is also
+/// `null`. Temporal columns (timestamp/date/time) are rendered as ISO-8601
+/// strings — Python's `_series_to_json_safe` converts `pandas.Timestamp` via
+/// `.isoformat()` (table.py:135-139) and orjson renders date/time natively, so
+/// a parquet table with a timestamp column serializes rather than 500ing.
+/// A genuinely non-JSON-native column (binary, nested) remains a hard error,
+/// matching Python's orjson failure on such a column rather than emitting
+/// garbage.
 fn arrow_column_to_json_values(array: &dyn Array) -> Result<Vec<Value>, SerializeError> {
     let n = array.len();
 
@@ -262,6 +266,36 @@ fn arrow_column_to_json_values(array: &dyn Array) -> Result<Vec<Value>, Serializ
         DataType::Float64 => map_native!(Float64Array),
         DataType::Utf8 => map_native!(StringArray),
         DataType::LargeUtf8 => map_native!(LargeStringArray),
+        // Temporal columns → ISO-8601 strings. Python's `_series_to_json_safe`
+        // converts `pandas.Timestamp` with `.isoformat()` (table.py:135-139) and
+        // orjson renders date/time natively; Arrow's cast-to-Utf8 yields the
+        // equivalent ISO-8601 text and handles every unit/timezone uniformly.
+        // Null slots stay JSON null, matching the null mask of every other arm.
+        DataType::Timestamp(_, _)
+        | DataType::Date32
+        | DataType::Date64
+        | DataType::Time32(_)
+        | DataType::Time64(_) => {
+            let cast =
+                arrow::compute::cast(array, &DataType::Utf8).map_err(|e| -> SerializeError {
+                    format!("arrow temporal column cast to string failed: {e}").into()
+                })?;
+            let s =
+                cast.as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| -> SerializeError {
+                        "arrow temporal cast did not yield a Utf8 array".into()
+                    })?;
+            (0..n)
+                .map(|i| {
+                    if s.is_null(i) {
+                        Value::Null
+                    } else {
+                        Value::from(s.value(i))
+                    }
+                })
+                .collect()
+        }
         other => {
             return Err(format!(
                 "application/json table serializer does not support arrow column type {other:?}"
@@ -453,20 +487,23 @@ mod tests {
         assert!(out.is_empty(), "empty table must yield empty json-seq body");
     }
 
-    /// H1: an unsupported Arrow column type is a hard error (→ HTTP 500), never
-    /// silently dropped or mis-encoded.
+    /// A genuinely non-JSON-native Arrow column type (binary) is a hard error
+    /// (→ HTTP 500), never silently dropped or mis-encoded — matching orjson's
+    /// failure on a bytes column rather than emitting garbage.
     #[test]
     fn json_table_unsupported_type_errors() {
-        use arrow::array::TimestampMillisecondArray;
-        use arrow::datatypes::TimeUnit;
+        use arrow::array::BinaryArray;
         let schema = Arc::new(Schema::new(vec![Field::new(
-            "t",
-            DataType::Timestamp(TimeUnit::Millisecond, None),
+            "blob",
+            DataType::Binary,
             false,
         )]));
         let batch = RecordBatch::try_new(
             schema.clone(),
-            vec![Arc::new(TimestampMillisecondArray::from(vec![0_i64, 1]))],
+            vec![Arc::new(BinaryArray::from(vec![
+                b"\x00\x01".as_ref(),
+                b"\x02".as_ref(),
+            ]))],
         )
         .unwrap();
         let err = json_serializer()(&ipc_bytes(&batch), &serde_json::Value::Null)
@@ -475,6 +512,54 @@ mod tests {
             err.to_string().contains("does not support"),
             "error must name the unsupported-type cause: {err}"
         );
+    }
+
+    /// A temporal column (timestamp/date) serializes to ISO-8601 strings rather
+    /// than 500ing: Python's `_series_to_json_safe` converts `pandas.Timestamp`
+    /// via `.isoformat()` (table.py:135-139). Reachable through ParquetAdapter,
+    /// which passes the native Arrow schema through, so a parquet table with a
+    /// timestamp column must serialize. Null slots stay JSON null.
+    #[test]
+    fn json_table_temporal_columns_become_iso_strings() {
+        use arrow::array::{Date32Array, TimestampMillisecondArray};
+        use arrow::datatypes::TimeUnit;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("ts", DataType::Timestamp(TimeUnit::Millisecond, None), true),
+            Field::new("d", DataType::Date32, true),
+        ]));
+        // ts: 2021-01-01T00:00:00 UTC (1609459200000 ms), then null.
+        // d:  2021-01-01 (18628 days since epoch), then null.
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(TimestampMillisecondArray::from(vec![
+                    Some(1_609_459_200_000_i64),
+                    None,
+                ])),
+                Arc::new(Date32Array::from(vec![Some(18_628_i32), None])),
+            ],
+        )
+        .unwrap();
+        let out = json_serializer()(&ipc_bytes(&batch), &serde_json::Value::Null).unwrap();
+        let parsed: Value = serde_json::from_slice(&out).unwrap();
+
+        // First slot is an ISO-8601 string with the right calendar date/time;
+        // second slot is JSON null. Assert on a date/time prefix rather than the
+        // exact fractional-second spelling so the test is robust to Arrow's cast
+        // formatting while still proving the calendar value is correct.
+        let ts0 = parsed["ts"][0].as_str().expect("ts[0] must be a string");
+        assert!(
+            ts0.starts_with("2021-01-01T00:00:00"),
+            "timestamp must render as ISO-8601: {ts0}"
+        );
+        assert_eq!(parsed["ts"][1], Value::Null, "null timestamp stays null");
+
+        let d0 = parsed["d"][0].as_str().expect("d[0] must be a string");
+        assert!(
+            d0.starts_with("2021-01-01"),
+            "date must render as ISO-8601: {d0}"
+        );
+        assert_eq!(parsed["d"][1], Value::Null, "null date stays null");
     }
 
     fn html_serializer() -> Arc<SerializerFn> {
