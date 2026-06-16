@@ -739,6 +739,108 @@ async fn concurrent_401s_single_refresh() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// (11) ContainerClient.get within an active search routes through KeyLookup
+//      (client M2). `node.search(q).get(key)` must look up `key` *within* the
+//      filtered results — sending a KeyLookup filter plus the active queries to
+//      the `search` link — and raise KeyNotFound when `key` is filtered out,
+//      NOT fetch /metadata/.../key unconditionally. Python container.py:280-310.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn get_within_active_search_routes_through_keylookup() {
+    use tiled_client::queries::Key;
+    use tiled_client::{AnyClient, ContainerClient, Context, error::ClientError};
+
+    // Fixed two-child "DB" the search endpoint filters over:
+    //   alpha -> color=red ; beta -> color=blue
+    fn child_container(name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": name,
+            "attributes": {
+                "ancestors": [],
+                "structure_family": "container",
+                "metadata": {},
+            },
+            "links": {
+                "self": format!("http://placeholder/api/v1/metadata/{name}"),
+                "search": format!("http://placeholder/api/v1/search/{name}"),
+                "full": format!("http://placeholder/api/v1/container/full/{name}"),
+            }
+        })
+    }
+
+    // Honor a `lookup` key filter together with an `eq(color, ...)` metadata
+    // filter, mirroring the server's combined narrowing.
+    async fn handle_search(
+        axum::extract::Query(params): axum::extract::Query<Vec<(String, String)>>,
+    ) -> impl IntoResponse {
+        let lookup = |k: &str| {
+            params
+                .iter()
+                .find(|(key, _)| key == k)
+                .map(|(_, v)| v.clone())
+        };
+        let lookup_key = lookup("filter[lookup][condition][key]");
+        let eq_key = lookup("filter[eq][condition][key]");
+        let eq_val = lookup("filter[eq][condition][value]");
+        let db = [("alpha", "red"), ("beta", "blue")];
+        let mut data = Vec::new();
+        for (name, color) in db {
+            let key_ok = lookup_key.as_deref().map(|lk| lk == name).unwrap_or(true);
+            let eq_ok = match (&eq_key, &eq_val) {
+                // eq value is JSON-encoded by the client (e.g. "red" -> "\"red\"").
+                (Some(k), Some(v)) if k == "color" => v == &format!("\"{color}\""),
+                (Some(_), _) => false,
+                _ => true,
+            };
+            if key_ok && eq_ok {
+                data.push(child_container(name));
+            }
+        }
+        let count = data.len();
+        // Omit `links` entirely so it defaults to None — an empty object would
+        // fail to deserialize into PaginationLinks (which requires `self`).
+        Json(serde_json::json!({"data": data, "meta": {"count": count}}))
+    }
+
+    let app = Router::new()
+        .route("/api/v1/", get(|| async { Json(about_payload()) }))
+        .route("/api/v1/search/", get(handle_search));
+    let base = spawn(app).await;
+
+    let (ctx, _) = Context::from_uri(&base).unwrap();
+    let root_item = serde_json::from_value(serde_json::json!({
+        "id": "",
+        "attributes": { "ancestors": [], "structure_family": "container", "metadata": {} },
+        "links": {
+            "self": format!("{base}/api/v1/metadata/"),
+            "search": format!("{base}/api/v1/search/"),
+            "full": format!("{base}/api/v1/container/full/"),
+        }
+    }))
+    .unwrap();
+    let root = ContainerClient::from_item(ctx, root_item, false).unwrap();
+
+    // Within a color=red filter, alpha is present and beta is filtered out.
+    let filtered = root.search(Key::new("color").eq("red"));
+
+    let alpha = filtered
+        .get("alpha")
+        .await
+        .expect("alpha is in the filtered results");
+    assert!(
+        matches!(alpha, AnyClient::Container(_)),
+        "get within search must return the matched child"
+    );
+
+    let err = filtered.get("beta").await.unwrap_err();
+    assert!(
+        matches!(err, ClientError::KeyNotFound(_)),
+        "a key filtered out of the active search must be KeyNotFound, got {err:?}"
+    );
+}
+
 #[allow(dead_code)]
 const _: fn() = || {
     let _ = HashMap::<String, String>::new();

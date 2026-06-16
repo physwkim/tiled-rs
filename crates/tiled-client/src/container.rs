@@ -95,7 +95,22 @@ impl ContainerClient {
     /// adds `?include_data_sources=true` so the server returns the child's
     /// `data_sources` payload (consistent with what `from_uri(...,
     /// include_data_sources=true)` requested at construction time).
+    ///
+    /// When this client carries active search filters (from [`search`] /
+    /// [`with_filter`]), the lookup is performed *within* the filtered result
+    /// set: a `KeyLookup` filter plus the active queries are routed through the
+    /// `search` link, and a key that is not in the filtered view yields
+    /// [`ClientError::KeyNotFound`]. This mirrors Python
+    /// `Container.__getitem__` (`container.py:280-310`), where
+    /// `node.search(...)["key"]` raises `KeyError` if `"key"` is absent from the
+    /// search results rather than fetching it unconditionally.
+    ///
+    /// [`search`]: Self::search
+    /// [`with_filter`]: Self::with_filter
     pub async fn get(&self, key: &str) -> Result<AnyClient> {
+        if !self.queries.is_empty() {
+            return self.get_within_search(key).await;
+        }
         let mut url = Url::parse(self.base.require_link("self")?).map_err(ClientError::from)?;
         // self link points to /metadata/.../<this>; appending `/<key>` walks one step.
         // Percent-encode the key so `?`, `#`, `/`, etc. don't reshape the URL.
@@ -119,6 +134,29 @@ impl ContainerClient {
         let item = resp
             .data
             .ok_or_else(|| ClientError::KeyNotFound(format!("no child '{key}'")))?;
+        AnyClient::from_item(
+            self.base.context.clone(),
+            item,
+            self.base.include_data_sources,
+        )
+    }
+
+    /// Look up `key` *within* the active search results: route a `KeyLookup`
+    /// filter plus the active queries through the `search` link with
+    /// `page[limit]=1`. An empty result means the key is not in the filtered
+    /// view → [`ClientError::KeyNotFound`] (Python's `KeyError`).
+    async fn get_within_search(&self, key: &str) -> Result<AnyClient> {
+        let lookup =
+            tiled_core::queries::Query::Lookup(tiled_core::queries::KeyLookup { key: key.into() });
+        let url = self.search_url_with(0, 1, &lookup.encode(), self.base.include_data_sources)?;
+        let resp: SearchResponse = retry(|| async {
+            let r = self.base.context.get(&url).await?;
+            decode_response::<SearchResponse>(r).await
+        })
+        .await?;
+        let item = resp.data.into_iter().next().ok_or_else(|| {
+            ClientError::KeyNotFound(format!("no child '{key}' in filtered results"))
+        })?;
         AnyClient::from_item(
             self.base.context.clone(),
             item,
@@ -195,12 +233,29 @@ impl ContainerClient {
     }
 
     fn search_url(&self, offset: usize, limit: usize) -> Result<Url> {
+        self.search_url_with(offset, limit, &[], false)
+    }
+
+    /// Build a `search` URL with `extra_filters` prepended before this client's
+    /// active queries (matching Python's param order: `KeyLookup` first, then
+    /// the standing queries, then sort). `include_data_sources` appends
+    /// `include_data_sources=true` when set.
+    fn search_url_with(
+        &self,
+        offset: usize,
+        limit: usize,
+        extra_filters: &[(String, String)],
+        include_data_sources: bool,
+    ) -> Result<Url> {
         let link = self.base.require_link("search")?;
         let mut url = Url::parse(link).map_err(ClientError::from)?;
         {
             let mut q = url.query_pairs_mut();
             q.append_pair("page[offset]", &offset.to_string());
             q.append_pair("page[limit]", &limit.to_string());
+            for (k, v) in extra_filters {
+                q.append_pair(k, v);
+            }
             for (k, v) in &self.queries {
                 q.append_pair(k, v);
             }
@@ -214,6 +269,9 @@ impl ContainerClient {
                     })
                     .collect();
                 q.append_pair("sort", &formatted.join(","));
+            }
+            if include_data_sources {
+                q.append_pair("include_data_sources", "true");
             }
         }
         Ok(url)
