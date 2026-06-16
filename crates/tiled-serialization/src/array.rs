@@ -115,7 +115,8 @@ fn serialize_array_csv(
         .and_then(|v| v.as_str())
         .unwrap_or("<")
         == ">";
-    // datetime64 unit, e.g. "[ns]" → "ns"; only consulted for kind 'M'.
+    // datetime64/timedelta64 unit, e.g. "[ns]" → "ns"; consulted for kinds 'M'
+    // (datetime64) and 'm' (timedelta64).
     let dt_unit: Option<&str> = metadata
         .get("dt_units")
         .and_then(|v| v.as_str())
@@ -224,14 +225,13 @@ fn serialize_array_csv(
                 datetime64_csv_cell(i64::from_le_bytes(b), dt_unit)
             }
             ("m", 8) => {
-                // timedelta64: raw i64 tick count. numpy.savetxt emits
-                // "{n} {unit}" (e.g. "5 seconds"); that distinct parity gap is
-                // tracked separately, so this still prints the integer for now.
+                // timedelta64 → str(numpy.timedelta64): "{n} {unit}" (e.g.
+                // "5 seconds"), NOT the raw tick count. See timedelta64_csv_cell.
                 let mut b: [u8; 8] = bytes.try_into().unwrap_or([0u8; 8]);
                 if big_endian {
                     b.reverse();
                 }
-                i64::from_le_bytes(b).to_string()
+                timedelta64_csv_cell(i64::from_le_bytes(b), dt_unit)
             }
             ("S", _) => {
                 // Fixed-length byte string: decode as UTF-8, strip trailing nulls.
@@ -616,6 +616,36 @@ fn datetime64_csv_cell(value: i64, unit: Option<&str>) -> String {
         other => return format!("datetime64(unsupported-unit:{other})"),
     };
     dt.format(fmt).to_string()
+}
+
+/// Render a numpy `timedelta64` tick as the CSV cell `numpy.savetxt(fmt="%s")`
+/// produces — i.e. `str(numpy.timedelta64(value, unit))` = `"{n} {unit_name}"`
+/// (verified against numpy 2.0.2). The tick count is printed verbatim: numpy
+/// does NOT pluralize by count (`1` → `"1 years"`, not `"1 year"`), prints `0`
+/// and negatives literally, and renders NaT (`i64::MIN`) as `"NaT"`. A
+/// missing/unsupported unit yields a visible placeholder rather than a wrong
+/// value, matching `datetime64_csv_cell`'s convention.
+fn timedelta64_csv_cell(value: i64, unit: Option<&str>) -> String {
+    if value == i64::MIN {
+        return "NaT".to_string(); // str(numpy.timedelta64('NaT'))
+    }
+    let Some(unit) = unit else {
+        return "timedelta64(missing-units)".to_string();
+    };
+    let name = match unit {
+        "Y" => "years",
+        "M" => "months",
+        "W" => "weeks",
+        "D" => "days",
+        "h" => "hours",
+        "m" => "minutes",
+        "s" => "seconds",
+        "ms" => "milliseconds",
+        "us" => "microseconds",
+        "ns" => "nanoseconds",
+        other => return format!("timedelta64(unsupported-unit:{other})"),
+    };
+    format!("{value} {name}")
 }
 
 /// Nest a flat, row-major value list into the JSON shape numpy/orjson produce:
@@ -1148,5 +1178,56 @@ mod tests {
             "2021-01-01T00:00:00,1970-01-01T00:00:00\n\
              1970-01-01T00:00:00,2021-01-01T00:00:00"
         );
+    }
+
+    /// The array CSV serializer renders timedelta64 as `str(numpy.timedelta64)` —
+    /// `"{n} {unit_name}"` — matching `numpy.savetxt(fmt="%s")`, NOT the raw
+    /// integer tick (verified against numpy 2.0.2). numpy does not pluralize by
+    /// count, so even `1` is `"1 <plural>"`.
+    #[test]
+    fn csv_array_timedelta64_matches_numpy_str() {
+        let ser = csv_serializer();
+        // (unit, tick value, expected str(numpy.timedelta64(value, unit)))
+        let cases: &[(&str, i64, &str)] = &[
+            ("[Y]", 5, "5 years"),
+            ("[M]", 5, "5 months"),
+            ("[W]", 5, "5 weeks"),
+            ("[D]", 5, "5 days"),
+            ("[h]", 5, "5 hours"),
+            ("[m]", 5, "5 minutes"),
+            ("[s]", 5, "5 seconds"),
+            ("[ms]", 5, "5 milliseconds"),
+            ("[us]", 5, "5 microseconds"),
+            ("[ns]", 5, "5 nanoseconds"),
+            // No pluralization at 1; literal 0 and negatives.
+            ("[s]", 1, "1 seconds"),
+            ("[s]", 0, "0 seconds"),
+            ("[Y]", -3, "-3 years"),
+        ];
+        for (unit, value, expected) in cases {
+            let data: Vec<u8> = value.to_le_bytes().to_vec();
+            let meta = serde_json::json!({
+                "itemsize": 8, "kind": "m", "byteorder": "<", "dt_units": unit, "shape": [1]
+            });
+            let out = ser(&data, &meta).unwrap();
+            assert_eq!(
+                std::str::from_utf8(&out).unwrap(),
+                *expected,
+                "unit {unit} value {value}"
+            );
+        }
+    }
+
+    /// CSV timedelta64 NaT → "NaT" (matching `str(numpy.timedelta64('NaT'))`),
+    /// not the raw i64::MIN sentinel.
+    #[test]
+    fn csv_array_timedelta64_nat_is_nat_string() {
+        let ser = csv_serializer();
+        let data: Vec<u8> = i64::MIN.to_le_bytes().to_vec();
+        let meta = serde_json::json!({
+            "itemsize": 8, "kind": "m", "byteorder": "<", "dt_units": "[s]", "shape": [1]
+        });
+        let out = ser(&data, &meta).unwrap();
+        assert_eq!(std::str::from_utf8(&out).unwrap(), "NaT");
     }
 }
