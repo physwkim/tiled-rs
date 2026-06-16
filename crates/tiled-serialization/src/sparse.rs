@@ -28,6 +28,18 @@ pub fn register_sparse_serializers(reg: &SerializationRegistry) {
         }),
     );
 
+    // application/json — column-dict `{dim0:[...],...,data:[...]}`, mirroring
+    // Python `serialize_json` (sparse.py:103-113): `{col: df[col].tolist()}`
+    // over the COO DataFrame. Reuses the table column-dict serializer since the
+    // server already hands us the COO Arrow IPC table (columns dim0..dimN,
+    // data). Unconditional: serde_json is always available (Python gates this on
+    // orjson; Rust has no such optional dependency).
+    reg.register(
+        StructureFamily::Sparse,
+        mime::JSON,
+        crate::table::json_table_serializer(),
+    );
+
     #[cfg(feature = "csv")]
     {
         for media_type in [
@@ -60,6 +72,13 @@ pub fn register_sparse_serializers(reg: &SerializationRegistry) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use arrow::array::{Float64Array, Int64Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::ipc::writer::FileWriter;
+    use arrow::record_batch::RecordBatch;
+    use serde_json::Value;
     use tiled_core::media_type::mime;
     use tiled_core::structures::StructureFamily;
 
@@ -69,6 +88,75 @@ mod tests {
         let reg = SerializationRegistry::new();
         super::register_sparse_serializers(&reg);
         reg
+    }
+
+    /// Encode a single-batch RecordBatch into Arrow IPC bytes — the COO table
+    /// (columns dim0..dimN, data) the server hands the sparse serializer.
+    fn ipc_bytes(batch: &RecordBatch) -> Vec<u8> {
+        let mut buf = Vec::new();
+        {
+            let mut w = FileWriter::try_new(&mut buf, &batch.schema()).unwrap();
+            w.write(batch).unwrap();
+            w.finish().unwrap();
+        }
+        buf
+    }
+
+    /// M3: `application/json` is registered for the sparse family
+    /// (Python sparse.py:109-113).
+    #[test]
+    fn sparse_json_registered() {
+        let reg = sparse_registry();
+        assert!(
+            reg.dispatch(StructureFamily::Sparse, mime::JSON).is_some(),
+            "Sparse must have an application/json serializer"
+        );
+    }
+
+    /// M3: the sparse JSON body is the COO column-dict
+    /// `{dim0:[...],dim1:[...],data:[...]}` in DataFrame column order — dims
+    /// before data, NOT alphabetized — matching Python `{col: df[col].tolist()}`
+    /// over `to_dataframe` (sparse.py:55-58,104-107).
+    #[test]
+    fn sparse_json_is_coo_column_dict_in_order() {
+        // A 2-nonzero COO frame: (dim0,dim1) coords + data values.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("dim0", DataType::Int64, false),
+            Field::new("dim1", DataType::Int64, false),
+            Field::new("data", DataType::Float64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(Float64Array::from(vec![10.0, 20.0])),
+            ],
+        )
+        .unwrap();
+
+        let serializer = sparse_registry()
+            .dispatch(StructureFamily::Sparse, mime::JSON)
+            .expect("sparse application/json must be registered");
+        let out = serializer(&ipc_bytes(&batch), &serde_json::Value::Null).unwrap();
+        let text = String::from_utf8(out.to_vec()).unwrap();
+
+        // Column order dim0, dim1, data preserved (not sorted: "data" would sort
+        // first). Assert on raw bytes — a re-parse re-sorts keys (no
+        // serde_json `preserve_order`).
+        let pos_dim0 = text.find(r#""dim0""#).expect("dim0 present");
+        let pos_dim1 = text.find(r#""dim1""#).expect("dim1 present");
+        let pos_data = text.find(r#""data""#).expect("data present");
+        assert!(
+            pos_dim0 < pos_dim1 && pos_dim1 < pos_data,
+            "COO columns must keep dim0,dim1,data order: {text}"
+        );
+
+        // Values are order-independent, so re-parse is safe for them.
+        let parsed: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(parsed["dim0"], serde_json::json!([1, 2]));
+        assert_eq!(parsed["dim1"], serde_json::json!([1, 2]));
+        assert_eq!(parsed["data"], serde_json::json!([10.0, 20.0]));
     }
 
     #[test]
