@@ -868,10 +868,29 @@ async fn build_auth_state(
             "--user / --proxied-auth-header require --auth-db-uri so the server can persist sessions"
         )
     })?;
-    let secret_str = jwt_secret
-        .ok_or_else(|| anyhow::anyhow!("--auth-db-uri requires --jwt-secret (>= 16 bytes)"))?;
-    let issuer = tiled_auth::Issuer::new(secret_str.as_bytes())
-        .map_err(|e| anyhow::anyhow!("jwt secret: {e}"))?;
+    // JWT signing secret(s). Python tiled supports key rotation via a list of
+    // secrets (`secret_keys` / `TILED_SECRET_KEYS`, a JSON list of strings): the
+    // first signs new tokens, all are tried when verifying. Honor that env when
+    // present; otherwise fall back to the single `--jwt-secret` / TILED_JWT_SECRET.
+    let issuer = match std::env::var("TILED_SECRET_KEYS") {
+        Ok(json) => {
+            let keys: Vec<String> = serde_json::from_str(&json).map_err(|e| {
+                anyhow::anyhow!("TILED_SECRET_KEYS must be a JSON list of strings: {e}")
+            })?;
+            let refs: Vec<&[u8]> = keys.iter().map(|s| s.as_bytes()).collect();
+            tiled_auth::Issuer::with_secrets(&refs)
+                .map_err(|e| anyhow::anyhow!("jwt secret: {e}"))?
+        }
+        Err(_) => {
+            let secret_str = jwt_secret.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--auth-db-uri requires --jwt-secret (or TILED_SECRET_KEYS for key rotation)"
+                )
+            })?;
+            tiled_auth::Issuer::new(secret_str.as_bytes())
+                .map_err(|e| anyhow::anyhow!("jwt secret: {e}"))?
+        }
+    };
     let db = tiled_auth::AuthDb::connect(auth_uri)
         .await
         .map_err(|e| anyhow::anyhow!("auth db connect: {e}"))?;

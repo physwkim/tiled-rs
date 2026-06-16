@@ -9,8 +9,10 @@
 //! invalidates every still-cached JWT instantly.
 
 use chrono::{Duration, Utc};
+use jsonwebtoken::errors::ErrorKind;
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::{Serialize, de::DeserializeOwned};
 
 use crate::error::{AuthError, Result};
 use crate::scopes::ScopeSet;
@@ -47,8 +49,14 @@ pub struct RefreshClaims {
 
 #[derive(Clone)]
 pub struct Issuer {
+    /// Signs every new token — derived from the *first* secret (Python tiled
+    /// encodes with `secret_keys[0]`, authentication.py:866).
     encoding: EncodingKey,
-    decoding: DecodingKey,
+    /// One verifier per configured secret, in order. A token is accepted if it
+    /// verifies against any of them, so a token signed by a rotated-out key
+    /// still validates until that key is dropped (Python tiled's `decode_token`
+    /// loops over `secret_keys`, authentication.py:165-172).
+    decoding: Vec<DecodingKey>,
     pub access_ttl: Duration,
     pub refresh_ttl: Duration,
 }
@@ -65,24 +73,68 @@ impl std::fmt::Debug for Issuer {
 }
 
 impl Issuer {
-    /// `secret` is HMAC-SHA256 keying material.
+    /// Single-secret convenience: no rotation. `secret` is HMAC-SHA256 keying
+    /// material. Equivalent to [`Issuer::with_secrets`] with a one-element list.
     pub fn new(secret: &[u8]) -> Result<Self> {
+        Self::with_secrets(std::slice::from_ref(&secret))
+    }
+
+    /// Build an Issuer over an ordered list of HMAC-SHA256 secrets to support
+    /// key rotation, mirroring Python tiled's `secret_keys` /
+    /// `TILED_SECRET_KEYS`: the **first** secret signs every new token, and a
+    /// presented token is accepted if it verifies against **any** secret (tried
+    /// in order). To rotate, prepend the new secret and keep the old one until
+    /// all tokens signed by it have expired, then drop it.
+    pub fn with_secrets(secrets: &[&[u8]]) -> Result<Self> {
+        if secrets.is_empty() {
+            return Err(AuthError::Validation(
+                "at least one JWT secret is required".into(),
+            ));
+        }
         // HMAC-SHA256 keying material must be at least 32 bytes (256 bits) —
         // the SHA-256 block/output width. Python tiled defaults to
         // secrets.token_hex(32); we reject weaker keys outright rather than
-        // silently accept a brute-forceable secret.
-        if secret.len() < 32 {
-            return Err(AuthError::Validation(format!(
-                "JWT secret must be at least 32 bytes, got {}",
-                secret.len()
-            )));
+        // silently accept a brute-forceable secret. Every rotation key is held
+        // to the same floor — a weak old key is as exploitable as a weak new one.
+        for secret in secrets {
+            if secret.len() < 32 {
+                return Err(AuthError::Validation(format!(
+                    "JWT secret must be at least 32 bytes, got {}",
+                    secret.len()
+                )));
+            }
         }
         Ok(Self {
-            encoding: EncodingKey::from_secret(secret),
-            decoding: DecodingKey::from_secret(secret),
+            encoding: EncodingKey::from_secret(secrets[0]),
+            decoding: secrets
+                .iter()
+                .map(|s| DecodingKey::from_secret(s))
+                .collect(),
             access_ttl: Duration::minutes(15),
             refresh_ttl: Duration::days(7),
         })
+    }
+
+    /// Verify `token` against each rotation key in order. Returns the claims on
+    /// the first key that accepts it. An *expired* token short-circuits: once a
+    /// key verifies the signature, a failed `exp` check is final — we do NOT try
+    /// the remaining keys (Python tiled re-raises `ExpiredSignatureError` from
+    /// inside the loop, authentication.py:169-170, rather than treating expiry
+    /// as a wrong-key miss). A signature mismatch falls through to the next key.
+    fn decode_rotating<T: DeserializeOwned>(&self, token: &str, v: &Validation) -> Result<T> {
+        let mut last: Option<jsonwebtoken::errors::Error> = None;
+        for key in &self.decoding {
+            match decode::<T>(token, key, v) {
+                Ok(data) => return Ok(data.claims),
+                Err(e) if matches!(e.kind(), ErrorKind::ExpiredSignature) => return Err(e.into()),
+                Err(e) => last = Some(e),
+            }
+        }
+        // `decoding` is never empty (with_secrets rejects that), so `last` is
+        // always populated here; the fallback is a defensive non-panic.
+        Err(last
+            .map(Into::into)
+            .unwrap_or_else(|| AuthError::Unauthorized("no JWT verification keys".into())))
     }
 
     pub fn with_ttls(mut self, access: Duration, refresh: Duration) -> Self {
@@ -139,11 +191,11 @@ impl Issuer {
         // Adding an iat/nbf gate here would diverge from Python and guard an
         // input this path cannot legitimately receive. The signature + `exp`
         // are the security boundary.
-        let data = decode::<AccessClaims>(token, &self.decoding, &v)?;
-        if data.claims.typ != "access" {
+        let claims: AccessClaims = self.decode_rotating(token, &v)?;
+        if claims.typ != "access" {
             return Err(AuthError::Unauthorized("not an access token".into()));
         }
-        Ok(data.claims)
+        Ok(claims)
     }
 
     pub fn verify_refresh(&self, token: &str) -> Result<RefreshClaims> {
@@ -154,11 +206,11 @@ impl Issuer {
         // expired is not accepted here. `iat`/`nbf` are intentionally not
         // validated here for the same reason as `verify_access` (auth-L1).
         v.leeway = 0;
-        let data = decode::<RefreshClaims>(token, &self.decoding, &v)?;
-        if data.claims.typ != "refresh" {
+        let claims: RefreshClaims = self.decode_rotating(token, &v)?;
+        if claims.typ != "refresh" {
             return Err(AuthError::Unauthorized("not a refresh token".into()));
         }
-        Ok(data.claims)
+        Ok(claims)
     }
 }
 
@@ -228,6 +280,78 @@ mod tests {
         assert!(
             issuer.verify_refresh(&token).is_err(),
             "refresh token expired 3s ago must be rejected with leeway=0"
+        );
+    }
+
+    // auth-H1: JWT signing-secret rotation. The first secret signs; every
+    // secret verifies (Python tiled secret_keys[0] encodes, decode_token loops).
+    const OLD: &[u8] = b"old-rotation-secret-key-thirtytwo-bytes!";
+    const NEW: &[u8] = b"new-rotation-secret-key-thirtytwo-bytes!";
+
+    #[test]
+    fn rotated_out_secret_still_verifies_and_new_signs() {
+        // A token minted before rotation, signed with the now-old secret.
+        let token_old = Issuer::new(OLD)
+            .unwrap()
+            .issue_access("p", "s", ScopeSet::default())
+            .unwrap();
+
+        // After rotation the list is [NEW, OLD]: the pre-rotation token still
+        // verifies (OLD is still present)…
+        let rotated = Issuer::with_secrets(&[NEW, OLD]).unwrap();
+        assert!(
+            rotated.verify_access(&token_old).is_ok(),
+            "a token signed by a rotated-out key must still verify until the key is dropped"
+        );
+
+        // …and a freshly issued token is signed with NEW (the first key):
+        let token_new = rotated.issue_access("p", "s", ScopeSet::default()).unwrap();
+        assert!(
+            Issuer::new(NEW).unwrap().verify_access(&token_new).is_ok(),
+            "new tokens must verify under the first (signing) key"
+        );
+        assert!(
+            Issuer::new(OLD).unwrap().verify_access(&token_new).is_err(),
+            "new tokens must NOT verify under the old key — it does not sign"
+        );
+
+        // Once OLD is dropped, the pre-rotation token stops verifying.
+        assert!(
+            Issuer::new(NEW).unwrap().verify_access(&token_old).is_err(),
+            "dropping the old key invalidates tokens it signed"
+        );
+    }
+
+    #[test]
+    fn expired_token_under_rotation_reports_expired_not_invalid() {
+        // Expired token signed by the first rotation key. The expiry must
+        // short-circuit the key loop and surface as ExpiredSignature (so the
+        // server answers "expired, refresh"), not be masked as a wrong-key miss
+        // by a later signature mismatch.
+        let issuer = Issuer::with_secrets(&[NEW, OLD])
+            .unwrap()
+            .with_ttls(Duration::seconds(-3), Duration::days(7));
+        let token = issuer.issue_access("p", "s", ScopeSet::default()).unwrap();
+        match issuer.verify_access(&token).unwrap_err() {
+            AuthError::Jwt(e) => assert!(
+                matches!(e.kind(), ErrorKind::ExpiredSignature),
+                "expired token must surface as ExpiredSignature, got {:?}",
+                e.kind()
+            ),
+            other => panic!("expected Jwt(ExpiredSignature), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn with_secrets_validates_inputs() {
+        assert!(
+            Issuer::with_secrets(&[]).is_err(),
+            "an empty secret list must be rejected"
+        );
+        let short: &[u8] = b"too-short";
+        assert!(
+            Issuer::with_secrets(&[NEW, short]).is_err(),
+            "a sub-32-byte rotation key must be rejected even if another key is valid"
         );
     }
 }
