@@ -6,9 +6,11 @@ use std::sync::Arc;
 use indexmap::IndexMap;
 use tokio::net::TcpListener;
 
-use tiled_adapters::{ArrayAdapter, MapAdapter};
+use bytes::Bytes;
+use tiled_adapters::{ArrayAdapter, CooAdapter, MapAdapter};
 use tiled_client::{AnyClient, from_uri};
 use tiled_core::adapters::AnyAdapter;
+use tiled_core::dtype::{BuiltinDType, Endianness, Kind};
 use tiled_core::queries::Query;
 
 fn build_root() -> MapAdapter {
@@ -29,6 +31,33 @@ fn build_root() -> MapAdapter {
         "subgroup".into(),
         AnyAdapter::Container(Arc::new(inner_container)),
     );
+
+    // Multi-block COO sparse array: dense shape [4,4] on a 2x2 chunk grid.
+    // block [0,0] local (1,1)=10.0 → global (1,1); block [1,1] local (0,0)=20.0
+    // → global (2,2). A full read must surface BOTH; read_block([0,0]) sees only
+    // the first. Exercises SparseClient::read() across blocks.
+    let coo = CooAdapter::from_blocks(
+        vec![4, 4],
+        vec![vec![2, 2], vec![2, 2]],
+        BuiltinDType::new(Endianness::Little, Kind::Float, 8),
+        None,
+        serde_json::json!({"kind": "coo"}),
+        vec![],
+        vec![
+            (
+                vec![0, 0],
+                vec![vec![1], vec![1]],
+                Bytes::from(10.0f64.to_le_bytes().to_vec()),
+            ),
+            (
+                vec![1, 1],
+                vec![vec![0], vec![0]],
+                Bytes::from(20.0f64.to_le_bytes().to_vec()),
+            ),
+        ],
+    )
+    .expect("build multi-block COO");
+    mapping.insert("some_sparse".into(), AnyAdapter::Sparse(Arc::new(coo)));
 
     MapAdapter::new(
         mapping,
@@ -111,6 +140,31 @@ async fn navigate_into_subgroup_and_read_metadata() {
 
     let inner_keys = sub_container.keys().await.unwrap();
     assert_eq!(inner_keys, vec!["nested_arr".to_string()]);
+}
+
+#[tokio::test]
+async fn read_full_sparse_assembles_all_blocks() {
+    let base = spawn_server(None).await;
+    let client = from_uri(&base).await.unwrap();
+    let root = client.into_container().unwrap();
+
+    let node = root.get("some_sparse").await.unwrap();
+    let sparse = node.as_sparse().expect("some_sparse is a sparse node");
+
+    let block = sparse.read().await.unwrap();
+    assert_eq!(block.shape, vec![4, 4]);
+
+    // Collect ((dim0, dim1), value) order-independently — the full read must
+    // surface the non-zeros from BOTH blocks, not just block [0,0].
+    let mut got: Vec<((i64, i64), f64)> = (0..block.data.len())
+        .map(|i| ((block.coords[0][i], block.coords[1][i]), block.data[i]))
+        .collect();
+    got.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        got,
+        vec![((1, 1), 10.0), ((2, 2), 20.0)],
+        "read() must assemble non-zeros from every block of the global frame"
+    );
 }
 
 #[tokio::test]

@@ -95,6 +95,33 @@ impl SparseClient {
         let shape = self.structure().shape.clone();
         decode_coo_arrow(bytes, shape)
     }
+
+    /// Read the **whole** sparse array as a decoded COO sparse array.
+    ///
+    /// Requests `links["full"]` (`GET /api/v1/array/full/{path}`) with
+    /// `application/vnd.apache.arrow.file`; the server assembles every block
+    /// into one global COO frame before encoding. Decodes the same
+    /// `dim0`…`dim{ndim-1}` + `data` table as [`read_block`](Self::read_block).
+    ///
+    /// Mirrors `client/sparse.py::read`, the full-read sibling of `read_block`.
+    /// Unlike `read_block` — which fetches a single chunk — this returns the
+    /// non-zeros from across all blocks, so it is the only way to see blocks
+    /// other than `[0, 0, …]` of a multi-block sparse array.
+    pub async fn read(&self) -> Result<SparseBlock> {
+        let link = self.base.require_link("full")?;
+        let url = Url::parse(link)?;
+
+        let bytes = retry(|| async {
+            self.base
+                .context
+                .get_bytes(&url, ARROW_FILE_MIME_TYPE)
+                .await
+        })
+        .await?;
+
+        let shape = self.structure().shape.clone();
+        decode_coo_arrow(bytes, shape)
+    }
 }
 
 /// Decode an Arrow IPC file containing a COO sparse table.
