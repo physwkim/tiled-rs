@@ -170,12 +170,29 @@ pub struct NodeLinks {
     pub extra: HashMap<String, String>,
 }
 
+impl NodeLinks {
+    /// True when no link is set. Used to omit the `links` key entirely for
+    /// `omit_links` responses — parity with Python, which skips the key rather
+    /// than emitting an empty object (`server/core.py:577,616`). In normal
+    /// responses `self` is always populated, so this only fires when a handler
+    /// deliberately clears links to honor `?omit_links=true`.
+    pub fn is_empty(&self) -> bool {
+        self.self_link.is_none()
+            && self.search.is_none()
+            && self.full.is_none()
+            && self.extra.is_empty()
+    }
+}
+
 /// A single resource in the API response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Resource<A = NodeAttributes> {
     pub id: String,
     pub attributes: A,
-    #[serde(default)]
+    // Omit `links` entirely when empty so an `omit_links` response drops the key
+    // (Python parity); a normal node always has `self`, so this never fires off
+    // the omit_links path.
+    #[serde(default, skip_serializing_if = "NodeLinks::is_empty")]
     pub links: NodeLinks,
 }
 

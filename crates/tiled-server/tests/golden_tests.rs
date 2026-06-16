@@ -314,6 +314,59 @@ async fn test_search_root() {
     assert!(links["self"].as_str().unwrap().contains("page[limit]"));
 }
 
+/// `?omit_links=true` on /metadata drops the per-node `links` key entirely
+/// (not an empty `{}`), matching Python `core.py:616` which only sets
+/// `d["links"]` when `not omit_links`.
+#[tokio::test]
+async fn test_metadata_omit_links() {
+    let app = build_app();
+
+    // Control: without omit_links the node carries a `links` object.
+    let (status, body) = get_json(&app, "/api/v1/metadata/some_array").await;
+    assert_eq!(status, 200);
+    assert!(body["data"]["links"].is_object());
+
+    // With omit_links=true the `links` key is absent (not `{}`).
+    let (status, body) = get_json(&app, "/api/v1/metadata/some_array?omit_links=true").await;
+    assert_eq!(status, 200);
+    assert!(
+        body["data"].get("links").is_none(),
+        "omit_links must drop the per-node links key, got: {}",
+        body["data"]
+    );
+}
+
+/// `?omit_links=true` on /search drops each entry's `links` key but leaves
+/// the envelope pagination links intact (Python `core.py:577` gates only the
+/// per-entry links; the page links come from the paginated-links builder).
+#[tokio::test]
+async fn test_search_omit_links() {
+    let app = build_app();
+    let (status, body) = get_json(
+        &app,
+        "/api/v1/search/?page[offset]=0&page[limit]=10&omit_links=true",
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    let entries = body["data"].as_array().unwrap();
+    assert_eq!(entries.len(), 2);
+    for entry in entries {
+        assert!(
+            entry.get("links").is_none(),
+            "omit_links must drop each entry's links key, got: {entry}"
+        );
+    }
+
+    // Envelope pagination links are unaffected.
+    assert!(
+        body["links"]["self"]
+            .as_str()
+            .unwrap()
+            .contains("page[offset]")
+    );
+}
+
 #[tokio::test]
 async fn test_array_block_data() {
     let app = build_app();

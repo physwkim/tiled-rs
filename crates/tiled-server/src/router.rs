@@ -307,6 +307,12 @@ pub async fn metadata(
         .get("include_data_sources")
         .map(|v| matches!(v.as_str(), "true" | "True" | "1"))
         .unwrap_or(false);
+    // ?omit_links=true drops the per-node `links` from the response (Python
+    // router.py:461 / core.py:616) — a size optimization, no data change.
+    let omit_links = params
+        .get("omit_links")
+        .map(|v| matches!(v.as_str(), "true" | "True" | "1"))
+        .unwrap_or(false);
     let select_metadata = params.get("select_metadata").map(String::as_str);
     // When a SQL catalog is wired, read directly through it: the
     // CatalogAdapter caches children eagerly to satisfy the sync trait,
@@ -329,6 +335,10 @@ pub async fn metadata(
 
     resource.attributes.metadata =
         apply_select_metadata(select_metadata, resource.attributes.metadata)?;
+
+    if omit_links {
+        resource.links = tiled_core::schemas::NodeLinks::default();
+    }
 
     Ok(Json(Response {
         data: Some(resource),
@@ -422,6 +432,11 @@ pub async fn search(
         .iter()
         .find(|(k, _)| k == "select_metadata")
         .map(|(_, v)| v.clone());
+    // ?omit_links=true drops the per-entry `links` (Python router.py:323 /
+    // core.py:577). The envelope pagination links are unaffected.
+    let omit_links = params
+        .iter()
+        .any(|(k, v)| k == "omit_links" && matches!(v.as_str(), "true" | "True" | "1"));
 
     let filter_params: Vec<(String, String)> = params
         .into_iter()
@@ -491,6 +506,12 @@ pub async fn search(
         for item in items.iter_mut() {
             item.attributes.metadata =
                 apply_select_metadata(Some(expr_str), item.attributes.metadata.take())?;
+        }
+    }
+    // Drop per-entry links when requested; the envelope pagination links remain.
+    if omit_links && let Some(ref mut items) = resp.data {
+        for item in items.iter_mut() {
+            item.links = tiled_core::schemas::NodeLinks::default();
         }
     }
     Ok(Json(resp))
