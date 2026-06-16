@@ -42,6 +42,15 @@ pub fn register_array_serializers(registry: &SerializationRegistry) {
         Box::new(serialize_array_html),
     );
 
+    // application/json: nested row-major JSON array (Python array.py:33-38,
+    // `safe_json_dump(array)`). Registered under the orjson guard in Python,
+    // which is effectively always present → register unconditionally.
+    registry.register(
+        StructureFamily::Array,
+        mime::JSON,
+        Box::new(serialize_array_json),
+    );
+
     // Sparse arrays also use octet-stream
     registry.register(
         StructureFamily::Sparse,
@@ -303,6 +312,123 @@ fn serialize_array_html(
     )))
 }
 
+/// JSON serializer for arrays (Python `array.py:33-38`, `safe_json_dump(array)`).
+///
+/// orjson serializes a numpy array to a nested, row-major JSON array whose
+/// nesting matches the shape (a 1-D array → `[v0, v1, ...]`, a 2-D array →
+/// `[[...], [...]]`, a 0-D array → the bare scalar). Floating NaN/inf become
+/// JSON `null` (orjson's float rule, mirrored by `serde_json::From<f64>`).
+///
+/// Scope: the numeric and boolean dtypes the array adapters emit (`f`/`i`/`u`/
+/// `b`). A complex/datetime/string array is a hard error rather than a silent
+/// mis-encode — Python's orjson numpy fast-path likewise rejects the dtypes it
+/// cannot represent natively.
+fn serialize_array_json(
+    data: &[u8],
+    metadata: &serde_json::Value,
+) -> Result<bytes::Bytes, crate::registry::SerializeError> {
+    let itemsize = metadata
+        .get("itemsize")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(8) as usize;
+    if itemsize == 0 {
+        return Err("itemsize must be > 0".into());
+    }
+    let kind = metadata.get("kind").and_then(|v| v.as_str()).unwrap_or("f");
+    let shape: Vec<usize> = metadata
+        .get("shape")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_u64().map(|n| n as usize))
+                .collect()
+        })
+        .unwrap_or_default();
+    let big_endian = metadata
+        .get("byteorder")
+        .and_then(|v| v.as_str())
+        .unwrap_or("<")
+        == ">";
+
+    let decode = |bytes: &[u8]| -> Result<serde_json::Value, crate::registry::SerializeError> {
+        macro_rules! le {
+            ($t:ty, $n:literal) => {{
+                let mut b: [u8; $n] = bytes.try_into().unwrap_or([0u8; $n]);
+                if big_endian {
+                    b.reverse();
+                }
+                <$t>::from_le_bytes(b)
+            }};
+        }
+        Ok(match (kind, itemsize) {
+            // `From<f64>`/`From<f32>` map NaN/inf to Value::Null (orjson rule).
+            ("f", 8) => serde_json::Value::from(le!(f64, 8)),
+            ("f", 4) => serde_json::Value::from(le!(f32, 4)),
+            ("i", 8) => serde_json::Value::from(le!(i64, 8)),
+            ("i", 4) => serde_json::Value::from(le!(i32, 4)),
+            ("i", 2) => serde_json::Value::from(le!(i16, 2)),
+            ("i", 1) => {
+                serde_json::Value::from(i8::from_le_bytes(bytes.try_into().unwrap_or([0u8; 1])))
+            }
+            ("u", 8) => serde_json::Value::from(le!(u64, 8)),
+            ("u", 4) => serde_json::Value::from(le!(u32, 4)),
+            ("u", 2) => serde_json::Value::from(le!(u16, 2)),
+            ("u", 1) => serde_json::Value::from(bytes.first().copied().unwrap_or(0)),
+            ("b", _) => serde_json::Value::from(bytes.iter().any(|&b| b != 0)),
+            _ => {
+                return Err(format!(
+                    "application/json array serializer does not support dtype {kind}{itemsize}"
+                )
+                .into());
+            }
+        })
+    };
+
+    let num_elements = data.len() / itemsize;
+    let expected: usize = shape.iter().product();
+    // `shape.iter().product()` is 1 for a 0-D array ([]), which holds exactly
+    // one element. Any other mismatch means metadata and bytes disagree.
+    if expected != num_elements {
+        return Err(format!(
+            "array shape {shape:?} ({expected} elements) does not match data length \
+             ({num_elements} elements)"
+        )
+        .into());
+    }
+
+    let mut flat = Vec::with_capacity(num_elements);
+    for i in 0..num_elements {
+        let start = i * itemsize;
+        flat.push(decode(&data[start..start + itemsize])?);
+    }
+
+    let nested = nest_array(&flat, &shape);
+    let body = serde_json::to_vec(&nested).map_err(|e| format!("json encode: {e}"))?;
+    Ok(bytes::Bytes::from(body))
+}
+
+/// Nest a flat, row-major value list into the JSON shape numpy/orjson produce:
+/// `[]` shape → the bare scalar; `[n]` → a flat array; higher rank → arrays of
+/// arrays. `shape` and `flat` are pre-validated to agree on element count.
+fn nest_array(flat: &[serde_json::Value], shape: &[usize]) -> serde_json::Value {
+    match shape {
+        [] => flat.first().cloned().unwrap_or(serde_json::Value::Null),
+        [_] => serde_json::Value::Array(flat.to_vec()),
+        [first, rest @ ..] => {
+            // Always emit exactly `first` inner arrays. `inner_len` can be 0
+            // (e.g. shape [2, 0] → `[[], []]`), so slice by an explicit index
+            // rather than `chunks(inner_len)` (which panics on a 0 stride).
+            let inner_len: usize = rest.iter().product();
+            let mut out = Vec::with_capacity(*first);
+            for i in 0..*first {
+                let chunk = &flat[i * inner_len..(i + 1) * inner_len];
+                out.push(nest_array(chunk, rest));
+            }
+            serde_json::Value::Array(out)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -426,6 +552,90 @@ mod tests {
             "must embed PNG as data URL: {html}"
         );
         assert!(html.ends_with("</body></html>"), "must close html: {html}");
+    }
+
+    fn json_array_serializer() -> std::sync::Arc<crate::registry::SerializerFn> {
+        let reg = SerializationRegistry::new();
+        register_array_serializers(&reg);
+        reg.dispatch(StructureFamily::Array, mime::JSON)
+            .expect("array application/json must be registered")
+    }
+
+    /// M1: `application/json` is registered for the array family (array.py:33-38).
+    #[test]
+    fn json_registered_for_array() {
+        let reg = SerializationRegistry::new();
+        register_array_serializers(&reg);
+        assert!(
+            reg.dispatch(StructureFamily::Array, mime::JSON).is_some(),
+            "array application/json must be registered"
+        );
+    }
+
+    /// M1: a 1-D array serializes to a flat JSON array.
+    #[test]
+    fn json_array_1d() {
+        let ser = json_array_serializer();
+        let data: Vec<u8> = [1.0f64, 2.0, 3.0]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let meta = serde_json::json!({"itemsize": 8, "kind": "f", "shape": [3]});
+        let out = ser(&data, &meta).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(parsed, serde_json::json!([1.0, 2.0, 3.0]));
+    }
+
+    /// M1: a 2-D array nests row-major, matching numpy/orjson.
+    #[test]
+    fn json_array_2d_nested_row_major() {
+        let ser = json_array_serializer();
+        let data: Vec<u8> = [1i64, 2, 3, 4]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let meta = serde_json::json!({"itemsize": 8, "kind": "i", "shape": [2, 2]});
+        let out = ser(&data, &meta).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(parsed, serde_json::json!([[1, 2], [3, 4]]));
+    }
+
+    /// M1: floating NaN/inf become JSON null (orjson float rule).
+    #[test]
+    fn json_array_nan_inf_become_null() {
+        let ser = json_array_serializer();
+        let data: Vec<u8> = [1.0f64, f64::NAN, f64::INFINITY]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let meta = serde_json::json!({"itemsize": 8, "kind": "f", "shape": [3]});
+        let out = ser(&data, &meta).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(parsed, serde_json::json!([1.0, null, null]));
+    }
+
+    /// M1: a 0-D array serializes to the bare scalar (no wrapping array).
+    #[test]
+    fn json_array_0d_is_scalar() {
+        let ser = json_array_serializer();
+        let data: Vec<u8> = 42i64.to_le_bytes().to_vec();
+        let meta = serde_json::json!({"itemsize": 8, "kind": "i", "shape": []});
+        let out = ser(&data, &meta).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(parsed, serde_json::json!(42));
+    }
+
+    /// M1: an unsupported dtype (complex) is a hard error, not a mis-encode.
+    #[test]
+    fn json_array_unsupported_dtype_errors() {
+        let ser = json_array_serializer();
+        let data: Vec<u8> = vec![0u8; 16];
+        let meta = serde_json::json!({"itemsize": 16, "kind": "c", "shape": [1]});
+        let err = ser(&data, &meta).expect_err("complex dtype must error");
+        assert!(
+            err.to_string().contains("does not support"),
+            "error must name the unsupported dtype: {err}"
+        );
     }
 
     /// Finding 5: the array CSV serializer is registered under all four media
