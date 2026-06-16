@@ -212,6 +212,16 @@ impl ScopeSet {
         Self(self.0.intersection(&other.0).copied().collect())
     }
 
+    /// Set union. Used to combine token-derived scopes with a principal's
+    /// role scopes for external OIDC sessions (Python `get_current_scopes`
+    /// returns `token_scopes | role_scopes`, `authentication.py:434`). The
+    /// result is canonicalized, so unioning in `admin` still yields `full()`.
+    pub fn union(&self, other: &Self) -> Self {
+        Self(Self::canonicalize(
+            self.0.union(&other.0).copied().collect(),
+        ))
+    }
+
     /// Subset test: every scope in `self` is also in `other`. The access
     /// policy uses it for the NO_ACCESS gate (requested scopes must be
     /// grantable) and the read-only check (untagged/public rows only for
@@ -296,6 +306,26 @@ mod tests {
         );
         // full ∩ x == x — capping by an admin set never drops a real scope.
         assert_eq!(admin.intersect(&x), x);
+    }
+
+    /// #1360: `union` combines token-derived scopes with role scopes for
+    /// external OIDC sessions, and stays canonical (unioning in `admin`
+    /// yields `full()`).
+    #[test]
+    fn union_combines_and_canonicalizes() {
+        let token = ScopeSet::from_iter([Scope::ReadMetadata, Scope::ReadData]);
+        let role = ScopeSet::from_iter([Scope::WriteData]);
+        let combined = token.union(&role);
+        assert!(combined.contains(Scope::ReadMetadata));
+        assert!(combined.contains(Scope::ReadData));
+        assert!(combined.contains(Scope::WriteData));
+
+        // admin on either side collapses to the full set.
+        let with_admin = token.union(&ScopeSet::from_iter([Scope::Admin]));
+        assert_eq!(with_admin, ScopeSet::full());
+
+        // union with empty is identity.
+        assert_eq!(token.union(&ScopeSet::new()), token);
     }
 
     /// Finding 1: the `inherit` metascope must expand to the principal's

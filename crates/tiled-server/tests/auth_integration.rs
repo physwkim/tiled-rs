@@ -770,6 +770,20 @@ async fn create_service_principal_admin_succeeds() {
 /// HS256 key pre-seeded into the cache so no JWKS network call is needed.
 /// Returns (app, auth_db, validator) so tests can mint matching tokens.
 async fn build_oidc_app() -> (axum::Router, AuthDb, Arc<tiled_auth::ExternalOidcValidator>) {
+    let (state, auth_db, validator) = build_oidc_state(std::collections::HashMap::new()).await;
+    (tiled_server::build_app(state), auth_db, validator)
+}
+
+/// Same as [`build_oidc_app`] but returns the `AppState` (so a test can call
+/// `validate_bearer` directly) and lets the caller configure the provider's
+/// `scopes_map` for the Entra scope-translation path (#1360).
+async fn build_oidc_state(
+    scopes_map: std::collections::HashMap<String, Vec<tiled_auth::Scope>>,
+) -> (
+    tiled_server::AppState,
+    AuthDb,
+    Arc<tiled_auth::ExternalOidcValidator>,
+) {
     use jsonwebtoken::Algorithm;
     use tiled_auth::{ExternalOidcValidator, OidcProvider};
 
@@ -791,6 +805,7 @@ async fn build_oidc_app() -> (axum::Router, AuthDb, Arc<tiled_auth::ExternalOidc
             audiences: vec!["tiled-test".into()],
             subject_claim: "sub".into(),
             algorithms: vec![Algorithm::HS256],
+            scopes_map,
         }])
         .unwrap(),
     );
@@ -840,7 +855,7 @@ async fn build_oidc_app() -> (axum::Router, AuthDb, Arc<tiled_auth::ExternalOidc
         webhook_config: None,
         request_timeout_secs: 30,
     };
-    (tiled_server::build_app(state), auth_db, validator)
+    (state, auth_db, validator)
 }
 
 /// Mint an HS256 OIDC token for the given subject using the test key.
@@ -867,6 +882,84 @@ fn mint_test_oidc_token(sub: &str) -> String {
         &EncodingKey::from_secret(b"oidc-test-secret"),
     )
     .unwrap()
+}
+
+/// Mint an HS256 OIDC token carrying a space-separated `scp` claim, using
+/// the same test key as [`mint_test_oidc_token`].
+fn mint_oidc_token_with_scp(sub: &str, scp: &str) -> String {
+    use chrono::Utc;
+    use jsonwebtoken::{Algorithm, EncodingKey, Header};
+
+    let now = Utc::now().timestamp();
+    let claims = serde_json::json!({
+        "iss": "https://issuer.test/",
+        "aud": "tiled-test",
+        "sub": sub,
+        "exp": now + 3600,
+        "nbf": now - 60,
+        "iat": now - 60,
+        "scp": scp,
+    });
+    let mut header = Header::new(Algorithm::HS256);
+    header.kid = Some("test-kid-1".into());
+    jsonwebtoken::encode(
+        &header,
+        &claims,
+        &EncodingKey::from_secret(b"oidc-test-secret"),
+    )
+    .unwrap()
+}
+
+/// #1360 end-to-end: an Entra-style provider (one with a `scopes_map`)
+/// translates the bearer token's `scp` claim to tiled scopes and unions them
+/// onto the principal's role scopes (Python `get_current_scopes`:
+/// `token_scopes | role_scopes`, `authentication.py:434`). A new OIDC
+/// principal gets the `"user"` role, which never grants `read:principals`;
+/// the token's `scp` maps to exactly that scope, so its presence in the
+/// resolved session proves the translation reached the auth context.
+#[tokio::test]
+async fn oidc_entra_scp_unions_into_session_scopes() {
+    let mut scopes_map = std::collections::HashMap::new();
+    scopes_map.insert(
+        "api://tiled/admin.read".to_string(),
+        vec![Scope::ReadPrincipals],
+    );
+    let (state, _auth_db, _validator) = build_oidc_state(scopes_map).await;
+
+    let token = mint_oidc_token_with_scp("entra-sub-1", "api://tiled/admin.read");
+    let ctx = tiled_server::app::validate_bearer(&state, &token)
+        .await
+        .expect("Entra OIDC token must validate");
+
+    assert!(
+        ctx.scopes.contains(Scope::ReadPrincipals),
+        "scp-mapped scope must be unioned into the session (the user role never grants it)"
+    );
+    assert!(
+        ctx.scopes.contains(Scope::ReadData),
+        "role scopes must still apply alongside the translated token scopes"
+    );
+}
+
+/// A plain OIDC provider (no `scopes_map`) ignores `scp`: the session's
+/// scopes come from the principal's role alone, so an `scp` that would map to
+/// `read:principals` under Entra confers nothing here.
+#[tokio::test]
+async fn oidc_plain_provider_ignores_scp_claim() {
+    let (state, _auth_db, _validator) = build_oidc_state(std::collections::HashMap::new()).await;
+    let token = mint_oidc_token_with_scp("plain-sub-1", "api://tiled/admin.read");
+    let ctx = tiled_server::app::validate_bearer(&state, &token)
+        .await
+        .expect("plain OIDC token must validate");
+
+    assert!(
+        !ctx.scopes.contains(Scope::ReadPrincipals),
+        "a provider without a scopes_map must not derive scopes from scp"
+    );
+    assert!(
+        ctx.scopes.contains(Scope::ReadData),
+        "role scopes still apply"
+    );
 }
 
 /// Invariant: a valid OIDC token in the approval body MUST create (or

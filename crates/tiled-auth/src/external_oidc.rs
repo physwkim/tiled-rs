@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 use crate::error::{AuthError, Result};
+use crate::scopes::{Scope, ScopeSet};
 
 /// One configured upstream IdP.
 #[derive(Debug, Clone)]
@@ -45,6 +46,19 @@ pub struct OidcProvider {
     /// matched JWK's `alg` field (RS256/ES256 fallback by key type).
     /// Never populated from the attacker-controlled token header.
     pub algorithms: Vec<Algorithm>,
+    /// Entra-style scope translation. Maps an upstream OAuth2 scope (as it
+    /// appears, space-separated, in the token's `scp` claim) to the set of
+    /// tiled scopes it grants. Mirrors Python
+    /// `EntraAuthenticator.scopes_map` (`authenticators.py:321,404-422`).
+    ///
+    /// - **Empty** (the default for a plain OIDC provider): no translation;
+    ///   the session's scopes come solely from the principal's role.
+    /// - **Non-empty** (Entra-style): the validator translates the token's
+    ///   `scp` claim into tiled scopes (each `scp` entry looked up here;
+    ///   unmapped entries are dropped). A token with **no** `scp` claim is
+    ///   granted the union of every mapped scope — Entra would not have
+    ///   issued the token had the user lacked the requested scopes.
+    pub scopes_map: HashMap<String, Vec<Scope>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -197,10 +211,16 @@ impl ExternalOidcValidator {
                 AuthError::Unauthorized(format!("token missing claim '{}'", provider.subject_claim))
             })?
             .to_string();
+        let scopes = if provider.scopes_map.is_empty() {
+            None
+        } else {
+            Some(translate_scp(&provider.scopes_map, &claims))
+        };
         Ok(ValidatedToken {
             provider: provider.name.clone(),
             sub,
             claims,
+            scopes,
         })
     }
 
@@ -257,6 +277,53 @@ pub struct ValidatedToken {
     pub provider: String,
     pub sub: String,
     pub claims: serde_json::Value,
+    /// Tiled scopes translated from the token's `scp` claim via the
+    /// provider's `scopes_map`. `None` when the provider has no `scopes_map`
+    /// (a plain OIDC provider) — the caller derives scopes from the
+    /// principal's role alone. `Some(set)` for Entra-style providers — the
+    /// caller unions these with the role scopes (Python `get_current_scopes`:
+    /// `token_scopes | role_scopes`, `authentication.py:434`).
+    pub scopes: Option<ScopeSet>,
+}
+
+/// Translate a token's `scp` claim into tiled scopes via a provider's
+/// `scopes_map`. Mirrors `EntraAuthenticator.decode_token`
+/// (`authenticators.py:404-422`):
+///
+/// - When the `scp` claim is present and non-empty, each space-separated
+///   entry is looked up in `scopes_map`; mapped tiled scopes are unioned,
+///   and an entry with no mapping is dropped (Python logs an "Unmapped Entra
+///   scope" warning and continues).
+/// - When the `scp` claim is absent or empty, **all** mapped scopes are
+///   granted (the union of every `scopes_map` value): Entra would not have
+///   issued the token if the user lacked the requested scopes.
+fn translate_scp(scopes_map: &HashMap<String, Vec<Scope>>, claims: &serde_json::Value) -> ScopeSet {
+    let scp_raw = claims.get("scp").and_then(|v| v.as_str()).unwrap_or("");
+    let mut out = ScopeSet::new();
+    if scp_raw.is_empty() {
+        for mapped in scopes_map.values() {
+            for &scope in mapped {
+                out.insert(scope);
+            }
+        }
+    } else {
+        for entry in scp_raw.split(' ').filter(|s| !s.is_empty()) {
+            match scopes_map.get(entry) {
+                Some(mapped) => {
+                    for &scope in mapped {
+                        out.insert(scope);
+                    }
+                }
+                None => {
+                    tracing::warn!(
+                        target: "tiled.auth",
+                        "unmapped Entra scope in 'scp' claim: {entry}"
+                    );
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Build the JWT `Validation` for a provider. `exp`, `iss`, `aud`, and
@@ -326,7 +393,134 @@ mod tests {
             audiences: vec!["tiled".into()],
             subject_claim: "sub".into(),
             algorithms: vec![Algorithm::HS256],
+            scopes_map: HashMap::new(),
         }
+    }
+
+    /// Build an HS256 token carrying a `kid` header (so `validate` can pick
+    /// the injected key) and an optional `scp` claim.
+    fn entra_token(secret: &[u8], kid: &str, scp: Option<&str>) -> String {
+        let now = Utc::now().timestamp();
+        let mut claims = serde_json::json!({
+            "iss": "https://issuer.test/",
+            "aud": "tiled",
+            "sub": "alice",
+            "exp": now + 3600,
+            "nbf": now - 60,
+        });
+        if let Some(s) = scp {
+            claims["scp"] = serde_json::Value::String(s.to_string());
+        }
+        let mut header = Header::new(Algorithm::HS256);
+        header.kid = Some(kid.to_string());
+        encode(&header, &claims, &EncodingKey::from_secret(secret)).unwrap()
+    }
+
+    async fn validator_with(
+        scopes_map: HashMap<String, Vec<Scope>>,
+        secret: &[u8],
+        kid: &str,
+    ) -> ExternalOidcValidator {
+        let mut provider = test_provider();
+        provider.scopes_map = scopes_map;
+        let v = ExternalOidcValidator::new(vec![provider]).unwrap();
+        v.inject_key_for_test(
+            "test",
+            kid,
+            DecodingKey::from_secret(secret),
+            Algorithm::HS256,
+        )
+        .await;
+        v
+    }
+
+    fn entra_scopes_map() -> HashMap<String, Vec<Scope>> {
+        let mut map = HashMap::new();
+        map.insert(
+            "api://app/read".to_string(),
+            vec![Scope::ReadMetadata, Scope::ReadData],
+        );
+        map.insert("api://app/write".to_string(), vec![Scope::WriteData]);
+        map
+    }
+
+    /// #1360: `translate_scp` mirrors `EntraAuthenticator.decode_token`
+    /// (`authenticators.py:404-422`) at its three boundaries: a present `scp`
+    /// grants only mapped entries (unmapped dropped); an absent OR empty `scp`
+    /// grants the union of every mapped scope.
+    #[test]
+    fn translate_scp_boundaries() {
+        let map = entra_scopes_map();
+
+        // Present scp: mapped entry grants its scopes; unmapped entry dropped.
+        let granted = translate_scp(&map, &serde_json::json!({"scp": "api://app/read bogus"}));
+        assert!(granted.contains(Scope::ReadMetadata));
+        assert!(granted.contains(Scope::ReadData));
+        assert!(
+            !granted.contains(Scope::WriteData),
+            "an ungranted/unmapped scp entry must not leak a scope"
+        );
+
+        // Absent scp: union of all mapped scopes.
+        let all = translate_scp(&map, &serde_json::json!({}));
+        assert!(all.contains(Scope::ReadMetadata));
+        assert!(all.contains(Scope::ReadData));
+        assert!(all.contains(Scope::WriteData));
+
+        // Empty scp string is treated like absent (Python: `if scp_raw:`).
+        let empty = translate_scp(&map, &serde_json::json!({"scp": ""}));
+        assert!(empty.contains(Scope::WriteData));
+    }
+
+    /// #1360: an Entra-style provider (non-empty `scopes_map`) translates the
+    /// token's `scp` claim end-to-end through `validate`.
+    #[tokio::test]
+    async fn validate_translates_entra_scp_to_tiled_scopes() {
+        let secret = b"entra-scope-translation-secret!!";
+        let v = validator_with(entra_scopes_map(), secret, "k1").await;
+        let token = entra_token(secret, "k1", Some("api://app/read api://app/unknown"));
+
+        let scopes = v
+            .validate(&token)
+            .await
+            .unwrap()
+            .scopes
+            .expect("provider with scopes_map must translate scopes");
+        assert!(scopes.contains(Scope::ReadMetadata));
+        assert!(scopes.contains(Scope::ReadData));
+        assert!(
+            !scopes.contains(Scope::WriteData),
+            "scopes not granted by scp must not appear"
+        );
+    }
+
+    /// #1360: a token with no `scp` claim is granted the union of all mapped
+    /// scopes (Entra would not have issued it without the requested grants).
+    #[tokio::test]
+    async fn validate_without_scp_grants_all_mapped_scopes() {
+        let secret = b"entra-no-scp-claim-secret-bytes!";
+        let v = validator_with(entra_scopes_map(), secret, "k1").await;
+        let token = entra_token(secret, "k1", None);
+
+        let scopes = v.validate(&token).await.unwrap().scopes.unwrap();
+        assert!(scopes.contains(Scope::ReadMetadata));
+        assert!(scopes.contains(Scope::ReadData));
+        assert!(scopes.contains(Scope::WriteData));
+    }
+
+    /// A plain OIDC provider (empty `scopes_map`) performs no translation;
+    /// `ValidatedToken.scopes` is `None` and the caller falls back to role
+    /// scopes alone — current behaviour is preserved.
+    #[tokio::test]
+    async fn validate_plain_provider_yields_no_token_scopes() {
+        let secret = b"plain-oidc-provider-secret-bytes";
+        let v = validator_with(HashMap::new(), secret, "k2").await;
+        let token = entra_token(secret, "k2", Some("api://app/read"));
+
+        assert!(
+            v.validate(&token).await.unwrap().scopes.is_none(),
+            "a provider without a scopes_map must not translate token scopes"
+        );
     }
 
     fn hs256_token(nbf_offset_secs: i64, secret: &[u8]) -> String {

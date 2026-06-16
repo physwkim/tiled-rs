@@ -394,9 +394,19 @@ pub async fn validate_bearer(state: &AppState, token: &str) -> Result<AuthContex
             .await
             .map_err(|e| format!("ensure principal: {e}"))?;
         db.touch_identity_login(identity.id).await.ok();
+        // Role scopes always apply. For an Entra-style provider (one with a
+        // `scopes_map`), the token's `scp` claim is translated to tiled scopes
+        // and unioned on top — Python `get_current_scopes` returns
+        // `token_scopes | role_scopes` (authentication.py:434). A plain OIDC
+        // provider yields `validated.scopes == None`, so role scopes stand alone.
+        let role_scopes = mint_session_scopes(&principal, state);
+        let scopes = match &validated.scopes {
+            Some(token_scopes) => token_scopes.union(&role_scopes),
+            None => role_scopes,
+        };
         return Ok(AuthContext {
             principal: Some(Arc::new(principal.clone())),
-            scopes: mint_session_scopes(&principal, state),
+            scopes,
             kind: AuthKind::Session,
         });
     }
