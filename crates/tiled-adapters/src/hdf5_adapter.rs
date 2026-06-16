@@ -111,6 +111,12 @@ impl Hdf5Adapter {
         // too.
         let dtype = dtype_from_hdf5(&ds)?;
 
+        // Pull the dataset's HDF5 attributes into the node metadata, mirroring
+        // upstream tiled's `metadata.update(get_hdf5_attrs(...))` in
+        // `HDF5ArrayAdapter.from_catalog` (hdf5.py:335). Attributes win on key
+        // collision, matching Python `dict.update`.
+        let metadata = merge_hdf5_attrs(metadata, read_hdf5_attrs(&ds));
+
         let chunks: Vec<Vec<usize>> = shape.iter().map(|d| vec![*d]).collect();
         let structure = ArrayStructure {
             data_type: DType::Builtin(dtype.clone()),
@@ -371,6 +377,106 @@ fn dtype_from_hdf5(ds: &rust_hdf5::H5Dataset) -> Result<BuiltinDType> {
     Ok(BuiltinDType::new(endianness, kind, element_size))
 }
 
+/// Read a dataset's HDF5 attributes into a JSON object, mirroring upstream
+/// tiled's `get_hdf5_attrs` (hdf5.py:70-87): `dict(node.attrs)` with bytes
+/// decoded to `str`.
+///
+/// The element type of each attribute is read from its HDF5 datatype class via
+/// [`H5Attribute::datatype`](rust_hdf5::H5Attribute::datatype) (added in
+/// rust-hdf5 0.2.20), NOT guessed from the byte width — the same reasoning that
+/// closed FINDING A-1 for the dataset dtype: a 1-byte attribute could be `u8`
+/// or `i8`, a 4-byte one `i32` or `f32`. Scalar integer / float / string
+/// attributes are converted to the matching `serde_json::Value`. Non-scalar
+/// (compound, enum, array) or otherwise unrepresentable attributes are skipped
+/// rather than guessed — omitting an attribute is safe, misreading it is not.
+///
+/// Failure to *enumerate* attributes yields an empty object; a per-attribute
+/// read failure drops that one attribute (best-effort, matching the tolerance
+/// of Python's `dict(attrs)`).
+fn read_hdf5_attrs(ds: &rust_hdf5::H5Dataset) -> serde_json::Map<String, serde_json::Value> {
+    use rust_hdf5::DatatypeMessage;
+    let mut out = serde_json::Map::new();
+    let Ok(names) = ds.attr_names() else {
+        return out;
+    };
+    for name in names {
+        let Ok(attr) = ds.attr(&name) else { continue };
+        let Ok(datatype) = attr.datatype() else {
+            continue;
+        };
+        let value: Option<serde_json::Value> = match datatype {
+            DatatypeMessage::FixedPoint {
+                signed: true, size, ..
+            } => match size {
+                1 => attr.read_numeric::<i8>().ok().map(Into::into),
+                2 => attr.read_numeric::<i16>().ok().map(Into::into),
+                4 => attr.read_numeric::<i32>().ok().map(Into::into),
+                8 => attr.read_numeric::<i64>().ok().map(Into::into),
+                _ => None,
+            },
+            DatatypeMessage::FixedPoint {
+                signed: false,
+                size,
+                ..
+            } => match size {
+                1 => attr.read_numeric::<u8>().ok().map(Into::into),
+                2 => attr.read_numeric::<u16>().ok().map(Into::into),
+                4 => attr.read_numeric::<u32>().ok().map(Into::into),
+                8 => attr.read_numeric::<u64>().ok().map(Into::into),
+                _ => None,
+            },
+            // NaN / ±inf have no JSON number representation, so `from_f64`
+            // returns `None` and the attribute is dropped rather than emitted
+            // as a misleading `null`.
+            DatatypeMessage::FloatingPoint { size, .. } => match size {
+                4 => attr
+                    .read_numeric::<f32>()
+                    .ok()
+                    .and_then(|v| serde_json::Number::from_f64(v as f64))
+                    .map(serde_json::Value::Number),
+                8 => attr
+                    .read_numeric::<f64>()
+                    .ok()
+                    .and_then(serde_json::Number::from_f64)
+                    .map(serde_json::Value::Number),
+                _ => None,
+            },
+            DatatypeMessage::FixedString { .. } | DatatypeMessage::VarLenString { .. } => {
+                attr.read_string().ok().map(serde_json::Value::String)
+            }
+            // Compound / enum / array attributes are not representable as a
+            // scalar JSON value — skip them.
+            _ => None,
+        };
+        if let Some(v) = value {
+            out.insert(name, v);
+        }
+    }
+    out
+}
+
+/// Merge HDF5 attributes into the node metadata, mirroring Python
+/// `metadata.update(attrs)`: attributes overwrite same-named keys in the base
+/// metadata. An empty attribute set leaves `metadata` untouched; non-object
+/// metadata (e.g. `null`) is replaced by the attribute object.
+fn merge_hdf5_attrs(
+    metadata: serde_json::Value,
+    attrs: serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Value {
+    if attrs.is_empty() {
+        return metadata;
+    }
+    match metadata {
+        serde_json::Value::Object(mut base) => {
+            for (k, v) in attrs {
+                base.insert(k, v);
+            }
+            serde_json::Value::Object(base)
+        }
+        _ => serde_json::Value::Object(attrs),
+    }
+}
+
 /// Read raw element bytes for a hyperslab using the dataset's KNOWN element
 /// type (from [`dtype_from_hdf5`]). Reading with the correct type — rather
 /// than guessing by byte size — is required: `read_slice::<T>` converts the
@@ -553,5 +659,86 @@ mod dtype_class {
     fn float64_dataset_reports_float_kind() {
         let (_dir, path) = write_dataset::<f64>("f64", &[1.0f64, 2.0, 3.0]);
         assert_eq!(adapter_kind(path, "f64"), Kind::Float);
+    }
+
+    /// Write an `i32` dataset carrying one attribute of each scalar class
+    /// (string / signed int / unsigned int / float) so the attribute-reading
+    /// path can be exercised end to end.
+    fn write_dataset_with_attrs(name: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("attrs.h5");
+        let file = rust_hdf5::H5File::create(&path).unwrap();
+        let ds = file.new_dataset::<i32>().shape([3]).create(name).unwrap();
+        ds.write_raw(&[10i32, 20, 30]).unwrap();
+        ds.new_attr::<rust_hdf5::types::VarLenUnicode>()
+            .shape(())
+            .create("units")
+            .unwrap()
+            .write_string("meters")
+            .unwrap();
+        ds.new_attr::<i32>()
+            .shape(())
+            .create("count")
+            .unwrap()
+            .write_numeric(&42i32)
+            .unwrap();
+        ds.new_attr::<u16>()
+            .shape(())
+            .create("flags")
+            .unwrap()
+            .write_numeric(&7u16)
+            .unwrap();
+        ds.new_attr::<f64>()
+            .shape(())
+            .create("scale")
+            .unwrap()
+            .write_numeric(&1.5f64)
+            .unwrap();
+        drop(ds);
+        drop(file);
+        (dir, path)
+    }
+
+    /// Dataset attributes are merged into the node metadata with the JSON type
+    /// dictated by each attribute's HDF5 datatype class — string → string,
+    /// signed/unsigned int → integer, float → float (parity with Python
+    /// `get_hdf5_attrs`). The integer kinds must NOT round-trip as JSON floats.
+    #[test]
+    fn dataset_attributes_are_merged_into_metadata() {
+        let (_dir, path) = write_dataset_with_attrs("img");
+        let adapter = Hdf5Adapter::from_path(path, "img", serde_json::json!({})).unwrap();
+        let meta = adapter.metadata();
+        assert_eq!(meta["units"], serde_json::json!("meters"));
+        assert_eq!(meta["count"], serde_json::json!(42));
+        assert_eq!(meta["flags"], serde_json::json!(7));
+        assert_eq!(meta["scale"], serde_json::json!(1.5));
+        assert!(meta["count"].is_i64(), "signed int attr must be a JSON int");
+        assert!(
+            meta["flags"].is_u64(),
+            "unsigned int attr must be a JSON int"
+        );
+        assert!(meta["scale"].is_f64(), "float attr must be a JSON float");
+    }
+
+    /// On a key collision the HDF5 attribute wins over the passed-in node
+    /// metadata (Python `metadata.update(get_hdf5_attrs(...))`), while
+    /// unrelated base keys survive.
+    #[test]
+    fn dataset_attributes_overwrite_base_metadata() {
+        let (_dir, path) = write_dataset_with_attrs("img");
+        let base = serde_json::json!({"units": "PLACEHOLDER", "source": "catalog"});
+        let adapter = Hdf5Adapter::from_path(path, "img", base).unwrap();
+        let meta = adapter.metadata();
+        assert_eq!(meta["units"], serde_json::json!("meters"));
+        assert_eq!(meta["source"], serde_json::json!("catalog"));
+    }
+
+    /// A dataset with no attributes leaves the passed-in metadata untouched.
+    #[test]
+    fn dataset_without_attributes_preserves_base_metadata() {
+        let (_dir, path) = write_dataset::<i64>("i64", &[1i64, 2, 3]);
+        let base = serde_json::json!({"source": "catalog"});
+        let adapter = Hdf5Adapter::from_path(path, "i64", base.clone()).unwrap();
+        assert_eq!(adapter.metadata(), &base);
     }
 }
