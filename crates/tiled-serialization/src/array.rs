@@ -494,12 +494,17 @@ fn datetime64_naive(
 /// microsecond resolution, so a `[ns]` sub-microsecond remainder is TRUNCATED
 /// (`.123456789` → `.123456`). No timezone suffix (datetime64 is naive).
 ///
-/// NaT (the `i64::MIN` sentinel) → JSON `null`. This is a deliberate, documented
-/// deviation from orjson, whose NaT handling is broken and unit-dependent (for
-/// ns/us where the sentinel lands in datetime's range it emits a garbage
-/// in-range instant, e.g. `1677-09-21T00:12:43.145224`; for s/ms it raises →
-/// HTTP 500). `null` matches the table path's `_series_to_json_safe`
-/// (NaT → None, table.py:113-139) and the numeric arms' missing→null rule.
+/// NaT (the `i64::MIN` sentinel) is NOT special-cased uniformly — we reproduce
+/// orjson's own unit-dependent NaT handling so a NaT element is byte-identical
+/// to a Python tiled server (all three behaviors verified against orjson 3.11.5):
+///   * `W`/`D`/`h`/`m`: orjson has an explicit NaT→epoch sentinel (NaT → epoch,
+///     NaT+1 → epoch+1 unit, while a merely-large value raises — i.e. a sentinel
+///     check, not arithmetic), so these emit `1970-01-01T00:00:00`.
+///   * `ns`: no NaT branch; the sentinel lands in datetime's range and renders a
+///     garbage in-range instant (`1677-09-21T00:12:43.145224`).
+///   * `Y`/`M`/`s`/`ms`/`us`: no NaT branch; the sentinel overflows the calendar
+///     or the representable range, so orjson raises → our `datetime64_naive`
+///     errors → HTTP 500.
 ///
 /// A missing/unrecognised unit is an error so the caller falls through to the
 /// unsupported-dtype path rather than emitting wrong data.
@@ -509,14 +514,19 @@ fn datetime64_to_json(
 ) -> Result<serde_json::Value, crate::registry::SerializeError> {
     use chrono::Timelike;
 
-    // numpy NaT → null (see doc: deliberate deviation from orjson).
-    if value == i64::MIN {
-        return Ok(serde_json::Value::Null);
-    }
     let unit = unit.ok_or_else(|| -> crate::registry::SerializeError {
         "datetime64 array is missing its dt_units; cannot decode".into()
     })?;
-    let dt = datetime64_naive(value, unit)?;
+    // orjson special-cases the NaT sentinel only for these four units, emitting
+    // the Unix epoch. Every other unit flows through the normal conversion: ns
+    // renders a garbage in-range instant, Y/M/s/ms/us overflow → error → 500.
+    let dt = if value == i64::MIN && matches!(unit, "W" | "D" | "h" | "m") {
+        chrono::NaiveDate::from_ymd_opt(1970, 1, 1)
+            .and_then(|d| d.and_hms_opt(0, 0, 0))
+            .expect("1970-01-01T00:00:00 is a valid datetime")
+    } else {
+        datetime64_naive(value, unit)?
+    };
 
     // orjson: omit the fractional part when the microsecond component is zero,
     // else exactly 6 digits (ns remainder truncated, matching orjson's µs cap).
@@ -799,16 +809,18 @@ mod tests {
 
     /// orjson renders numpy `datetime64` arrays as ISO-8601 strings (array.py:33-38
     /// → `safe_json_dump` → `OPT_SERIALIZE_NUMPY`); the array JSON serializer must
-    /// too, not 500. datetime64[ns]: epoch → fixed 9-digit fraction, a real
-    /// instant, and NaT (`i64::MIN`) → JSON null.
+    /// too, not 500. datetime64[ns]: epoch → no fraction (µs component zero) and a
+    /// real 2021 instant. NaT for `[ns]` is exercised separately
+    /// (`json_array_datetime64_nat_matches_orjson`) because orjson does NOT emit
+    /// null there — it renders the in-range garbage instant.
     #[test]
     fn json_array_datetime64_ns_renders_iso() {
         let ser = json_array_serializer();
-        // 0 = epoch; 1_609_459_200_000_000_000 ns = 2021-01-01T00:00:00; i64::MIN = NaT.
-        let vals: [i64; 3] = [0, 1_609_459_200_000_000_000, i64::MIN];
+        // 0 = epoch; 1_609_459_200_000_000_000 ns = 2021-01-01T00:00:00.
+        let vals: [i64; 2] = [0, 1_609_459_200_000_000_000];
         let data: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
         let meta = serde_json::json!({
-            "itemsize": 8, "kind": "M", "byteorder": "<", "dt_units": "[ns]", "shape": [3]
+            "itemsize": 8, "kind": "M", "byteorder": "<", "dt_units": "[ns]", "shape": [2]
         });
         let out = ser(&data, &meta).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
@@ -816,11 +828,41 @@ mod tests {
         // component is zero (verified against orjson 3.11.5).
         assert_eq!(parsed[0], "1970-01-01T00:00:00");
         assert_eq!(parsed[1], "2021-01-01T00:00:00");
+    }
+
+    /// NaT (`i64::MIN`) in the JSON path replicates orjson 3.11.5's verified,
+    /// unit-dependent behavior verbatim (no null deviation):
+    ///   * `W`/`D`/`h`/`m` → epoch `1970-01-01T00:00:00` (orjson's NaT sentinel);
+    ///   * `ns` → the in-range garbage instant `1677-09-21T00:12:43.145224`;
+    ///   * `Y`/`M`/`s`/`ms`/`us` → error (orjson raises → HTTP 500).
+    #[test]
+    fn json_array_datetime64_nat_matches_orjson() {
+        let ser = json_array_serializer();
+        let one = |unit: &str| -> Result<serde_json::Value, _> {
+            let data: Vec<u8> = i64::MIN.to_le_bytes().to_vec();
+            let meta = serde_json::json!({
+                "itemsize": 8, "kind": "M", "byteorder": "<", "dt_units": unit, "shape": [1]
+            });
+            ser(&data, &meta).map(|out| serde_json::from_slice::<serde_json::Value>(&out).unwrap())
+        };
+        // W/D/h/m: orjson's explicit NaT→epoch sentinel.
+        for unit in ["[W]", "[D]", "[h]", "[m]"] {
+            assert_eq!(
+                one(unit).unwrap_or_else(|e| panic!("{unit} NaT must be epoch, got err {e}")),
+                serde_json::json!(["1970-01-01T00:00:00"]),
+                "NaT[{unit}] must be epoch (orjson sentinel)"
+            );
+        }
+        // ns: no sentinel; the in-range garbage instant orjson actually emits.
         assert_eq!(
-            parsed[2],
-            serde_json::Value::Null,
-            "NaT must serialize to null"
+            one("[ns]").unwrap(),
+            serde_json::json!(["1677-09-21T00:12:43.145224"]),
+            "NaT[ns] must match orjson's in-range garbage instant"
         );
+        // Y/M/s/ms/us: orjson raises → we error (→ HTTP 500), never wrong data.
+        for unit in ["[Y]", "[M]", "[s]", "[ms]", "[us]"] {
+            one(unit).expect_err(&format!("NaT[{unit}] must error (orjson raises)"));
+        }
     }
 
     /// Fractional seconds: orjson formats datetime64 at MICROSECOND resolution,
