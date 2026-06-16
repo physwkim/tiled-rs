@@ -40,6 +40,16 @@ pub fn register_sparse_serializers(reg: &SerializationRegistry) {
         crate::table::json_table_serializer(),
     );
 
+    // text/html — render the COO frame as an HTML <table>, mirroring Python
+    // `serialize_html(to_dataframe(sparse_arr), ...)` (sparse.py:93-98), which
+    // delegates to the table HTML serializer. Reuses the table HTML serializer
+    // since the server already hands us the COO Arrow IPC table.
+    reg.register(
+        StructureFamily::Sparse,
+        "text/html",
+        crate::table::html_table_serializer(),
+    );
+
     #[cfg(feature = "csv")]
     {
         for media_type in [
@@ -157,6 +167,42 @@ mod tests {
         assert_eq!(parsed["dim0"], serde_json::json!([1, 2]));
         assert_eq!(parsed["dim1"], serde_json::json!([1, 2]));
         assert_eq!(parsed["data"], serde_json::json!([10.0, 20.0]));
+    }
+
+    /// M3: `text/html` is registered for the sparse family (Python
+    /// sparse.py:93-98), rendering the COO frame as an HTML <table>.
+    #[test]
+    fn sparse_html_registered_and_renders_coo_table() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("dim0", DataType::Int64, false),
+            Field::new("data", DataType::Float64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(Float64Array::from(vec![10.0, 20.0])),
+            ],
+        )
+        .unwrap();
+        let serializer = sparse_registry()
+            .dispatch(StructureFamily::Sparse, "text/html")
+            .expect("sparse text/html must be registered (Python sparse.py:93-98)");
+        let out = serializer(&ipc_bytes(&batch), &serde_json::Value::Null).unwrap();
+        let html = String::from_utf8(out.to_vec()).unwrap();
+        assert!(
+            html.starts_with(r#"<html><body><table border="1" class="dataframe">"#),
+            "sparse html must render an HTML table: {html}"
+        );
+        assert!(
+            html.contains("<th>dim0</th>"),
+            "dim0 header present: {html}"
+        );
+        assert!(
+            html.contains("<th>data</th>"),
+            "data header present: {html}"
+        );
+        assert!(html.contains("<td>10.0</td>"), "data cell rendered: {html}");
     }
 
     #[test]
