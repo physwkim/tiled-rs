@@ -277,6 +277,29 @@ fn ensure_supported(query: &Query) -> Result<(), UnsupportedQuery> {
     }
 }
 
+/// Recursively collect every string value from a JSON tree.
+///
+/// Parity with Python's `walk_string_values` (tiled/adapters/mapping.py:444):
+/// descends into objects and arrays, yields leaf strings, ignores numeric /
+/// boolean / null nodes.  JSON structural characters (braces, colons, …) are
+/// NOT included — this yields values only, not the serialized form.
+fn walk_string_values<'a>(v: &'a serde_json::Value, out: &mut Vec<&'a str>) {
+    match v {
+        serde_json::Value::String(s) => out.push(s.as_str()),
+        serde_json::Value::Object(map) => {
+            for val in map.values() {
+                walk_string_values(val, out);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for item in arr {
+                walk_string_values(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Match a query against a BlueskyRun's metadata. Searches keys inside
 /// `metadata.start` first (the natural place for run-level fields like
 /// `plan_name`, `sample`, …), falling back to top-level metadata.
@@ -289,7 +312,24 @@ fn matches_run_query(adapter: &AnyAdapter, query: &Query) -> bool {
             .or_else(|| meta.get(key))
     };
     match query {
-        Query::FullText(ft) => meta.to_string().contains(&ft.text),
+        Query::FullText(ft) => {
+            // Parity with Python full_text_search (mapping.py:525-551):
+            // split query on whitespace, lowercase, match if ANY query word
+            // appears in ANY string value's words (case-insensitive, word-
+            // based).  meta.to_string() was wrong: case-sensitive substring
+            // match on JSON structural characters.
+            let query_words: std::collections::HashSet<String> = ft
+                .text
+                .split_whitespace()
+                .map(|w| w.to_lowercase())
+                .collect();
+            let mut strings = Vec::new();
+            walk_string_values(meta, &mut strings);
+            strings
+                .iter()
+                .flat_map(|s| s.split_whitespace())
+                .any(|w| query_words.contains(&w.to_lowercase()))
+        }
         Query::StructureFamily(sf) => adapter.structure_family() == sf.value,
         Query::Eq(eq) => lookup(&eq.key).is_some_and(|v| v == &eq.value),
         Query::NotEq(neq) => lookup(&neq.key).is_none_or(|v| v != &neq.value),
@@ -640,5 +680,84 @@ mod tests {
             "only loaded runs may appear; orphan stop is dropped"
         );
         assert_eq!(paired[0].0, "a");
+    }
+
+    // ---- L1b: FullText must be case-insensitive and word-based ----
+
+    use super::walk_string_values;
+
+    #[test]
+    fn fulltext_word_match_case_insensitive() {
+        // Python: words are lowercased before matching; query word "scan" must
+        // hit a metadata string "Scan".
+        let a = run(json!({"start": {"plan_name": "Scan"}}));
+        let q = Query::FullText(tiled_core::queries::FullText {
+            text: "scan".into(),
+        });
+        assert!(
+            matches_run_query(&a, &q),
+            "FullText must be case-insensitive (query 'scan' should match value 'Scan')"
+        );
+    }
+
+    #[test]
+    fn fulltext_does_not_match_partial_word() {
+        // Python FullText is word-based: "can" must NOT match "scan".
+        let a = run(json!({"start": {"plan_name": "scan"}}));
+        let q = Query::FullText(tiled_core::queries::FullText { text: "can".into() });
+        assert!(
+            !matches_run_query(&a, &q),
+            "FullText must not match a partial word ('can' should not match 'scan')"
+        );
+    }
+
+    #[test]
+    fn fulltext_does_not_search_json_structure() {
+        // The old meta.to_string() included JSON keys and structural chars like
+        // '{', '"'.  FullText must search string VALUES only.
+        let a = run(json!({"start": {"plan_name": "count"}}));
+        // "plan_name" is a JSON key, not a value; searching for it must not match.
+        let q = Query::FullText(tiled_core::queries::FullText {
+            text: "plan_name".into(),
+        });
+        assert!(
+            !matches_run_query(&a, &q),
+            "FullText must not match JSON keys — only string values"
+        );
+    }
+
+    #[test]
+    fn fulltext_matches_nested_string_value() {
+        let a = run(json!({"start": {"sample": {"name": "quartz"}}}));
+        let q = Query::FullText(tiled_core::queries::FullText {
+            text: "quartz".into(),
+        });
+        assert!(matches_run_query(&a, &q));
+    }
+
+    #[test]
+    fn fulltext_no_match_returns_false() {
+        let a = run(json!({"start": {"plan_name": "scan"}}));
+        let q = Query::FullText(tiled_core::queries::FullText {
+            text: "xray".into(),
+        });
+        assert!(!matches_run_query(&a, &q));
+    }
+
+    // ---- walk_string_values ----
+
+    #[test]
+    fn walk_string_values_extracts_nested_strings() {
+        let v = json!({
+            "a": {"b": "hello", "c": ["world", 42]},
+            "d": true
+        });
+        let mut out = Vec::new();
+        walk_string_values(&v, &mut out);
+        // Order is object-key-iteration order (arbitrary in serde_json, but
+        // both "hello" and "world" must be present).
+        assert!(out.contains(&"hello"), "must find 'hello' in nested object");
+        assert!(out.contains(&"world"), "must find 'world' in nested array");
+        assert_eq!(out.len(), 2, "numeric and boolean leaves must be skipped");
     }
 }
