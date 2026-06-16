@@ -63,9 +63,14 @@ impl ContainerClient {
 
     /// Iterate the *names* of children, page by page, until the server stops
     /// returning a `next` link. Default page size is 100.
+    ///
+    /// Requests `fields=""` so the server returns only ids, not full attribute
+    /// payloads (Python `Container.__iter__`, container.py:243). Against a
+    /// Python server this is 5–10× fewer bytes; the Rust server ignores the
+    /// hint and returns full items, from which the id is still read.
     pub async fn keys(&self) -> Result<Vec<String>> {
         let mut out = Vec::new();
-        for entry in self.list_entries(None).await? {
+        for entry in self.list_entries_with_fields(None, Some("")).await? {
             out.push(entry.id);
         }
         Ok(out)
@@ -171,13 +176,35 @@ impl ContainerClient {
     }
 
     /// List the children of this container, optionally limited to `limit`
-    /// items. Returns each as a parsed `Item`.
+    /// items. Returns each as a parsed `Item` with its full attribute payload.
     pub async fn list_entries(&self, limit: Option<usize>) -> Result<Vec<Item>> {
+        // `None` fields → the server returns full items (structure_family,
+        // structure, metadata, links). Callers such as `xarray`/`composite`
+        // depend on these, so the full payload is requested here.
+        self.list_entries_with_fields(limit, None).await
+    }
+
+    /// Paginate the children, optionally projecting which fields the server
+    /// returns. `fields = Some("")` requests id-only entries (Python
+    /// `fields=""`, core.py:248 → `attributes={"ancestors": ...}`, self-link
+    /// only); `fields = None` requests full items. Used by [`keys`] to avoid
+    /// pulling full attribute payloads it discards.
+    ///
+    /// [`keys`]: Self::keys
+    async fn list_entries_with_fields(
+        &self,
+        limit: Option<usize>,
+        fields: Option<&str>,
+    ) -> Result<Vec<Item>> {
         let mut all = Vec::new();
         let mut offset = 0usize;
         let page = limit.unwrap_or(100).min(100);
+        let extra: Vec<(String, String)> = match fields {
+            Some(f) => vec![("fields".to_string(), f.to_string())],
+            None => Vec::new(),
+        };
         loop {
-            let url = self.search_url(offset, page)?;
+            let url = self.search_url_with(offset, page, &extra, false)?;
             let resp: SearchResponse = retry(|| async {
                 let r = self.base.context.get(&url).await?;
                 decode_response::<SearchResponse>(r).await
@@ -236,10 +263,6 @@ impl ContainerClient {
     pub fn sort_by(mut self, key: impl Into<String>, direction: SortDirection) -> Self {
         self.sort.push((key.into(), direction));
         self
-    }
-
-    fn search_url(&self, offset: usize, limit: usize) -> Result<Url> {
-        self.search_url_with(offset, limit, &[], false)
     }
 
     /// Build a `search` URL with `extra_filters` prepended before this client's

@@ -900,6 +900,76 @@ async fn len_sends_fields_count_projection() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// (13) ContainerClient.keys() sends the empty `fields=` projection hint and
+//      parses id-only entries (client L2). Python container.py:243 sends
+//      `fields=""` so the server returns only ids (core.py:248,476,611-620 →
+//      attributes={"ancestors": ...}, self-link only). The Rust client must
+//      send the hint AND deserialize the id-only resource shape.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn keys_sends_empty_fields_projection_and_parses_id_only_entries() {
+    use tiled_client::{ContainerClient, Context};
+
+    #[derive(Default)]
+    struct ServerState {
+        last_params: Mutex<Vec<(String, String)>>,
+    }
+    let state: Arc<ServerState> = Arc::new(ServerState::default());
+
+    // Python's `fields=""` resource: id + attributes{ancestors} + self-link
+    // only. No structure_family/structure/metadata.
+    fn id_only(name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": name,
+            "attributes": { "ancestors": [] },
+            "links": { "self": format!("http://placeholder/api/v1/metadata/{name}") }
+        })
+    }
+
+    async fn handle_search(
+        State(state): State<Arc<ServerState>>,
+        axum::extract::Query(params): axum::extract::Query<Vec<(String, String)>>,
+    ) -> impl IntoResponse {
+        *state.last_params.lock().await = params;
+        // Honor the projection by emitting id-only rows (no `next` link → one page).
+        let data = vec![id_only("alpha"), id_only("beta")];
+        Json(serde_json::json!({"data": data, "meta": {"count": 2}}))
+    }
+
+    let app = Router::new()
+        .route("/api/v1/", get(|| async { Json(about_payload()) }))
+        .route("/api/v1/search/", get(handle_search))
+        .with_state(state.clone());
+    let base = spawn(app).await;
+
+    let (ctx, _) = Context::from_uri(&base).unwrap();
+    let root_item = serde_json::from_value(serde_json::json!({
+        "id": "",
+        "attributes": { "ancestors": [], "structure_family": "container", "metadata": {} },
+        "links": {
+            "self": format!("{base}/api/v1/metadata/"),
+            "search": format!("{base}/api/v1/search/"),
+        }
+    }))
+    .unwrap();
+    let root = ContainerClient::from_item(ctx, root_item, false).unwrap();
+
+    let keys = root.keys().await.unwrap();
+    assert_eq!(
+        keys,
+        vec!["alpha".to_string(), "beta".to_string()],
+        "keys() must parse id-only entries into names"
+    );
+
+    let params = state.last_params.lock().await.clone();
+    assert!(
+        params.iter().any(|(k, v)| k == "fields" && v.is_empty()),
+        "keys() must send the empty fields= projection hint, got: {params:?}"
+    );
+}
+
 #[allow(dead_code)]
 const _: fn() = || {
     let _ = HashMap::<String, String>::new();
