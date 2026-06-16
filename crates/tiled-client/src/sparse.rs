@@ -214,6 +214,44 @@ fn col_to_f64(col: &dyn Array) -> Result<Vec<f64>> {
             .iter()
             .map(|&v| v as f64)
             .collect()),
+        // Integer `data` columns: a sparse adapter storing integer non-zeros
+        // (e.g. a count matrix) preserves its native dtype through the server's
+        // COO serializer (`dyn_ndarray_to_arrow`). Python passes the column
+        // straight to `sparse.COO`, which promotes integers to float; mirror
+        // that by casting to f64 (matches how `col_to_i64` accepts every
+        // integer width for the coordinate columns).
+        DataType::Int64 => Ok(col
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .values()
+            .iter()
+            .map(|&v| v as f64)
+            .collect()),
+        DataType::UInt64 => Ok(col
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap()
+            .values()
+            .iter()
+            .map(|&v| v as f64)
+            .collect()),
+        DataType::Int32 => Ok(col
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .values()
+            .iter()
+            .map(|&v| v as f64)
+            .collect()),
+        DataType::UInt32 => Ok(col
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .unwrap()
+            .values()
+            .iter()
+            .map(|&v| v as f64)
+            .collect()),
         other => Err(ClientError::Invalid(format!(
             "column 'data' has unsupported type {other:?}"
         ))),
@@ -224,7 +262,7 @@ fn col_to_f64(col: &dyn Array) -> Result<Vec<f64>> {
 mod tests {
     use std::sync::Arc;
 
-    use arrow::array::{Array, Float64Array, Int64Array};
+    use arrow::array::{Array, Float64Array, Int32Array, Int64Array, UInt32Array, UInt64Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::ipc::writer::FileWriter;
     use arrow::record_batch::RecordBatch;
@@ -276,6 +314,29 @@ mod tests {
         assert_eq!(block.shape, shape);
         assert_eq!(block.coords[0], dim0);
         assert_eq!(block.data, data);
+    }
+
+    /// client-M3: an integer `data` column (Int64/UInt64/Int32/UInt32) must
+    /// decode (cast to f64), not error — Python passes integer sparse data
+    /// straight to `sparse.COO`. Each integer width yields the same f64 values.
+    #[test]
+    fn col_to_f64_accepts_integer_data_columns() {
+        assert_eq!(
+            col_to_f64(&Int64Array::from(vec![1i64, 2, 3])).unwrap(),
+            vec![1.0, 2.0, 3.0]
+        );
+        assert_eq!(
+            col_to_f64(&UInt64Array::from(vec![4u64, 5])).unwrap(),
+            vec![4.0, 5.0]
+        );
+        assert_eq!(
+            col_to_f64(&Int32Array::from(vec![-6i32, 7])).unwrap(),
+            vec![-6.0, 7.0]
+        );
+        assert_eq!(
+            col_to_f64(&UInt32Array::from(vec![8u32, 9])).unwrap(),
+            vec![8.0, 9.0]
+        );
     }
 
     #[test]
