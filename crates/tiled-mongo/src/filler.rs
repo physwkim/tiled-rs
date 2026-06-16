@@ -84,7 +84,7 @@ impl Filler {
     fn get_handler(&self, resource_uid: &str) -> Result<Arc<dyn FileHandler>> {
         // Check cache first.
         {
-            let cache = self.handler_cache.lock().unwrap();
+            let cache = self.handler_cache.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(handler) = cache.get(resource_uid) {
                 return Ok(handler.clone());
             }
@@ -123,10 +123,35 @@ impl Filler {
 
         // Cache it.
         {
-            let mut cache = self.handler_cache.lock().unwrap();
+            let mut cache = self.handler_cache.lock().unwrap_or_else(|e| e.into_inner());
             cache.insert(resource_uid.to_string(), handler.clone());
         }
 
         Ok(handler)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    /// A panic while holding the handler_cache lock poisons the mutex.
+    /// `.unwrap_or_else(|e| e.into_inner())` must recover and return the inner
+    /// HashMap rather than propagating a panic on every subsequent fill call.
+    #[test]
+    fn poisoned_mutex_is_recovered_not_panicked() {
+        let m: Mutex<HashMap<String, i32>> = Mutex::new(HashMap::new());
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = m.lock().unwrap();
+            panic!("poison!");
+        });
+        assert!(m.is_poisoned());
+        // Must not panic.
+        let inner = m.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            inner.is_empty(),
+            "recovered map must be the original empty map"
+        );
     }
 }
