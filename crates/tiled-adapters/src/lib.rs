@@ -1,4 +1,5 @@
 pub mod array_adapter;
+pub mod coo_adapter;
 pub mod map_adapter;
 pub mod npy_adapter;
 pub mod ragged_adapter;
@@ -17,6 +18,7 @@ pub mod tiff_adapter;
 pub mod zarr_adapter;
 
 pub use array_adapter::ArrayAdapter;
+pub use coo_adapter::CooAdapter;
 pub use map_adapter::MapAdapter;
 pub use npy_adapter::NpyAdapter;
 pub use ragged_adapter::{RaggedAdapter, RaggedAdapterRead, RaggedData};
