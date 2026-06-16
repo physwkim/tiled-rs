@@ -10,8 +10,9 @@ use bytes::Bytes;
 use indexmap::IndexMap;
 use tower::ServiceExt;
 
-use tiled_adapters::{ArrayAdapter, MapAdapter, NpyFrameOpener, SequenceAdapter};
+use tiled_adapters::{ArrayAdapter, CooAdapter, MapAdapter, NpyFrameOpener, SequenceAdapter};
 use tiled_core::adapters::AnyAdapter;
+use tiled_core::dtype::{BuiltinDType, Endianness, Kind};
 use tiled_core::queries::Query;
 
 /// Build a demo tree matching what we'd test against.
@@ -1704,4 +1705,115 @@ async fn test_zip_max_depth_clamped_to_depth_limit() {
         names.contains(&"subgroup/nested_arr.bin".to_string()),
         "subgroup/nested_arr.bin must be present (depth 1 ≤ 5); got: {names:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Sparse (COO) read stack — end-to-end integration (H3)
+//
+// Proves the full chain `CooAdapter` -> `array_full`/`array_block` route ->
+// `build_sparse_response` (Arrow IPC encode) -> Sparse serializer dispatch.
+// A 2-D COO with shape [3, 3] and two non-zeros — (0, 1) = 5.0, (2, 0) = 7.0 —
+// must come back as an Arrow table with columns `dim0`, `dim1`, `data`.
+// ---------------------------------------------------------------------------
+
+/// Build an app whose root tree holds one sparse leaf `sparse_arr`.
+fn build_sparse_app() -> axum::Router {
+    // dim0 (rows) = [0, 2], dim1 (cols) = [1, 0], data = [5.0, 7.0]
+    let coords: Vec<Vec<i64>> = vec![vec![0, 2], vec![1, 0]];
+    let mut data_bytes = Vec::new();
+    data_bytes.extend_from_slice(&5.0f64.to_le_bytes());
+    data_bytes.extend_from_slice(&7.0f64.to_le_bytes());
+
+    let coo = CooAdapter::from_arrays(
+        coords,
+        Bytes::from(data_bytes),
+        BuiltinDType::new(Endianness::Little, Kind::Float, 8),
+        vec![3, 3],
+        None,
+        serde_json::json!({"element": "Cu"}),
+        vec![],
+    )
+    .expect("valid COO inputs");
+
+    let mut mapping = IndexMap::new();
+    mapping.insert("sparse_arr".to_string(), AnyAdapter::Sparse(Arc::new(coo)));
+    let root = MapAdapter::new(mapping, serde_json::json!({}), vec![]);
+    let root_tree: Arc<dyn tiled_core::adapters::ContainerAdapter> = Arc::new(root);
+    build_app_for_root(root_tree, 300_000_000)
+}
+
+/// Decode an Arrow IPC file body into the COO `(dim0, dim1, data)` columns.
+fn decode_coo_arrow(body: &Bytes) -> (Vec<i64>, Vec<i64>, Vec<f64>) {
+    use arrow::array::{Float64Array, Int64Array};
+    use arrow::ipc::reader::FileReader;
+    use std::io::Cursor;
+
+    let reader =
+        FileReader::try_new(Cursor::new(body.as_ref()), None).expect("body is a valid Arrow file");
+
+    let (mut dim0, mut dim1, mut data) = (Vec::new(), Vec::new(), Vec::new());
+    for batch in reader {
+        let batch = batch.expect("valid record batch");
+        let schema = batch.schema();
+        let c0 = batch
+            .column(schema.index_of("dim0").expect("dim0 column"))
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("dim0 is Int64");
+        let c1 = batch
+            .column(schema.index_of("dim1").expect("dim1 column"))
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("dim1 is Int64");
+        let cd = batch
+            .column(schema.index_of("data").expect("data column"))
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("data is Float64");
+        for i in 0..batch.num_rows() {
+            dim0.push(c0.value(i));
+            dim1.push(c1.value(i));
+            data.push(cd.value(i));
+        }
+    }
+    (dim0, dim1, data)
+}
+
+#[tokio::test]
+async fn test_sparse_array_full_returns_coo_arrow_table() {
+    let app = build_sparse_app();
+    let (status, headers, body) =
+        get_with_headers(&app, "/api/v1/array/full/sparse_arr", &[]).await;
+
+    assert_eq!(status, StatusCode::OK, "body: {body:?}");
+    let ct = headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(ct.contains("arrow"), "unexpected content-type: {ct}");
+
+    let (dim0, dim1, data) = decode_coo_arrow(&body);
+    assert_eq!(dim0, vec![0, 2], "dim0 coordinates");
+    assert_eq!(dim1, vec![1, 0], "dim1 coordinates");
+    assert_eq!(data, vec![5.0, 7.0], "data values");
+}
+
+#[tokio::test]
+async fn test_sparse_array_block_returns_coo_arrow_table() {
+    let app = build_sparse_app();
+    // Single-block COO: block 0,0 carries the whole table.
+    let (status, headers, body) =
+        get_with_headers(&app, "/api/v1/array/block/sparse_arr?block=0,0", &[]).await;
+
+    assert_eq!(status, StatusCode::OK, "body: {body:?}");
+    let ct = headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(ct.contains("arrow"), "unexpected content-type: {ct}");
+
+    let (dim0, dim1, data) = decode_coo_arrow(&body);
+    assert_eq!(dim0, vec![0, 2], "dim0 coordinates");
+    assert_eq!(dim1, vec![1, 0], "dim1 coordinates");
+    assert_eq!(data, vec![5.0, 7.0], "data values");
 }
