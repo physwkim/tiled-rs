@@ -841,6 +841,65 @@ async fn get_within_active_search_routes_through_keylookup() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// (12) ContainerClient.len() sends the `fields=count` projection hint (client
+//      L1). Python container.py:206 sends `fields=count` so the server returns
+//      only the count without materializing the item page (core.py:264 →
+//      `items = []`). The Rust server ignores the hint but still returns
+//      `meta.count`, so this is correct against both servers.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn len_sends_fields_count_projection() {
+    use tiled_client::{ContainerClient, Context};
+
+    #[derive(Default)]
+    struct ServerState {
+        last_params: Mutex<Vec<(String, String)>>,
+    }
+    let state: Arc<ServerState> = Arc::new(ServerState::default());
+
+    async fn handle_search(
+        State(state): State<Arc<ServerState>>,
+        axum::extract::Query(params): axum::extract::Query<Vec<(String, String)>>,
+    ) -> impl IntoResponse {
+        *state.last_params.lock().await = params;
+        // Mirror Python's count-only response: empty `data`, count in `meta`.
+        Json(serde_json::json!({"data": [], "meta": {"count": 42}}))
+    }
+
+    let app = Router::new()
+        .route("/api/v1/", get(|| async { Json(about_payload()) }))
+        .route("/api/v1/search/", get(handle_search))
+        .with_state(state.clone());
+    let base = spawn(app).await;
+
+    let (ctx, _) = Context::from_uri(&base).unwrap();
+    // No inline `structure.count` → len() falls through to the search endpoint.
+    let root_item = serde_json::from_value(serde_json::json!({
+        "id": "",
+        "attributes": { "ancestors": [], "structure_family": "container", "metadata": {} },
+        "links": {
+            "self": format!("{base}/api/v1/metadata/"),
+            "search": format!("{base}/api/v1/search/"),
+        }
+    }))
+    .unwrap();
+    let root = ContainerClient::from_item(ctx, root_item, false).unwrap();
+
+    let n = root.len().await.unwrap();
+    assert_eq!(
+        n, 42,
+        "len() must read meta.count from the count-only response"
+    );
+
+    let params = state.last_params.lock().await.clone();
+    assert!(
+        params.iter().any(|(k, v)| k == "fields" && v == "count"),
+        "len() must send the fields=count projection hint, got: {params:?}"
+    );
+}
+
 #[allow(dead_code)]
 const _: fn() = || {
     let _ = HashMap::<String, String>::new();

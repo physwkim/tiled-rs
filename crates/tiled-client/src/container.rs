@@ -79,8 +79,14 @@ impl ContainerClient {
         {
             return Ok(count as usize);
         }
-        // Fall back to a search with limit=0; meta.count is the total.
-        let url = self.search_url(0, 0)?;
+        // Fall back to a search with limit=0; meta.count is the total. The
+        // `fields=count` hint tells a (Python) server to skip materializing any
+        // item rows and return only the count (core.py:264 → `items = []`); the
+        // Rust server ignores the hint but still returns `meta.count`, so this
+        // is a pure-perf projection that is correct against both. Mirrors Python
+        // `Container.__len__` (container.py:206).
+        let url =
+            self.search_url_with(0, 0, &[("fields".to_string(), "count".to_string())], false)?;
         let resp: SearchResponse = retry(|| async {
             let r = self.base.context.get(&url).await?;
             decode_response::<SearchResponse>(r).await
