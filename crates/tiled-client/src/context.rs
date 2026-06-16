@@ -22,14 +22,15 @@ use crate::cache::HttpCache;
 use crate::error::{ClientError, Result};
 use crate::utils::{decode_response, default_headers, handle_error, retry};
 
-/// Cap on idle keep-alive connections retained per host. Mirrors Python
-/// tiled's `MAX_CONCURRENT_CONNECTIONS = 16` (`tiled/client/context.py:39`),
-/// which it feeds to `httpx.Limits(max_connections=16,
-/// max_keepalive_connections=16)`. reqwest's builder exposes only the
-/// keep-alive idle pool (`pool_max_idle_per_host`), not httpx's hard
-/// total-`max_connections` cap — Python enforces that hard cap with a separate
-/// application-level `threading.Semaphore`, which this transport-pool setting
-/// does not replace.
+/// Cap on concurrent connections / data fetches. Mirrors Python tiled's
+/// `MAX_CONCURRENT_CONNECTIONS = 16` (`tiled/client/context.py:39`), which it
+/// feeds to `httpx.Limits(max_connections=16, max_keepalive_connections=16)`.
+/// reqwest's builder exposes only the keep-alive idle pool
+/// (`pool_max_idle_per_host`), not httpx's hard total-`max_connections` cap.
+/// Python enforces that hard cap with a separate application-level
+/// `threading.Semaphore` (`context.py:297`); we mirror it with
+/// [`ContextInner::data_fetch_semaphore`], acquired at the same bulk-data
+/// fetch sites Python throttles.
 pub(crate) const MAX_CONCURRENT_CONNECTIONS: usize = 16;
 
 /// Connection context: HTTP client + base URL + auth state.
@@ -69,6 +70,15 @@ pub(crate) struct ContextInner {
     pub(crate) cache: Option<Arc<HttpCache>>,
     /// Optional client resolver for spec-based dispatch.
     pub(crate) resolver: Option<Arc<dyn ClientResolver>>,
+    /// Hard ceiling on concurrent bulk-data fetches, shared across every
+    /// client on this context. Mirrors Python's per-`Context`
+    /// `_concurrent_request_semaphore` (`context.py:297`): reqwest's pool
+    /// exposes no hard total-connection cap, so the ceiling is enforced here
+    /// at the three fetch sites Python wraps with `throttle()` — array
+    /// block/slice and dataframe partition (`array.py:133,181`,
+    /// `dataframe.py:122`). Metadata/search/auth requests are not throttled,
+    /// matching Python.
+    pub(crate) data_fetch_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl std::fmt::Debug for ContextInner {
@@ -210,6 +220,9 @@ impl Context {
                 refresh_lock: Mutex::new(()),
                 cache: options.cache,
                 resolver: options.resolver,
+                data_fetch_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                    MAX_CONCURRENT_CONNECTIONS,
+                )),
             }),
         };
         Ok((ctx, node_path_parts))
@@ -429,6 +442,18 @@ impl Context {
     {
         let resp = self.get(url).await?;
         decode_response::<tiled_core::schemas::Response<T>>(resp).await
+    }
+
+    /// Acquire a permit before a bulk-data fetch, capping concurrent
+    /// data-fetch GETs at `MAX_CONCURRENT_CONNECTIONS`. Mirrors Python
+    /// `Context.throttle()` (`context.py:661`): the permit is held across the
+    /// fetch (including retries) and released on drop. The semaphore is never
+    /// closed, so acquisition cannot fail.
+    pub(crate) async fn data_fetch_permit(&self) -> tokio::sync::OwnedSemaphorePermit {
+        Arc::clone(&self.inner.data_fetch_semaphore)
+            .acquire_owned()
+            .await
+            .expect("data-fetch semaphore is never closed")
     }
 
     pub async fn get_bytes(&self, url: &Url, accept: &str) -> Result<bytes::Bytes> {
@@ -842,5 +867,32 @@ mod tests {
     async fn from_uri_promotes_api_key_to_state() {
         let (ctx, _) = Context::from_uri("http://localhost:8000/?api_key=secret").unwrap();
         assert_eq!(ctx.api_key().await.as_deref(), Some("secret"));
+    }
+
+    #[tokio::test]
+    async fn data_fetch_permits_cap_at_max_connections() {
+        let (ctx, _) = Context::from_uri("http://localhost:8000").unwrap();
+        // Boundary: fresh context starts with exactly MAX_CONCURRENT_CONNECTIONS
+        // permits, the hard ceiling Python sets via `threading.Semaphore`.
+        assert_eq!(
+            ctx.inner.data_fetch_semaphore.available_permits(),
+            MAX_CONCURRENT_CONNECTIONS
+        );
+
+        // Boundary: holding all permits drains the semaphore to zero, and the
+        // next acquire would block — the cap is enforced, not advisory.
+        let mut permits = Vec::new();
+        for _ in 0..MAX_CONCURRENT_CONNECTIONS {
+            permits.push(ctx.data_fetch_permit().await);
+        }
+        assert_eq!(ctx.inner.data_fetch_semaphore.available_permits(), 0);
+        assert!(ctx.inner.data_fetch_semaphore.try_acquire().is_err());
+
+        // Boundary: dropping the held permits restores the full ceiling.
+        drop(permits);
+        assert_eq!(
+            ctx.inner.data_fetch_semaphore.available_permits(),
+            MAX_CONCURRENT_CONNECTIONS
+        );
     }
 }

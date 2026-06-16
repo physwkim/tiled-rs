@@ -86,6 +86,10 @@ impl ArrayClient {
             .join(",");
         url.query_pairs_mut().append_pair("block", &block_str);
 
+        // Cap concurrent bulk-data fetches across the whole context, mirroring
+        // Python's `with self.context.throttle()` around `_get_block`
+        // (`array.py:133`). Held across retries, released on drop.
+        let _permit = self.base.context.data_fetch_permit().await;
         let bytes = retry(|| async {
             self.base
                 .context

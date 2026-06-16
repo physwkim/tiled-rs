@@ -84,6 +84,10 @@ impl TableClient {
                 }
             }
         }
+        // Cap concurrent bulk-data fetches across the whole context, mirroring
+        // Python's `with self.context.throttle()` around `_get_partition`
+        // (`dataframe.py:122`). Held across retries, released on drop.
+        let _permit = self.base.context.data_fetch_permit().await;
         let bytes = retry(|| async {
             self.base
                 .context
