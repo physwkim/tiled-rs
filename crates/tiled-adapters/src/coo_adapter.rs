@@ -2,9 +2,15 @@
 //!
 //! Corresponds to `tiled/adapters/sparse.py:COOAdapter`.
 //!
-//! A `CooAdapter` wraps a single in-memory COO block (all-zero block indices,
-//! matching Python `COOAdapter.from_arrays` which stores
-//! `{(0, 0, ...): (coords, data)}`).
+//! A `CooAdapter` holds one or more COO blocks keyed by their N-dimensional
+//! block index, each storing *block-local* coordinates (matching Python
+//! `COOAdapter.__init__`, whose `blocks` dict is block-local). `read` assembles
+//! every block into the global coordinate frame — shifting each block's
+//! coordinates by its chunk offset `sum(chunks[d][..b[d]])` — before applying
+//! any slice; `read_block` returns one block's local coordinates.
+//! `from_arrays` builds the common single-block-at-origin case.
+
+use std::collections::BTreeMap;
 
 use bytes::Bytes;
 
@@ -16,33 +22,78 @@ use tiled_core::structures::{SparseLayout, SparseStructure, Spec, StructureFamil
 
 /// In-memory COO sparse adapter.
 ///
-/// Holds a single block (block index = all zeros). Per-dimension coordinate
-/// arrays are stored as `Vec<Vec<i64>>` and promoted to `DynNDArray` on read.
+/// Holds one or more blocks keyed by their N-dimensional block index, each
+/// storing *block-local* per-dimension coordinate arrays. `read` assembles all
+/// blocks into the global coordinate frame; `read_block` returns one block's
+/// local data.
 ///
-/// Python parity: `COOAdapter.from_arrays` / `read_block` / `read`
-/// in `tiled/adapters/sparse.py`.
+/// Python parity: `COOAdapter.__init__` (block-local `blocks` dict) /
+/// `from_arrays` / `read_block` / `read` in `tiled/adapters/sparse.py`.
 #[derive(Debug)]
 pub struct CooAdapter {
-    /// Per-dimension coordinate arrays, each of length `nnz`.
-    /// `coords[d][i]` is the index in dimension `d` for non-zero `i`.
-    /// Mirrors Python's `coords[d, :]` from the `(ndim, nnz)` coords matrix.
-    coords: Vec<Vec<i64>>,
-    /// Non-zero values, shape `[nnz]`.
-    data: DynNDArray,
+    /// Blocks keyed by their N-dim block index, ordered for deterministic
+    /// assembly. Coordinates are *block-local* (mirrors Python `self.blocks`).
+    blocks: BTreeMap<Vec<usize>, CooBlock>,
     structure: SparseStructure,
     metadata: serde_json::Value,
     specs: Vec<Spec>,
 }
 
+/// One COO block: block-local coordinates and the matching values buffer.
+#[derive(Debug, Clone)]
+struct CooBlock {
+    /// One `Vec<i64>` per dimension, each length `nnz` (block-local indices).
+    /// `coords[d][i]` is the index in dimension `d` for non-zero `i`.
+    coords: Vec<Vec<i64>>,
+    /// Raw non-zero values for this block (`nnz` elements, little-endian).
+    data: Bytes,
+}
+
+/// Validate per-dimension coord arrays against a data buffer and build a block.
+fn make_block(
+    coord_arrays: Vec<Vec<i64>>,
+    data: Bytes,
+    ndim: usize,
+    elem: usize,
+) -> Result<CooBlock> {
+    if coord_arrays.len() != ndim {
+        return Err(TiledError::Validation(format!(
+            "coord_arrays has {} entries but shape has {ndim} dimensions",
+            coord_arrays.len()
+        )));
+    }
+    // nnz is the length of the first dim's coordinate array (or 0 for a
+    // scalar/0-dim shape). All per-dim arrays must agree.
+    let nnz = coord_arrays.first().map_or(0, Vec::len);
+    for (d, c) in coord_arrays.iter().enumerate() {
+        if c.len() != nnz {
+            return Err(TiledError::Validation(format!(
+                "coord_arrays[{d}] has length {} but expected {nnz}",
+                c.len()
+            )));
+        }
+    }
+    let expected = nnz * elem;
+    if data.len() != expected {
+        return Err(TiledError::Validation(format!(
+            "data has {} bytes but expected {expected} ({nnz} elements × {elem} bytes/elem)",
+            data.len()
+        )));
+    }
+    Ok(CooBlock {
+        coords: coord_arrays,
+        data,
+    })
+}
+
 impl CooAdapter {
-    /// Build from per-dimension coordinate arrays and a flat data array.
+    /// Build a single-block adapter (block at all-zero indices) — the common
+    /// case. Mirrors Python `COOAdapter.from_arrays(coords, data, shape)`.
     ///
     /// - `coord_arrays` — one `Vec<i64>` per dimension, each length `nnz`.
     /// - `data_bytes` / `data_dtype` — raw non-zero values (`nnz` elements).
     /// - `shape` — full shape of the sparse array (one entry per dimension).
     /// - `dims` — optional dimension names.
-    ///
-    /// Mirrors Python `COOAdapter.from_arrays(coords, data, shape, dims=None)`.
     pub fn from_arrays(
         coord_arrays: Vec<Vec<i64>>,
         data_bytes: Bytes,
@@ -53,88 +104,189 @@ impl CooAdapter {
         specs: Vec<Spec>,
     ) -> Result<Self> {
         let ndim = shape.len();
-        if coord_arrays.len() != ndim {
-            return Err(TiledError::Validation(format!(
-                "coord_arrays has {} entries but shape has {} dimensions",
-                coord_arrays.len(),
-                ndim
-            )));
-        }
-
-        // nnz is the length of the first dim's coordinate array (or 0 for
-        // a scalar/0-dim shape). All per-dim arrays must agree.
-        let nnz = coord_arrays.first().map_or(0, Vec::len);
-        for (d, c) in coord_arrays.iter().enumerate() {
-            if c.len() != nnz {
-                return Err(TiledError::Validation(format!(
-                    "coord_arrays[{d}] has length {} but expected {nnz}",
-                    c.len()
-                )));
-            }
-        }
-
-        let expected_bytes = nnz * data_dtype.element_size();
-        if data_bytes.len() != expected_bytes {
-            return Err(TiledError::Validation(format!(
-                "data has {} bytes but expected {} ({nnz} elements × {} bytes/elem)",
-                data_bytes.len(),
-                expected_bytes,
-                data_dtype.element_size()
-            )));
-        }
+        let elem = data_dtype.element_size();
+        let block = make_block(coord_arrays, data_bytes, ndim, elem)?;
 
         // Single chunk covering the whole shape — matches Python's
         //   chunks = tuple((dim,) for dim in shape)
         let chunks: Vec<Vec<usize>> = shape.iter().map(|&s| vec![s]).collect();
+        let structure = Self::build_structure(shape, chunks, data_dtype, dims);
 
-        // Coordinates are stored / served as signed int64 little-endian.
-        let coord_dtype = BuiltinDType::new(Endianness::Little, Kind::Integer, 8);
-
-        let structure = SparseStructure {
-            chunks,
-            shape: shape.clone(),
-            data_type: Some(DType::Builtin(data_dtype.clone())),
-            coord_data_type: Some(coord_dtype),
-            dims,
-            resizable: Default::default(),
-            layout: SparseLayout::COO,
-        };
-        let data = DynNDArray::new(data_bytes, data_dtype, vec![nnz]);
-
+        let mut blocks = BTreeMap::new();
+        blocks.insert(vec![0usize; ndim], block);
         Ok(Self {
-            coords: coord_arrays,
-            data,
+            blocks,
             structure,
             metadata,
             specs,
         })
     }
 
-    /// Number of non-zeros.
-    fn nnz(&self) -> usize {
-        self.data.shape.first().copied().unwrap_or(0)
+    /// Build a multi-block adapter from *block-local* coordinates.
+    ///
+    /// - `chunks` is the chunk grid (`chunks[d]` lists the sizes of the chunks
+    ///   along dimension `d`, summing to `shape[d]`).
+    /// - Each `(block_index, coord_arrays, data)` gives one block whose
+    ///   coordinates are in its block-local frame.
+    ///
+    /// `read` reassembles the global frame by adding the chunk offset
+    /// `sum(chunks[d][..block[d]])` to each coordinate, mirroring Python
+    /// `COOAdapter.read` (`tiled/adapters/sparse.py:175-191`); the blocks dict
+    /// itself holds block-local coordinates (`COOAdapter.__init__`).
+    pub fn from_blocks(
+        shape: Vec<usize>,
+        chunks: Vec<Vec<usize>>,
+        data_dtype: BuiltinDType,
+        dims: Option<Vec<String>>,
+        metadata: serde_json::Value,
+        specs: Vec<Spec>,
+        blocks: Vec<(Vec<usize>, Vec<Vec<i64>>, Bytes)>,
+    ) -> Result<Self> {
+        let ndim = shape.len();
+        if chunks.len() != ndim {
+            return Err(TiledError::Validation(format!(
+                "chunks has {} dimensions but shape has {ndim}",
+                chunks.len()
+            )));
+        }
+        for (d, c) in chunks.iter().enumerate() {
+            let total: usize = c.iter().sum();
+            if total != shape[d] {
+                return Err(TiledError::Validation(format!(
+                    "chunks[{d}] sums to {total} but shape[{d}] is {}",
+                    shape[d]
+                )));
+            }
+        }
+
+        let elem = data_dtype.element_size();
+        let mut map: BTreeMap<Vec<usize>, CooBlock> = BTreeMap::new();
+        for (index, coord_arrays, data) in blocks {
+            if index.len() != ndim {
+                return Err(TiledError::Validation(format!(
+                    "block index {index:?} has {} dimensions, expected {ndim}",
+                    index.len()
+                )));
+            }
+            for (d, &bi) in index.iter().enumerate() {
+                if bi >= chunks[d].len() {
+                    return Err(TiledError::Validation(format!(
+                        "block index {bi} is out of range for dimension {d} ({} chunks)",
+                        chunks[d].len()
+                    )));
+                }
+            }
+            let block = make_block(coord_arrays, data, ndim, elem)?;
+            if map.insert(index.clone(), block).is_some() {
+                return Err(TiledError::Validation(format!(
+                    "duplicate block index {index:?}"
+                )));
+            }
+        }
+
+        let structure = Self::build_structure(shape, chunks, data_dtype, dims);
+        Ok(Self {
+            blocks: map,
+            structure,
+            metadata,
+            specs,
+        })
     }
 
-    /// Materialise per-dimension `DynNDArray` coord arrays from the stored
-    /// `Vec<Vec<i64>>` and return the full `SparseData` for the single block.
-    fn full_block_data(&self) -> SparseData {
+    /// Assemble the COO `SparseStructure` shared by both constructors.
+    fn build_structure(
+        shape: Vec<usize>,
+        chunks: Vec<Vec<usize>>,
+        data_dtype: BuiltinDType,
+        dims: Option<Vec<String>>,
+    ) -> SparseStructure {
+        // Coordinates are stored / served as signed int64 little-endian.
+        let coord_dtype = BuiltinDType::new(Endianness::Little, Kind::Integer, 8);
+        SparseStructure {
+            chunks,
+            shape,
+            data_type: Some(DType::Builtin(data_dtype)),
+            coord_data_type: Some(coord_dtype),
+            dims,
+            resizable: Default::default(),
+            layout: SparseLayout::COO,
+        }
+    }
+
+    /// Element size (bytes) of the value dtype.
+    fn elem(&self) -> usize {
+        match &self.structure.data_type {
+            Some(DType::Builtin(b)) => b.element_size(),
+            _ => 0,
+        }
+    }
+
+    /// Total number of non-zeros across all blocks.
+    fn nnz(&self) -> usize {
+        let elem = self.elem();
+        if elem == 0 {
+            return 0;
+        }
+        self.blocks.values().map(|b| b.data.len() / elem).sum()
+    }
+
+    /// Global coordinate offset of `block` per dimension:
+    /// `sum(chunks[d][..block[d]])`.
+    fn block_offsets(&self, block: &[usize]) -> Vec<i64> {
+        block
+            .iter()
+            .enumerate()
+            .map(|(d, &b)| self.structure.chunks[d][..b].iter().sum::<usize>() as i64)
+            .collect()
+    }
+
+    /// Concatenate every block into the global coordinate frame, shifting each
+    /// block's coordinates by its chunk offset. Returns `(global_coords,
+    /// data_bytes)` with one coordinate per non-zero across all blocks.
+    fn assemble_global(&self) -> (Vec<Vec<i64>>, Vec<u8>) {
+        let ndim = self.structure.shape.len();
+        let total = self.nnz();
+        let mut coords: Vec<Vec<i64>> = vec![Vec::with_capacity(total); ndim];
+        let mut data: Vec<u8> = Vec::with_capacity(total * self.elem());
+        for (index, block) in &self.blocks {
+            let offsets = self.block_offsets(index);
+            for d in 0..ndim {
+                let off = offsets[d];
+                coords[d].extend(block.coords[d].iter().map(|&c| c + off));
+            }
+            data.extend_from_slice(&block.data);
+        }
+        (coords, data)
+    }
+
+    /// Wrap per-dimension coordinate arrays and a values buffer as `SparseData`.
+    fn build_sparse_data(&self, coords: Vec<Vec<i64>>, data_bytes: &[u8]) -> SparseData {
         let coord_dtype = self
             .structure
             .coord_data_type
             .clone()
-            .expect("coord_data_type always set by from_arrays");
-        let nnz = self.nnz();
-        let coords: Vec<DynNDArray> = self
-            .coords
+            .expect("coord_data_type always set by constructors");
+        let data_dtype = match &self.structure.data_type {
+            Some(DType::Builtin(b)) => b.clone(),
+            _ => unreachable!("data_type is always a builtin dtype"),
+        };
+        let elem = data_dtype.element_size();
+        let nnz = if elem == 0 {
+            0
+        } else {
+            data_bytes.len() / elem
+        };
+        let coord_arrays: Vec<DynNDArray> = coords
             .iter()
             .map(|dim_coords| {
                 let bytes: Vec<u8> = dim_coords.iter().flat_map(|&v| v.to_le_bytes()).collect();
                 DynNDArray::new(Bytes::from(bytes), coord_dtype.clone(), vec![nnz])
             })
             .collect();
+        let data = DynNDArray::new(Bytes::copy_from_slice(data_bytes), data_dtype, vec![nnz]);
         SparseData {
-            coords,
-            data: self.data.clone(),
+            coords: coord_arrays,
+            data,
         }
     }
 }
@@ -158,15 +310,16 @@ impl SparseAdapterRead for CooAdapter {
         &self.structure
     }
 
-    /// Return the stored COO data for `block`.
+    /// Return one block's *block-local* COO data.
     ///
-    /// The adapter holds exactly one block (all-zero indices). Any other block
-    /// key is out of range. Mirrors Python `read_block`:
+    /// Mirrors Python `read_block`, which returns the block's local coordinates
+    /// (`tiled/adapters/sparse.py:169-173`):
     /// ```python
     /// coords, data = self.blocks[block]
     /// arr = sparse.COO(data=data[:], coords=coords[:], shape=shape)
     /// return arr[slice] if slice else arr
     /// ```
+    /// An unknown block index is out of range (Python raises `KeyError`).
     fn read_block<'a>(&'a self, block: &'a [usize]) -> BoxFuture<'a, Result<SparseData>> {
         Box::pin(async move {
             let ndim = self.structure.shape.len();
@@ -176,26 +329,26 @@ impl SparseAdapterRead for CooAdapter {
                     block.len()
                 )));
             }
-            if block.iter().any(|&b| b != 0) {
-                return Err(TiledError::Validation(format!(
-                    "block {:?} is out of range: this adapter has a single block at all-zero indices",
-                    block
-                )));
+            match self.blocks.get(block) {
+                Some(b) => Ok(self.build_sparse_data(b.coords.clone(), &b.data)),
+                None => Err(TiledError::Validation(format!(
+                    "block {block:?} is out of range: no such block in this sparse array"
+                ))),
             }
-            Ok(self.full_block_data())
         })
     }
 
     /// Return the COO data selected by `slice`.
     ///
-    /// A full slice returns all non-zeros unchanged. A partial slice applies
-    /// numpy *basic* indexing to the sparse array, exactly as Python
-    /// `COOAdapter.read` does `arr[slice]` (`tiled/adapters/sparse.py:175-191`):
-    /// non-zeros whose coordinates fall outside the selected region are
-    /// dropped, surviving coordinates are remapped into the sliced frame
-    /// (`(coord - start) / step`), and `Index` dimensions are removed from the
-    /// result. `NDSlice` carries only `Index`/`Slice`/`Ellipsis`, so this is
-    /// numpy basic indexing — no boolean or advanced indexing.
+    /// All blocks are first assembled into the global coordinate frame
+    /// (Python `COOAdapter.read`, `tiled/adapters/sparse.py:175-191`). A full
+    /// slice returns every non-zero unchanged. A partial slice applies numpy
+    /// *basic* indexing, exactly as Python does `arr[slice]`: non-zeros whose
+    /// coordinates fall outside the selected region are dropped, surviving
+    /// coordinates are remapped into the sliced frame (`(coord - start) /
+    /// step`), and `Index` dimensions are removed from the result. `NDSlice`
+    /// carries only `Index`/`Slice`/`Ellipsis`, so this is numpy basic indexing
+    /// — no boolean or advanced indexing.
     ///
     /// The returned [`SparseData`] holds the surviving coordinates and data;
     /// the grid shape of the sliced result is derived by the caller from the
@@ -203,8 +356,9 @@ impl SparseAdapterRead for CooAdapter {
     /// array read path pairs a slice with its computed shape.
     fn read<'a>(&'a self, slice: &'a NDSlice) -> BoxFuture<'a, Result<SparseData>> {
         Box::pin(async move {
+            let (global_coords, data_bytes) = self.assemble_global();
             if slice.is_empty() {
-                return Ok(self.full_block_data());
+                return Ok(self.build_sparse_data(global_coords, &data_bytes));
             }
 
             let ndim = self.structure.shape.len();
@@ -241,15 +395,22 @@ impl SparseAdapterRead for CooAdapter {
                 .filter(|s| matches!(s, DimSel::Slice { .. }))
                 .count();
 
+            // View the assembled non-zeros as coordinate rows (one tuple per
+            // non-zero) so the scan reads each non-zero's coordinates together
+            // instead of range-indexing parallel column arrays.
+            let total = self.nnz();
+            let elem = self.elem();
+            let rows: Vec<Vec<i64>> = (0..total)
+                .map(|i| global_coords.iter().map(|col| col[i]).collect())
+                .collect();
+
             // Scan every non-zero, keeping those selected on all axes and
             // remapping their coordinates into the sliced frame.
-            let nnz = self.nnz();
             let mut new_coords: Vec<Vec<i64>> = vec![Vec::new(); kept_dims];
             let mut kept: Vec<usize> = Vec::new();
-            'nz: for i in 0..nnz {
+            'nz: for (i, row) in rows.iter().enumerate() {
                 let mut projected: Vec<i64> = Vec::with_capacity(kept_dims);
-                for (d, sel) in sels.iter().enumerate() {
-                    let c = self.coords[d][i];
+                for (sel, &c) in sels.iter().zip(row.iter()) {
                     match sel {
                         DimSel::Index(idx) => {
                             if c != *idx {
@@ -270,34 +431,13 @@ impl SparseAdapterRead for CooAdapter {
                 kept.push(i);
             }
 
-            // Materialise filtered coordinate buffers (int64 LE) ...
-            let coord_dtype = self
-                .structure
-                .coord_data_type
-                .clone()
-                .expect("coord_data_type always set by from_arrays");
-            let new_nnz = kept.len();
-            let coords: Vec<DynNDArray> = new_coords
-                .iter()
-                .map(|dim_coords| {
-                    let bytes: Vec<u8> = dim_coords.iter().flat_map(|&v| v.to_le_bytes()).collect();
-                    DynNDArray::new(Bytes::from(bytes), coord_dtype.clone(), vec![new_nnz])
-                })
-                .collect();
-
-            // ... and the filtered data buffer (preserving element order).
-            let elem = self.data.dtype.element_size();
-            let mut data_bytes: Vec<u8> = Vec::with_capacity(new_nnz * elem);
+            // Filter the assembled data buffer to the kept non-zeros, preserving
+            // order, then wrap the remapped coordinates + data as `SparseData`.
+            let mut filtered: Vec<u8> = Vec::with_capacity(kept.len() * elem);
             for &i in &kept {
-                data_bytes.extend_from_slice(&self.data.data[i * elem..(i + 1) * elem]);
+                filtered.extend_from_slice(&data_bytes[i * elem..(i + 1) * elem]);
             }
-            let data = DynNDArray::new(
-                Bytes::from(data_bytes),
-                self.data.dtype.clone(),
-                vec![new_nnz],
-            );
-
-            Ok(SparseData { coords, data })
+            Ok(self.build_sparse_data(new_coords, &filtered))
         })
     }
 }
@@ -762,5 +902,126 @@ mod tests {
         assert_eq!(adapter.nnz(), 0);
         let sd = adapter.read_block(&[0, 0]).await.unwrap();
         assert_eq!(sd.data.shape, vec![0]);
+    }
+
+    // ------------------------------------------------------------------
+    // Multi-block COO — global-offset assembly (review M5).
+    // 4x4 grid, 2x2 chunks. Block [0,0] holds local (1,1)=10.0 -> global (1,1);
+    // block [1,1] holds local (0,0)=20.0 -> global (2,2). Coordinates stored in
+    // each block are *block-local*; `read` adds the chunk offset.
+    // ------------------------------------------------------------------
+
+    fn make_multiblock_adapter() -> CooAdapter {
+        let bytes = |v: f64| Bytes::from(v.to_le_bytes().to_vec());
+        CooAdapter::from_blocks(
+            vec![4, 4],
+            vec![vec![2, 2], vec![2, 2]],
+            f64_dtype(),
+            None,
+            serde_json::json!({}),
+            vec![],
+            vec![
+                (vec![0, 0], vec![vec![1], vec![1]], bytes(10.0)),
+                (vec![1, 1], vec![vec![0], vec![0]], bytes(20.0)),
+            ],
+        )
+        .expect("valid multi-block COO")
+    }
+
+    fn read_i64_vec(arr: &DynNDArray) -> Vec<i64> {
+        arr.data
+            .chunks_exact(8)
+            .map(|b| i64::from_le_bytes(b.try_into().unwrap()))
+            .collect()
+    }
+
+    fn read_f64_vec(arr: &DynNDArray) -> Vec<f64> {
+        arr.data
+            .chunks_exact(8)
+            .map(|b| f64::from_le_bytes(b.try_into().unwrap()))
+            .collect()
+    }
+
+    // boundary: full read assembles block-local coords into the global frame
+    #[tokio::test]
+    async fn test_multiblock_read_assembles_global_offsets() {
+        let adapter = make_multiblock_adapter();
+        assert_eq!(adapter.nnz(), 2);
+        let sd = adapter.read(&NDSlice::empty()).await.unwrap();
+        // BTreeMap order: block [0,0] then [1,1].
+        // (1,1)=10.0 then (2,2)=20.0 (local (0,0) + offset (2,2)).
+        assert_eq!(read_i64_vec(&sd.coords[0]), vec![1, 2]);
+        assert_eq!(read_i64_vec(&sd.coords[1]), vec![1, 2]);
+        assert_eq!(read_f64_vec(&sd.data), vec![10.0, 20.0]);
+    }
+
+    // boundary: read_block returns the block's *local* coordinates, not global
+    #[tokio::test]
+    async fn test_multiblock_read_block_returns_local_coords() {
+        let adapter = make_multiblock_adapter();
+        let sd = adapter.read_block(&[1, 1]).await.unwrap();
+        assert_eq!(sd.data.shape, vec![1]);
+        assert_eq!(read_i64_vec(&sd.coords[0]), vec![0]); // local row, not 2
+        assert_eq!(read_i64_vec(&sd.coords[1]), vec![0]); // local col, not 2
+        assert_eq!(read_f64_vec(&sd.data), vec![20.0]);
+    }
+
+    // boundary: a grid position with no stored block is out of range
+    #[tokio::test]
+    async fn test_multiblock_read_block_unknown_errors() {
+        let adapter = make_multiblock_adapter();
+        let err = adapter.read_block(&[0, 1]).await.unwrap_err();
+        assert!(err.to_string().contains("out of range"));
+    }
+
+    // boundary: a slice spanning blocks drops/remaps non-zeros across the grid
+    #[tokio::test]
+    async fn test_multiblock_read_slice_across_blocks() {
+        let adapter = make_multiblock_adapter();
+        // rows [2,4): drops global (1,1)=10.0, keeps (2,2)=20.0 remapped row 2->0
+        let sd = adapter
+            .read(&NDSlice::from_numpy_str("2:4").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(sd.data.shape, vec![1]);
+        assert_eq!(read_i64_vec(&sd.coords[0]), vec![0]); // row remapped 2 -> 0
+        assert_eq!(read_i64_vec(&sd.coords[1]), vec![2]); // col unchanged
+        assert_eq!(read_f64_vec(&sd.data), vec![20.0]);
+    }
+
+    // boundary: chunk grid that does not tile the shape is rejected
+    #[test]
+    fn test_from_blocks_rejects_bad_chunk_sum() {
+        let err = CooAdapter::from_blocks(
+            vec![4, 4],
+            vec![vec![2, 1], vec![2, 2]], // dim 0 chunks sum to 3, not 4
+            f64_dtype(),
+            None,
+            serde_json::json!({}),
+            vec![],
+            vec![],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("sums to"));
+    }
+
+    // boundary: a block index outside the chunk grid is rejected
+    #[test]
+    fn test_from_blocks_rejects_out_of_grid_block() {
+        let err = CooAdapter::from_blocks(
+            vec![4, 4],
+            vec![vec![2, 2], vec![2, 2]],
+            f64_dtype(),
+            None,
+            serde_json::json!({}),
+            vec![],
+            vec![(
+                vec![2, 0],
+                vec![vec![0], vec![0]],
+                Bytes::from(1.0f64.to_le_bytes().to_vec()),
+            )],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("out of range"));
     }
 }
