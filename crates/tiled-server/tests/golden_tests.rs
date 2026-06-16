@@ -1771,6 +1771,61 @@ async fn test_partition_oob_is_400() {
     assert_eq!(body["error"]["code"], 400);
 }
 
+/// Client M4: `POST /table/partition` is the wide-table fallback — the column
+/// projection arrives as a JSON-array body (the Python client switches to POST
+/// when the `?column=` list would overflow the URI, dataframe.py:122-133). The
+/// body projects exactly like repeated `?column=`; an empty body means all
+/// columns.
+#[cfg(feature = "csv-adapter")]
+#[tokio::test]
+async fn test_table_partition_post_column_projection() {
+    use std::io::Write;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.csv");
+    let mut f = std::fs::File::create(&path).unwrap();
+    writeln!(f, "x,y,z").unwrap();
+    writeln!(f, "1,10,100").unwrap();
+    writeln!(f, "2,20,200").unwrap();
+    f.flush().unwrap();
+    let app = build_table_app(path, 300_000_000);
+
+    // JSON body ["y","z"] projects to those two columns (partition 0).
+    let (status, body) = post_json(
+        &app,
+        "/api/v1/table/partition/some_table?partition=0",
+        serde_json::json!(["y", "z"]),
+    )
+    .await;
+    assert_eq!(status, 200, "POST table/partition must succeed");
+    let (cols, rows) = decode_arrow(&body);
+    assert_eq!(
+        cols,
+        vec!["y", "z"],
+        "POST JSON body projects to columns y,z"
+    );
+    assert_eq!(rows, 2);
+
+    // Empty body → all columns (defensive parity with an absent projection).
+    let (status, body) = post_json(
+        &app,
+        "/api/v1/table/partition/some_table?partition=0",
+        serde_json::json!([]),
+    )
+    .await;
+    assert_eq!(status, 200);
+    let (cols, _) = decode_arrow(&body);
+    assert_eq!(cols, vec!["x", "y", "z"], "empty body → all columns");
+
+    // OOB partition still 400 via the POST path (same core as GET).
+    let (status, _) = post_json(
+        &app,
+        "/api/v1/table/partition/some_table?partition=9",
+        serde_json::json!(["x"]),
+    )
+    .await;
+    assert_eq!(status, 400, "OOB partition via POST must still be 400");
+}
+
 // ---------------------------------------------------------------------------
 // M5: ?max_depth query parameter caps the zip-export walk depth, clamped to
 // DEPTH_LIMIT=5 — parity with Python tiled's DEPTH_LIMIT (core.py:62).

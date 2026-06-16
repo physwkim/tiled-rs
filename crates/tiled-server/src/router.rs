@@ -2060,16 +2060,8 @@ pub async fn table_partition(
     headers: HeaderMap,
     auth: crate::AuthContext,
 ) -> Result<impl IntoResponse, ServerError> {
-    auth.require(tiled_auth::Scope::ReadData)?;
     let segments = segments_from_uri(&uri, "/api/v1/table/partition/");
-    // H2: per-node policy check.
-    let _ = resolve_entry(&state, auth.clone(), &segments, tiled_auth::Scope::ReadData).await?;
-
-    let partition: usize = params
-        .iter()
-        .find(|(k, _)| k == "partition")
-        .and_then(|(_, v)| v.parse().ok())
-        .unwrap_or(0);
+    let partition = table_partition_index(&params);
 
     // Collect column projection: `column` (preferred) + `field` (deprecated alias).
     // Both may be repeated: ?column=A&column=B selects columns A and B.
@@ -2079,21 +2071,88 @@ pub async fn table_partition(
         .filter(|(k, _)| k == "column" || k == "field")
         .map(|(_, v)| v.clone())
         .collect();
-    let fields: Option<Vec<String>> = if columns.is_empty() {
-        None
-    } else {
-        Some(columns)
-    };
+    let fields: Option<Vec<String>> = (!columns.is_empty()).then_some(columns);
+    let format_param = table_partition_format(&params);
 
-    let format_param = params
+    table_partition_core(
+        &state,
+        &auth,
+        &segments,
+        partition,
+        fields,
+        format_param,
+        &headers,
+    )
+    .await
+}
+
+/// `POST /api/v1/table/partition/{path}` — the wide-table fallback. When a
+/// column projection would overflow the GET URI, the Python client moves the
+/// columns into a JSON-array body (`dataframe.py:122-133`) and the server reads
+/// them from there instead of repeated `column=` params (parity with
+/// `post_table_partition`, router.py:1115). `partition`/`format` stay query
+/// params. An absent or empty body means "all columns".
+pub async fn post_table_partition(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+    Query(params): Query<Vec<(String, String)>>,
+    headers: HeaderMap,
+    auth: crate::AuthContext,
+    columns: Option<Json<Vec<String>>>,
+) -> Result<impl IntoResponse, ServerError> {
+    let segments = segments_from_uri(&uri, "/api/v1/table/partition/");
+    let partition = table_partition_index(&params);
+    let format_param = table_partition_format(&params);
+    let fields = columns.map(|Json(c)| c).filter(|c| !c.is_empty());
+
+    table_partition_core(
+        &state,
+        &auth,
+        &segments,
+        partition,
+        fields,
+        format_param,
+        &headers,
+    )
+    .await
+}
+
+fn table_partition_index(params: &[(String, String)]) -> usize {
+    params
+        .iter()
+        .find(|(k, _)| k == "partition")
+        .and_then(|(_, v)| v.parse().ok())
+        .unwrap_or(0)
+}
+
+fn table_partition_format(params: &[(String, String)]) -> Option<String> {
+    params
         .iter()
         .find(|(k, _)| k == "format")
-        .map(|(_, v)| v.clone());
+        .map(|(_, v)| v.clone())
+}
+
+/// Shared read+respond core for the GET and POST `table/partition` handlers.
+/// The two differ only in where the column projection comes from (repeated
+/// query params vs a JSON body); auth, the per-node policy check, the tree
+/// walk, the bounds check, and response negotiation are identical.
+async fn table_partition_core(
+    state: &AppState,
+    auth: &crate::AuthContext,
+    segments: &[String],
+    partition: usize,
+    fields: Option<Vec<String>>,
+    format_param: Option<String>,
+    headers: &HeaderMap,
+) -> Result<axum::response::Response, ServerError> {
+    auth.require(tiled_auth::Scope::ReadData)?;
+    // H2: per-node policy check.
+    let _ = resolve_entry(state, auth.clone(), segments, tiled_auth::Scope::ReadData).await?;
 
     // The async tree walk resolves each hop on the executor and hands back an
     // owned `Arc` leaf; the partition read future offloads its own blocking and
     // is awaited on the executor; the Arrow IPC encode is offloaded on its own.
-    let adapter = core::walk_tree(state.root_tree.as_ref(), &segments).await?;
+    let adapter = core::walk_tree(state.root_tree.as_ref(), segments).await?;
     let table_adapter: Arc<dyn tiled_core::adapters::TableAdapterRead> =
         adapter.as_table_arc().ok_or_else(|| {
             ServerError::WrongType(format!("'{}' is not a table", segments.join("/")))
@@ -2111,7 +2170,7 @@ pub async fn table_partition(
         .await
         .map_err(ServerError::from)?;
 
-    build_table_response(table, format_param.as_deref(), &headers, &state).await
+    build_table_response(table, format_param.as_deref(), headers, state).await
 }
 
 // ---------------------------------------------------------------------------

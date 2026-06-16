@@ -503,6 +503,29 @@ impl Context {
         Ok(resp)
     }
 
+    /// POST a JSON body and return the raw response bytes, with an explicit
+    /// `Accept`. Used by the wide-table read fallback (`dataframe.py:122-133`):
+    /// when a column projection would overflow the GET URL, the columns move
+    /// into a JSON body and the data still comes back as Arrow IPC bytes. This
+    /// is a read, so it neither consults nor invalidates the response cache.
+    pub async fn post_bytes(
+        &self,
+        url: &Url,
+        accept: &str,
+        body: &serde_json::Value,
+    ) -> Result<bytes::Bytes> {
+        let req = self
+            .request(Method::POST, url)
+            .await?
+            .header(reqwest::header::ACCEPT, accept)
+            .json(body);
+        let req = self.add_csrf(req).await;
+        let resp = self.send_with_auth(req).await?;
+        self.maybe_capture_csrf(&resp).await;
+        let resp = handle_error(resp).await?;
+        Ok(resp.bytes().await?)
+    }
+
     pub async fn patch_json(&self, url: &Url, body: &serde_json::Value) -> Result<Response> {
         let req = self.request(Method::PATCH, url).await?.json(body);
         let req = self.add_csrf(req).await;

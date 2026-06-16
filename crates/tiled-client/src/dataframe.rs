@@ -74,27 +74,66 @@ impl TableClient {
         columns: Option<&[&str]>,
     ) -> Result<TablePartition> {
         let link = self.base.require_link("partition")?;
-        let mut url = Url::parse(link)?;
-        {
-            let mut q = url.query_pairs_mut();
-            q.append_pair("partition", &partition.to_string());
-            if let Some(cols) = columns {
-                for col in cols {
-                    q.append_pair("column", col);
-                }
-            }
-        }
+
+        // Mirror Python `_get_partition` (`dataframe.py:117-149`): estimate the
+        // GET URL length and, if the column projection would overflow
+        // `URL_CHARACTER_LIMIT`, move the columns into a POST JSON body instead
+        // of repeated `column=` query params. A wide table (hundreds of
+        // columns) otherwise blows past server URI limits → HTTP 414.
+        const URL_CHARACTER_LIMIT: usize = 2_000; // base.py BaseClient.URL_CHARACTER_LIMIT
+        const EXTRA_CHARS_PER_ITEM: usize = "&column=".len(); // dataframe.py:26
+        let projected_len = link.len()
+            + columns
+                .map(|cols| {
+                    cols.iter()
+                        .map(|c| EXTRA_CHARS_PER_ITEM + c.len())
+                        .sum::<usize>()
+                })
+                .unwrap_or(0);
+
         // Cap concurrent bulk-data fetches across the whole context, mirroring
         // Python's `with self.context.throttle()` around `_get_partition`
         // (`dataframe.py:122`). Held across retries, released on drop.
         let _permit = self.base.context.data_fetch_permit().await;
-        let bytes = retry(|| async {
-            self.base
-                .context
-                .get_bytes(&url, ARROW_FILE_MIME_TYPE)
-                .await
-        })
-        .await?;
+        let bytes = if projected_len > URL_CHARACTER_LIMIT {
+            // POST: `partition` stays a query param; the columns become the JSON
+            // body (`json=columns`, dataframe.py:130).
+            let mut url = Url::parse(link)?;
+            url.query_pairs_mut()
+                .append_pair("partition", &partition.to_string());
+            let body = serde_json::Value::Array(
+                columns
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(|c| serde_json::Value::String((*c).to_string()))
+                    .collect(),
+            );
+            retry(|| async {
+                self.base
+                    .context
+                    .post_bytes(&url, ARROW_FILE_MIME_TYPE, &body)
+                    .await
+            })
+            .await?
+        } else {
+            let mut url = Url::parse(link)?;
+            {
+                let mut q = url.query_pairs_mut();
+                q.append_pair("partition", &partition.to_string());
+                if let Some(cols) = columns {
+                    for col in cols {
+                        q.append_pair("column", col);
+                    }
+                }
+            }
+            retry(|| async {
+                self.base
+                    .context
+                    .get_bytes(&url, ARROW_FILE_MIME_TYPE)
+                    .await
+            })
+            .await?
+        };
 
         let cursor = Cursor::new(bytes.to_vec());
         let reader = FileReader::try_new(cursor, None)?;

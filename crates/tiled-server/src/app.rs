@@ -166,7 +166,7 @@ pub fn build_app(state: AppState) -> Router {
         .route("/api/v1/container/full", post(router::container_full_post))
         .route(
             "/api/v1/table/partition/{*path}",
-            get(router::table_partition),
+            get(router::table_partition).post(router::post_table_partition),
         )
         .route("/api/v1/table/full/{*path}", get(router::table_full))
         .route("/api/v1/table/full", post(router::table_full_post))
