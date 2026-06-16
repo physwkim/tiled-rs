@@ -225,6 +225,13 @@ pub fn resolve_media_type(
     family: StructureFamily,
     registry: &SerializationRegistry,
 ) -> Option<String> {
+    // An absent/blank Accept header expresses no preference — serve the family
+    // default. Python substitutes the family default for a missing Accept
+    // before negotiating (`request.headers.get("Accept", default_media_type)`,
+    // core.py:387), so a no-Accept request resolves to the default, never 406.
+    if accept.trim().is_empty() {
+        return default_media_type(family);
+    }
     let available = registry.media_types(family);
     for part in accept.split(',') {
         let part_trimmed = part.trim();
@@ -260,7 +267,11 @@ pub fn resolve_media_type(
             return Some(media_type.to_string());
         }
     }
-    default_media_type(family)
+    // Every concrete media type the client listed is unserviceable for this
+    // family. Python raises `UnsupportedMediaTypes` → HTTP 406 (core.py:413-419);
+    // return `None` so the caller does the same, rather than silently serving
+    // the family default under a Content-Type the client never asked for.
+    None
 }
 
 pub(crate) fn default_media_type(family: StructureFamily) -> Option<String> {
@@ -369,16 +380,18 @@ mod tests {
 
     /// `image/*` with no registered image/png serializer must NOT invent the
     /// format: it falls through to the next Accept entry (mirroring Python's
-    /// inner `for…else: continue`), and to the array default when alone.
+    /// inner `for…else: continue`), and — when `image/*` is the ONLY requested
+    /// type — yields `None` so the caller raises HTTP 406. Python maps
+    /// `image/*` → `image/png`, finds no serializer, and raises
+    /// `UnsupportedMediaTypes` (core.py:397-419); it does NOT fall back to the
+    /// octet-stream default.
     #[test]
     fn image_wildcard_falls_through_when_png_unregistered() {
         let reg = array_registry(); // octet-stream + CSV, but no image/png
-        // `image/*` alone → array default (octet-stream), not a bogus image/png.
+        // `image/*` alone, no png serializer → None (Python 406), not a silent
+        // octet-stream default the client never asked for.
         let only = resolve_media_type("image/*", StructureFamily::Array, &reg);
-        assert_eq!(
-            only.as_deref(),
-            Some(tiled_core::media_type::mime::OCTET_STREAM)
-        );
+        assert_eq!(only, None);
         // `image/*, application/octet-stream` → the second, serviceable entry
         // wins (faithful Accept-list fallback, not a short-circuit on image/*).
         let listed = resolve_media_type(
@@ -389,6 +402,36 @@ mod tests {
         assert_eq!(
             listed.as_deref(),
             Some(tiled_core::media_type::mime::OCTET_STREAM)
+        );
+    }
+
+    /// S6/H1: a concrete Accept the family cannot serve must resolve to `None`
+    /// (caller → HTTP 406), never the family default. A blank/absent Accept,
+    /// by contrast, expresses no preference and resolves to the family default.
+    #[test]
+    fn unsupported_concrete_accept_returns_none_not_default() {
+        let reg = array_registry(); // octet-stream + CSV
+        // Concrete unsupported type → None (Python UnsupportedMediaTypes/406).
+        assert_eq!(
+            resolve_media_type("text/xml", StructureFamily::Array, &reg),
+            None,
+            "an unsupported concrete Accept must 406, not serve octet-stream",
+        );
+        // Empty/absent Accept → family default (no preference).
+        assert_eq!(
+            resolve_media_type("", StructureFamily::Array, &reg).as_deref(),
+            Some(tiled_core::media_type::mime::OCTET_STREAM),
+            "a missing Accept must resolve to the family default",
+        );
+        // Table family: unsupported concrete → None; empty → Arrow default.
+        let treg = crate::default_registry();
+        assert_eq!(
+            resolve_media_type("text/xml", StructureFamily::Table, &treg),
+            None,
+        );
+        assert_eq!(
+            resolve_media_type("", StructureFamily::Table, &treg).as_deref(),
+            Some(tiled_core::media_type::mime::ARROW_FILE),
         );
     }
 

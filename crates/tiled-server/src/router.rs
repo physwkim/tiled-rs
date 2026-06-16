@@ -566,11 +566,12 @@ async fn build_array_response(
         &state.serialization_registry,
     )
     .ok_or_else(|| {
-        // `None` here means an explicit `?format=` was given but resolves to
-        // nothing serviceable for this family (Python format-priority error).
+        // `None` means the requested representation — an explicit `?format=` or
+        // a concrete `Accept` header — resolves to nothing this family can
+        // serve. Python raises UnsupportedMediaTypes → HTTP 406.
         unsupported_media_type(
             family,
-            format_param.unwrap_or_default(),
+            format_param.unwrap_or(accept),
             &state.serialization_registry,
         )
     })?;
@@ -637,11 +638,12 @@ async fn build_table_response(
         &state.serialization_registry,
     )
     .ok_or_else(|| {
-        // Explicit `?format=` that resolves to nothing this family serves →
-        // Python format-priority error. Bail before the (expensive) IPC encode.
+        // `None` — an explicit `?format=` or a concrete `Accept` that resolves
+        // to nothing this family serves (Python UnsupportedMediaTypes → 406).
+        // Bail before the (expensive) IPC encode.
         unsupported_media_type(
             family,
-            format_param.unwrap_or_default(),
+            format_param.unwrap_or(accept),
             &state.serialization_registry,
         )
     })?;
@@ -786,7 +788,7 @@ async fn build_sparse_response(
     .ok_or_else(|| {
         unsupported_media_type(
             family,
-            format_param.unwrap_or_default(),
+            format_param.unwrap_or(accept),
             &state.serialization_registry,
         )
     })?;

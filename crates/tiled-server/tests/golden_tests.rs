@@ -1043,6 +1043,44 @@ async fn array_export_unsupported_format_returns_406_not_raw_bytes() {
     assert_eq!(json["error"]["code"], 406);
 }
 
+/// S6/H1 (Accept-header case of the same family): a concrete `Accept` the array
+/// family cannot serve must return HTTP 406 — NOT 200 with the octet-stream
+/// default served under the client's unwanted Content-Type. Mirrors Python's
+/// `UnsupportedMediaTypes` → 406 (core.py:413-419). A *missing* Accept, by
+/// contrast, expresses no preference and still resolves to the default (200).
+#[tokio::test]
+async fn array_unsupported_accept_header_returns_406() {
+    let app = build_app();
+
+    // Concrete, unserviceable Accept → 406 (not a silent octet-stream default).
+    let (status, _headers, body) = get_with_headers(
+        &app,
+        "/api/v1/array/full/some_array",
+        &[("accept", "text/xml")],
+    )
+    .await;
+    assert_eq!(
+        status, 406,
+        "an unsupported concrete Accept must be 406, not 200-with-octet-stream"
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&body).expect("406 body must be a JSON error, not raw array bytes");
+    assert_eq!(json["error"]["code"], 406);
+
+    // No Accept header → no preference → family default (octet-stream), 200.
+    let (status, headers, _body) =
+        get_with_headers(&app, "/api/v1/array/full/some_array", &[]).await;
+    assert_eq!(status, 200, "a missing Accept must still serve the default");
+    let content_type = headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        content_type.starts_with("application/octet-stream"),
+        "missing Accept must default to octet-stream; got {content_type}"
+    );
+}
+
 /// Finding 4: a >2-D array exported as CSV must return HTTP 406
 /// (UnsupportedShape, mirroring Python serialize_csv array.py:42-43), not 200
 /// with a silently-flattened single-column CSV.
