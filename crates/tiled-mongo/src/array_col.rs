@@ -365,7 +365,7 @@ impl ArrayAdapterRead for ArrayColumnAdapter {
         &self.structure
     }
 
-    fn read<'a>(&'a self, _slice: &'a NDSlice) -> BoxFuture<'a, Result<DynNDArray>> {
+    fn read<'a>(&'a self, slice: &'a NDSlice) -> BoxFuture<'a, Result<DynNDArray>> {
         Box::pin(async move {
             // Move a clone of self onto the blocking thread pool so the
             // synchronous MongoDB queries don't pin an async worker thread.
@@ -386,14 +386,18 @@ impl ArrayAdapterRead for ArrayColumnAdapter {
                 .await
                 .map_err(|e| TiledError::Internal(format!("blocking read: {e}")))??;
 
-            Ok(DynNDArray::new(bytes::Bytes::from(raw), dtype, shape))
+            // Sub-slice the assembled column. Every other array adapter applies
+            // the requested NDSlice here (sequence_adapter.rs:211,
+            // zarr_adapter.rs:130, tiff_adapter.rs:147); dropping it made
+            // `?slice=` silently return the full array on Mongo-backed nodes.
+            DynNDArray::new(bytes::Bytes::from(raw), dtype, shape).apply_slice(slice)
         })
     }
 
     fn read_block<'a>(
         &'a self,
         block: &'a [usize],
-        _slice: &'a NDSlice,
+        slice: &'a NDSlice,
     ) -> BoxFuture<'a, Result<DynNDArray>> {
         Box::pin(async move {
             if block.len() != self.shape.len() {
@@ -443,7 +447,9 @@ impl ArrayAdapterRead for ArrayColumnAdapter {
                 .await
                 .map_err(|e| TiledError::Internal(format!("blocking read_block: {e}")))??;
 
-            Ok(DynNDArray::new(bytes::Bytes::from(raw), dtype, block_shape))
+            // Sub-slice within the block, block-relative — same contract as
+            // sequence_adapter.rs:276. Previously the slice was dropped.
+            DynNDArray::new(bytes::Bytes::from(raw), dtype, block_shape).apply_slice(slice)
         })
     }
 }
@@ -595,5 +601,40 @@ mod tests {
         assert_eq!(guess_dtype("boolean").itemsize, 1);
         assert_eq!(guess_dtype("string").itemsize, 40);
         assert_eq!(guess_dtype("array").itemsize, 8);
+    }
+
+    /// Regression: `read`/`read_block` must apply the requested `NDSlice` to the
+    /// assembled column — every other array adapter does, and dropping it made
+    /// `?slice=` silently return the full array on Mongo-backed nodes. This
+    /// exercises the exact post-fetch composition `read` performs (a column
+    /// assembled by `scatter_bson_to_bytes`, wrapped as a `DynNDArray`, then
+    /// sub-sliced). The Mongo fetch half is not reachable in unit tests, so the
+    /// end-to-end `read()` path needs a live-Mongo integration harness the crate
+    /// does not have; this guards the assembled-column↔slice contract.
+    #[test]
+    fn assembled_column_apply_slice_selects_rows() {
+        let dtype = float_dtype();
+        // Five events (seq 1..=5) → values 10,20,30,40,50.
+        let pairs = vec![
+            (1i64, Bson::Double(10.0)),
+            (2, Bson::Double(20.0)),
+            (3, Bson::Double(30.0)),
+            (4, Bson::Double(40.0)),
+            (5, Bson::Double(50.0)),
+        ];
+        let bytes = ArrayColumnAdapter::scatter_bson_to_bytes(pairs, 0, 5, &dtype);
+        let full = DynNDArray::new(bytes::Bytes::from(bytes), dtype, vec![5]);
+
+        // A `1:4` row slice must select events 2,3,4 and report shape [3].
+        let sliced = full
+            .apply_slice(&NDSlice::from_numpy_str("1:4").unwrap())
+            .unwrap();
+        assert_eq!(sliced.shape, vec![3]);
+        let got: Vec<f64> = sliced
+            .data
+            .chunks_exact(8)
+            .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(got, vec![20.0, 30.0, 40.0]);
     }
 }
