@@ -1095,8 +1095,21 @@ pub async fn container_full(
                 ServerError::WrongType(format!("'{}' is not a container", segments.join("/")))
             })?
         };
+        let max_depth: Option<usize> = params
+            .get("max_depth")
+            .and_then(|s| s.parse::<usize>().ok())
+            .map(|d| d.min(DEPTH_LIMIT));
         let mut entries: Vec<ZipEntry> = Vec::new();
-        collect_zip_entries(container, "", &path, access_filter.as_ref(), &mut entries).await?;
+        collect_zip_entries(
+            container,
+            "",
+            &path,
+            access_filter.as_ref(),
+            &mut entries,
+            0,
+            max_depth,
+        )
+        .await?;
 
         // Phase 2: for each entry IN ORDER, read the leaf on the executor (no
         // `block_on`), then hand that single decoded leaf to a spawn_blocking
@@ -1283,6 +1296,10 @@ struct ZipEntry {
 /// phase 2 (one write per leaf, returned for the next iteration).
 type ZipBuf = zip::ZipWriter<Cursor<Vec<u8>>>;
 
+/// Maximum walk depth for zip export — mirrors Python `DEPTH_LIMIT = 5`
+/// (`tiled/server/core.py:62`).
+const DEPTH_LIMIT: usize = 5;
+
 /// Phase 1 of the deep-export: recursively collect every visible leaf below
 /// `container` into a flat, ordered `out` list. Runs on the executor — the
 /// async container `search`/`keys`/`get` resolve through the adapter (a
@@ -1291,12 +1308,16 @@ type ZipBuf = zip::ZipWriter<Cursor<Vec<u8>>>;
 /// in phase 2. Returns a [`BoxFuture`] so the recursive call type-checks.
 /// H3: `access_filter` (when Some) is applied at each level to skip children
 /// the caller is not permitted to see.
+/// `current_depth` is the depth of `container` relative to the export root
+/// (0 = root). `max_depth` caps the walk; `None` means unlimited.
 fn collect_zip_entries<'a>(
     container: &'a dyn ContainerAdapter,
     prefix: &'a str,
     base_path: &'a str,
     access_filter: Option<&'a tiled_core::queries::AccessBlobFilter>,
     out: &'a mut Vec<ZipEntry>,
+    current_depth: usize,
+    max_depth: Option<usize>,
 ) -> tiled_core::adapters::BoxFuture<'a, Result<(), ServerError>> {
     Box::pin(async move {
         let visible_keys = match access_filter {
@@ -1329,7 +1350,32 @@ fn collect_zip_entries<'a>(
                     leaf: ZipLeaf::Table(arc),
                 });
             } else if let Some(child_c) = child.as_container() {
-                collect_zip_entries(child_c, &entry_name, base_path, access_filter, out).await?;
+                if max_depth.is_some_and(|d| current_depth >= d) {
+                    // Depth cap reached: emit a crumb so the client knows the
+                    // subtree was truncated rather than silently missing.
+                    let crumb = serde_json::json!({
+                        "path": format!("{base_path}/{entry_name}"),
+                        "structure_family": "container",
+                        "note": "subtree not exported: max_depth reached",
+                    });
+                    let crumb_bytes = serde_json::to_vec(&crumb)
+                        .map_err(|e| ServerError::Internal(format!("json: {e}")))?;
+                    out.push(ZipEntry {
+                        name: format!("{entry_name}.json"),
+                        leaf: ZipLeaf::Crumb(crumb_bytes),
+                    });
+                } else {
+                    collect_zip_entries(
+                        child_c,
+                        &entry_name,
+                        base_path,
+                        access_filter,
+                        out,
+                        current_depth + 1,
+                        max_depth,
+                    )
+                    .await?;
+                }
             } else {
                 // Sparse/Awkward and any future family: drop a crumb describing
                 // the leaf (identical to the previous behaviour).

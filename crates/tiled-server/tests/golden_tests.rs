@@ -1627,3 +1627,79 @@ async fn test_partition_oob_is_400() {
     );
     assert_eq!(body["error"]["code"], 400);
 }
+
+// ---------------------------------------------------------------------------
+// M5: ?max_depth query parameter caps the zip-export walk depth, clamped to
+// DEPTH_LIMIT=5 — parity with Python tiled's DEPTH_LIMIT (core.py:62).
+// ---------------------------------------------------------------------------
+
+/// `?max_depth=0` exports only root-level leaves; containers at the root
+/// become crumb entries instead of being descended into.
+/// Tree: some_array (leaf) + subgroup/nested_arr (container → array).
+/// With max_depth=0: some_array.bin present, subgroup.json crumb present,
+/// subgroup/nested_arr.bin absent.
+#[tokio::test]
+async fn test_zip_max_depth_0_stops_at_root() {
+    use std::io::Read;
+
+    let app = build_app();
+    let (status, _, body) =
+        get_with_headers(&app, "/api/v1/container/full/?format=zip&max_depth=0", &[]).await;
+    assert_eq!(status, 200, "zip export with max_depth=0 must succeed");
+
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(body.to_vec())).expect("valid zip");
+    let names: Vec<String> = (0..zip.len())
+        .map(|i| zip.by_index(i).unwrap().name().to_string())
+        .collect();
+
+    assert!(
+        names.contains(&"some_array.bin".to_string()),
+        "root-level array must be present; got: {names:?}"
+    );
+    assert!(
+        names.contains(&"subgroup.json".to_string()),
+        "capped container must emit a crumb; got: {names:?}"
+    );
+    assert!(
+        !names.contains(&"subgroup/nested_arr.bin".to_string()),
+        "nested array below capped container must not be exported; got: {names:?}"
+    );
+
+    // Verify the crumb carries the truncation note.
+    let mut crumb_bytes = Vec::new();
+    zip.by_name("subgroup.json")
+        .unwrap()
+        .read_to_end(&mut crumb_bytes)
+        .unwrap();
+    let crumb: serde_json::Value = serde_json::from_slice(&crumb_bytes).unwrap();
+    assert!(
+        crumb["note"].as_str().unwrap_or("").contains("max_depth"),
+        "crumb note must mention max_depth; got: {crumb}"
+    );
+}
+
+/// `?max_depth=99` is silently clamped to DEPTH_LIMIT=5; a tree of depth 1
+/// exports fully regardless of the over-large input.
+#[tokio::test]
+async fn test_zip_max_depth_clamped_to_depth_limit() {
+    let app = build_app();
+    let (status, _, body) =
+        get_with_headers(&app, "/api/v1/container/full/?format=zip&max_depth=99", &[]).await;
+    assert_eq!(status, 200, "zip export with max_depth=99 must succeed");
+
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(body.to_vec())).expect("valid zip");
+    let names: Vec<String> = (0..zip.len())
+        .map(|i| zip.by_index(i).unwrap().name().to_string())
+        .collect();
+
+    // The test tree is only depth-1 so max_depth=5 (after clamp) still
+    // exports everything: both the root array and the nested array.
+    assert!(
+        names.contains(&"some_array.bin".to_string()),
+        "some_array.bin must be present; got: {names:?}"
+    );
+    assert!(
+        names.contains(&"subgroup/nested_arr.bin".to_string()),
+        "subgroup/nested_arr.bin must be present (depth 1 ≤ 5); got: {names:?}"
+    );
+}
