@@ -1413,19 +1413,32 @@ pub async fn container_full(
         let _ = resolve_entry(&state, auth.clone(), &segments, tiled_auth::Scope::ReadData).await?;
     }
 
+    // No Accept header expresses no preference → resolve to the container
+    // family default (text/html) via `negotiate_media_type`. Do NOT substitute a
+    // concrete type here: that would make a no-Accept request indistinguishable
+    // from an explicit unsupported one and defeat the 406 below.
     let accept = headers
         .get("accept")
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/json");
+        .unwrap_or("");
     let format_str = params.get("format").map(|s| s.to_string());
-    // Resolve effective media type once: format param beats Accept header.
+    // Resolve effective media type once: format param beats Accept header. An
+    // explicit but unserviceable format/Accept resolves to `None` → HTTP 406,
+    // consistent with the array/table/sparse handlers (no silent HTML fallback).
+    let family = tiled_core::structures::StructureFamily::Container;
     let media_type = tiled_serialization::negotiate_media_type(
         format_str.as_deref(),
         accept,
-        tiled_core::structures::StructureFamily::Container,
+        family,
         &state.serialization_registry,
     )
-    .unwrap_or_else(|| "text/html".to_string());
+    .ok_or_else(|| {
+        unsupported_media_type(
+            family,
+            format_str.as_deref().unwrap_or(accept),
+            &state.serialization_registry,
+        )
+    })?;
     let path = segments.join("/");
 
     // H3: compute access filter once (async) so it can be pushed into the

@@ -1066,6 +1066,54 @@ async fn array_full_format_param_beats_accept_header() {
     assert_eq!(lines[9].trim(), "9.0", "last CSV line must be 9.0");
 }
 
+/// Serialization M4a: GET /container/full with no Accept header (no preference)
+/// serves the HTML listing — the container family default — preserving the
+/// behavior the handler previously obtained via a hardcoded text/html fallback.
+#[tokio::test]
+async fn container_full_no_accept_serves_html_default() {
+    let app = build_app();
+    let (status, headers, _body) = get_with_headers(&app, "/api/v1/container/full/", &[]).await;
+    assert_eq!(status, 200);
+    let ct = headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        ct.starts_with("text/html"),
+        "no-Accept container listing must default to text/html; got {ct}"
+    );
+}
+
+/// Serialization M4a: an EXPLICIT, unserviceable Accept on /container/full must
+/// return HTTP 406 — NOT a silent text/html body — consistent with the
+/// array/table/sparse handlers. Before the fix, `unwrap_or_else(|| "text/html")`
+/// coerced `Accept: application/json` (no container JSON serializer) into an
+/// HTML response under Content-Type: text/html.
+#[tokio::test]
+async fn container_full_explicit_unsupported_accept_returns_406() {
+    let app = build_app();
+    // application/json has no container serializer registered (M4b still open).
+    let (status, _h, _b) = get_with_headers(
+        &app,
+        "/api/v1/container/full/",
+        &[("accept", "application/json")],
+    )
+    .await;
+    assert_eq!(
+        status, 406,
+        "explicit unsupported Accept must be 406, not a silent HTML body"
+    );
+
+    // Same for an explicit ?format= that resolves to nothing (no alias, no
+    // serializer) → negotiate returns None → 406 (the M4a path via format param).
+    let (status2, _h2, _b2) =
+        get_with_headers(&app, "/api/v1/container/full/?format=zzz", &[]).await;
+    assert_eq!(
+        status2, 406,
+        "explicit unresolvable ?format= must be 406, not a silent HTML body"
+    );
+}
+
 /// Finding 1 (H2 export-corruption family, unsupported-format case): a
 /// `?format=` that resolves to a media type with no serializer for this family
 /// must return HTTP 406, NOT HTTP 200 with the raw payload mislabeled under the

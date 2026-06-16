@@ -280,6 +280,14 @@ pub(crate) fn default_media_type(family: StructureFamily) -> Option<String> {
         StructureFamily::Sparse | StructureFamily::Table => {
             Some(tiled_core::media_type::mime::ARROW_FILE.to_string())
         }
+        // A no-preference request (blank/`*/*` Accept) on a container resolves to
+        // the HTML listing, the only representation the Rust container handler
+        // serves by default. This codifies the behavior the `container_full`
+        // handler previously obtained via a hardcoded `text/html` fallback, so
+        // that an *explicit* unsupported format can now resolve to `None` (→ 406)
+        // instead of being silently coerced to HTML. (Python's container default
+        // is `application/x-hdf5`, which the Rust server does not implement.)
+        StructureFamily::Container => Some("text/html".to_string()),
         _ => None,
     }
 }
