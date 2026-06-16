@@ -211,6 +211,15 @@ pub fn negotiate_media_type(
 }
 
 /// Resolve the appropriate media type from an Accept header.
+///
+/// Each Accept entry is matched in two passes:
+/// 1. **Exact match** (including MIME params like `;header=absent`) — lets
+///    the caller select a variant-specific serializer registered under the
+///    full string (e.g. `"text/csv;header=absent"`).
+/// 2. **Base-type match** (params stripped) — the standard case.
+///
+/// Quality (`q=`) factors are intentionally not parsed; entries are tried
+/// in the order the client listed them.
 pub fn resolve_media_type(
     accept: &str,
     family: StructureFamily,
@@ -218,7 +227,19 @@ pub fn resolve_media_type(
 ) -> Option<String> {
     let available = registry.media_types(family);
     for part in accept.split(',') {
-        let media_type = part.trim().split(';').next().unwrap_or("").trim();
+        let part_trimmed = part.trim();
+        let media_type = part_trimmed.split(';').next().unwrap_or("").trim();
+
+        // Pass 1: exact match preserving MIME params (e.g. "text/csv;header=absent").
+        // Skip wildcard entries — "*/*" and "image/*" are not registered media types.
+        if media_type != "*/*"
+            && media_type != "image/*"
+            && available.iter().any(|m| m == part_trimmed)
+        {
+            return Some(part_trimmed.to_string());
+        }
+
+        // Pass 2: base-type match (standard case).
         if media_type == "*/*" {
             return default_media_type(family);
         }
@@ -368,6 +389,50 @@ mod tests {
         assert_eq!(
             listed.as_deref(),
             Some(tiled_core::media_type::mime::OCTET_STREAM)
+        );
+    }
+
+    /// M5: `Accept: text/csv;header=absent` must resolve to the exact
+    /// registered variant — not fall back to plain `text/csv`.
+    /// `Accept: text/csv;q=0.5` (quality param) must fall back to `text/csv`
+    /// because `q` is a negotiation weight, not a format selector.
+    #[test]
+    fn accept_mime_params_select_exact_variant_if_registered() {
+        // Build a minimal table registry that has both "text/csv" and
+        // "text/csv;header=absent" registered.
+        let reg = SerializationRegistry::new();
+        reg.register(
+            StructureFamily::Table,
+            tiled_core::media_type::mime::CSV,
+            Box::new(|_d: &[u8], _m: &serde_json::Value| Ok(bytes::Bytes::new())),
+        );
+        reg.register(
+            StructureFamily::Table,
+            "text/csv;header=absent",
+            Box::new(|_d: &[u8], _m: &serde_json::Value| Ok(bytes::Bytes::new())),
+        );
+
+        // Exact variant requested via Accept.
+        let got = resolve_media_type("text/csv;header=absent", StructureFamily::Table, &reg);
+        assert_eq!(
+            got.as_deref(),
+            Some("text/csv;header=absent"),
+            "exact MIME param must select the variant serializer"
+        );
+
+        // Quality param (q=) is NOT a format selector — must fall back to base.
+        let got_q = resolve_media_type("text/csv;q=0.5", StructureFamily::Table, &reg);
+        assert_eq!(
+            got_q.as_deref(),
+            Some(tiled_core::media_type::mime::CSV),
+            "q= quality factor must not prevent base-type match"
+        );
+
+        // Plain base type still resolves normally.
+        let got_plain = resolve_media_type("text/csv", StructureFamily::Table, &reg);
+        assert_eq!(
+            got_plain.as_deref(),
+            Some(tiled_core::media_type::mime::CSV)
         );
     }
 
