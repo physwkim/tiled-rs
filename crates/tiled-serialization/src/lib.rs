@@ -1,4 +1,5 @@
 pub mod array;
+pub mod container_json;
 pub mod html_container;
 pub mod json_seq;
 pub mod ragged;
@@ -31,6 +32,7 @@ pub fn default_registry() -> SerializationRegistry {
     ragged::register_ragged_serializers(&reg);
     html_container::register_html_serializer(&reg);
     json_seq::register_json_seq_serializer(&reg);
+    container_json::register_container_json_serializer(&reg);
     #[cfg(feature = "image")]
     image_array::register_image_serializers(&reg);
     #[cfg(feature = "parquet")]

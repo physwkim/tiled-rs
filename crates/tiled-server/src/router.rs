@@ -1615,7 +1615,7 @@ pub async fn container_full(
         ));
     }
 
-    // Non-zip: build Vec<Resource> on the executor (async walk/keys/search/get).
+    // Non-zip: resolve the container on the executor (async walk/keys/search/get).
     let walked_nonzip;
     let container: &dyn ContainerAdapter = if segments.is_empty() {
         state.root_tree.as_ref()
@@ -1625,30 +1625,46 @@ pub async fn container_full(
             ServerError::WrongType(format!("'{}' is not a container", segments.join("/")))
         })?
     };
-    // H3: apply access filter to listing.
-    let queries: Vec<tiled_core::queries::Query> = access_filter
-        .map(|f| vec![tiled_core::queries::Query::AccessBlobFilter(f)])
-        .unwrap_or_default();
-    let visible_keys = if queries.is_empty() {
-        container.keys().await?
+
+    // Assemble the body for the registered Container serializer. application/json
+    // is the recursive `{contents, metadata}` tree (Python `serialize_json`,
+    // container.py:91-115); text/html and application/json-seq consume the
+    // immediate-children Resource listing.
+    let body_json = if media_type == tiled_core::media_type::mime::JSON {
+        // Root node: the container's own metadata plus the recursively-built
+        // child tree. The access filter is applied at every level inside the
+        // helper (parity with Python's per-node `filter_for_access`).
+        let contents = build_container_json_contents(container, access_filter.as_ref()).await?;
+        let mut tree = serde_json::Map::new();
+        tree.insert("contents".into(), serde_json::Value::Object(contents));
+        tree.insert("metadata".into(), container.metadata().clone());
+        serde_json::to_vec(&serde_json::Value::Object(tree))
+            .map_err(|e| ServerError::Internal(format!("encode: {e}")))?
     } else {
-        // An unsupported query variant propagates as HTTP 400.
-        container.search(&queries).await?
-    };
-    let mut children: Vec<tiled_core::schemas::Resource> = Vec::new();
-    for k in &visible_keys {
-        let Some(child) = container.get(k).await? else {
-            continue;
-        };
-        let child_path = if path.is_empty() {
-            k.clone()
+        // H3: apply access filter to listing.
+        let queries: Vec<tiled_core::queries::Query> = access_filter
+            .map(|f| vec![tiled_core::queries::Query::AccessBlobFilter(f)])
+            .unwrap_or_default();
+        let visible_keys = if queries.is_empty() {
+            container.keys().await?
         } else {
-            format!("{path}/{k}")
+            // An unsupported query variant propagates as HTTP 400.
+            container.search(&queries).await?
         };
-        children.push(core::construct_resource(&child, k, &child_path, &base_url).await?);
-    }
-    let body_json =
-        serde_json::to_vec(&children).map_err(|e| ServerError::Internal(format!("encode: {e}")))?;
+        let mut children: Vec<tiled_core::schemas::Resource> = Vec::new();
+        for k in &visible_keys {
+            let Some(child) = container.get(k).await? else {
+                continue;
+            };
+            let child_path = if path.is_empty() {
+                k.clone()
+            } else {
+                format!("{path}/{k}")
+            };
+            children.push(core::construct_resource(&child, k, &child_path, &base_url).await?);
+        }
+        serde_json::to_vec(&children).map_err(|e| ServerError::Internal(format!("encode: {e}")))?
+    };
 
     let body = if let Some(serializer) = state.serialization_registry.dispatch(
         tiled_core::structures::StructureFamily::Container,
@@ -1787,6 +1803,100 @@ fn collect_zip_entries<'a>(
             }
         }
         Ok(())
+    })
+}
+
+/// Build the `contents` map of the Python container `application/json` tree
+/// (`serialize_json` + `walk`, `tiled/serialization/container.py:14-115`) for
+/// `container`: one `{"contents", "metadata"}` node per visible child.
+///
+/// - array → leaf node (`contents: {}` plus the child's own metadata).
+/// - table → its columns become synthetic array children, each with empty
+///   `contents` and empty `metadata`. Python yields one `walk` entry per column
+///   and navigates to `table[col]`, an `ArrayAdapter.from_array(...)` whose
+///   `metadata or {}` is `{}` (container.py:33-35, adapters/arrow.py:184,
+///   adapters/core.py:24).
+/// - container → recurse; an EMPTY container (no array/table descendant at any
+///   depth) is OMITTED, because Python's `walk` only yields at array leaves and
+///   table columns, so a subtree with none is never added to the tree.
+/// - sparse/awkward → leaf node. Python's `walk` has no branch for these (they
+///   fall into `else: filtered.items()` and raise `AttributeError`), so Rust
+///   emits a leaf to degrade gracefully rather than return 500.
+///
+/// `access_filter` (when `Some`) is applied at each container level, matching
+/// the deep-export walk and Python's per-node `filter_for_access`.
+fn build_container_json_contents<'a>(
+    container: &'a dyn ContainerAdapter,
+    access_filter: Option<&'a tiled_core::queries::AccessBlobFilter>,
+) -> tiled_core::adapters::BoxFuture<
+    'a,
+    Result<serde_json::Map<String, serde_json::Value>, ServerError>,
+> {
+    Box::pin(async move {
+        let visible_keys = match access_filter {
+            Some(f) => {
+                container
+                    .search(&[tiled_core::queries::Query::AccessBlobFilter(f.clone())])
+                    .await?
+            }
+            None => container.keys().await?,
+        };
+        let mut contents = serde_json::Map::new();
+        for key in visible_keys {
+            let Some(child) = container.get(&key).await? else {
+                continue;
+            };
+            let node = match child.structure_family() {
+                tiled_core::structures::StructureFamily::Container => {
+                    let sub = build_container_json_contents(
+                        child
+                            .as_container()
+                            .expect("container family => as_container"),
+                        access_filter,
+                    )
+                    .await?;
+                    if sub.is_empty() {
+                        continue;
+                    }
+                    let mut node = serde_json::Map::new();
+                    node.insert("contents".into(), serde_json::Value::Object(sub));
+                    node.insert("metadata".into(), child.metadata().clone());
+                    serde_json::Value::Object(node)
+                }
+                tiled_core::structures::StructureFamily::Table => {
+                    let columns = child
+                        .as_table()
+                        .expect("table family => as_table")
+                        .structure()
+                        .columns
+                        .clone();
+                    if columns.is_empty() {
+                        continue;
+                    }
+                    let mut col_contents = serde_json::Map::new();
+                    for col in columns {
+                        col_contents
+                            .insert(col, serde_json::json!({"contents": {}, "metadata": {}}));
+                    }
+                    let mut node = serde_json::Map::new();
+                    node.insert("contents".into(), serde_json::Value::Object(col_contents));
+                    node.insert("metadata".into(), child.metadata().clone());
+                    serde_json::Value::Object(node)
+                }
+                _ => {
+                    // array / sparse / awkward => leaf.
+                    let mut node = serde_json::Map::new();
+                    node.insert(
+                        "contents".into(),
+                        serde_json::Value::Object(serde_json::Map::new()),
+                    );
+                    node.insert("metadata".into(), child.metadata().clone());
+                    serde_json::Value::Object(node)
+                }
+            };
+            contents.insert(key, node);
+        }
+        Ok(contents)
     })
 }
 

@@ -1112,18 +1112,15 @@ async fn container_full_no_accept_serves_html_default() {
 /// Serialization M4a: an EXPLICIT, unserviceable Accept on /container/full must
 /// return HTTP 406 — NOT a silent text/html body — consistent with the
 /// array/table/sparse handlers. Before the fix, `unwrap_or_else(|| "text/html")`
-/// coerced `Accept: application/json` (no container JSON serializer) into an
-/// HTML response under Content-Type: text/html.
+/// coerced an unsupported Accept (no container serializer) into an HTML response
+/// under Content-Type: text/html.
 #[tokio::test]
 async fn container_full_explicit_unsupported_accept_returns_406() {
     let app = build_app();
-    // application/json has no container serializer registered (M4b still open).
-    let (status, _h, _b) = get_with_headers(
-        &app,
-        "/api/v1/container/full/",
-        &[("accept", "application/json")],
-    )
-    .await;
+    // A concrete media type with no container serializer (text/csv is registered
+    // only for the array/table families) must 406, not silently serve HTML.
+    let (status, _h, _b) =
+        get_with_headers(&app, "/api/v1/container/full/", &[("accept", "text/csv")]).await;
     assert_eq!(
         status, 406,
         "explicit unsupported Accept must be 406, not a silent HTML body"
@@ -1137,6 +1134,76 @@ async fn container_full_explicit_unsupported_accept_returns_406() {
         status2, 406,
         "explicit unresolvable ?format= must be 406, not a silent HTML body"
     );
+}
+
+/// Serialization M4b: `application/json` for a container returns the recursive
+/// `{contents, metadata}` tree (Python `serialize_json`, container.py:91-115),
+/// resolvable via BOTH `Accept: application/json` and `?format=json`. The
+/// pre-M4b behavior was HTTP 406 (no container JSON serializer registered).
+#[tokio::test]
+async fn container_full_application_json_recursive_tree() {
+    let app = build_app();
+    let expected = serde_json::json!({
+        "contents": {
+            "some_array": {"contents": {}, "metadata": {"element": "Cu"}},
+            "subgroup": {
+                "contents": {
+                    "nested_arr": {"contents": {}, "metadata": {}}
+                },
+                "metadata": {"nested": true}
+            }
+        },
+        "metadata": {"description": "test catalog"}
+    });
+
+    // Path 1: Accept header.
+    let (status, headers, body) = get_with_headers(
+        &app,
+        "/api/v1/container/full/",
+        &[("accept", "application/json")],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "Accept: application/json must serve the JSON tree"
+    );
+    let ct = headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        ct.starts_with("application/json"),
+        "Content-Type must be application/json; got {ct}"
+    );
+    let got: serde_json::Value = serde_json::from_slice(&body).expect("body must be JSON");
+    assert_eq!(got, expected, "Accept-negotiated JSON tree mismatch");
+
+    // Path 2: ?format=json (resolves via the core alias table).
+    let (status2, _h2, body2) =
+        get_with_headers(&app, "/api/v1/container/full/?format=json", &[]).await;
+    assert_eq!(status2, 200, "?format=json must serve the JSON tree");
+    let got2: serde_json::Value = serde_json::from_slice(&body2).expect("body must be JSON");
+    assert_eq!(got2, expected, "?format=json tree mismatch");
+}
+
+/// Serialization M4b: requesting `application/json` on a NESTED container roots
+/// the tree at that container — its own metadata at top level, descendants under
+/// `contents`. Guards the recursive descent's per-node metadata + omission of
+/// the parent.
+#[tokio::test]
+async fn container_full_application_json_nested_container() {
+    let app = build_app();
+    let (status, _h, body) =
+        get_with_headers(&app, "/api/v1/container/full/subgroup?format=json", &[]).await;
+    assert_eq!(status, 200);
+    let got: serde_json::Value = serde_json::from_slice(&body).expect("body must be JSON");
+    let expected = serde_json::json!({
+        "contents": {
+            "nested_arr": {"contents": {}, "metadata": {}}
+        },
+        "metadata": {"nested": true}
+    });
+    assert_eq!(got, expected, "nested-container JSON tree mismatch");
 }
 
 /// Finding 1 (H2 export-corruption family, unsupported-format case): a
