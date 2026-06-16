@@ -43,6 +43,11 @@ pub fn register_table_serializers(registry: &SerializationRegistry) {
         mime::JSON_SEQ,
         json_seq_table_serializer(),
     );
+
+    // text/html: render the table as an HTML <table> (Python `serialize_html`,
+    // table.py:86-90, which calls `df.to_html`). Mirrors the array `text/html`
+    // registration (array.rs) so browser navigation gets HTML, not a 406.
+    registry.register(StructureFamily::Table, "text/html", html_table_serializer());
 }
 
 /// Column-dict JSON serializer for the table family (Python `table.py:141-147`).
@@ -110,6 +115,71 @@ pub(crate) fn json_seq_table_serializer() -> SerializerFn {
         }
         Ok(Bytes::from(out))
     })
+}
+
+/// HTML serializer for the table family (Python `serialize_html`,
+/// table.py:86-90, which calls `df.to_html(index=preserve_index)` with
+/// `preserve_index=False`).
+///
+/// Renders the Arrow IPC table as a minimal HTML `<table>`: a `<thead>` row of
+/// column names followed by one `<tbody>` row per record. Cell values reuse the
+/// JSON-safe column conversion (`table_ipc_to_safe_columns`), so missing/NaN
+/// render as empty cells and numbers/bools/strings as their display text. Cell
+/// and header text is HTML-escaped. The markup is NOT byte-identical to pandas
+/// `to_html` (this workspace has no pandas), matching the array `text/html`
+/// precedent (array.rs) of a functional, non-pandas HTML rendering.
+///
+/// Shared with the sparse family, which renders an HTML table from the same
+/// Arrow IPC representation (Python sparse.py delegates to the table HTML
+/// serializer after converting the COO array to a DataFrame).
+pub(crate) fn html_table_serializer() -> SerializerFn {
+    Box::new(move |data, _meta| -> Result<Bytes, SerializeError> {
+        let columns = table_ipc_to_safe_columns(data)?;
+        let nrows = columns.first().map(|(_, vals)| vals.len()).unwrap_or(0);
+        let mut out = String::from(r#"<html><body><table border="1" class="dataframe">"#);
+        out.push_str("<thead><tr>");
+        for (name, _) in &columns {
+            out.push_str("<th>");
+            html_escape_into(&mut out, name);
+            out.push_str("</th>");
+        }
+        out.push_str("</tr></thead><tbody>");
+        for row in 0..nrows {
+            out.push_str("<tr>");
+            for (_, vals) in &columns {
+                out.push_str("<td>");
+                html_escape_into(&mut out, &html_cell_text(&vals[row]));
+                out.push_str("</td>");
+            }
+            out.push_str("</tr>");
+        }
+        out.push_str("</tbody></table></body></html>");
+        Ok(Bytes::from(out.into_bytes()))
+    })
+}
+
+/// Display text for one JSON-safe cell value: a string verbatim, `null`
+/// (missing/NaN) as an empty cell, and numbers/bools via their JSON repr.
+fn html_cell_text(v: &Value) -> String {
+    match v {
+        Value::Null => String::new(),
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Append `s` to `out`, escaping the HTML-significant characters so cell/header
+/// text cannot break out of its element.
+fn html_escape_into(out: &mut String, s: &str) {
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            _ => out.push(c),
+        }
+    }
 }
 
 /// Decode Arrow IPC bytes into JSON-safe columns, preserving schema order.
@@ -404,6 +474,92 @@ mod tests {
         assert!(
             err.to_string().contains("does not support"),
             "error must name the unsupported-type cause: {err}"
+        );
+    }
+
+    fn html_serializer() -> Arc<SerializerFn> {
+        let reg = SerializationRegistry::new();
+        register_table_serializers(&reg);
+        reg.dispatch(StructureFamily::Table, "text/html")
+            .expect("table text/html must be registered")
+    }
+
+    /// M2: `text/html` is registered for the table family (Python serialize_html,
+    /// table.py:86-90) so `Accept: text/html` gets an HTML table, not a 406.
+    #[test]
+    fn html_registered_for_table() {
+        let reg = SerializationRegistry::new();
+        register_table_serializers(&reg);
+        assert!(
+            reg.dispatch(StructureFamily::Table, "text/html").is_some(),
+            "table text/html must be registered (Python table.py:86-90)"
+        );
+    }
+
+    /// M2: the HTML body is an escaped `<table>` with a header row in schema
+    /// column order and one row per record; a string containing `<` is escaped
+    /// so it cannot break out of its cell.
+    #[test]
+    fn html_table_renders_escaped_table_in_schema_order() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("b", DataType::Int64, false),
+            Field::new("a", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["x", "a<b"])),
+            ],
+        )
+        .unwrap();
+        let out = html_serializer()(&ipc_bytes(&batch), &serde_json::Value::Null).unwrap();
+        let html = String::from_utf8(out.to_vec()).unwrap();
+
+        assert!(
+            html.starts_with(r#"<html><body><table border="1" class="dataframe">"#),
+            "must open an html table: {html}"
+        );
+        assert!(
+            html.ends_with("</table></body></html>"),
+            "must close: {html}"
+        );
+        // Headers present in schema order (b before a).
+        let pos_b = html.find("<th>b</th>").expect("header b present");
+        let pos_a = html.find("<th>a</th>").expect("header a present");
+        assert!(pos_b < pos_a, "headers must keep schema order: {html}");
+        // Data cells rendered.
+        assert!(html.contains("<td>1</td>"), "int cell rendered: {html}");
+        assert!(html.contains("<td>x</td>"), "string cell rendered: {html}");
+        // `<` inside a string is escaped, not emitted raw.
+        assert!(
+            html.contains("<td>a&lt;b</td>"),
+            "string cell must be HTML-escaped: {html}"
+        );
+    }
+
+    /// M2: a null/NaN cell renders as an empty `<td>`, not the text "null".
+    #[test]
+    fn html_table_null_cell_is_empty() {
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Float64, true)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Float64Array::from(vec![Some(1.0), None]))],
+        )
+        .unwrap();
+        let out = html_serializer()(&ipc_bytes(&batch), &serde_json::Value::Null).unwrap();
+        let html = String::from_utf8(out.to_vec()).unwrap();
+        assert!(
+            html.contains("<td>1.0</td>"),
+            "present value rendered: {html}"
+        );
+        assert!(
+            html.contains("<td></td>"),
+            "missing value must be an empty cell: {html}"
+        );
+        assert!(
+            !html.contains("null"),
+            "must not emit the text 'null': {html}"
         );
     }
 }
