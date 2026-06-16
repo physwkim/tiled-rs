@@ -216,7 +216,12 @@ pub async fn about(State(state): State<AppState>, BaseUrl(base_url): BaseUrl) ->
                 "https://blueskyproject.io/tiled".into(),
             ),
         ]),
-        meta: HashMap::from([("root_path".into(), serde_json::Value::String(String::new()))]),
+        // Python: `request.scope.get("root_path") or "" + "/api"`, and `+`
+        // binds tighter than `or`, so this is `root_path or "/api"` — the
+        // no-proxy default is "/api", not "". Rust has no ASGI scope / proxy
+        // root_path source plumbed, so we emit the no-proxy default. (A proxy
+        // mount prefix override is not yet implemented; see router.py:301.)
+        meta: HashMap::from([("root_path".into(), serde_json::Value::String("/api".into()))]),
     };
 
     Json(about)

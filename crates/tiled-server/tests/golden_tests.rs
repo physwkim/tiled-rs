@@ -226,8 +226,9 @@ async fn test_about_endpoint() {
     // formats must be present
     assert!(body.get("formats").is_some());
 
-    // meta must have root_path
-    assert!(body["meta"].get("root_path").is_some());
+    // meta.root_path is the no-proxy default "/api" (Python router.py:301:
+    // `root_path or "/api"`), not "".
+    assert_eq!(body["meta"]["root_path"], "/api");
 }
 
 #[tokio::test]
