@@ -19,7 +19,7 @@
 //! # use tiled_client::ContainerClient;
 //! # async fn run(c: ContainerClient) -> tiled_client::Result<()> {
 //! // Full-text search
-//! let items = c.clone().search(FullText { text: "hello".into() }).keys().await?;
+//! let items = c.clone().search(Query::FullText(FullText { text: "hello".into() })).keys().await?;
 //! // Key equality
 //! let items = c.clone().search(Key::new("color").eq("red")).keys().await?;
 //! // Numeric comparison
