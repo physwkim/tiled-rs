@@ -309,6 +309,31 @@ pub struct PutSpecsRequest {
     pub specs: Vec<Spec>,
 }
 
+// ---------------------------------------------------------------------------
+// Distinct response (`GET /api/v1/distinct/{path}`)
+// ---------------------------------------------------------------------------
+
+/// One distinct value, with an optional occurrence count. Mirrors Python
+/// `DistinctValueInfo` (server/schemas.py:504-506). `count` is `null` unless
+/// the request set `?counts=true`. `value` is `null` for the group of rows
+/// where the key is absent (json_extract → NULL, like Python).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DistinctValueInfo {
+    pub value: serde_json::Value,
+    pub count: Option<i64>,
+}
+
+/// Response body for `GET /api/v1/distinct/{path}`. Mirrors Python
+/// `GetDistinctResponse` (server/schemas.py:509-512). Each facet is always
+/// present on the wire (possibly `null`), matching Python's `model_dump()`
+/// default; a facet is `null` when its query flag was not requested.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GetDistinctResponse {
+    pub metadata: Option<HashMap<String, Vec<DistinctValueInfo>>>,
+    pub structure_families: Option<Vec<DistinctValueInfo>>,
+    pub specs: Option<Vec<DistinctValueInfo>>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

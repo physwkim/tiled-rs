@@ -150,6 +150,8 @@ pub fn build_app(state: AppState) -> Router {
         .route("/api/v1/metadata/{*path}", get(router::metadata))
         .route("/api/v1/search/", get(router::search_root))
         .route("/api/v1/search/{*path}", get(router::search))
+        .route("/api/v1/distinct/", get(router::distinct_root))
+        .route("/api/v1/distinct/{*path}", get(router::distinct))
         .route("/api/v1/array/block/{*path}", get(router::array_block))
         .route(
             "/api/v1/array/full/{*path}",

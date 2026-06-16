@@ -965,6 +965,201 @@ impl Catalog {
             }
         }
     }
+
+    /// Distinct metadata-key values, structure families, and/or specs among the
+    /// direct children of `parent_id` (`None` = root), scoped by the same search
+    /// `queries` as a listing. Mirrors Python `CatalogAdapter.get_distinct`
+    /// (catalog/adapter.py:647-698) and `format_distinct_result` (2331-2338):
+    /// each facet is a `GROUP BY` over the column with `COUNT(col)` — so the
+    /// missing-key group reports count 0 — and `counts=false` omits the count.
+    pub async fn get_distinct(
+        &self,
+        parent_id: Option<i64>,
+        queries: &[Query],
+        metadata_keys: &[String],
+        structure_families: bool,
+        specs: bool,
+        counts: bool,
+    ) -> Result<tiled_core::schemas::GetDistinctResponse> {
+        let dialect = Dialect::for_pool(self.pool());
+        let mut builder = WhereBuilder::new(dialect);
+        apply_queries(&mut builder, queries);
+        let (where_clause, bindings) = builder.finish();
+        // parent_id placeholder is numbered after the WHERE bindings, exactly
+        // as in `search_children`: SQLite binds it first (positional `?`),
+        // Postgres last (`$N+1`).
+        let parent_clause = match dialect {
+            Dialect::Sqlite => {
+                if parent_id.is_some() {
+                    "parent_id = ?".to_string()
+                } else {
+                    "parent_id IS NULL".to_string()
+                }
+            }
+            Dialect::Postgres => {
+                if parent_id.is_some() {
+                    format!("parent_id = ${}", bindings.len() + 1)
+                } else {
+                    "parent_id IS NULL".to_string()
+                }
+            }
+        };
+
+        let mut resp = tiled_core::schemas::GetDistinctResponse::default();
+
+        if !metadata_keys.is_empty() {
+            let mut map = std::collections::HashMap::new();
+            for key in metadata_keys {
+                // GROUP BY the JSON value (Python `metadata_[keys]` → `#>`),
+                // SELECT it as JSON text so any storage class round-trips back
+                // to its original JSON type: SQLite `json_quote`, Postgres
+                // `::text`.
+                let group_expr = dialect.json_value("metadata", key);
+                let value_expr = match dialect {
+                    Dialect::Sqlite => format!("json_quote({group_expr})"),
+                    Dialect::Postgres => format!("({group_expr})::text"),
+                };
+                let rows = self
+                    .run_distinct_group(
+                        &parent_clause,
+                        &where_clause,
+                        &bindings,
+                        parent_id,
+                        &value_expr,
+                        &group_expr,
+                        counts,
+                    )
+                    .await?;
+                map.insert(key.clone(), rows);
+            }
+            resp.metadata = Some(map);
+        }
+
+        if structure_families {
+            let value_expr = match dialect {
+                Dialect::Sqlite => "json_quote(structure_family)".to_string(),
+                Dialect::Postgres => "to_jsonb(structure_family)::text".to_string(),
+            };
+            resp.structure_families = Some(
+                self.run_distinct_group(
+                    &parent_clause,
+                    &where_clause,
+                    &bindings,
+                    parent_id,
+                    &value_expr,
+                    "structure_family",
+                    counts,
+                )
+                .await?,
+            );
+        }
+
+        if specs {
+            // `specs` is already a JSON array column; for Postgres jsonb cast to
+            // text, for SQLite it is stored as JSON text already.
+            let value_expr = match dialect {
+                Dialect::Sqlite => "specs".to_string(),
+                Dialect::Postgres => "specs::text".to_string(),
+            };
+            resp.specs = Some(
+                self.run_distinct_group(
+                    &parent_clause,
+                    &where_clause,
+                    &bindings,
+                    parent_id,
+                    &value_expr,
+                    "specs",
+                    counts,
+                )
+                .await?,
+            );
+        }
+
+        Ok(resp)
+    }
+
+    /// Run one facet's `GROUP BY` query and decode `(value, count)` rows.
+    /// `value_expr` must yield JSON text (parsed back to a `serde_json::Value`);
+    /// `group_expr` is the parameter-free column expression grouped + counted.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_distinct_group(
+        &self,
+        parent_clause: &str,
+        where_clause: &str,
+        bindings: &[Bind],
+        parent_id: Option<i64>,
+        value_expr: &str,
+        group_expr: &str,
+        counts: bool,
+    ) -> Result<Vec<tiled_core::schemas::DistinctValueInfo>> {
+        let select_cols = if counts {
+            format!("{value_expr} AS v, COUNT({group_expr}) AS c")
+        } else {
+            format!("{value_expr} AS v")
+        };
+        let sql = format!(
+            "SELECT {select_cols} FROM nodes \
+             WHERE {parent_clause} AND {where_clause} GROUP BY {group_expr}"
+        );
+        let mut out = Vec::new();
+        match self.pool() {
+            DbPool::Sqlite(pool) => {
+                let mut q = sqlx::query(&sql);
+                if parent_id.is_some() {
+                    q = q.bind(parent_id);
+                }
+                for b in bindings {
+                    q = match b {
+                        Bind::Text(s) => q.bind(s.clone()),
+                        Bind::Int(i) => q.bind(*i),
+                        Bind::Real(f) => q.bind(*f),
+                    };
+                }
+                for row in &q.fetch_all(pool).await? {
+                    let value = parse_distinct_value(row.try_get::<Option<String>, _>("v")?);
+                    let count = if counts {
+                        Some(row.try_get::<i64, _>("c")?)
+                    } else {
+                        None
+                    };
+                    out.push(tiled_core::schemas::DistinctValueInfo { value, count });
+                }
+            }
+            DbPool::Postgres(pool) => {
+                let mut q = sqlx::query(&sql);
+                for b in bindings {
+                    q = match b {
+                        Bind::Text(s) => q.bind(s.clone()),
+                        Bind::Int(i) => q.bind(*i),
+                        Bind::Real(f) => q.bind(*f),
+                    };
+                }
+                if parent_id.is_some() {
+                    q = q.bind(parent_id);
+                }
+                for row in &q.fetch_all(pool).await? {
+                    let value = parse_distinct_value(row.try_get::<Option<String>, _>("v")?);
+                    let count = if counts {
+                        Some(row.try_get::<i64, _>("c")?)
+                    } else {
+                        None
+                    };
+                    out.push(tiled_core::schemas::DistinctValueInfo { value, count });
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Parse a distinct facet's JSON-text value back into a `serde_json::Value`.
+/// A SQL NULL (or unparseable text) becomes JSON `null`, matching the
+/// missing-key group Python returns as `{"value": null}`.
+fn parse_distinct_value(text: Option<String>) -> serde_json::Value {
+    match text {
+        Some(s) => serde_json::from_str(&s).unwrap_or(serde_json::Value::Null),
+        None => serde_json::Value::Null,
+    }
 }
 
 fn bind_all_sqlite<'q>(

@@ -297,6 +297,147 @@ async fn post_metadata_creates_asset_free_and_rejects_external_assets() {
     assert_eq!(status, StatusCode::NO_CONTENT);
 }
 
+/// Server H2: `GET /api/v1/distinct/{path}` returns the unique metadata-key
+/// values, structure families, and specs among a container's children, with
+/// optional counts — unblocking the Python client's `distinct()` (404 today).
+/// Mirrors Python `get_distinct` (catalog/adapter.py:647-698): each facet is a
+/// `GROUP BY` with `COUNT(col)`, so the missing-key group reports count 0, and
+/// without `?counts=true` the count is null. Response is the bare
+/// `GetDistinctResponse` object; unrequested facets are null.
+#[tokio::test]
+async fn distinct_groups_metadata_structure_families_and_specs() {
+    let (app, _dir) = build_test_app().await;
+
+    let register =
+        |key: &str, family: &str, metadata: serde_json::Value, specs: serde_json::Value| {
+            serde_json::json!({
+                "key": key,
+                "structure_family": family,
+                "metadata": metadata,
+                "specs": specs,
+                "data_sources": [],
+            })
+        };
+    for body in [
+        register(
+            "a",
+            "container",
+            serde_json::json!({"plan": "count", "n": 1}),
+            serde_json::json!([{"name": "xas"}]),
+        ),
+        register(
+            "b",
+            "container",
+            serde_json::json!({"plan": "count", "n": 2}),
+            serde_json::json!([{"name": "xas"}]),
+        ),
+        register(
+            "c",
+            "array",
+            serde_json::json!({"plan": "scan"}),
+            serde_json::json!([]),
+        ),
+        // "d" lacks the "plan" key → the missing-key (null) group, count 0.
+        register(
+            "d",
+            "table",
+            serde_json::json!({"other": 5}),
+            serde_json::json!([]),
+        ),
+    ] {
+        let (status, b) = json_request(&app, Method::POST, "/api/v1/register/", body).await;
+        assert_eq!(status, StatusCode::CREATED, "register: {b}");
+    }
+
+    // metadata facet with counts — group root's children by metadata.plan.
+    let (status, body) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/distinct/?metadata=plan&counts=true",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "distinct: {body}");
+    let plan = body["metadata"]["plan"]
+        .as_array()
+        .expect("metadata.plan is an array");
+    let got: Vec<(serde_json::Value, i64)> = plan
+        .iter()
+        .map(|e| (e["value"].clone(), e["count"].as_i64().unwrap()))
+        .collect();
+    assert!(
+        got.contains(&(serde_json::json!("count"), 2)),
+        "got: {got:?}"
+    );
+    assert!(
+        got.contains(&(serde_json::json!("scan"), 1)),
+        "got: {got:?}"
+    );
+    assert!(
+        got.contains(&(serde_json::json!(null), 0)),
+        "missing-key null group with count 0: {got:?}"
+    );
+    // Unrequested facets are null (bare object, not wrapped in {data,...}).
+    assert!(body["structure_families"].is_null());
+    assert!(body["specs"].is_null());
+
+    // structure_families facet with counts.
+    let (status, body) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/distinct/?structure_families=true&counts=true",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let mut fams = std::collections::HashMap::new();
+    for e in body["structure_families"].as_array().unwrap() {
+        fams.insert(
+            e["value"].as_str().unwrap().to_string(),
+            e["count"].as_i64().unwrap(),
+        );
+    }
+    assert_eq!(fams.get("container"), Some(&2));
+    assert_eq!(fams.get("array"), Some(&1));
+    assert_eq!(fams.get("table"), Some(&1));
+
+    // specs facet with counts — two distinct specs values ([] and [{name}]).
+    let (status, body) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/distinct/?specs=true&counts=true",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let specs = body["specs"].as_array().unwrap();
+    assert_eq!(specs.len(), 2, "two distinct specs values: {specs:?}");
+    let total: i64 = specs.iter().map(|e| e["count"].as_i64().unwrap()).sum();
+    assert_eq!(total, 4, "every child counted once: {specs:?}");
+    assert!(
+        specs.iter().any(|e| e["value"] == serde_json::json!([])),
+        "the empty-specs group is present: {specs:?}"
+    );
+
+    // Without ?counts, every entry's count is null (Python's counts=False).
+    let (status, body) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/distinct/?metadata=plan",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body["metadata"]["plan"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|e| e["count"].is_null()),
+        "no ?counts → count null: {body}"
+    );
+}
+
 /// F-F: DELETE on a subtree holding an internally-managed (writable) data
 /// source is refused by default with 409 (mirrors Python `WouldDeleteData`,
 /// app.py:367-374). Passing `?external_only=false` forces the delete.

@@ -57,6 +57,11 @@ pub enum ServerError {
     /// (router.py:609-613, 1176-1179). Distinct from [`Self::Validation`]
     /// (422): the request is structurally valid but names a non-existent slot.
     BadRequest(String),
+    /// The target node does not support this operation. Maps to HTTP 405 to
+    /// match Python tiled, which raises `HTTP_405_METHOD_NOT_ALLOWED` when an
+    /// entry lacks the requested capability — e.g. `get_distinct`
+    /// (router.py:444-447) — as opposed to the route itself not existing.
+    MethodNotAllowed(String),
 }
 
 impl std::fmt::Display for ServerError {
@@ -75,6 +80,7 @@ impl std::fmt::Display for ServerError {
             Self::InvalidQuery(msg) => write!(f, "Invalid query: {msg}"),
             Self::WrongType(msg) => write!(f, "Wrong type for route: {msg}"),
             Self::BadRequest(msg) => write!(f, "Bad request: {msg}"),
+            Self::MethodNotAllowed(msg) => write!(f, "Method not allowed: {msg}"),
         }
     }
 }
@@ -107,6 +113,7 @@ impl IntoResponse for ServerError {
             Self::InvalidQuery(msg) => (StatusCode::BAD_REQUEST, 400, msg),
             Self::WrongType(msg) => (StatusCode::NOT_FOUND, 404, msg),
             Self::BadRequest(msg) => (StatusCode::BAD_REQUEST, 400, msg),
+            Self::MethodNotAllowed(msg) => (StatusCode::METHOD_NOT_ALLOWED, 405, msg),
         };
 
         let body = schemas::Response::<()> {

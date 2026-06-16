@@ -496,6 +496,119 @@ pub async fn search(
     Ok(Json(resp))
 }
 
+// ---------------------------------------------------------------------------
+// GET /api/v1/distinct/{path} — unique metadata-key values / structure
+// families / specs among a container's children. Python parity:
+// router.py:401-447. Catalog-only capability; a server without a catalog has
+// no node that supports get_distinct → 405.
+// ---------------------------------------------------------------------------
+
+pub async fn distinct_root(
+    state: State<AppState>,
+    params: Query<Vec<(String, String)>>,
+    auth: crate::AuthContext,
+) -> Result<impl IntoResponse, ServerError> {
+    distinct(
+        state,
+        OriginalUri("/api/v1/distinct/".parse().expect("static URI")),
+        params,
+        auth,
+    )
+    .await
+}
+
+pub async fn distinct(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+    Query(params): Query<Vec<(String, String)>>,
+    auth: crate::AuthContext,
+) -> Result<impl IntoResponse, ServerError> {
+    auth.require(tiled_auth::Scope::ReadMetadata)?;
+    let segments = segments_from_uri(&uri, "/api/v1/distinct/");
+
+    // Facet flags + the metadata keys to inspect. httpx encodes Python bools as
+    // "true"/"false"; accept "1" too. `metadata` is repeated (one per key),
+    // mirroring the client's `params={"metadata": metadata_keys, ...}`
+    // (client/container.py:596-602).
+    let want_bool = |name: &str| {
+        params
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| matches!(v.to_ascii_lowercase().as_str(), "true" | "1"))
+            .unwrap_or(false)
+    };
+    let structure_families = want_bool("structure_families");
+    let specs = want_bool("specs");
+    let counts = want_bool("counts");
+    let metadata_keys: Vec<String> = params
+        .iter()
+        .filter(|(k, _)| k == "metadata")
+        .map(|(_, v)| v.clone())
+        .collect();
+
+    let filter_params: Vec<(String, String)> = params
+        .iter()
+        .filter(|(k, _)| k.starts_with("filter["))
+        .cloned()
+        .collect();
+    let mut queries = tiled_core::queries::decode_query_filters(&filter_params)?;
+
+    // Per-ancestor auth gate, identical to search/metadata reads (404, not 403,
+    // when an ancestor's per-node policy drops ReadMetadata).
+    let auth = if !segments.is_empty() {
+        resolve_entry(&state, auth, &segments, tiled_auth::Scope::ReadMetadata).await?
+    } else {
+        auth
+    };
+
+    // Scope to the nodes the principal may see — the same list filter the
+    // search path injects, so distinct counts only permitted children.
+    if let Some(ref policy) = state.access_policy {
+        let principal_ref = auth.principal.as_deref();
+        let requested = tiled_auth::ScopeSet::from_iter([tiled_auth::Scope::ReadMetadata]);
+        if let Some(f) = policy
+            .list_filter(principal_ref, &auth.scopes, &requested)
+            .await
+        {
+            queries.insert(0, tiled_core::queries::Query::AccessBlobFilter(f));
+        }
+    }
+
+    // Distinct is a catalog capability; without one, no node supports it → 405
+    // (Python router.py:444-447).
+    let Some(ref catalog) = state.catalog else {
+        return Err(ServerError::MethodNotAllowed(
+            "This node does not support distinct.".into(),
+        ));
+    };
+
+    // Resolve the container's node id; root (empty path) → distinct over the
+    // top-level children (parent_id IS NULL).
+    let parent_id = if segments.is_empty() {
+        None
+    } else {
+        let node = catalog
+            .lookup(&segments)
+            .await
+            .map_err(map_catalog_err)?
+            .ok_or_else(|| ServerError::NotFound(format!("'{}' not found", segments.join("/"))))?;
+        Some(node.id)
+    };
+
+    let resp = catalog
+        .get_distinct(
+            parent_id,
+            &queries,
+            &metadata_keys,
+            structure_families,
+            specs,
+            counts,
+        )
+        .await
+        .map_err(map_catalog_err)?;
+    Ok(Json(resp))
+}
+
 // Enforce the configured `response_bytesize_limit` (parity gap L4). Mirrors
 // Python tiled, which compares the decoded data size against
 // `settings.response_bytesize_limit` BEFORE packing and raises
