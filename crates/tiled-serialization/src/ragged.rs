@@ -39,6 +39,23 @@ pub fn register_ragged_serializers(registry: &SerializationRegistry) {
         tiled_core::media_type::mime::ZIP,
         Box::new(to_zipped_buffers),
     );
+    // Arrow IPC + Parquet, mirroring Python's awkward serializers
+    // (tiled/serialization/awkward.py:48-78), which do
+    // `awkward.to_arrow_table(array)` and write IPC / Parquet. Here the array
+    // is the JSON list-of-lists, converted to a single Arrow `List<primitive>`
+    // column. Feature-gated like the table serializers.
+    #[cfg(feature = "arrow-ipc")]
+    registry.register(
+        StructureFamily::Ragged,
+        tiled_core::media_type::mime::ARROW_FILE,
+        Box::new(to_arrow),
+    );
+    #[cfg(feature = "parquet")]
+    registry.register(
+        StructureFamily::Ragged,
+        tiled_core::media_type::mime::PARQUET,
+        Box::new(to_parquet),
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -55,6 +72,204 @@ pub fn register_ragged_serializers(registry: &SerializationRegistry) {
 /// ```
 fn to_json(data: &[u8], _metadata: &serde_json::Value) -> Result<bytes::Bytes, SerializeError> {
     Ok(bytes::Bytes::copy_from_slice(data))
+}
+
+// ---------------------------------------------------------------------------
+// Arrow IPC + Parquet serializers
+//
+// Mirror Python's awkward Arrow/Parquet serializers
+// (tiled/serialization/awkward.py:48-78): `awkward.to_arrow_table(array)` then
+// write IPC / Parquet. Here the array is the JSON list-of-lists, converted to
+// a single Arrow `List<...<primitive>>` column (nesting depth = ndim-1).
+// ---------------------------------------------------------------------------
+
+#[cfg(any(feature = "arrow-ipc", feature = "parquet"))]
+use arrow::array::ArrayRef;
+
+/// Build a one-column Arrow RecordBatch from the ragged JSON list-of-lists.
+///
+/// The column has Arrow type `List<...<primitive>>` with nesting depth
+/// `ndim - 1` (from `RaggedStructure.shape`); the leaf primitive comes from
+/// `RaggedStructure.data_type`. The column is named `"ragged"`: a bare ragged
+/// array has no field name (`awkward.to_arrow_table` labels it in an
+/// implementation-defined way), so a stable explicit name is used.
+#[cfg(any(feature = "arrow-ipc", feature = "parquet"))]
+fn build_ragged_record_batch(
+    data: &[u8],
+    metadata: &serde_json::Value,
+) -> Result<arrow::record_batch::RecordBatch, SerializeError> {
+    use arrow::datatypes::{Field, Schema};
+    use std::sync::Arc;
+
+    let value: serde_json::Value = serde_json::from_slice(data)
+        .map_err(|e| format!("ragged/arrow: cannot parse JSON list-of-lists: {e}"))?;
+    let structure = RaggedStructure::from_json(metadata)
+        .map_err(|e| format!("ragged/arrow: cannot parse RaggedStructure from metadata: {e}"))?;
+    let primitive = dtype_to_primitive(&structure.data_type)
+        .ok_or_else(|| format!("ragged/arrow: unsupported dtype {:?}", structure.data_type))?;
+
+    let rows = value
+        .as_array()
+        .ok_or("ragged/arrow: top-level JSON must be an array")?;
+    let ndim = structure.shape.len();
+    if ndim < 2 {
+        return Err(format!(
+            "ragged/arrow: ragged array must have at least 2 dimensions, shape has {ndim}"
+        )
+        .into());
+    }
+    // The outer JSON array elements are the rows; the remaining list-nesting
+    // depth above the scalar leaf is ndim - 1 (one list wrapper per axis).
+    let elems: Vec<&serde_json::Value> = rows.iter().collect();
+    let column = build_nested(&elems, ndim - 1, &primitive)?;
+
+    let field = Arc::new(Field::new("ragged", column.data_type().clone(), true));
+    let schema = Arc::new(Schema::new(vec![field]));
+    arrow::record_batch::RecordBatch::try_new(schema, vec![column])
+        .map_err(|e| format!("ragged/arrow: cannot build record batch: {e}").into())
+}
+
+/// Recursively build a nested Arrow `List<...>` array from JSON. `list_levels`
+/// is the number of list wrappers remaining; at 0 the elements are scalars and
+/// a leaf primitive array is built.
+#[cfg(any(feature = "arrow-ipc", feature = "parquet"))]
+fn build_nested(
+    values: &[&serde_json::Value],
+    list_levels: usize,
+    primitive: &str,
+) -> Result<ArrayRef, SerializeError> {
+    use arrow::array::ListArray;
+    use arrow::buffer::{OffsetBuffer, ScalarBuffer};
+    use arrow::datatypes::Field;
+    use std::sync::Arc;
+
+    if list_levels == 0 {
+        return build_leaf(values, primitive);
+    }
+    let mut offsets: Vec<i32> = Vec::with_capacity(values.len() + 1);
+    offsets.push(0);
+    let mut children: Vec<&serde_json::Value> = Vec::new();
+    for v in values {
+        let arr = v
+            .as_array()
+            .ok_or_else(|| format!("ragged/arrow: expected a nested list, got {v}"))?;
+        children.extend(arr.iter());
+        offsets.push(
+            i32::try_from(children.len())
+                .map_err(|_| "ragged/arrow: list offset exceeds i32".to_string())?,
+        );
+    }
+    let child = build_nested(&children, list_levels - 1, primitive)?;
+    let field = Arc::new(Field::new("item", child.data_type().clone(), true));
+    let offset_buffer = OffsetBuffer::new(ScalarBuffer::from(offsets));
+    Ok(Arc::new(ListArray::new(field, offset_buffer, child, None)))
+}
+
+/// Build a leaf Arrow primitive array from JSON scalar values, mapping the
+/// `RaggedStructure.data_type` primitive to the Arrow type. A JSON `null`
+/// becomes a null element; a non-null value that cannot convert is an error
+/// (never silently nulled). float16/complex leaves are unsupported.
+#[cfg(any(feature = "arrow-ipc", feature = "parquet"))]
+fn build_leaf(values: &[&serde_json::Value], primitive: &str) -> Result<ArrayRef, SerializeError> {
+    use arrow::array::{
+        BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
+        UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    };
+    use std::sync::Arc;
+
+    // Collect `Option<T>`, erroring if a non-null value fails `extract`.
+    fn collect<T, F>(
+        values: &[&serde_json::Value],
+        extract: F,
+    ) -> Result<Vec<Option<T>>, SerializeError>
+    where
+        F: Fn(&serde_json::Value) -> Option<T>,
+    {
+        values
+            .iter()
+            .map(|v| {
+                if v.is_null() {
+                    Ok(None)
+                } else {
+                    extract(v)
+                        .map(Some)
+                        .ok_or_else(|| format!("ragged/arrow: value {v} not convertible").into())
+                }
+            })
+            .collect()
+    }
+
+    let arr: ArrayRef = match primitive {
+        "int8" => Arc::new(Int8Array::from(collect(values, |v| {
+            v.as_i64().map(|x| x as i8)
+        })?)),
+        "int16" => Arc::new(Int16Array::from(collect(values, |v| {
+            v.as_i64().map(|x| x as i16)
+        })?)),
+        "int32" => Arc::new(Int32Array::from(collect(values, |v| {
+            v.as_i64().map(|x| x as i32)
+        })?)),
+        "int64" => Arc::new(Int64Array::from(collect(values, |v| v.as_i64())?)),
+        "uint8" => Arc::new(UInt8Array::from(collect(values, |v| {
+            v.as_u64().map(|x| x as u8)
+        })?)),
+        "uint16" => Arc::new(UInt16Array::from(collect(values, |v| {
+            v.as_u64().map(|x| x as u16)
+        })?)),
+        "uint32" => Arc::new(UInt32Array::from(collect(values, |v| {
+            v.as_u64().map(|x| x as u32)
+        })?)),
+        "uint64" => Arc::new(UInt64Array::from(collect(values, |v| v.as_u64())?)),
+        "float32" => Arc::new(Float32Array::from(collect(values, |v| {
+            v.as_f64().map(|x| x as f32)
+        })?)),
+        "float64" => Arc::new(Float64Array::from(collect(values, |v| v.as_f64())?)),
+        "bool" => Arc::new(BooleanArray::from(collect(values, |v| v.as_bool())?)),
+        other => {
+            return Err(format!(
+                "ragged/arrow: leaf dtype {other} is not supported for Arrow (float16/complex)"
+            )
+            .into());
+        }
+    };
+    Ok(arr)
+}
+
+/// Arrow IPC serializer (`application/vnd.apache.arrow.file`).
+#[cfg(feature = "arrow-ipc")]
+fn to_arrow(data: &[u8], metadata: &serde_json::Value) -> Result<bytes::Bytes, SerializeError> {
+    let batch = build_ragged_record_batch(data, metadata)?;
+    let schema = batch.schema();
+    let mut buf = Vec::new();
+    {
+        let mut writer = arrow::ipc::writer::FileWriter::try_new(&mut buf, &schema)
+            .map_err(|e| format!("ragged/arrow: ipc writer: {e}"))?;
+        writer
+            .write(&batch)
+            .map_err(|e| format!("ragged/arrow: ipc write: {e}"))?;
+        writer
+            .finish()
+            .map_err(|e| format!("ragged/arrow: ipc finish: {e}"))?;
+    }
+    Ok(bytes::Bytes::from(buf))
+}
+
+/// Parquet serializer (`application/x-parquet`).
+#[cfg(feature = "parquet")]
+fn to_parquet(data: &[u8], metadata: &serde_json::Value) -> Result<bytes::Bytes, SerializeError> {
+    let batch = build_ragged_record_batch(data, metadata)?;
+    let mut buf = Vec::new();
+    {
+        let mut writer = parquet::arrow::ArrowWriter::try_new(&mut buf, batch.schema(), None)
+            .map_err(|e| format!("ragged/parquet: writer: {e}"))?;
+        writer
+            .write(&batch)
+            .map_err(|e| format!("ragged/parquet: write: {e}"))?;
+        writer
+            .close()
+            .map_err(|e| format!("ragged/parquet: close: {e}"))?;
+    }
+    Ok(bytes::Bytes::from(buf))
 }
 
 // ---------------------------------------------------------------------------
@@ -881,6 +1096,130 @@ mod tests {
             reg.dispatch(StructureFamily::Ragged, tiled_core::media_type::mime::ZIP)
                 .is_some(),
             "application/zip must be registered for ragged"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Arrow IPC + Parquet (server-serialization L1): ragged → single
+    // Arrow `List<primitive>` column, round-tripped back to verify the
+    // nested list values survive.
+    // ------------------------------------------------------------------
+
+    #[cfg(feature = "arrow-ipc")]
+    fn read_single_list_column(batch: &arrow::record_batch::RecordBatch) -> Vec<Vec<f64>> {
+        use arrow::array::{Array, Float64Array, ListArray};
+        assert_eq!(batch.num_columns(), 1);
+        assert_eq!(batch.schema().field(0).name(), "ragged");
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .expect("column must be a ListArray");
+        (0..col.len())
+            .map(|i| {
+                let row = col.value(i);
+                let row = row.as_any().downcast_ref::<Float64Array>().unwrap();
+                row.iter().map(|x| x.unwrap()).collect()
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "arrow-ipc")]
+    #[test]
+    fn ragged_to_arrow_round_trips_list_of_float64() {
+        use arrow::ipc::reader::FileReader;
+
+        let json_bytes = serde_json::to_vec(&sample_json()).unwrap();
+        let meta = serde_json::to_value(f64_structure(3)).unwrap();
+        let arrow_bytes = to_arrow(&json_bytes, &meta).expect("to_arrow must succeed");
+
+        let reader = FileReader::try_new(std::io::Cursor::new(arrow_bytes.as_ref()), None).unwrap();
+        let batches: Vec<_> = reader.map(|b| b.unwrap()).collect();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(
+            read_single_list_column(&batches[0]),
+            vec![vec![1.0, 2.0, 3.0], vec![4.0], vec![5.0, 6.0]]
+        );
+    }
+
+    #[cfg(feature = "arrow-ipc")]
+    #[test]
+    fn ragged_to_arrow_handles_int64_leaf() {
+        use arrow::array::{Array, Int64Array, ListArray};
+        use arrow::ipc::reader::FileReader;
+
+        let structure = RaggedStructure {
+            data_type: DType::Builtin(BuiltinDType::new(Endianness::Little, Kind::Integer, 8)),
+            shape: vec![Some(2), None],
+            size: 0,
+            chunks: vec![Some(vec![2]), None],
+            dims: None,
+            resizable: Resizable::default(),
+        };
+        let json_bytes = serde_json::to_vec(&serde_json::json!([[1, 2], [3]])).unwrap();
+        let meta = serde_json::to_value(structure).unwrap();
+        let arrow_bytes = to_arrow(&json_bytes, &meta).expect("to_arrow must succeed");
+
+        let reader = FileReader::try_new(std::io::Cursor::new(arrow_bytes.as_ref()), None).unwrap();
+        let batch = reader.into_iter().next().unwrap().unwrap();
+        let col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+        let row0 = col.value(0);
+        let row0 = row0.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(row0.values(), &[1, 2]);
+    }
+
+    #[cfg(feature = "arrow-ipc")]
+    #[test]
+    fn ragged_arrow_registered() {
+        let reg = crate::registry::SerializationRegistry::new();
+        register_ragged_serializers(&reg);
+        assert!(
+            reg.dispatch(
+                StructureFamily::Ragged,
+                tiled_core::media_type::mime::ARROW_FILE
+            )
+            .is_some(),
+            "arrow IPC must be registered for ragged"
+        );
+    }
+
+    #[cfg(feature = "parquet")]
+    #[test]
+    fn ragged_to_parquet_round_trips_list_of_float64() {
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let json_bytes = serde_json::to_vec(&sample_json()).unwrap();
+        let meta = serde_json::to_value(f64_structure(3)).unwrap();
+        let pq_bytes = to_parquet(&json_bytes, &meta).expect("to_parquet must succeed");
+
+        let reader = ParquetRecordBatchReaderBuilder::try_new(pq_bytes)
+            .unwrap()
+            .build()
+            .unwrap();
+        let batches: Vec<_> = reader.map(|b| b.unwrap()).collect();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(
+            read_single_list_column(&batches[0]),
+            vec![vec![1.0, 2.0, 3.0], vec![4.0], vec![5.0, 6.0]]
+        );
+    }
+
+    #[cfg(feature = "parquet")]
+    #[test]
+    fn ragged_parquet_registered() {
+        let reg = crate::registry::SerializationRegistry::new();
+        register_ragged_serializers(&reg);
+        assert!(
+            reg.dispatch(
+                StructureFamily::Ragged,
+                tiled_core::media_type::mime::PARQUET
+            )
+            .is_some(),
+            "parquet must be registered for ragged"
         );
     }
 }
