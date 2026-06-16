@@ -162,7 +162,27 @@ impl ContainerClient {
         Ok(all)
     }
 
-    /// Add a `key=value` filter to subsequent searches.
+    /// Apply a typed query filter, returning a new client that returns only
+    /// matching entries.
+    ///
+    /// Mirrors Python `Container.search(query)`. Chain multiple calls for AND
+    /// semantics (each additional query narrows the result set). Use the types
+    /// in [`crate::queries`] to build queries; the [`crate::queries::Key`]
+    /// builder covers equality, inequality, and numeric comparisons.
+    ///
+    /// ```no_run
+    /// use tiled_client::queries::{FullText, Key};
+    /// # use tiled_client::ContainerClient;
+    /// # async fn run(c: ContainerClient) -> tiled_client::Result<()> {
+    /// let items = c.search(Key::new("color").eq("red")).keys().await?;
+    /// # Ok(()) }
+    /// ```
+    pub fn search(mut self, query: tiled_core::queries::Query) -> Self {
+        self.queries.extend(query.encode());
+        self
+    }
+
+    /// Add a raw `key=value` filter pair to subsequent searches.
     pub fn with_filter(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.queries.push((key.into(), value.into()));
         self
