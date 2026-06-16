@@ -255,6 +255,14 @@ fn normalize_floats(values: &[f32]) -> Vec<u8> {
         .collect()
 }
 
+/// PNG encoding entry point for the Array HTML serializer's try-then-fallback.
+pub(crate) fn encode_array_png(
+    data: &[u8],
+    metadata: &serde_json::Value,
+) -> Result<bytes::Bytes, crate::registry::SerializeError> {
+    encode_image(data, metadata, ImageFormat::Png)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -35,6 +35,13 @@ pub fn register_array_serializers(registry: &SerializationRegistry) {
         );
     }
 
+    // text/html: try PNG embed, fall back to CSV (mirrors Python serialize_html, array.py:143-163).
+    registry.register(
+        StructureFamily::Array,
+        "text/html",
+        Box::new(serialize_array_html),
+    );
+
     // Sparse arrays also use octet-stream
     registry.register(
         StructureFamily::Sparse,
@@ -271,6 +278,31 @@ fn serialize_array_csv(
     Ok(bytes::Bytes::from(output))
 }
 
+/// HTML serializer for arrays (Python `serialize_html`, array.py:143-163).
+///
+/// Tries to render the array as a PNG image embedded in an `<img>` data URL.
+/// Falls back to a plain CSV body when PNG encoding is unavailable or fails.
+fn serialize_array_html(
+    data: &[u8],
+    metadata: &serde_json::Value,
+) -> Result<bytes::Bytes, crate::registry::SerializeError> {
+    #[cfg(feature = "image")]
+    {
+        if let Ok(png_bytes) = crate::image_array::encode_array_png(data, metadata) {
+            use base64::Engine as _;
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
+            return Ok(bytes::Bytes::from(format!(
+                r#"<html><body><img src="data:image/png;base64,{b64}"/></body></html>"#
+            )));
+        }
+    }
+    let csv = serialize_array_csv(data, metadata)?;
+    let text = String::from_utf8_lossy(&csv);
+    Ok(bytes::Bytes::from(format!(
+        "<html><body>{text}</body></html>"
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -342,6 +374,58 @@ mod tests {
         let meta_2d = serde_json::json!({"itemsize": 8, "kind": "f", "shape": [2, 3]});
         let out_2d = ser(&data, &meta_2d).expect("2-D CSV is supported");
         assert_eq!(std::str::from_utf8(&out_2d).unwrap().lines().count(), 2);
+    }
+
+    /// M3: `text/html` is registered for arrays and wraps CSV in a minimal HTML
+    /// body when PNG is unavailable or fails.  A zero-rank shape ([]) causes
+    /// encode_image to return Err("array has zero rank") regardless of whether
+    /// the `image` feature is compiled in, so this test covers the CSV fallback
+    /// path in both configurations.
+    #[test]
+    fn html_array_csv_fallback() {
+        let reg = SerializationRegistry::new();
+        register_array_serializers(&reg);
+        let ser = reg
+            .dispatch(StructureFamily::Array, "text/html")
+            .expect("text/html must be registered for array");
+        // 0-rank array: PNG fails (encode_image rejects shape=[]) → CSV fallback.
+        let meta = serde_json::json!({"itemsize": 8, "kind": "f", "shape": []});
+        let out = ser(&[], &meta).unwrap();
+        let html = std::str::from_utf8(&out).unwrap();
+        assert!(
+            html.starts_with("<html><body>"),
+            "must wrap in html/body: {html}"
+        );
+        assert!(html.ends_with("</body></html>"), "must close html: {html}");
+        assert!(
+            !html.contains("<img"),
+            "CSV fallback must not embed an img tag: {html}"
+        );
+    }
+
+    /// M3: When the `image` feature is enabled, a 2-D array produces PNG-embed HTML.
+    #[cfg(feature = "image")]
+    #[test]
+    fn html_array_png_path_embeds_data_url() {
+        let reg = SerializationRegistry::new();
+        register_array_serializers(&reg);
+        let ser = reg
+            .dispatch(StructureFamily::Array, "text/html")
+            .expect("text/html must be registered for array");
+        // 2×2 u8 grayscale array → PNG succeeds → img data URL.
+        let data: Vec<u8> = vec![0u8, 64, 128, 255];
+        let meta = serde_json::json!({"itemsize": 1, "kind": "u", "shape": [2, 2]});
+        let out = ser(&data, &meta).unwrap();
+        let html = std::str::from_utf8(&out).unwrap();
+        assert!(
+            html.starts_with("<html><body>"),
+            "must open html/body: {html}"
+        );
+        assert!(
+            html.contains(r#"<img src="data:image/png;base64,"#),
+            "must embed PNG as data URL: {html}"
+        );
+        assert!(html.ends_with("</body></html>"), "must close html: {html}");
     }
 
     /// Finding 5: the array CSV serializer is registered under all four media

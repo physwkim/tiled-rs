@@ -5164,6 +5164,7 @@ name = "tiled-serialization"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "base64",
  "bytes",
  "csv",
  "dashmap",

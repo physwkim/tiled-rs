@@ -10,7 +10,7 @@ csv = ["dep:csv"]
 arrow-ipc = []
 msgpack = ["dep:rmp-serde"]
 parquet = ["dep:parquet"]
-image = ["dep:tiff", "dep:image"]
+image = ["dep:tiff", "dep:image", "dep:base64"]
 hdf5 = ["dep:rust-hdf5", "dep:tempfile"]
 
 [dependencies]
@@ -31,6 +31,7 @@ rmp-serde = { workspace = true, optional = true }
 parquet = { workspace = true, optional = true }
 tiff = { workspace = true, optional = true }
 image = { workspace = true, optional = true }
+base64 = { workspace = true, optional = true }
 zip = "2"
 rust-hdf5 = { workspace = true, optional = true }
 tempfile = { workspace = true, optional = true }
