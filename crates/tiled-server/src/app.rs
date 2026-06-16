@@ -170,6 +170,10 @@ pub fn build_app(state: AppState) -> Router {
         )
         .route("/api/v1/table/full/{*path}", get(router::table_full))
         .route("/api/v1/table/full", post(router::table_full_post))
+        // Ragged read path (Python router.py:838 `get_ragged_full`). GET-only:
+        // Python serves no GET `/ragged/block` (the advertised `block` link
+        // targets the PUT-only write route).
+        .route("/api/v1/ragged/full/{*path}", get(router::ragged_full))
         .route("/api/v1/register/", post(router::register_root))
         .route("/api/v1/register/{*path}", post(router::register))
         .route("/api/v1/metadata/{*path}", patch(router::patch_metadata))

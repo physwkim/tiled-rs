@@ -288,6 +288,10 @@ pub(crate) fn default_media_type(family: StructureFamily) -> Option<String> {
         // instead of being silently coerced to HTML. (Python's container default
         // is `application/x-hdf5`, which the Rust server does not implement.)
         StructureFamily::Container => Some("text/html".to_string()),
+        // A no-preference request (blank/`*/*` Accept) on a ragged node resolves
+        // to JSON list-of-lists (Python DEFAULT_MEDIA_TYPES[ragged]["*/*"] =
+        // "application/json", core.py:323).
+        StructureFamily::Ragged => Some(tiled_core::media_type::mime::JSON.to_string()),
         _ => None,
     }
 }

@@ -2164,3 +2164,178 @@ async fn test_get_revisions_405_without_catalog() {
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
 }
+
+// ---------------------------------------------------------------------------
+// Ragged read path (Serialization L1 + serving slice): GET /ragged/full
+// serves a variable-length-row array through the registry. Fixture rows
+// [[1,2,3],[4],[5,6]] (shape [3, None], float64) mirror the serializer unit
+// tests so the wire output can be checked against known buffers.
+// ---------------------------------------------------------------------------
+
+/// Build an app whose root holds a ragged node `some_ragged`
+/// (`[[1,2,3],[4],[5,6]]`) and an array node `some_array` (for the wrong-type
+/// route check). Separate from `build_test_tree` so the existing child-count
+/// assertions there are not perturbed.
+fn build_ragged_app() -> axum::Router {
+    use tiled_adapters::RaggedAdapter;
+
+    let mut mapping = IndexMap::new();
+    let ragged = RaggedAdapter::from_rows_f64(
+        vec![vec![1.0, 2.0, 3.0], vec![4.0], vec![5.0, 6.0]],
+        serde_json::json!({"element": "Cu"}),
+        vec![],
+    );
+    mapping.insert(
+        "some_ragged".to_string(),
+        AnyAdapter::Ragged(Arc::new(ragged)),
+    );
+
+    let arr = ArrayAdapter::from_f64_1d(&[0.0, 1.0, 2.0], serde_json::json!({}));
+    mapping.insert("some_array".to_string(), AnyAdapter::Array(Arc::new(arr)));
+
+    let root = MapAdapter::new(mapping, serde_json::json!({}), vec![]);
+    let root_tree: Arc<dyn tiled_core::adapters::ContainerAdapter> = Arc::new(root);
+    build_app_for_root(root_tree, 300_000_000)
+}
+
+/// No Accept header → ragged family default `application/json` (Python
+/// DEFAULT_MEDIA_TYPES[ragged]["*/*"], core.py:323): the JSON list-of-lists.
+#[tokio::test]
+async fn ragged_full_no_accept_serves_json_list_of_lists() {
+    let app = build_ragged_app();
+    let (status, headers, body) =
+        get_with_headers(&app, "/api/v1/ragged/full/some_ragged", &[]).await;
+    assert_eq!(status, 200);
+    let ct = headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        ct.starts_with("application/json"),
+        "no-Accept ragged read must default to application/json; got {ct}"
+    );
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        json,
+        serde_json::json!([[1.0, 2.0, 3.0], [4.0], [5.0, 6.0]])
+    );
+}
+
+/// `?slice=0:2` selects the first two rows; the JSON output drops the third.
+#[tokio::test]
+async fn ragged_full_slice_selects_rows() {
+    let app = build_ragged_app();
+    let (status, body) = get(&app, "/api/v1/ragged/full/some_ragged?slice=0:2").await;
+    assert_eq!(status, 200);
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json, serde_json::json!([[1.0, 2.0, 3.0], [4.0]]));
+}
+
+/// A slice Awkward cannot apply (scalar reduction `0,1`) → HTTP 422, not 500
+/// (Python `RaggedSlicingError` → 422, router.py:873-880).
+#[tokio::test]
+async fn ragged_full_unapplicable_slice_is_422() {
+    let app = build_ragged_app();
+    let (status, _body) = get(&app, "/api/v1/ragged/full/some_ragged?slice=0,1").await;
+    assert_eq!(status, 422, "scalar-reducing ragged slice must be 422");
+}
+
+/// `Accept: application/zip` → Awkward zip-of-buffers; round-trips back to the
+/// original list-of-lists via the deserializer.
+#[tokio::test]
+async fn ragged_full_accept_zip_round_trips() {
+    let app = build_ragged_app();
+    let (status, headers, body) = get_with_headers(
+        &app,
+        "/api/v1/ragged/full/some_ragged",
+        &[("accept", "application/zip")],
+    )
+    .await;
+    assert_eq!(status, 200);
+    let ct = headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(ct.starts_with("application/zip"), "got Content-Type {ct}");
+    assert_eq!(&body[..2], b"PK", "zip body must start with the PK magic");
+    let back = tiled_serialization::ragged::from_zipped_buffers(&body).unwrap();
+    assert_eq!(
+        back,
+        serde_json::json!([[1.0, 2.0, 3.0], [4.0], [5.0, 6.0]])
+    );
+}
+
+/// `Accept: application/vnd.apache.arrow.file` → a one-column `List<float64>`
+/// Arrow IPC file (Serialization L1). Checked by the Arrow file magic.
+#[tokio::test]
+async fn ragged_full_accept_arrow_ipc() {
+    let app = build_ragged_app();
+    let (status, headers, body) = get_with_headers(
+        &app,
+        "/api/v1/ragged/full/some_ragged",
+        &[("accept", "application/vnd.apache.arrow.file")],
+    )
+    .await;
+    assert_eq!(status, 200);
+    let ct = headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        ct.starts_with("application/vnd.apache.arrow.file"),
+        "got Content-Type {ct}"
+    );
+    assert_eq!(
+        &body[..6],
+        b"ARROW1",
+        "Arrow IPC file must start with ARROW1"
+    );
+}
+
+/// `?format=parquet` → a Parquet file (Serialization L1). Checked by the
+/// Parquet `PAR1` magic, and that `?format=` wins regardless of Accept.
+#[tokio::test]
+async fn ragged_full_format_parquet() {
+    let app = build_ragged_app();
+    let (status, headers, body) = get_with_headers(
+        &app,
+        "/api/v1/ragged/full/some_ragged?format=application/x-parquet",
+        &[("accept", "application/json")],
+    )
+    .await;
+    assert_eq!(status, 200);
+    let ct = headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        ct.starts_with("application/x-parquet"),
+        "got Content-Type {ct}"
+    );
+    assert_eq!(&body[..4], b"PAR1", "Parquet file must start with PAR1");
+    assert_eq!(
+        &body[body.len() - 4..],
+        b"PAR1",
+        "Parquet file must end with PAR1"
+    );
+}
+
+/// GET /ragged/full on a non-ragged node (an array) is a wrong-type-for-route
+/// → HTTP 404 (Python `WrongTypeForRoute` → 404, router.py:393-394).
+#[tokio::test]
+async fn ragged_full_on_array_node_is_404() {
+    let app = build_ragged_app();
+    let (status, _body) = get(&app, "/api/v1/ragged/full/some_array").await;
+    assert_eq!(status, 404, "ragged route on an array node must be 404");
+}
+
+/// An explicit, unserviceable `?format=` on a ragged node → HTTP 406 (format
+/// has hard priority; no silent fallback to the Accept default).
+#[tokio::test]
+async fn ragged_full_explicit_unsupported_format_is_406() {
+    let app = build_ragged_app();
+    // text/csv has no ragged serializer (registered only for array/table).
+    let (status, _h, _b) =
+        get_with_headers(&app, "/api/v1/ragged/full/some_ragged?format=text/csv", &[]).await;
+    assert_eq!(status, 406, "unserviceable ?format= on ragged must be 406");
+}

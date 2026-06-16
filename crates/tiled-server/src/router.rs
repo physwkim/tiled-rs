@@ -987,6 +987,76 @@ async fn build_sparse_response(
     Ok(serve_with_range(headers, &media_type, body))
 }
 
+// Shared by `ragged_full`: encode an already-read `RaggedData` through the
+// serialization registry so format negotiation applies (JSON list-of-lists,
+// Awkward zip-of-buffers, and — feature-gated — Arrow IPC / Parquet). Mirrors
+// Python `construct_data_response` for the ragged family (router.py:890-902).
+async fn build_ragged_response(
+    data: tiled_core::adapters::RaggedData,
+    format_param: Option<&str>,
+    headers: &HeaderMap,
+    state: &AppState,
+) -> Result<axum::response::Response, ServerError> {
+    // Cap the decoded size before serialization. Python guards on
+    // `array._impl.nbytes` (the Awkward buffers' total size, router.py:882); the
+    // dominant term is the data buffer = leaf-element count × itemsize.
+    // `RaggedStructure.size` is exactly that leaf count; the O(rows) offset
+    // buffers Python additionally counts do not change the order of magnitude.
+    let nbytes = data
+        .structure
+        .size
+        .saturating_mul(data.structure.data_type.element_size());
+    check_response_size(
+        nbytes,
+        state.response_bytesize_limit,
+        "Use slicing (\"?slice=...\") to request smaller chunks.",
+    )?;
+
+    let family = tiled_core::structures::StructureFamily::Ragged;
+    let accept = headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let media_type = tiled_serialization::negotiate_media_type(
+        format_param,
+        accept,
+        family,
+        &state.serialization_registry,
+    )
+    .ok_or_else(|| {
+        unsupported_media_type(
+            family,
+            format_param.unwrap_or(accept),
+            &state.serialization_registry,
+        )
+    })?;
+
+    let serializer = state
+        .serialization_registry
+        .dispatch(family, &media_type)
+        .ok_or_else(|| {
+            unsupported_media_type(family, &media_type, &state.serialization_registry)
+        })?;
+
+    // The ragged serializers consume the JSON list-of-lists as their `&[u8]`
+    // data argument and the serialized `RaggedStructure` as metadata (the ZIP
+    // and Arrow/Parquet serializers read shape/dtype from it).
+    let payload = data
+        .to_json_bytes()
+        .map_err(|e| ServerError::Internal(format!("ragged JSON encode failed: {e}")))?;
+    let ser_meta = data
+        .structure_as_metadata()
+        .map_err(|e| ServerError::Internal(format!("ragged structure encode failed: {e}")))?;
+
+    // Serializers run CPU-bound encode work; offload off the async executor.
+    let body = tokio::task::spawn_blocking(move || serializer(&payload, &ser_meta))
+        .await
+        .map_err(|e| ServerError::Internal(format!("serialize task failed: {e}")))?
+        .map_err(map_serialize_error)?;
+
+    Ok(serve_with_range(headers, &media_type, body))
+}
+
 // ---------------------------------------------------------------------------
 // GET /api/v1/array/block/{*path}
 // ---------------------------------------------------------------------------
@@ -2164,6 +2234,60 @@ pub async fn array_full(
         .map_err(ServerError::from)?;
 
     build_array_response(data, format_str.as_deref(), &headers, &state).await
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/ragged/full/{*path}
+// ---------------------------------------------------------------------------
+
+/// Serve a ragged (variable-length row) array. Mirrors Python `get_ragged_full`
+/// (router.py:838-906): resolve the entry, read the (optionally sliced) array,
+/// then negotiate and serialize. A slice that Awkward cannot apply surfaces as
+/// HTTP 422 (Python `RaggedSlicingError` → 422, router.py:873-880), not 500.
+///
+/// Python advertises a `block` link for ragged too (links.py:43), but only
+/// `GET /ragged/full` exists as a read route — the `block` link targets the
+/// PUT-only `/ragged/block` write endpoint — so no GET block handler is added.
+pub async fn ragged_full(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    auth: crate::AuthContext,
+) -> Result<impl IntoResponse, ServerError> {
+    auth.require(tiled_auth::Scope::ReadData)?;
+    let segments = segments_from_uri(&uri, "/api/v1/ragged/full/");
+    let _ = resolve_entry(&state, auth.clone(), &segments, tiled_auth::Scope::ReadData).await?;
+
+    let slice_str = params
+        .get("slice")
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+    let format_str = params.get("format").map(|s| s.to_string());
+    let adapter = core::walk_tree(state.root_tree.as_ref(), &segments).await?;
+
+    let slice = match slice_str.as_str() {
+        "" => tiled_core::ndslice::NDSlice::empty(),
+        s => tiled_core::ndslice::NDSlice::from_numpy_str(s)
+            .map_err(|e| ServerError::Validation(format!("Invalid slice '{s}': {e}")))?,
+    };
+
+    let ragged = adapter.as_ragged_arc().ok_or_else(|| {
+        ServerError::WrongType(format!("'{}' is not a ragged array", segments.join("/")))
+    })?;
+
+    // A slice Awkward cannot apply (out-of-bounds row index, scalar reduction,
+    // index past a short ragged row) is a client error → 422, matching Python's
+    // `RaggedSlicingError` handling (router.py:873-880), not a 500.
+    let data = ragged.read(&slice).await.map_err(|e| match e {
+        tiled_core::TiledError::InvalidSlice(msg) => ServerError::Validation(format!(
+            "Cannot apply the requested slice to the given ragged array: {msg}. \
+             Try reading the entire array and slicing it on the client side instead."
+        )),
+        other => ServerError::from(other),
+    })?;
+
+    build_ragged_response(data, format_str.as_deref(), &headers, &state).await
 }
 
 // ---------------------------------------------------------------------------
