@@ -232,6 +232,30 @@ async fn test_about_endpoint() {
 }
 
 #[tokio::test]
+async fn test_about_authentication_required_with_api_key() {
+    // Python: `authentication.required = not settings.allow_anonymous_access`
+    // (router.py:301). A single-user API-key server has no login providers but
+    // still requires the key, so `required` must be true even with an empty
+    // `providers` list. Guards the fix that replaced
+    // `!providers.is_empty() || external_oidc.is_some()` with
+    // `!no_auth_configured()`. `/api/v1/` is public (see `test_about_is_public`),
+    // so no credential is needed to read the discovery document.
+    let app = build_app_with_api_key("secret123");
+    let (status, body) = get_json(&app, "/api/v1/").await;
+    assert_eq!(status, 200);
+
+    assert_eq!(body["authentication"]["required"], true);
+    // No login providers configured (API-key-only), yet auth is still required.
+    assert_eq!(
+        body["authentication"]["providers"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+}
+
+#[tokio::test]
 async fn test_root_metadata() {
     let app = build_app();
     let (status, body) = get_json(&app, "/api/v1/metadata/").await;

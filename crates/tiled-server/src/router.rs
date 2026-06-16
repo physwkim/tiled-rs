@@ -196,7 +196,15 @@ pub async fn about(State(state): State<AppState>, BaseUrl(base_url): BaseUrl) ->
             })
         })
         .collect();
-    let auth_required = !providers.is_empty() || state.external_oidc.is_some();
+    // Python: `authentication.required = not settings.allow_anonymous_access`
+    // (router.py:301) — purely the anonymous-access policy, NOT whether login
+    // providers exist. Rust's `no_auth_configured()` (no api_key AND no
+    // auth_db) is the single source of truth for "anonymous access allowed",
+    // so it is exactly Rust's `allow_anonymous_access`. Negating it fixes the
+    // previous `!providers.is_empty() || external_oidc.is_some()`, which
+    // misreported a single-user `api_key`-only server (no authenticators) as
+    // NOT requiring auth even though every request needs the key.
+    let auth_required = !state.no_auth_configured();
 
     let about = About {
         api_version: 0,
