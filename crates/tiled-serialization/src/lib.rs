@@ -1,6 +1,7 @@
 pub mod array;
 pub mod html_container;
 pub mod json_seq;
+pub mod ragged;
 pub mod registry;
 pub mod table;
 
@@ -25,6 +26,7 @@ pub fn default_registry() -> SerializationRegistry {
     let reg = SerializationRegistry::new();
     array::register_array_serializers(&reg);
     table::register_table_serializers(&reg);
+    ragged::register_ragged_serializers(&reg);
     html_container::register_html_serializer(&reg);
     json_seq::register_json_seq_serializer(&reg);
     #[cfg(feature = "image")]
