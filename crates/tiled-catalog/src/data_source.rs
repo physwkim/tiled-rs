@@ -87,6 +87,48 @@ impl Catalog {
         }
     }
 
+    /// Look up a single asset by id, scoped to `node_id`: the asset must belong
+    /// to one of the node's data sources. Mirrors Python
+    /// `CatalogNodeAdapter.asset_by_id` (catalog/adapter.py:412-430), which joins
+    /// asset → data_source → node and filters on `node.id == self.node.id`.
+    /// Returns `None` when no asset with that id belongs to the node — so a
+    /// client cannot download another node's files by passing a foreign asset
+    /// id to this node's path. (The Rust schema attaches each asset to one
+    /// data_source via a direct FK rather than Python's association table, so the
+    /// join is one hop shorter but node-scoping is identical.)
+    pub async fn asset_by_id(&self, node_id: i64, asset_id: i64) -> Result<Option<Asset>> {
+        match self.pool() {
+            DbPool::Sqlite(pool) => {
+                let row = sqlx::query(
+                    "SELECT a.id, a.data_source_id, a.data_uri, a.is_directory,
+                            a.parameter, a.num
+                       FROM assets a
+                       JOIN data_sources ds ON a.data_source_id = ds.id
+                      WHERE ds.node_id = ? AND a.id = ?",
+                )
+                .bind(node_id)
+                .bind(asset_id)
+                .fetch_optional(pool)
+                .await?;
+                row.as_ref().map(asset_from_sqlite_row).transpose()
+            }
+            DbPool::Postgres(pool) => {
+                let row = sqlx::query(
+                    "SELECT a.id, a.data_source_id, a.data_uri, a.is_directory,
+                            a.parameter, a.num
+                       FROM assets a
+                       JOIN data_sources ds ON a.data_source_id = ds.id
+                      WHERE ds.node_id = $1 AND a.id = $2",
+                )
+                .bind(node_id)
+                .bind(asset_id)
+                .fetch_optional(pool)
+                .await?;
+                row.as_ref().map(asset_from_postgres_row).transpose()
+            }
+        }
+    }
+
     pub async fn create_data_source(
         &self,
         node_id: i64,

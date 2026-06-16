@@ -45,6 +45,11 @@ pub struct TiledConfig {
     /// Per-request timeout in seconds (L5). Default: 30.
     #[serde(default = "default_request_timeout_secs")]
     pub request_timeout_secs: u64,
+    /// Whether the raw-asset download endpoints (`/api/v1/asset/bytes` and
+    /// `/api/v1/asset/manifest`) may serve backing files from disk. Mirrors
+    /// Python `expose_raw_assets`, which defaults to `True` (settings.py:57).
+    #[serde(default = "default_expose_raw_assets")]
+    pub expose_raw_assets: bool,
 }
 
 /// Default for [`TiledConfig::response_bytesize_limit`] — 300 MB, matching
@@ -56,6 +61,12 @@ pub fn default_response_bytesize_limit() -> usize {
 /// Default for [`TiledConfig::request_timeout_secs`] — 30 s.
 pub fn default_request_timeout_secs() -> u64 {
     30
+}
+
+/// Default for [`TiledConfig::expose_raw_assets`] — `true`, matching Python
+/// tiled (`settings.py:57`).
+pub fn default_expose_raw_assets() -> bool {
+    true
 }
 
 // `Default` is hand-written (not derived) so `response_bytesize_limit` agrees
@@ -71,6 +82,7 @@ impl Default for TiledConfig {
             access_control: None,
             response_bytesize_limit: default_response_bytesize_limit(),
             request_timeout_secs: default_request_timeout_secs(),
+            expose_raw_assets: default_expose_raw_assets(),
         }
     }
 }

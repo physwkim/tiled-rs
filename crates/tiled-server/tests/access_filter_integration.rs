@@ -158,6 +158,7 @@ async fn search_respects_tag_based_access_policy() {
         spec_views: Vec::new(),
         webhook_config: None,
         request_timeout_secs: 30,
+        expose_raw_assets: true,
     };
     let app = tiled_server::build_app(state);
 
@@ -278,6 +279,7 @@ async fn admin_search_sees_all_nodes() {
         spec_views: Vec::new(),
         webhook_config: None,
         request_timeout_secs: 30,
+        expose_raw_assets: true,
     };
     let app = tiled_server::build_app(state);
 
@@ -402,6 +404,7 @@ async fn array_append_denied_by_tag_policy_returns_404() {
         spec_views: Vec::new(),
         webhook_config: None,
         request_timeout_secs: 30,
+        expose_raw_assets: true,
     };
     let app = tiled_server::build_app(state);
 
@@ -491,6 +494,7 @@ async fn anonymous_search_shows_only_public_nodes() {
         spec_views: Vec::new(),
         webhook_config: None,
         request_timeout_secs: 30,
+        expose_raw_assets: true,
     };
     let app = tiled_server::build_app(state);
 
@@ -584,6 +588,7 @@ async fn public_tagged_node_is_listable_and_readable_by_anonymous() {
         spec_views: Vec::new(),
         webhook_config: None,
         request_timeout_secs: 30,
+        expose_raw_assets: true,
     };
     let app = tiled_server::build_app(state);
 
@@ -690,6 +695,7 @@ async fn anonymous_search_excludes_user_owned_nodes() {
         spec_views: Vec::new(),
         webhook_config: None,
         request_timeout_secs: 30,
+        expose_raw_assets: true,
     };
     let app = tiled_server::build_app(state);
 
@@ -795,6 +801,7 @@ async fn cross_user_search_excludes_other_users_owned_nodes() {
         spec_views: Vec::new(),
         webhook_config: None,
         request_timeout_secs: 30,
+        expose_raw_assets: true,
     };
     let app = tiled_server::build_app(state);
 
@@ -907,6 +914,7 @@ async fn metadata_read_excludes_other_users_owned_node() {
         spec_views: Vec::new(),
         webhook_config: None,
         request_timeout_secs: 30,
+        expose_raw_assets: true,
     };
     let app = tiled_server::build_app(state);
 

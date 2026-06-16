@@ -209,6 +209,83 @@ async fn delete_refuses_internally_managed_subtree() {
     );
 }
 
+/// Server M3: `asset_by_id` is node-scoped — an asset id resolves only via the
+/// path of the node that owns it, so a foreign asset id returns None (404 at the
+/// HTTP layer), never another node's files.
+#[tokio::test]
+async fn asset_by_id_is_node_scoped() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("sqlite://{}", dir.path().join("catalog.db").display());
+    let cat = Catalog::connect(&uri).await.unwrap();
+    cat.migrate().await.unwrap();
+
+    let make_array = |key: &str| RegisterRequest {
+        key: key.into(),
+        structure_family: "array".into(),
+        metadata: json!({}),
+        specs: json!([]),
+        access_blob: json!({}),
+    };
+    let array_a = cat
+        .create_node(None, vec![], make_array("a"))
+        .await
+        .unwrap();
+    let array_b = cat
+        .create_node(None, vec![], make_array("b"))
+        .await
+        .unwrap();
+
+    let ds_spec = |data_uri: &str, is_directory: bool| DataSourceSpec {
+        structure_family: "array".into(),
+        structure: json!({
+            "shape": [10],
+            "data_type": {"endianness": "little", "kind": "f", "itemsize": 8},
+            "chunks": [[10]],
+        }),
+        mimetype: "application/x-hdf5".into(),
+        parameters: json!({}),
+        management: "external".into(),
+        assets: vec![AssetSpec {
+            data_uri: data_uri.into(),
+            is_directory,
+            parameter: "data_uri".into(),
+            num: None,
+        }],
+    };
+    let ds_a = cat
+        .create_data_source(array_a.id, ds_spec("file:///tmp/a.h5", false))
+        .await
+        .unwrap();
+    cat.create_data_source(array_b.id, ds_spec("file:///tmp/b_dir", true))
+        .await
+        .unwrap();
+
+    let asset_a = cat.list_assets(ds_a.id).await.unwrap().remove(0);
+
+    // Own node resolves the asset.
+    let got = cat.asset_by_id(array_a.id, asset_a.id).await.unwrap();
+    assert!(got.is_some(), "owning node must resolve its asset");
+    assert_eq!(got.unwrap().data_uri, "file:///tmp/a.h5");
+
+    // The OTHER node must NOT resolve node a's asset id, even though it exists.
+    assert!(
+        cat.asset_by_id(array_b.id, asset_a.id)
+            .await
+            .unwrap()
+            .is_none(),
+        "asset_by_id must be node-scoped: a foreign asset id returns None"
+    );
+
+    // A nonexistent asset id returns None.
+    assert!(
+        cat.asset_by_id(array_a.id, 999_999)
+            .await
+            .unwrap()
+            .is_none(),
+        "nonexistent asset id returns None"
+    );
+}
+
 #[tokio::test]
 async fn metadata_size_limit_rejected() {
     let dir = tempfile::tempdir().unwrap();

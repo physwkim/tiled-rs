@@ -661,6 +661,10 @@ pub async fn run(command: Command) -> Result<()> {
                     .as_ref()
                     .map(|c| c.request_timeout_secs)
                     .unwrap_or(30),
+                expose_raw_assets: file_config
+                    .as_ref()
+                    .map(|c| c.expose_raw_assets)
+                    .unwrap_or(true),
             };
 
             let app = tiled_server::build_app(state);

@@ -186,6 +186,13 @@ pub fn build_app(state: AppState) -> Router {
         // (with ?number=N) drops one. Catalog-only → 405 without a catalog.
         .route("/api/v1/revisions/{*path}", get(router::get_revisions))
         .route("/api/v1/revisions/{*path}", delete(router::delete_revision))
+        // Raw-asset download (Python router.py:2570-2723). Gated by
+        // `expose_raw_assets`; catalog-only → 405 without a catalog.
+        .route("/api/v1/asset/bytes/{*path}", get(router::get_asset_bytes))
+        .route(
+            "/api/v1/asset/manifest/{*path}",
+            get(router::get_asset_manifest),
+        )
         .route("/api/v1/data_source/{*path}", put(router::put_data_source))
         .route("/documents/{*path}", get(router::get_documents))
         // Webhooks (upstream tiled #1353).

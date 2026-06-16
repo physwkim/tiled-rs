@@ -3226,6 +3226,245 @@ pub async fn delete_revision(
 }
 
 // ---------------------------------------------------------------------------
+// GET /api/v1/asset/bytes/{*path} + /api/v1/asset/manifest/{*path}
+// ---------------------------------------------------------------------------
+//
+// Raw-asset download (upstream tiled router.py:2570-2723). Gated by
+// `expose_raw_assets` (default true). Only `file://` assets are served. A
+// directory asset requires a `relative_path` (one of the entries from
+// /asset/manifest); a single-file asset must not have one.
+
+/// Required `id` query param → the asset id (Python `id: int`).
+fn parse_asset_id(params: &HashMap<String, String>) -> Result<i64, ServerError> {
+    params
+        .get("id")
+        .ok_or_else(|| ServerError::Validation("query parameter 'id' is required".into()))?
+        .parse::<i64>()
+        .map_err(|_| ServerError::Validation("'id' must be an integer".into()))
+}
+
+/// Convert an asset `file://` data_uri to a filesystem path (Python
+/// `path_from_uri`, utils.py:745). `url::Url::to_file_path` handles the
+/// `file://host/path` and `file:///path` forms plus percent-decoding.
+fn path_from_file_uri(uri: &str) -> Result<std::path::PathBuf, ServerError> {
+    // The `file:` prefix is validated by the caller before this runs, so a
+    // failure here means the stored data_uri is corrupt — a server-side data
+    // integrity problem, not bad client input. Classify as Internal (500) so
+    // the URI is logged server-side and not echoed to the client.
+    let url = url::Url::parse(uri)
+        .map_err(|e| ServerError::Internal(format!("invalid asset data_uri '{uri}': {e}")))?;
+    url.to_file_path()
+        .map_err(|_| ServerError::Internal(format!("asset data_uri is not a file path: {uri}")))
+}
+
+/// Shared prelude for both asset endpoints, in Python's check order
+/// (router.py:2584-2615): resolve + scope-gate the entry, apply the
+/// `expose_raw_assets` policy (403), require a catalog (== Python's
+/// `hasattr(entry, "asset_by_id")` → 405 for the in-memory tree), look up the
+/// node, then fetch the node-scoped asset (404 if absent).
+async fn resolve_asset(
+    state: &AppState,
+    auth: crate::AuthContext,
+    segments: &[String],
+    asset_id: i64,
+) -> Result<tiled_catalog::orm::Asset, ServerError> {
+    // Per-ancestor auth gate + terminal read:data (Python get_entry
+    // scopes=["read:data"]). resolve_entry narrows per node and enforces
+    // read:data at the resolved entry. Bad path → 404, insufficient scope → 403.
+    resolve_entry(state, auth, segments, tiled_auth::Scope::ReadData).await?;
+    // expose_raw_assets policy (router.py:2596-2603).
+    if !state.expose_raw_assets {
+        return Err(ServerError::Forbidden(
+            "This Tiled server is configured not to allow downloading raw assets.".into(),
+        ));
+    }
+    // No catalog → the in-memory tree adapters have no `asset_by_id`, mirroring
+    // Python's `hasattr` check (router.py:2604-2608) → 405.
+    let Some(catalog) = state.catalog.as_ref() else {
+        return Err(ServerError::MethodNotAllowed(
+            "This node does not support downloading assets.".into(),
+        ));
+    };
+    let node = catalog
+        .lookup(segments)
+        .await
+        .map_err(map_catalog_err)?
+        .ok_or_else(|| ServerError::NotFound(format!("'{}' not found", segments.join("/"))))?;
+    catalog
+        .asset_by_id(node.id, asset_id)
+        .await
+        .map_err(map_catalog_err)?
+        .ok_or_else(|| {
+            ServerError::NotFound(format!(
+                "This node exists but it does not have an Asset with id {asset_id}"
+            ))
+        })
+}
+
+pub async fn get_asset_bytes(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    auth: crate::AuthContext,
+) -> Result<impl IntoResponse, ServerError> {
+    let segments = segments_from_uri(&uri, "/api/v1/asset/bytes/");
+    let asset_id = parse_asset_id(&params)?;
+    let asset = resolve_asset(&state, auth, &segments, asset_id).await?;
+
+    let relative_path = params.get("relative_path").filter(|s| !s.is_empty());
+    // Directory vs single-file relative_path rules (router.py:2616-2635).
+    if asset.is_directory {
+        let Some(rel) = relative_path else {
+            return Err(ServerError::BadRequest(format!(
+                "This asset is a directory. Must specify relative path, from \
+                 manifest provided by /asset/manifest/...?id={asset_id}"
+            )));
+        };
+        if std::path::Path::new(rel).is_absolute() {
+            return Err(ServerError::BadRequest(
+                "relative_path query parameter must be a *relative* path".into(),
+            ));
+        }
+    } else if relative_path.is_some() {
+        return Err(ServerError::BadRequest(
+            "This asset is not a directory. The relative_path query parameter must not be set."
+                .into(),
+        ));
+    }
+
+    if !asset.data_uri.starts_with("file:") {
+        return Err(ServerError::BadRequest(
+            "Only download assets stored as file:// is currently supported.".into(),
+        ));
+    }
+    let base = path_from_file_uri(&asset.data_uri)?;
+    let full_path = match relative_path {
+        Some(rel) => {
+            // Correct traversal guard. (Python's check at router.py:2645,
+            // `not commonpath([p, p/rel]) != p`, is inverted and would reject
+            // the valid case; we implement the documented intent: refuse to
+            // serve anything that canonicalizes outside the asset directory,
+            // e.g. a `../..` escape that survived the not-absolute check.)
+            let canonical_base = tokio::fs::canonicalize(&base)
+                .await
+                .map_err(|e| map_asset_io_err(e, "asset directory"))?;
+            let candidate = canonical_base.join(rel);
+            let resolved = tokio::fs::canonicalize(&candidate)
+                .await
+                .map_err(|e| map_asset_io_err(e, "requested file"))?;
+            if !resolved.starts_with(&canonical_base) {
+                return Err(ServerError::BadRequest(
+                    "relative_path escapes the asset directory".into(),
+                ));
+            }
+            resolved
+        }
+        None => base,
+    };
+
+    let filename = full_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| "download".to_string());
+    let bytes = tokio::fs::read(&full_path)
+        .await
+        .map_err(|e| map_asset_io_err(e, "asset file"))?;
+
+    // Raw bytes: octet-stream + attachment so any client downloads rather than
+    // renders. serve_with_range adds Range support (resumable large downloads).
+    let mut resp = serve_with_range(
+        &headers,
+        "application/octet-stream",
+        bytes::Bytes::from(bytes),
+    );
+    if let Ok(value) = axum::http::HeaderValue::from_str(&format!(
+        "attachment; filename=\"{}\"",
+        filename.replace('"', "")
+    )) {
+        resp.headers_mut()
+            .insert(axum::http::header::CONTENT_DISPOSITION, value);
+    }
+    Ok(resp)
+}
+
+pub async fn get_asset_manifest(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+    Query(params): Query<HashMap<String, String>>,
+    auth: crate::AuthContext,
+) -> Result<impl IntoResponse, ServerError> {
+    let segments = segments_from_uri(&uri, "/api/v1/asset/manifest/");
+    let asset_id = parse_asset_id(&params)?;
+    let asset = resolve_asset(&state, auth, &segments, asset_id).await?;
+
+    if !asset.is_directory {
+        return Err(ServerError::BadRequest(
+            "This asset is not a directory. There is no manifest.".into(),
+        ));
+    }
+    if !asset.data_uri.starts_with("file:") {
+        return Err(ServerError::BadRequest(
+            "Only download assets stored as file:// is currently supported.".into(),
+        ));
+    }
+    let dir = path_from_file_uri(&asset.data_uri)?;
+    // Manifest entries are paths RELATIVE to the asset directory. Python
+    // documents the manifest as relative (client/base.py:342) and the client
+    // feeds each entry straight back as `relative_path`; the Python *server*
+    // emits absolute paths via `Path(root, file)` (router.py:2722), which the
+    // /asset/bytes endpoint then rejects as absolute — a round-trip bug. Rust
+    // returns relative paths so manifest → relative_path → bytes works.
+    let manifest = tokio::task::spawn_blocking(move || collect_manifest(&dir))
+        .await
+        .map_err(|e| ServerError::Internal(format!("manifest walk task failed: {e}")))??;
+    Ok(Json(serde_json::json!({ "manifest": manifest })))
+}
+
+/// Map a filesystem error from asset serving: a missing file/dir is a 404
+/// (the asset row exists but its backing file is gone), anything else a 500.
+fn map_asset_io_err(e: std::io::Error, what: &str) -> ServerError {
+    if e.kind() == std::io::ErrorKind::NotFound {
+        ServerError::NotFound(format!("{what} not found on disk"))
+    } else {
+        ServerError::Internal(format!("reading {what}: {e}"))
+    }
+}
+
+/// Recursively collect every regular file under `dir`, returned as
+/// forward-slash paths relative to `dir`, sorted for deterministic output.
+/// Symlinked directories are not descended (matching `os.walk`'s default
+/// `followlinks=False`); a symlink is recorded as a leaf entry.
+fn collect_manifest(dir: &std::path::Path) -> Result<Vec<String>, ServerError> {
+    fn walk(
+        base: &std::path::Path,
+        cur: &std::path::Path,
+        out: &mut Vec<String>,
+    ) -> Result<(), ServerError> {
+        let entries = std::fs::read_dir(cur).map_err(|e| map_asset_io_err(e, "asset directory"))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| map_asset_io_err(e, "asset directory entry"))?;
+            let file_type = entry
+                .file_type()
+                .map_err(|e| map_asset_io_err(e, "asset directory entry"))?;
+            let path = entry.path();
+            if file_type.is_dir() {
+                walk(base, &path, out)?;
+            } else {
+                let rel = path.strip_prefix(base).unwrap_or(&path);
+                out.push(rel.to_string_lossy().replace('\\', "/"));
+            }
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    walk(dir, dir, &mut out)?;
+    out.sort();
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
 // PUT /api/v1/data_source/{*path} — replace structure / parameters
 // ---------------------------------------------------------------------------
 //

@@ -110,6 +110,12 @@ pub struct AppState {
     /// timeouts to the ASGI server (uvicorn) and has no in-app default;
     /// 30 s matches the common uvicorn keepalive default.
     pub request_timeout_secs: u64,
+    /// Whether the raw-asset download endpoints (`GET /api/v1/asset/bytes` and
+    /// `/api/v1/asset/manifest`) are allowed to serve backing files from disk.
+    /// Mirrors Python `Settings.expose_raw_assets`, which defaults to `True`
+    /// (settings.py:57); when `false` both endpoints return 403 even for
+    /// otherwise-valid requests.
+    pub expose_raw_assets: bool,
 }
 
 /// One `spec_views` entry. Wire-compatible with tiled-web's
