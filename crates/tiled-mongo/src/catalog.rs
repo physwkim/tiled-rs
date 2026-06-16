@@ -285,6 +285,7 @@ fn matches_run_query(adapter: &AnyAdapter, query: &Query) -> bool {
     let lookup = |key: &str| -> Option<&serde_json::Value> {
         meta.get("start")
             .and_then(|s| s.get(key))
+            .or_else(|| meta.get("stop").and_then(|s| s.get(key)))
             .or_else(|| meta.get(key))
     };
     match query {
@@ -507,6 +508,59 @@ mod tests {
             value: json!("count"),
         });
         assert!(!matches_run_query(&a, &q));
+    }
+
+    // L1a: lookup must search meta["stop"] as well as meta["start"].
+    // Eq/NotEq on stop fields like exit_status silently missed before this fix.
+
+    #[test]
+    fn eq_on_stop_field_matches() {
+        let a = run(json!({"start": {}, "stop": {"exit_status": "success"}}));
+        let q = Query::Eq(tiled_core::queries::Eq {
+            key: "exit_status".into(),
+            value: json!("success"),
+        });
+        assert!(
+            matches_run_query(&a, &q),
+            "Eq must find fields in meta['stop']"
+        );
+    }
+
+    #[test]
+    fn eq_on_stop_field_does_not_match_wrong_value() {
+        let a = run(json!({"start": {}, "stop": {"exit_status": "success"}}));
+        let q = Query::Eq(tiled_core::queries::Eq {
+            key: "exit_status".into(),
+            value: json!("fail"),
+        });
+        assert!(!matches_run_query(&a, &q));
+    }
+
+    #[test]
+    fn notin_on_stop_field_excludes_matching_run() {
+        let a = run(json!({"start": {}, "stop": {"exit_status": "abort"}}));
+        let q = Query::NotIn(NotInQ {
+            key: "exit_status".into(),
+            value: vec![json!("abort"), json!("fail")],
+        });
+        assert!(
+            !matches_run_query(&a, &q),
+            "NotIn must find the key in meta['stop'] and exclude the run"
+        );
+    }
+
+    #[test]
+    fn start_field_takes_priority_over_stop_field() {
+        // If the same key exists in both start and stop, start wins.
+        let a = run(json!({"start": {"plan_name": "scan"}, "stop": {"plan_name": "count"}}));
+        let q = Query::Eq(tiled_core::queries::Eq {
+            key: "plan_name".into(),
+            value: json!("scan"),
+        });
+        assert!(
+            matches_run_query(&a, &q),
+            "start field must shadow stop field with the same key"
+        );
     }
 
     // H7: the batched run_stop lookup replaces an N+1 find_one per run. The
