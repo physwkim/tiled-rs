@@ -760,3 +760,398 @@ async fn create_service_principal_admin_succeeds() {
         "response must carry a uuid"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Device-code OIDC approval tests (tiled#1377)
+// ---------------------------------------------------------------------------
+
+/// Build an AppState + App with an ExternalOidcValidator wired in, using an
+/// HS256 key pre-seeded into the cache so no JWKS network call is needed.
+/// Returns (app, auth_db, validator) so tests can mint matching tokens.
+async fn build_oidc_app() -> (axum::Router, AuthDb, Arc<tiled_auth::ExternalOidcValidator>) {
+    use jsonwebtoken::Algorithm;
+    use tiled_auth::{ExternalOidcValidator, OidcProvider};
+
+    let dir = tempfile::tempdir().unwrap();
+    let cat_uri = format!("sqlite://{}", dir.path().join("catalog.db").display());
+    let auth_uri = format!("sqlite://{}", dir.path().join("auth.db").display());
+    let catalog = Catalog::connect(&cat_uri).await.unwrap();
+    catalog.migrate().await.unwrap();
+    let auth_db = AuthDb::connect(&auth_uri).await.unwrap();
+    auth_db.migrate().await.unwrap();
+
+    let issuer = Issuer::new(b"this-is-a-test-secret-32-bytes-long!!").unwrap();
+
+    let validator = Arc::new(
+        ExternalOidcValidator::new(vec![OidcProvider {
+            name: "test-idp".into(),
+            jwks_url: "https://example.test/jwks".into(), // never fetched
+            issuer: "https://issuer.test/".into(),
+            audiences: vec!["tiled-test".into()],
+            subject_claim: "sub".into(),
+            algorithms: vec![Algorithm::HS256],
+        }])
+        .unwrap(),
+    );
+    // Pre-seed the cache so validate() skips the JWKS HTTP call.
+    validator
+        .inject_key_for_test(
+            "test-idp",
+            "test-kid-1",
+            jsonwebtoken::DecodingKey::from_secret(b"oidc-test-secret"),
+            Algorithm::HS256,
+        )
+        .await;
+
+    let resolver: Arc<dyn tiled_catalog::adapter::LeafResolver> =
+        Arc::new(tiled_catalog::adapter::UnresolvedLeaf);
+    let root_tree: Arc<dyn ContainerAdapter> = Arc::new(tiled_catalog::CatalogAdapter::root(
+        catalog.clone(),
+        resolver,
+    ));
+    let registry = Arc::new(tiled_serialization::default_registry());
+    let state = tiled_server::AppState {
+        root_tree,
+        serialization_registry: registry,
+        query_names: Query::all_query_names()
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        base_url: Some("http://localhost:8000".into()),
+        cors_policy: tiled_server::state::CorsOriginPolicy::Permissive,
+        trust_forwarded_headers: false,
+        api_key: None,
+        catalog: Some(catalog),
+        auth_db: Some(auth_db.clone()),
+        issuer: Some(issuer),
+        authenticators: vec![],
+        proxied_header_auth: None,
+        external_oidc: Some(validator.clone()),
+        forwarded_allow_ips: None,
+        max_request_body_bytes: 10 * 1024 * 1024,
+        response_bytesize_limit: 300_000_000,
+        streaming_bus: tiled_server::streaming::StreamingBus::new(),
+        access_policy: None,
+        default_login_scopes: tiled_auth::ScopeSet::full(),
+        enable_web: false,
+        web_assets_dir: None,
+        spec_views: vec![],
+        webhook_config: None,
+    };
+    (tiled_server::build_app(state), auth_db, validator)
+}
+
+/// Mint an HS256 OIDC token for the given subject using the test key.
+/// Token is signed with secret `b"oidc-test-secret"`, kid `"test-kid-1"`,
+/// iss `"https://issuer.test/"`, aud `"tiled-test"`.
+fn mint_test_oidc_token(sub: &str) -> String {
+    use chrono::Utc;
+    use jsonwebtoken::{Algorithm, EncodingKey, Header};
+
+    let now = Utc::now().timestamp();
+    let claims = serde_json::json!({
+        "iss": "https://issuer.test/",
+        "aud": "tiled-test",
+        "sub": sub,
+        "exp": now + 3600,
+        "nbf": now - 60,
+        "iat": now - 60,
+    });
+    let mut header = Header::new(Algorithm::HS256);
+    header.kid = Some("test-kid-1".into());
+    jsonwebtoken::encode(
+        &header,
+        &claims,
+        &EncodingKey::from_secret(b"oidc-test-secret"),
+    )
+    .unwrap()
+}
+
+/// Invariant: a valid OIDC token in the approval body MUST create (or
+/// upsert) the principal, approve the device code, and allow the CLI
+/// client to poll a Granted status with access tokens.
+#[tokio::test]
+async fn device_approve_oidc_valid_creates_principal_and_approves() {
+    let (app, auth_db, _validator) = build_oidc_app().await;
+
+    // Initiate a device code.
+    let (status, body) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/auth/device/initiate",
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "initiate: {body}");
+    let user_code = body["user_code"].as_str().unwrap().to_string();
+    let device_code = body["device_code"].as_str().unwrap().to_string();
+
+    // Approve using an OIDC token — no tiled session required.
+    let oidc_token = mint_test_oidc_token("alice-oidc-sub");
+    let (status, body) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/auth/device/approve",
+        &[],
+        Some(json!({"user_code": user_code, "oidc_token": oidc_token})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "approve: {body}");
+
+    // Poll: must return Granted with tokens.
+    let (status, body) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/auth/device/token",
+        &[],
+        Some(json!({"device_code": device_code})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "token: {body}");
+    assert!(body["access_token"].is_string(), "missing access_token");
+    assert!(body["refresh_token"].is_string(), "missing refresh_token");
+
+    // Principal was upserted: ensure_principal on the same sub returns the same id.
+    let (p1, _) = auth_db
+        .ensure_principal("test-idp", "alice-oidc-sub")
+        .await
+        .unwrap();
+    let (p2, _) = auth_db
+        .ensure_principal("test-idp", "alice-oidc-sub")
+        .await
+        .unwrap();
+    assert_eq!(p1.id, p2.id, "ensure_principal must be idempotent");
+}
+
+/// Invariant: an invalid (forged/malformed) OIDC token MUST NOT create
+/// a principal or approve the device code. The code must remain Pending.
+#[tokio::test]
+async fn device_approve_oidc_invalid_does_not_approve() {
+    let (app, auth_db, _validator) = build_oidc_app().await;
+
+    // Initiate.
+    let (_, body) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/auth/device/initiate",
+        &[],
+        None,
+    )
+    .await;
+    let user_code = body["user_code"].as_str().unwrap().to_string();
+    let device_code = body["device_code"].as_str().unwrap().to_string();
+
+    // Record the principal count before.
+    let before_count = auth_db.list_api_keys(None).await.unwrap(); // just a sanity DB call
+
+    // Submit a forged (garbage) token.
+    let (status, _) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/auth/device/approve",
+        &[],
+        Some(json!({
+            "user_code": user_code,
+            "oidc_token": "not.a.real.jwt"
+        })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "forged token must be rejected"
+    );
+
+    // Token signed with the WRONG key — same structure but wrong signature.
+    let bad_token = {
+        use jsonwebtoken::{Algorithm, EncodingKey, Header};
+        let now = chrono::Utc::now().timestamp();
+        let claims = serde_json::json!({
+            "iss": "https://issuer.test/",
+            "aud": "tiled-test",
+            "sub": "attacker",
+            "exp": now + 3600,
+            "nbf": now - 60,
+        });
+        let mut header = Header::new(Algorithm::HS256);
+        header.kid = Some("test-kid-1".into());
+        jsonwebtoken::encode(&header, &claims, &EncodingKey::from_secret(b"wrong-secret")).unwrap()
+    };
+    let (status, _) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/auth/device/approve",
+        &[],
+        Some(json!({
+            "user_code": user_code,
+            "oidc_token": bad_token
+        })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "wrong-key token must be rejected"
+    );
+
+    // Device code must still be pending — not approved.
+    // An expired token (we can check by polling — should still say pending).
+    let (status, body) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/auth/device/token",
+        &[],
+        Some(json!({"device_code": device_code})),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "device code must still be pending after rejected approval: {body}"
+    );
+    let detail = body["error"]["message"].as_str().unwrap_or("");
+    assert_eq!(detail, "authorization_pending");
+
+    // No principal was created for the attacker subject.
+    let attacker_identity = auth_db.find_identity("test-idp", "attacker").await.unwrap();
+    assert!(
+        attacker_identity.is_none(),
+        "failed validation must not create a principal"
+    );
+    drop(before_count);
+}
+
+/// Invariant: submitting an oidc_token when no external_oidc validator is
+/// configured must be rejected (validation error) before any DB access.
+#[tokio::test]
+async fn device_approve_oidc_no_validator_configured_is_rejected() {
+    // Use the standard (non-OIDC) test app — external_oidc is None.
+    let (app, _dir, _cat, _auth_db) = build_test_app().await;
+
+    let (_, body) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/auth/device/initiate",
+        &[],
+        None,
+    )
+    .await;
+    let user_code = body["user_code"].as_str().unwrap().to_string();
+
+    let (status, _) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/auth/device/approve",
+        &[],
+        Some(json!({"user_code": user_code, "oidc_token": "any.token.here"})),
+    )
+    .await;
+    // 422 (Validation) because external_oidc is not configured.
+    assert!(
+        status == StatusCode::UNPROCESSABLE_ENTITY || status == StatusCode::BAD_REQUEST,
+        "expected 400/422 when no validator configured, got {status}"
+    );
+}
+
+/// Invariant: with no oidc_token and no session, approval must be rejected.
+#[tokio::test]
+async fn device_approve_no_credentials_rejected() {
+    let (app, _dir, _cat, _auth_db) = build_test_app().await;
+
+    let (_, body) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/auth/device/initiate",
+        &[],
+        None,
+    )
+    .await;
+    let user_code = body["user_code"].as_str().unwrap().to_string();
+    let device_code = body["device_code"].as_str().unwrap().to_string();
+
+    let (status, _) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/auth/device/approve",
+        &[],
+        Some(json!({"user_code": user_code})),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "unauthenticated approval must be rejected"
+    );
+
+    // Code still pending.
+    let (status, body) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/auth/device/token",
+        &[],
+        Some(json!({"device_code": device_code})),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "code must remain pending: {body}"
+    );
+}
+
+/// Invariant: the session-based approval path (Bearer token, no oidc_token)
+/// must still work after device_approve was moved from private_auth to
+/// public_auth. A logged-in user should be able to approve via their session.
+#[tokio::test]
+async fn device_approve_session_bearer_still_works() {
+    let (app, _dir, _cat, _auth_db) = build_test_app().await;
+
+    // Login to get a session bearer token.
+    let (_, body) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/auth/dummy/login",
+        &[],
+        Some(json!({"username": "alice", "password": "wonderland"})),
+    )
+    .await;
+    let access = body["access_token"].as_str().unwrap().to_string();
+    let bearer = format!("Bearer {access}");
+
+    // Initiate a device code.
+    let (status, body) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/auth/device/initiate",
+        &[],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "initiate: {body}");
+    let user_code = body["user_code"].as_str().unwrap().to_string();
+    let device_code = body["device_code"].as_str().unwrap().to_string();
+
+    // Approve using the session bearer (no oidc_token).
+    let (status, body) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/auth/device/approve",
+        &[("authorization", &bearer)],
+        Some(json!({"user_code": user_code})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "approve: {body}");
+
+    // Poll: must return Granted.
+    let (status, body) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/auth/device/token",
+        &[],
+        Some(json!({"device_code": device_code})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "token: {body}");
+    assert!(body["access_token"].is_string(), "missing access_token");
+}

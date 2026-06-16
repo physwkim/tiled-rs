@@ -120,6 +120,32 @@ impl ExternalOidcValidator {
         self
     }
 
+    /// Pre-seed the JWKS key cache so tests can skip the network fetch.
+    /// The key is stored under `provider_name` / `kid` with the given
+    /// algorithm. Call this on the validator before minting test tokens.
+    ///
+    /// Only intended for test helpers in dependent crates; not for
+    /// production use.
+    #[doc(hidden)]
+    pub async fn inject_key_for_test(
+        &self,
+        provider_name: &str,
+        kid: &str,
+        key: DecodingKey,
+        alg: Algorithm,
+    ) {
+        let mut cache_map = HashMap::new();
+        cache_map.insert(kid.to_string(), (key, alg));
+        let cached = CachedKeys {
+            keys: cache_map,
+            expires_at: Utc::now() + Duration::hours(1),
+        };
+        self.cache
+            .write()
+            .await
+            .insert(provider_name.to_string(), cached);
+    }
+
     /// Try each configured provider's `iss` claim against the token; on
     /// match, fetch the JWKS (cached) and validate the signature. Returns
     /// the (provider, sub) tuple on success.

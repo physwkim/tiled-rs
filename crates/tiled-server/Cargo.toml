@@ -66,3 +66,5 @@ serde_json = { workspace = true }
 axum = { workspace = true }
 tower = { workspace = true }
 bytes = { workspace = true }
+jsonwebtoken = { workspace = true }
+chrono = { workspace = true }
