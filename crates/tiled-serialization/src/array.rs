@@ -115,6 +115,11 @@ fn serialize_array_csv(
         .and_then(|v| v.as_str())
         .unwrap_or("<")
         == ">";
+    // datetime64 unit, e.g. "[ns]" → "ns"; only consulted for kind 'M'.
+    let dt_unit: Option<&str> = metadata
+        .get("dt_units")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim_start_matches('[').trim_end_matches(']'));
 
     let format_value = |bytes: &[u8]| -> String {
         match (kind, itemsize) {
@@ -209,8 +214,19 @@ fn serialize_array_csv(
                     _ => format!("unsupported-complex{itemsize}"),
                 }
             }
-            ("M", 8) | ("m", 8) => {
-                // Datetime/timedelta: underlying i64 epoch value in dtype units.
+            ("M", 8) => {
+                // datetime64 → str(numpy.datetime64): a resolution-truncated ISO
+                // string (NOT the raw tick count). See datetime64_csv_cell.
+                let mut b: [u8; 8] = bytes.try_into().unwrap_or([0u8; 8]);
+                if big_endian {
+                    b.reverse();
+                }
+                datetime64_csv_cell(i64::from_le_bytes(b), dt_unit)
+            }
+            ("m", 8) => {
+                // timedelta64: raw i64 tick count. numpy.savetxt emits
+                // "{n} {unit}" (e.g. "5 seconds"); that distinct parity gap is
+                // tracked separately, so this still prints the integer for now.
                 let mut b: [u8; 8] = bytes.try_into().unwrap_or([0u8; 8]);
                 if big_endian {
                     b.reverse();
@@ -421,10 +437,54 @@ fn dt_oor(value: i64, unit: &str) -> crate::registry::SerializeError {
     format!("datetime64 value {value} ({unit}) is out of the representable range").into()
 }
 
+/// Map a numpy `datetime64` tick `value` in `unit` to a naive datetime.
+///
+/// `value` must NOT be the NaT sentinel (`i64::MIN`); callers render NaT per
+/// their own format. The unit only affects how the tick count maps to an
+/// instant — the per-serializer FORMAT (orjson for JSON, `str(numpy.datetime64)`
+/// for CSV) is applied by the caller. Errors on an unrecognised unit or an
+/// out-of-representable-range value.
+fn datetime64_naive(
+    value: i64,
+    unit: &str,
+) -> Result<chrono::NaiveDateTime, crate::registry::SerializeError> {
+    use chrono::{Duration, NaiveDate, NaiveDateTime};
+
+    let epoch: NaiveDateTime = NaiveDate::from_ymd_opt(1970, 1, 1)
+        .and_then(|d| d.and_hms_opt(0, 0, 0))
+        .expect("1970-01-01T00:00:00 is a valid datetime");
+    let from_delta = |d: Option<Duration>| {
+        d.and_then(|d| epoch.checked_add_signed(d))
+            .ok_or_else(|| dt_oor(value, unit))
+    };
+    let from_ym = |year: i64, month: u32| {
+        i32::try_from(year)
+            .ok()
+            .and_then(|y| NaiveDate::from_ymd_opt(y, month, 1))
+            .and_then(|d| d.and_hms_opt(0, 0, 0))
+            .ok_or_else(|| dt_oor(value, unit))
+    };
+    match unit {
+        // Calendar units are not fixed-duration; offset the epoch's Y/M fields.
+        "Y" => from_ym(1970 + value, 1),
+        "M" => from_ym(1970 + value.div_euclid(12), value.rem_euclid(12) as u32 + 1),
+        "W" => from_delta(Duration::try_weeks(value)),
+        "D" => from_delta(Duration::try_days(value)),
+        "h" => from_delta(Duration::try_hours(value)),
+        "m" => from_delta(Duration::try_minutes(value)),
+        "s" => from_delta(Duration::try_seconds(value)),
+        "ms" => from_delta(Duration::try_milliseconds(value)),
+        // µs/ns constructors are infallible for any i64 (within TimeDelta range);
+        // only the epoch addition can overflow.
+        "us" => from_delta(Some(Duration::microseconds(value))),
+        "ns" => from_delta(Some(Duration::nanoseconds(value))),
+        other => Err(format!("datetime64 unit '{other}' is not supported").into()),
+    }
+}
+
 /// Render a numpy `datetime64` tick count as the JSON value orjson produces for
 /// it under `OPT_SERIALIZE_NUMPY` (the array `application/json` path is
-/// `safe_json_dump(array)`, array.py:33-38). `value` is the count of `unit`s
-/// since the naive `1970-01-01T00:00:00` epoch.
+/// `safe_json_dump(array)`, array.py:33-38).
 ///
 /// Format — verified byte-for-byte against orjson 3.11.5: a full RFC 3339
 /// datetime `YYYY-MM-DDTHH:MM:SS` for every unit (orjson does NOT truncate to
@@ -441,14 +501,13 @@ fn dt_oor(value: i64, unit: &str) -> crate::registry::SerializeError {
 /// HTTP 500). `null` matches the table path's `_series_to_json_safe`
 /// (NaT → None, table.py:113-139) and the numeric arms' missing→null rule.
 ///
-/// A missing or unrecognised unit (including finer-than-nanosecond units chrono
-/// cannot represent) is an error so the caller falls through to the
+/// A missing/unrecognised unit is an error so the caller falls through to the
 /// unsupported-dtype path rather than emitting wrong data.
 fn datetime64_to_json(
     value: i64,
     unit: Option<&str>,
 ) -> Result<serde_json::Value, crate::registry::SerializeError> {
-    use chrono::{Duration, NaiveDate, NaiveDateTime, Timelike};
+    use chrono::Timelike;
 
     // numpy NaT → null (see doc: deliberate deviation from orjson).
     if value == i64::MIN {
@@ -457,45 +516,7 @@ fn datetime64_to_json(
     let unit = unit.ok_or_else(|| -> crate::registry::SerializeError {
         "datetime64 array is missing its dt_units; cannot decode".into()
     })?;
-    let epoch: NaiveDateTime = NaiveDate::from_ymd_opt(1970, 1, 1)
-        .and_then(|d| d.and_hms_opt(0, 0, 0))
-        .expect("1970-01-01T00:00:00 is a valid datetime");
-
-    // The unit only affects how `value` maps to an instant; the output FORMAT is
-    // uniform across units (full datetime + optional µs), so each arm yields a
-    // NaiveDateTime and the formatting below is shared.
-    let from_delta = |d: Option<Duration>| {
-        d.and_then(|d| epoch.checked_add_signed(d))
-            .ok_or_else(|| dt_oor(value, unit))
-    };
-    let from_ym = |year: i64, month: u32| {
-        i32::try_from(year)
-            .ok()
-            .and_then(|y| NaiveDate::from_ymd_opt(y, month, 1))
-            .and_then(|d| d.and_hms_opt(0, 0, 0))
-            .ok_or_else(|| dt_oor(value, unit))
-    };
-    let dt: NaiveDateTime = match unit {
-        // Calendar units are not fixed-duration; offset the epoch's Y/M fields.
-        "Y" => from_ym(1970 + value, 1)?,
-        "M" => from_ym(1970 + value.div_euclid(12), value.rem_euclid(12) as u32 + 1)?,
-        "W" => from_delta(Duration::try_weeks(value))?,
-        "D" => from_delta(Duration::try_days(value))?,
-        "h" => from_delta(Duration::try_hours(value))?,
-        "m" => from_delta(Duration::try_minutes(value))?,
-        "s" => from_delta(Duration::try_seconds(value))?,
-        "ms" => from_delta(Duration::try_milliseconds(value))?,
-        // µs/ns constructors are infallible for any i64 (within TimeDelta range);
-        // only the epoch addition can overflow.
-        "us" => from_delta(Some(Duration::microseconds(value)))?,
-        "ns" => from_delta(Some(Duration::nanoseconds(value)))?,
-        other => {
-            return Err(format!(
-                "application/json array serializer does not support datetime64 unit '{other}'"
-            )
-            .into());
-        }
-    };
+    let dt = datetime64_naive(value, unit)?;
 
     // orjson: omit the fractional part when the microsecond component is zero,
     // else exactly 6 digits (ns remainder truncated, matching orjson's µs cap).
@@ -507,6 +528,42 @@ fn datetime64_to_json(
         format!("{base}.{micros:06}")
     };
     Ok(serde_json::Value::String(s))
+}
+
+/// Render a numpy `datetime64` tick count as the CSV cell `numpy.savetxt(fmt=
+/// "%s")` produces — i.e. `str(numpy.datetime64(value, unit))` (the array CSV
+/// path is `serialize_csv` → `numpy.savetxt`, array.py:41-46). Unlike the JSON
+/// path's orjson format, `str()` is RESOLUTION-TRUNCATED to the unit (verified
+/// against numpy 2.0.2): `Y`→`2021`, `M`→`2021-01`, `W`/`D`→`2021-01-01`,
+/// `h`→`...T00`, `m`→`...T00:00`, `s`→`...T00:00:00`, and `ms`/`us`/`ns` carry a
+/// fixed 3/6/9-digit fraction that is ALWAYS present (and, unlike orjson, the
+/// `ns` fraction is NOT truncated). NaT → `"NaT"`, matching `str`. A missing or
+/// unsupported unit yields a visible placeholder rather than a wrong instant,
+/// matching this serializer's existing "unsupported …" cell convention.
+fn datetime64_csv_cell(value: i64, unit: Option<&str>) -> String {
+    if value == i64::MIN {
+        return "NaT".to_string(); // str(numpy.datetime64('NaT'))
+    }
+    let Some(unit) = unit else {
+        return "datetime64(missing-units)".to_string();
+    };
+    let dt = match datetime64_naive(value, unit) {
+        Ok(dt) => dt,
+        Err(_) => return format!("datetime64(unsupported-unit:{unit})"),
+    };
+    let fmt = match unit {
+        "Y" => "%Y",
+        "M" => "%Y-%m",
+        "W" | "D" => "%Y-%m-%d",
+        "h" => "%Y-%m-%dT%H",
+        "m" => "%Y-%m-%dT%H:%M",
+        "s" => "%Y-%m-%dT%H:%M:%S",
+        "ms" => "%Y-%m-%dT%H:%M:%S.%3f",
+        "us" => "%Y-%m-%dT%H:%M:%S.%6f",
+        "ns" => "%Y-%m-%dT%H:%M:%S.%9f",
+        other => return format!("datetime64(unsupported-unit:{other})"),
+    };
+    dt.format(fmt).to_string()
 }
 
 /// Nest a flat, row-major value list into the JSON shape numpy/orjson produce:
@@ -894,5 +951,68 @@ mod tests {
                 "{mt} must serialize as CSV with numpy-style float formatting"
             );
         }
+    }
+
+    /// The array CSV serializer renders datetime64 as `str(numpy.datetime64)` —
+    /// a resolution-truncated ISO string — matching `numpy.savetxt(fmt="%s")`,
+    /// NOT the raw integer tick (verified against numpy 2.0.2). This is a
+    /// DIFFERENT format from the JSON path's orjson output (full datetime, µs):
+    /// CSV truncates to the unit and keeps the full ns fraction.
+    #[test]
+    fn csv_array_datetime64_matches_numpy_str() {
+        let ser = csv_serializer();
+        // (unit, tick value, expected str(numpy.datetime64(value, unit)))
+        let cases: &[(&str, i64, &str)] = &[
+            ("[Y]", 51, "2021"),
+            ("[M]", 612, "2021-01"),
+            ("[D]", 18_628, "2021-01-01"),
+            ("[h]", 447_072, "2021-01-01T00"),
+            ("[s]", 1_609_459_200, "2021-01-01T00:00:00"),
+            ("[ms]", 1_609_459_200_123, "2021-01-01T00:00:00.123"),
+            ("[us]", 1_609_459_200_123_456, "2021-01-01T00:00:00.123456"),
+            (
+                "[ns]",
+                1_609_459_200_123_456_789,
+                "2021-01-01T00:00:00.123456789",
+            ),
+        ];
+        for (unit, value, expected) in cases {
+            let data: Vec<u8> = value.to_le_bytes().to_vec();
+            let meta = serde_json::json!({
+                "itemsize": 8, "kind": "M", "byteorder": "<", "dt_units": unit, "shape": [1]
+            });
+            let out = ser(&data, &meta).unwrap();
+            assert_eq!(std::str::from_utf8(&out).unwrap(), *expected, "unit {unit}");
+        }
+    }
+
+    /// CSV datetime64 NaT → "NaT" (matching `str(numpy.datetime64('NaT'))`),
+    /// not the raw i64::MIN sentinel.
+    #[test]
+    fn csv_array_datetime64_nat_is_nat_string() {
+        let ser = csv_serializer();
+        let data: Vec<u8> = i64::MIN.to_le_bytes().to_vec();
+        let meta = serde_json::json!({
+            "itemsize": 8, "kind": "M", "byteorder": "<", "dt_units": "[s]", "shape": [1]
+        });
+        let out = ser(&data, &meta).unwrap();
+        assert_eq!(std::str::from_utf8(&out).unwrap(), "NaT");
+    }
+
+    /// CSV datetime64 lays out 2-D as comma-separated rows, one date per cell.
+    #[test]
+    fn csv_array_datetime64_2d_layout() {
+        let ser = csv_serializer();
+        let vals: [i64; 4] = [1_609_459_200, 0, 0, 1_609_459_200];
+        let data: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let meta = serde_json::json!({
+            "itemsize": 8, "kind": "M", "byteorder": "<", "dt_units": "[s]", "shape": [2, 2]
+        });
+        let out = ser(&data, &meta).unwrap();
+        assert_eq!(
+            std::str::from_utf8(&out).unwrap(),
+            "2021-01-01T00:00:00,1970-01-01T00:00:00\n\
+             1970-01-01T00:00:00,2021-01-01T00:00:00"
+        );
     }
 }
