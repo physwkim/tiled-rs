@@ -192,6 +192,111 @@ async fn register_then_read_then_patch_then_delete() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
+/// Server H3: `POST /api/v1/metadata/{path}` is the client's common
+/// (asset-free) creation endpoint (`tiled/client/container.py:733-740`). It
+/// must (a) create + persist like `/register/`, and (b) REJECT data sources
+/// carrying externally-managed assets with 400, directing them to `/register/`
+/// (Python parity: `router.py:1769`, asset guard at `1794-1799`). Previously
+/// the route was absent → Axum answered 405.
+#[tokio::test]
+async fn post_metadata_creates_asset_free_and_rejects_external_assets() {
+    let (app, _dir) = build_test_app().await;
+
+    // (a) Root POST /metadata/ creates a container and persists it.
+    let (status, body) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/metadata/",
+        serde_json::json!({
+            "key": "viameta",
+            "structure_family": "container",
+            "metadata": {"description": "made via /metadata"},
+            "specs": [],
+            "data_sources": [],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "post /metadata/ root: {body}");
+    assert_eq!(body["id"], "viameta");
+
+    // It round-trips from the DB via GET.
+    let (status, body) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/metadata/viameta",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["data"]["id"], "viameta");
+    assert_eq!(
+        body["data"]["attributes"]["metadata"]["description"],
+        "made via /metadata"
+    );
+
+    // Nested POST /metadata/{path} also creates a child under "viameta".
+    let (status, body) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/metadata/viameta",
+        serde_json::json!({
+            "key": "child",
+            "structure_family": "container",
+            "metadata": {},
+            "specs": [],
+            "data_sources": [],
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "post /metadata/viameta: {body}"
+    );
+    assert_eq!(body["id"], "child");
+
+    // (b) A data source carrying an externally-managed asset is rejected with
+    // 400 (must use /register/ instead) and is NOT persisted.
+    let (status, _body) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/metadata/",
+        serde_json::json!({
+            "key": "withasset",
+            "structure_family": "array",
+            "metadata": {},
+            "specs": [],
+            "data_sources": [
+                {
+                    "structure_family": "array",
+                    "management": "external",
+                    "assets": [
+                        {"data_uri": "file:///tmp/x.h5", "is_directory": false}
+                    ]
+                }
+            ],
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "asset-bearing /metadata create must be rejected"
+    );
+    let (status, _) = empty_request(&app, Method::GET, "/api/v1/metadata/withasset").await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "rejected node must not exist"
+    );
+
+    // Cleanup: child first (non-empty container DELETE is 409), then root.
+    let (status, _) = empty_request(&app, Method::DELETE, "/api/v1/metadata/viameta/child").await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = empty_request(&app, Method::DELETE, "/api/v1/metadata/viameta").await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+}
+
 /// F-F: DELETE on a subtree holding an internally-managed (writable) data
 /// source is refused by default with 409 (mirrors Python `WouldDeleteData`,
 /// app.py:367-374). Passing `?external_only=false` forces the delete.

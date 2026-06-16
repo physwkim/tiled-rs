@@ -172,6 +172,11 @@ pub fn build_app(state: AppState) -> Router {
         .route("/api/v1/register/{*path}", post(router::register))
         .route("/api/v1/metadata/{*path}", patch(router::patch_metadata))
         .route("/api/v1/metadata/{*path}", delete(router::delete_metadata))
+        // POST /metadata is the client's common (asset-free) write path; it
+        // shares the create core with /register but rejects externally-managed
+        // assets (Python parity: router.py:1769).
+        .route("/api/v1/metadata/", post(router::post_metadata_root))
+        .route("/api/v1/metadata/{*path}", post(router::post_metadata))
         .route("/api/v1/data_source/{*path}", put(router::put_data_source))
         .route("/documents/{*path}", get(router::get_documents))
         // Webhooks (upstream tiled #1353).

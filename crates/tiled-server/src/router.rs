@@ -27,6 +27,17 @@ fn segments_from_uri(uri: &axum::http::Uri, prefix: &str) -> Vec<String> {
     PathSegments::from_raw_path(uri.path(), prefix).0
 }
 
+/// Strip whichever creation-route prefix the request used. `POST /register/{path}`
+/// and its asset-free alias `POST /metadata/{path}` (Python parity: router.py:1769)
+/// share one create core; the child path is the suffix after the matched prefix.
+fn create_segments_from_uri(uri: &axum::http::Uri) -> Vec<String> {
+    if uri.path().contains("/api/v1/metadata/") {
+        segments_from_uri(uri, "/api/v1/metadata/")
+    } else {
+        segments_from_uri(uri, "/api/v1/register/")
+    }
+}
+
 /// Walk `segments` through the catalog (when present) or the in-memory
 /// tree, apply the per-node access policy at each level, and verify the
 /// caller's narrowed scopes include `required_scope`.
@@ -2165,7 +2176,63 @@ pub async fn register(
     auth.require(tiled_auth::Scope::WriteMetadata)?;
     auth.require(tiled_auth::Scope::CreateNode)?;
     auth.require(tiled_auth::Scope::Register)?;
-    let segments = segments_from_uri(&uri, "/api/v1/register/");
+    let segments = create_segments_from_uri(&uri);
+    create_node_core(state, segments, base_url, auth, req).await
+}
+
+// POST /api/v1/metadata/ — root variant of the asset-free creation alias.
+pub async fn post_metadata_root(
+    state: State<AppState>,
+    base_url: BaseUrl,
+    auth: crate::AuthContext,
+    body: Json<tiled_core::schemas::PostMetadataRequest>,
+) -> Result<impl IntoResponse, ServerError> {
+    post_metadata(
+        state,
+        OriginalUri("/api/v1/metadata/".parse().expect("static URI")),
+        base_url,
+        auth,
+        body,
+    )
+    .await
+}
+
+// POST /api/v1/metadata/{*path} — asset-free node creation (Python parity:
+// post_metadata, router.py:1769-1814). Shares the create core with /register/
+// but, unlike it, does NOT require the `register` scope and REJECTS
+// externally-managed assets, directing such requests to POST /register/{path}.
+pub async fn post_metadata(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+    BaseUrl(base_url): BaseUrl,
+    auth: crate::AuthContext,
+    Json(req): Json<tiled_core::schemas::PostMetadataRequest>,
+) -> Result<impl IntoResponse, ServerError> {
+    auth.require(tiled_auth::Scope::WriteMetadata)?;
+    auth.require(tiled_auth::Scope::CreateNode)?;
+    // Python rejects externally-managed assets on this endpoint
+    // (router.py:1794-1799); they must go through POST /register/{path}.
+    if req.data_sources.iter().any(|ds| !ds.assets.is_empty()) {
+        return Err(ServerError::BadRequest(
+            "Externally-managed assets cannot be registered using POST \
+             /metadata/{path}. Use POST /register/{path} instead."
+                .into(),
+        ));
+    }
+    let segments = create_segments_from_uri(&uri);
+    create_node_core(state, segments, base_url, auth, req).await
+}
+
+/// Shared node-creation core for `POST /register/{path}` and
+/// `POST /metadata/{path}` (Python `_create_node`, router.py:1852). Callers
+/// apply their own scope/asset gating before delegating here.
+async fn create_node_core(
+    state: AppState,
+    segments: Vec<String>,
+    base_url: String,
+    auth: crate::AuthContext,
+    req: tiled_core::schemas::PostMetadataRequest,
+) -> Result<impl IntoResponse, ServerError> {
     let path = segments.join("/");
     // Prefer the top-level `key` (Python tiled wire format, used by cirrus),
     // fall back to `metadata.key` for older clients, then synthesise.
