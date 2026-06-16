@@ -1006,8 +1006,10 @@ async fn array_full_format_param_beats_accept_header() {
         10,
         "CSV body for a 10-element array must have 10 lines; got: {body_str:?}"
     );
-    assert_eq!(lines[0].trim(), "0", "first CSV line must be 0");
-    assert_eq!(lines[9].trim(), "9", "last CSV line must be 9");
+    // Whole-number floats keep the decimal point ("0.0", not "0"), matching
+    // Python numpy.savetxt(fmt="%s") — see tiled-serialization L1 (ensure_decimal).
+    assert_eq!(lines[0].trim(), "0.0", "first CSV line must be 0.0");
+    assert_eq!(lines[9].trim(), "9.0", "last CSV line must be 9.0");
 }
 
 /// Finding 1 (H2 export-corruption family, unsupported-format case): a
