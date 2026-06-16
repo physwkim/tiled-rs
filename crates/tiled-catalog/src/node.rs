@@ -26,6 +26,21 @@ pub struct RegisterRequest {
 /// representations.
 pub type NodeRecord = Node;
 
+/// One historical version of a node's metadata, as pushed onto the `revisions`
+/// table by [`Catalog::update_metadata`]. Mirrors Python's `Revision`
+/// (server/schemas.py:147-165): `revision_number` is the per-node sequential
+/// `revision` column, and `time_updated` is the stored `time_created` (the
+/// instant that version was superseded). `access_blob` is stored but omitted
+/// from the listing response, matching `construct_revisions_response`
+/// (server/core.py:330-353).
+#[derive(Debug, Clone)]
+pub struct Revision {
+    pub revision_number: i64,
+    pub metadata: Value,
+    pub specs: Value,
+    pub time_updated: String,
+}
+
 const MAX_METADATA_BYTES: usize = 10 * 1024 * 1024;
 const MAX_STRUCTURE_BYTES: usize = 10 * 1024 * 1024;
 const MAX_SPECS: usize = 20;
@@ -528,6 +543,98 @@ impl Catalog {
             }
         }
         Ok(())
+    }
+
+    /// List a node's metadata revisions, oldest first (ascending `revision`),
+    /// windowed by `[offset, offset + limit)`. Mirrors Python
+    /// `CatalogNodeAdapter.revisions` (catalog/adapter.py:972-982), which
+    /// selects `orm.Revision` for the node with `.offset(offset).limit(limit)`.
+    pub async fn list_revisions(
+        &self,
+        node_id: i64,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<Revision>> {
+        match self.pool() {
+            DbPool::Sqlite(pool) => {
+                let rows = sqlx::query(
+                    "SELECT revision, metadata, specs, time_created
+                       FROM revisions
+                      WHERE node_id = ?
+                      ORDER BY revision
+                      LIMIT ? OFFSET ?",
+                )
+                .bind(node_id)
+                .bind(limit as i64)
+                .bind(offset as i64)
+                .fetch_all(pool)
+                .await?;
+                rows.iter()
+                    .map(|row| {
+                        Ok(Revision {
+                            // SQLite INTEGER decodes natively to i64.
+                            revision_number: row.get::<i64, _>("revision"),
+                            metadata: serde_json::from_str(&row.get::<String, _>("metadata"))?,
+                            specs: serde_json::from_str(&row.get::<String, _>("specs"))?,
+                            time_updated: row.get::<String, _>("time_created"),
+                        })
+                    })
+                    .collect()
+            }
+            DbPool::Postgres(pool) => {
+                let rows = sqlx::query(
+                    "SELECT revision, metadata::text AS metadata, specs::text AS specs,
+                            time_created::text AS time_created
+                       FROM revisions
+                      WHERE node_id = $1
+                      ORDER BY revision
+                      LIMIT $2 OFFSET $3",
+                )
+                .bind(node_id)
+                .bind(limit as i64)
+                .bind(offset as i64)
+                .fetch_all(pool)
+                .await?;
+                rows.iter()
+                    .map(|row| {
+                        Ok(Revision {
+                            // Postgres `revision` is INTEGER (i32); widen to i64.
+                            revision_number: row.get::<i32, _>("revision") as i64,
+                            metadata: serde_json::from_str(&row.get::<String, _>("metadata"))?,
+                            specs: serde_json::from_str(&row.get::<String, _>("specs"))?,
+                            time_updated: row.get::<String, _>("time_created"),
+                        })
+                    })
+                    .collect()
+            }
+        }
+    }
+
+    /// Delete one revision of a node by its `revision_number`. Returns
+    /// `Ok(false)` when no such revision exists (the caller maps that to 404),
+    /// `Ok(true)` on success. Mirrors Python
+    /// `CatalogNodeAdapter.delete_revision` (catalog/adapter.py:1200-1217),
+    /// which raises 404 when `rowcount == 0`.
+    pub async fn delete_revision(&self, node_id: i64, number: i64) -> Result<bool> {
+        let affected = match self.pool() {
+            DbPool::Sqlite(pool) => {
+                sqlx::query("DELETE FROM revisions WHERE node_id = ? AND revision = ?")
+                    .bind(node_id)
+                    .bind(number)
+                    .execute(pool)
+                    .await?
+                    .rows_affected()
+            }
+            DbPool::Postgres(pool) => {
+                sqlx::query("DELETE FROM revisions WHERE node_id = $1 AND revision = $2")
+                    .bind(node_id)
+                    .bind(number as i32)
+                    .execute(pool)
+                    .await?
+                    .rows_affected()
+            }
+        };
+        Ok(affected > 0)
     }
 }
 

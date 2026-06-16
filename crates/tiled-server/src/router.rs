@@ -2871,6 +2871,142 @@ pub async fn put_metadata(
 }
 
 // ---------------------------------------------------------------------------
+// GET /api/v1/revisions/{*path} — list a node's metadata revision history.
+// DELETE /api/v1/revisions/{*path}?number=N — drop one revision.
+// Python parity: router.py:2496-2535 (get_revisions / delete_revision).
+// Revisions are a catalog capability: a server without a catalog has no node
+// that supports them → 405.
+// ---------------------------------------------------------------------------
+
+pub async fn get_revisions(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+    Query(params): Query<HashMap<String, String>>,
+    BaseUrl(base_url): BaseUrl,
+    auth: crate::AuthContext,
+) -> Result<impl IntoResponse, ServerError> {
+    auth.require(tiled_auth::Scope::ReadMetadata)?;
+    let segments = segments_from_uri(&uri, "/api/v1/revisions/");
+    let offset: usize = params
+        .get("page[offset]")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let limit: usize = params
+        .get("page[limit]")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(links::DEFAULT_PAGE_SIZE)
+        .min(links::MAX_PAGE_SIZE);
+
+    // A node that does not persist revisions (no catalog → in-memory tree)
+    // does not support them → 405, matching Python's "This node does not
+    // support revisions." (router.py:2521-2525).
+    let Some(catalog) = state.catalog.as_ref() else {
+        return Err(ServerError::MethodNotAllowed(
+            "This node does not support revisions.".into(),
+        ));
+    };
+    if segments.is_empty() {
+        return Err(ServerError::Validation(
+            "the catalog root has no revisions".into(),
+        ));
+    }
+    // Per-ancestor auth gate (read:metadata), identical to the metadata read.
+    resolve_entry(&state, auth, &segments, tiled_auth::Scope::ReadMetadata).await?;
+    let node = catalog
+        .lookup(&segments)
+        .await
+        .map_err(map_catalog_err)?
+        .ok_or_else(|| ServerError::NotFound(format!("'{}' not found", segments.join("/"))))?;
+
+    let revisions = catalog
+        .list_revisions(node.id, offset, limit)
+        .await
+        .map_err(map_catalog_err)?;
+    let count = revisions.len();
+    // Each item: `{revision_number, attributes: {metadata, specs, time_updated}}`
+    // (Python construct_revisions_response, server/core.py:339-348). access_blob
+    // is intentionally not surfaced.
+    let data: Vec<serde_json::Value> = revisions
+        .into_iter()
+        .map(|r| {
+            serde_json::json!({
+                "revision_number": r.revision_number,
+                "attributes": {
+                    "metadata": r.metadata,
+                    "specs": r.specs,
+                    "time_updated": r.time_updated,
+                },
+            })
+        })
+        .collect();
+    let path = segments.join("/");
+    let pg_links = links::pagination_links(
+        &base_url,
+        "revisions",
+        &path,
+        None,
+        offset,
+        limit,
+        None,
+        count,
+    );
+    Ok(Json(serde_json::json!({
+        "data": data,
+        "links": pg_links,
+        "meta": {"count": count},
+    })))
+}
+
+pub async fn delete_revision(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+    Query(params): Query<HashMap<String, String>>,
+    auth: crate::AuthContext,
+) -> Result<impl IntoResponse, ServerError> {
+    auth.require(tiled_auth::Scope::DeleteRevision)?;
+    let segments = segments_from_uri(&uri, "/api/v1/revisions/");
+    // `?number=N` is required (Python `number: int` is a mandatory query param).
+    let number: i64 = params
+        .get("number")
+        .ok_or_else(|| ServerError::Validation("query parameter 'number' is required".into()))?
+        .parse()
+        .map_err(|_| ServerError::Validation("'number' must be an integer".into()))?;
+
+    let Some(catalog) = state.catalog.as_ref() else {
+        return Err(ServerError::MethodNotAllowed(
+            "This node does not support a del request for revisions.".into(),
+        ));
+    };
+    if segments.is_empty() {
+        return Err(ServerError::Validation(
+            "the catalog root has no revisions".into(),
+        ));
+    }
+    // Per-ancestor auth gate; the terminal node additionally needs
+    // delete:revision (Python get_entry scopes=["delete:revision"]).
+    resolve_entry(&state, auth, &segments, tiled_auth::Scope::DeleteRevision).await?;
+    let node = catalog
+        .lookup(&segments)
+        .await
+        .map_err(map_catalog_err)?
+        .ok_or_else(|| ServerError::NotFound(format!("'{}' not found", segments.join("/"))))?;
+
+    let deleted = catalog
+        .delete_revision(node.id, number)
+        .await
+        .map_err(map_catalog_err)?;
+    if !deleted {
+        // Python raises 404 when rowcount == 0 (catalog/adapter.py:1207-1212).
+        return Err(ServerError::NotFound(format!(
+            "No revision {number} for node '{}'",
+            segments.join("/")
+        )));
+    }
+    // Python returns json_or_msgpack(None) → a `null` body with 200.
+    Ok(Json(serde_json::Value::Null))
+}
+
+// ---------------------------------------------------------------------------
 // PUT /api/v1/data_source/{*path} — replace structure / parameters
 // ---------------------------------------------------------------------------
 //

@@ -1199,3 +1199,96 @@ async fn put_metadata_replaces_wholesale_and_signals_unapplied_access_blob() {
 
     let _ = empty_request(&app, Method::DELETE, "/api/v1/metadata/n1").await;
 }
+
+/// Server M2: `GET /api/v1/revisions/{path}` lists a node's metadata history and
+/// `DELETE .../{path}?number=N` drops one. The revisions table is populated by
+/// every metadata update (PUT/PATCH without ?drop_revision). Mirrors Python
+/// get_revisions / delete_revision (router.py:2496-2535) and
+/// construct_revisions_response (core.py:330-353): each item is
+/// `{revision_number, attributes: {metadata, specs, time_updated}}`, ascending
+/// by revision; a missing revision DELETE is 404.
+#[tokio::test]
+async fn revisions_list_then_delete_round_trip() {
+    let (app, _dir) = build_test_app().await;
+
+    // Create a node, then update it twice — each PUT pushes the PRE-update
+    // state onto the revisions table (revision 1 = {"v":1}, revision 2 = {"v":2}).
+    let (status, _) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/metadata/",
+        serde_json::json!({
+            "key": "rev1",
+            "structure_family": "container",
+            "metadata": {"v": 1},
+            "specs": [],
+            "data_sources": [],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    for v in [2, 3] {
+        let (status, _) = json_request(
+            &app,
+            Method::PUT,
+            "/api/v1/metadata/rev1",
+            serde_json::json!({"metadata": {"v": v}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "put v={v}");
+    }
+
+    // GET lists both revisions, ascending, carrying the superseded metadata.
+    let (status, body) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/revisions/rev1",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "get revisions: {body}");
+    assert_eq!(body["meta"]["count"], 2);
+    let data = body["data"].as_array().unwrap();
+    assert_eq!(data.len(), 2);
+    assert_eq!(data[0]["revision_number"], 1);
+    assert_eq!(
+        data[0]["attributes"]["metadata"],
+        serde_json::json!({"v": 1})
+    );
+    assert_eq!(data[1]["revision_number"], 2);
+    assert_eq!(
+        data[1]["attributes"]["metadata"],
+        serde_json::json!({"v": 2})
+    );
+    assert!(
+        data[0]["attributes"]["time_updated"].is_string(),
+        "time_updated must be present: {body}"
+    );
+    assert!(
+        body["links"]["self"]
+            .as_str()
+            .unwrap()
+            .contains("/revisions/rev1"),
+        "self link points at the revisions route: {body}"
+    );
+
+    // DELETE revision 1 → 200; the list then holds only revision 2.
+    let (status, _) = empty_request(&app, Method::DELETE, "/api/v1/revisions/rev1?number=1").await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/revisions/rev1",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["meta"]["count"], 1);
+    assert_eq!(body["data"][0]["revision_number"], 2);
+
+    // DELETE a non-existent revision → 404.
+    let (status, _) = empty_request(&app, Method::DELETE, "/api/v1/revisions/rev1?number=99").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let _ = empty_request(&app, Method::DELETE, "/api/v1/metadata/rev1").await;
+}

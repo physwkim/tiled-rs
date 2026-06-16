@@ -1894,3 +1894,17 @@ async fn test_put_metadata_405_without_catalog() {
     let resp = app.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
 }
+
+/// Server M2: an in-memory (no-catalog) node persists no revisions, so
+/// GET /revisions/{path} answers 405 — matching Python's "This node does not
+/// support revisions." (router.py:2521-2525).
+#[tokio::test]
+async fn test_get_revisions_405_without_catalog() {
+    let app = build_app();
+    let req = Request::builder()
+        .uri("/api/v1/revisions/some_array")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+}

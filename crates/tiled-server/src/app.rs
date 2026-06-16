@@ -182,6 +182,10 @@ pub fn build_app(state: AppState) -> Router {
         // assets (Python parity: router.py:1769).
         .route("/api/v1/metadata/", post(router::post_metadata_root))
         .route("/api/v1/metadata/{*path}", post(router::post_metadata))
+        // Revision history (Python router.py:2496-2535). GET lists, DELETE
+        // (with ?number=N) drops one. Catalog-only → 405 without a catalog.
+        .route("/api/v1/revisions/{*path}", get(router::get_revisions))
+        .route("/api/v1/revisions/{*path}", delete(router::delete_revision))
         .route("/api/v1/data_source/{*path}", put(router::put_data_source))
         .route("/documents/{*path}", get(router::get_documents))
         // Webhooks (upstream tiled #1353).

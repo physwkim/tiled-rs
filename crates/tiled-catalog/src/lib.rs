@@ -28,4 +28,4 @@ pub use adapter::CatalogAdapter;
 pub use data_source::{AssetRecord, DataSourceRecord};
 pub use db::{Catalog, DbPool};
 pub use error::{CatalogError, Result};
-pub use node::{NodeRecord, RegisterRequest};
+pub use node::{NodeRecord, RegisterRequest, Revision};
