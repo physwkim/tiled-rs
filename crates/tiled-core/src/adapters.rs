@@ -57,6 +57,15 @@ pub trait ArrayAdapterRead: BaseAdapter {
 }
 
 pub trait ArrayAdapterWrite: ArrayAdapterRead {
+    /// Overwrite the whole array. `data.shape` must equal the array's shape
+    /// (`structure().shape`). `PUT /array/full` routes here.
+    fn write<'a>(&'a self, data: DynNDArray) -> BoxFuture<'a, Result<()>>;
+
+    /// Overwrite a single chunk addressed by `block` (one index per axis).
+    /// `data.shape` must equal that chunk's shape — the per-axis lengths
+    /// `structure().chunks[axis][block[axis]]`. `PUT /array/block` routes here.
+    /// Distinct from [`ArrayAdapterWrite::write`]: this targets one chunk, not
+    /// the whole array, so block and full writes no longer share a sentinel.
     fn write_block<'a>(&'a self, data: DynNDArray, block: &'a [usize])
     -> BoxFuture<'a, Result<()>>;
 

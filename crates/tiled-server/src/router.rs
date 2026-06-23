@@ -1433,15 +1433,121 @@ pub async fn array_full_put(
         )));
     }
     let shape = structure.shape.clone();
-    let ndim = shape.len();
     let payload = tiled_core::dtype::DynNDArray::new(body, dtype, shape);
+    writable.write(payload).await.map_err(ServerError::from)?;
+
+    let path = segments.join("/");
+    // Signal subscribers that the node's data changed (closest existing event).
+    state.streaming_bus.publish(
+        &path,
+        crate::streaming::UpdateKind::DataAppended { partition: None },
+    );
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+// ---------------------------------------------------------------------------
+// PUT /api/v1/array/block/{*path} — overwrite a single chunk
+// ---------------------------------------------------------------------------
+//
+// The write counterpart of `GET /array/block`. `?block=i,j,…` addresses one
+// chunk (a single index per axis — no ranges, unlike the multi-chunk read),
+// and the body is that chunk's raw C-order buffer. Mirrors Python tiled's
+// `PUT /array/block` (`router.py`): the partial-write path for chunked stores
+// (zarr), distinct from the whole-array `PUT /array/full`.
+pub async fn array_block_put(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+    Query(params): Query<HashMap<String, String>>,
+    auth: crate::AuthContext,
+    body: bytes::Bytes,
+) -> Result<impl IntoResponse, ServerError> {
+    auth.require(tiled_auth::Scope::WriteData)?;
+    let segments = segments_from_uri(&uri, "/api/v1/array/block/");
+    let _ = resolve_entry(
+        &state,
+        auth.clone(),
+        &segments,
+        tiled_auth::Scope::WriteData,
+    )
+    .await?;
+
+    let adapter = core::walk_tree(state.root_tree.as_ref(), &segments).await?;
+    let array_adapter: Arc<dyn tiled_core::adapters::ArrayAdapterRead> =
+        adapter.as_array_arc().ok_or_else(|| {
+            ServerError::WrongType(format!("'{}' is not an array", segments.join("/")))
+        })?;
+    let writable = array_adapter.as_writable().ok_or_else(|| {
+        ServerError::MethodNotAllowed(
+            "this array node is not writable; only internally-managed arrays under \
+             the server's writable storage accept writes"
+                .into(),
+        )
+    })?;
+
+    let structure = array_adapter.structure();
+    let ndim = structure.shape.len();
+    let dtype = match &structure.data_type {
+        tiled_core::dtype::DType::Builtin(b) => b.clone(),
+        _ => {
+            return Err(ServerError::Validation(
+                "array write: only builtin (non-struct) dtypes are supported".into(),
+            ));
+        }
+    };
+
+    // `?block=` is one index per axis (no ranges: a write targets exactly one
+    // chunk). Empty defaults to the origin chunk.
+    let block_str = params.get("block").map(|s| s.as_str()).unwrap_or("");
+    let block: Vec<usize> = if block_str.is_empty() {
+        vec![0usize; ndim]
+    } else {
+        block_str
+            .split(',')
+            .map(|s| {
+                s.trim().parse::<usize>().map_err(|_| {
+                    ServerError::Validation(format!(
+                        "block index must be a non-negative integer, got '{s}'"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    if block.len() != ndim {
+        return Err(ServerError::Validation(format!(
+            "block has {} indices but the array is {ndim}-dimensional",
+            block.len()
+        )));
+    }
+
+    // The addressed chunk's shape comes from the structure's chunk grid; the
+    // body must hold exactly that many elements.
+    let mut chunk_shape = Vec::with_capacity(ndim);
+    for (axis, &b) in block.iter().enumerate() {
+        let sizes = &structure.chunks[axis];
+        let len = *sizes.get(b).ok_or_else(|| {
+            ServerError::Validation(format!(
+                "block index {b} out of range on axis {axis} ({} chunks)",
+                sizes.len()
+            ))
+        })?;
+        chunk_shape.push(len);
+    }
+    let elem = dtype.element_size();
+    let expected = chunk_shape.iter().product::<usize>() * elem;
+    if body.len() != expected {
+        return Err(ServerError::Validation(format!(
+            "array block write: body is {} bytes but chunk {block:?} needs {expected} \
+             (chunk shape {chunk_shape:?}, {elem}-byte elements)",
+            body.len()
+        )));
+    }
+    let payload = tiled_core::dtype::DynNDArray::new(body, dtype, chunk_shape);
     writable
-        .write_block(payload, &vec![0usize; ndim])
+        .write_block(payload, &block)
         .await
         .map_err(ServerError::from)?;
 
     let path = segments.join("/");
-    // Signal subscribers that the node's data changed (closest existing event).
     state.streaming_bus.publish(
         &path,
         crate::streaming::UpdateKind::DataAppended { partition: None },

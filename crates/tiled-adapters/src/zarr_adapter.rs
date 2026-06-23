@@ -193,24 +193,11 @@ impl ArrayAdapterRead for ZarrAdapter {
 }
 
 impl ArrayAdapterWrite for ZarrAdapter {
-    fn write_block<'a>(
-        &'a self,
-        data: DynNDArray,
-        block: &'a [usize],
-    ) -> BoxFuture<'a, Result<()>> {
-        // `/array/full` writes the whole array: the endpoint hands us the
-        // all-zero block plus full-shape data. zarr's `store_array_subset`
-        // splits that across the real chunk grid, so a managed zarr array is
-        // not capped at a single chunk (unlike npy).
+    fn write<'a>(&'a self, data: DynNDArray) -> BoxFuture<'a, Result<()>> {
+        // Whole-array write: `store_array_subset` over the full extent splits
+        // the buffer across the real chunk grid, so a managed zarr array is not
+        // capped at a single chunk (unlike npy).
         Box::pin(async move {
-            for (axis, &b) in block.iter().enumerate() {
-                if b != 0 {
-                    return Err(TiledError::Validation(format!(
-                        "zarr full write expects the whole array (block all-zero); \
-                         block[{axis}] = {b}"
-                    )));
-                }
-            }
             if data.shape != self.structure.shape {
                 return Err(TiledError::Validation(format!(
                     "zarr write shape {:?} does not match the array shape {:?}",
@@ -223,16 +210,49 @@ impl ArrayAdapterWrite for ZarrAdapter {
             // read path also forwards verbatim), which is exactly what
             // `store_array_subset` expects before it re-encodes to the store.
             let bytes = data.data.to_vec();
-            tokio::task::spawn_blocking(move || {
-                let subset = ArraySubset::new_with_shape(shape);
-                array
-                    .store_array_subset(&subset, bytes)
-                    .map_err(|e| TiledError::Internal(format!("zarr store: {e}")))
-            })
-            .await
-            .map_err(|e| TiledError::Internal(format!("zarr write spawn: {e}")))?
+            store_subset_blocking(array, ArraySubset::new_with_shape(shape), bytes).await
         })
     }
+
+    fn write_block<'a>(
+        &'a self,
+        data: DynNDArray,
+        block: &'a [usize],
+    ) -> BoxFuture<'a, Result<()>> {
+        // One chunk addressed by `block`; the subset is exactly that chunk's
+        // region (same arithmetic `read_block` uses), and `data` must match the
+        // chunk's shape — no whole-array sentinel.
+        let subset = self.array_subset_for_block(block);
+        let array = self.array.clone();
+        Box::pin(async move {
+            let subset = subset?;
+            let expected: Vec<usize> = subset.shape().iter().map(|&d| d as usize).collect();
+            if data.shape != expected {
+                return Err(TiledError::Validation(format!(
+                    "zarr block write shape {:?} does not match the chunk shape {expected:?}",
+                    data.shape
+                )));
+            }
+            let bytes = data.data.to_vec();
+            store_subset_blocking(array, subset, bytes).await
+        })
+    }
+}
+
+/// Store `bytes` into `subset` of `array` on the blocking pool (store I/O +
+/// encode). Shared by the whole-array and per-chunk write paths.
+async fn store_subset_blocking(
+    array: Arc<Array<FilesystemStore>>,
+    subset: ArraySubset,
+    bytes: Vec<u8>,
+) -> Result<()> {
+    tokio::task::spawn_blocking(move || {
+        array
+            .store_array_subset(&subset, bytes)
+            .map_err(|e| TiledError::Internal(format!("zarr store: {e}")))
+    })
+    .await
+    .map_err(|e| TiledError::Internal(format!("zarr write spawn: {e}")))?
 }
 
 /// Generate a `data_uri` and create a zero-filled zarr store skeleton under
@@ -658,7 +678,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_block_persists_multi_chunk_array_gated_by_into_writable() {
+    async fn write_persists_multi_chunk_array_gated_by_into_writable() {
         let root = tempfile::tempdir().unwrap();
         let root_abs = root.path().canonicalize().unwrap();
         let structure = f64_structure(vec![4], vec![vec![2, 2]]);
@@ -688,7 +708,7 @@ mod tests {
             BuiltinDType::new(Endianness::native(), Kind::Float, 8),
             vec![4],
         );
-        writer.write_block(data, &[0usize]).await.unwrap();
+        writer.write(data).await.unwrap();
 
         let back = rw
             .read(&NDSlice::from_numpy_str("").unwrap())
@@ -698,7 +718,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_block_rejects_shape_mismatch_and_nonzero_block() {
+    async fn write_block_targets_one_chunk_leaving_others_intact() {
+        let root = tempfile::tempdir().unwrap();
+        let root_abs = root.path().canonicalize().unwrap();
+        // 4 elements on a 2-chunk grid: chunk 0 = [0,1], chunk 1 = [2,3].
+        init_storage_zarr(
+            &root_abs,
+            &["arr".into()],
+            &f64_structure(vec![4], vec![vec![2, 2]]),
+        )
+        .unwrap();
+        let rw = ZarrAdapter::from_path(
+            root_abs.join("arr.zarr"),
+            MANAGED_ARRAY_PATH,
+            serde_json::json!({}),
+        )
+        .unwrap()
+        .into_writable();
+        let w = rw.as_writable().unwrap();
+        let dt = || BuiltinDType::new(Endianness::native(), Kind::Float, 8);
+
+        // Write only chunk 1 (shape [2]); chunk 0 stays at the zero fill.
+        let chunk1 = DynNDArray::new(f64_le(&[7.0, 8.0]), dt(), vec![2]);
+        w.write_block(chunk1, &[1usize]).await.unwrap();
+        let back = rw
+            .read(&NDSlice::from_numpy_str("").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(read_f64(&back), vec![0.0, 0.0, 7.0, 8.0]);
+
+        // Then write chunk 0 (shape [2]); chunk 1 is preserved.
+        let chunk0 = DynNDArray::new(f64_le(&[5.0, 6.0]), dt(), vec![2]);
+        w.write_block(chunk0, &[0usize]).await.unwrap();
+        let back = rw
+            .read(&NDSlice::from_numpy_str("").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(read_f64(&back), vec![5.0, 6.0, 7.0, 8.0]);
+    }
+
+    #[tokio::test]
+    async fn write_block_rejects_wrong_chunk_shape_and_out_of_range_block() {
         let root = tempfile::tempdir().unwrap();
         let root_abs = root.path().canonicalize().unwrap();
         init_storage_zarr(
@@ -717,12 +777,12 @@ mod tests {
         let w = rw.as_writable().unwrap();
         let dt = || BuiltinDType::new(Endianness::native(), Kind::Float, 8);
 
-        // Wrong shape (3 elements into a 4-element array).
-        let wrong = DynNDArray::new(Bytes::from(vec![0u8; 24]), dt(), vec![3]);
-        assert!(w.write_block(wrong, &[0usize]).await.is_err());
-        // Non-zero block index is not the whole-array write this path accepts.
+        // Whole-array data into a single chunk → shape mismatch (chunk is [2]).
         let full = DynNDArray::new(Bytes::from(vec![0u8; 32]), dt(), vec![4]);
-        assert!(w.write_block(full, &[1usize]).await.is_err());
+        assert!(w.write_block(full, &[0usize]).await.is_err());
+        // Block index past the grid (only chunks 0,1 exist).
+        let chunk = DynNDArray::new(Bytes::from(vec![0u8; 16]), dt(), vec![2]);
+        assert!(w.write_block(chunk, &[2usize]).await.is_err());
     }
 
     #[test]

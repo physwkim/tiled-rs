@@ -251,3 +251,97 @@ async fn zarr_write_rejects_wrong_body_length() {
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
 }
+
+#[tokio::test]
+async fn block_put_writes_one_chunk_leaving_others_intact() {
+    let (app, _writable_dir, _db_dir) = build_write_app().await;
+    let ds = DataSource {
+        structure_family: StructureFamily::Array,
+        structure: Some(AnyStructure::Array(array_f64_multichunk())),
+        id: None,
+        mimetype: Some("application/x-zarr".into()),
+        parameters: serde_json::json!({}),
+        properties: serde_json::json!({}),
+        assets: vec![],
+        management: Management::Writable,
+    };
+    let (status, body) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/metadata/",
+        serde_json::json!({
+            "key": "arr", "structure_family": "array",
+            "metadata": {}, "specs": [], "data_sources": [ds],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create failed: {body}");
+
+    // The grid is [[2, 2]]: chunk 0 = elements [0,1], chunk 1 = [2,3]. Write
+    // only chunk 1; chunk 0 must stay at the zero fill.
+    let chunk1: Vec<u8> = [7.0f64, 8.0].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let (status, _) = bytes_request(
+        &app,
+        Method::PUT,
+        "/api/v1/array/block/arr?block=1",
+        None,
+        chunk1,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "block 1 write failed");
+
+    let (_status, back) = bytes_request(
+        &app,
+        Method::GET,
+        "/api/v1/array/full/arr",
+        Some("application/octet-stream"),
+        Vec::new(),
+    )
+    .await;
+    let floats: Vec<f64> = back
+        .chunks_exact(8)
+        .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    assert_eq!(
+        floats,
+        vec![0.0, 0.0, 7.0, 8.0],
+        "only chunk 1 should be set"
+    );
+
+    // Now write chunk 0; chunk 1 is preserved.
+    let chunk0: Vec<u8> = [5.0f64, 6.0].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let (status, _) = bytes_request(
+        &app,
+        Method::PUT,
+        "/api/v1/array/block/arr?block=0",
+        None,
+        chunk0,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "block 0 write failed");
+
+    let (_status, back) = bytes_request(
+        &app,
+        Method::GET,
+        "/api/v1/array/full/arr",
+        Some("application/octet-stream"),
+        Vec::new(),
+    )
+    .await;
+    let floats: Vec<f64> = back
+        .chunks_exact(8)
+        .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    assert_eq!(floats, vec![5.0, 6.0, 7.0, 8.0], "both chunks now set");
+
+    // A wrong-size block body is rejected (chunk holds 2 f64 = 16 bytes).
+    let (status, _) = bytes_request(
+        &app,
+        Method::PUT,
+        "/api/v1/array/block/arr?block=0",
+        None,
+        vec![0u8; 24],
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+}

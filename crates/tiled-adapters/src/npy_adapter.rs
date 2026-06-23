@@ -159,24 +159,11 @@ impl ArrayAdapterRead for NpyAdapter {
 }
 
 impl ArrayAdapterWrite for NpyAdapter {
-    fn write_block<'a>(
-        &'a self,
-        data: DynNDArray,
-        block: &'a [usize],
-    ) -> BoxFuture<'a, Result<()>> {
+    fn write<'a>(&'a self, data: DynNDArray) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             let path = self.path.clone().ok_or_else(|| {
                 TiledError::Internal("npy adapter has no backing path to write".into())
             })?;
-            // Single chunk per axis: only the all-zero block is the whole
-            // array. A non-zero block index has no corresponding chunk file.
-            for (axis, &b) in block.iter().enumerate() {
-                if b != 0 {
-                    return Err(TiledError::Validation(format!(
-                        "npy adapter has a single chunk per axis; block[{axis}] = {b}"
-                    )));
-                }
-            }
             // The `.npy` file holds the whole array, so a write must supply
             // exactly the registered shape — no partial / mismatched writes.
             if data.shape != self.structure.shape {
@@ -189,6 +176,26 @@ impl ArrayAdapterWrite for NpyAdapter {
             tokio::task::spawn_blocking(move || write_atomic(&path, &bytes))
                 .await
                 .map_err(|e| TiledError::Internal(format!("npy write spawn: {e}")))?
+        })
+    }
+
+    fn write_block<'a>(
+        &'a self,
+        data: DynNDArray,
+        block: &'a [usize],
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            // npy exposes a single chunk per axis, so the only valid block is
+            // the all-zero one — which is exactly the whole array. A non-zero
+            // index has no corresponding chunk.
+            for (axis, &b) in block.iter().enumerate() {
+                if b != 0 {
+                    return Err(TiledError::Validation(format!(
+                        "npy adapter has a single chunk per axis; block[{axis}] = {b}"
+                    )));
+                }
+            }
+            self.write(data).await
         })
     }
 }
