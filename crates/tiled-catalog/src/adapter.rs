@@ -330,6 +330,21 @@ fn ensure_supported(query: &Query) -> Result<(), UnsupportedQuery> {
     }
 }
 
+/// Resolve a (possibly dotted) metadata key to its JSON value, walking nested
+/// objects: `"a.b"` descends `meta["a"]["b"]`. Returns `None` when any segment
+/// is absent (or an intermediate isn't an object); a present-but-null leaf
+/// returns `Some(Value::Null)`. Mirrors the SQL path's
+/// `json_extract(metadata, '$.a.b')` / `metadata -> '$.a.b'`
+/// (search.rs `Dialect::json_text`) so this in-memory screen and the
+/// authoritative SQL evaluator agree on nested keys (catalog M3).
+fn nested_get<'a>(meta: &'a serde_json::Value, key: &str) -> Option<&'a serde_json::Value> {
+    let mut cur = meta;
+    for seg in key.split('.') {
+        cur = cur.get(seg)?;
+    }
+    Some(cur)
+}
+
 /// Evaluate one query filter against a child node's row fields.
 ///
 /// This path is called only from `CatalogAdapter::search` (container_full
@@ -347,9 +362,9 @@ fn matches_query(
     use Query::*;
     match query {
         FullText(q) => meta.to_string().contains(&q.text),
-        Eq(eq) => meta.get(&eq.key).is_some_and(|v| v == &eq.value),
-        NotEq(neq) => meta.get(&neq.key).is_none_or(|v| v != &neq.value),
-        KeyPresent(kp) => meta.get(&kp.key).is_some() == kp.exists,
+        Eq(eq) => nested_get(meta, &eq.key).is_some_and(|v| v == &eq.value),
+        NotEq(neq) => nested_get(meta, &neq.key).is_none_or(|v| v != &neq.value),
+        KeyPresent(kp) => nested_get(meta, &kp.key).is_some() == kp.exists,
         StructureFamily(sf) => structure_family == sf.value.to_string(),
         AccessBlobFilter(f) => matches_access_blob_filter(access_blob, f),
         // Lookup and KeysFilter filter by node key (tree position), not by
@@ -448,7 +463,8 @@ impl LeafResolver for UnresolvedLeaf {
 mod tests {
     use serde_json::json;
     use tiled_core::queries::{
-        AccessBlobFilter, Eq as EqQ, In as InQ, KeyLookup, KeysFilter, NotIn as NotInQ, Query,
+        AccessBlobFilter, Eq as EqQ, In as InQ, KeyLookup, KeyPresent as KeyPresentQ, KeysFilter,
+        NotEq as NotEqQ, NotIn as NotInQ, Query,
     };
 
     use super::{ensure_supported, matches_query};
@@ -607,5 +623,121 @@ mod tests {
                 value: json!(2)
             })
         ));
+    }
+
+    // catalog M3: a dotted key addresses a nested path, matching the SQL path's
+    // `json_extract(metadata, '$.a.b')` rather than a flat top-level key named
+    // literally "a.b".
+
+    #[test]
+    fn eq_dotted_key_addresses_nested_value() {
+        let meta = json!({"a": {"b": 7}});
+        let blob = json!({});
+        assert!(
+            matches_query(
+                &meta,
+                FAMILY,
+                &blob,
+                &Query::Eq(EqQ {
+                    key: "a.b".into(),
+                    value: json!(7)
+                })
+            ),
+            "dotted Eq must descend into the nested object"
+        );
+        assert!(
+            !matches_query(
+                &meta,
+                FAMILY,
+                &blob,
+                &Query::Eq(EqQ {
+                    key: "a.b".into(),
+                    value: json!(8)
+                })
+            ),
+            "dotted Eq must compare the nested value, not match blindly"
+        );
+        // A flat top-level key literally named "a.b" does not exist here, so the
+        // old `meta.get("a.b")` would have failed to match the nested 7.
+        assert!(
+            !matches_query(
+                &meta,
+                FAMILY,
+                &blob,
+                &Query::Eq(EqQ {
+                    key: "missing.path".into(),
+                    value: json!(7)
+                })
+            ),
+            "absent nested path must not match"
+        );
+    }
+
+    #[test]
+    fn key_present_dotted_key_checks_nested_path() {
+        let meta = json!({"a": {"b": 1}});
+        let blob = json!({});
+        assert!(matches_query(
+            &meta,
+            FAMILY,
+            &blob,
+            &Query::KeyPresent(KeyPresentQ {
+                key: "a.b".into(),
+                exists: true
+            })
+        ));
+        assert!(matches_query(
+            &meta,
+            FAMILY,
+            &blob,
+            &Query::KeyPresent(KeyPresentQ {
+                key: "a.c".into(),
+                exists: false
+            })
+        ));
+    }
+
+    #[test]
+    fn not_eq_dotted_key_includes_missing_path_like_sql() {
+        // The catalog SQL NotEq is `(lhs IS NULL OR lhs != value)`, so a node
+        // missing the (nested) key is "not equal" and stays in the result. The
+        // in-memory screen mirrors that.
+        let blob = json!({});
+        let present_equal = json!({"a": {"b": 5}});
+        assert!(
+            !matches_query(
+                &present_equal,
+                FAMILY,
+                &blob,
+                &Query::NotEq(NotEqQ {
+                    key: "a.b".into(),
+                    value: json!(5)
+                })
+            ),
+            "present-and-equal nested value must be excluded by NotEq"
+        );
+        let present_different = json!({"a": {"b": 6}});
+        assert!(matches_query(
+            &present_different,
+            FAMILY,
+            &blob,
+            &Query::NotEq(NotEqQ {
+                key: "a.b".into(),
+                value: json!(5)
+            })
+        ));
+        let missing = json!({"a": {"z": 0}});
+        assert!(
+            matches_query(
+                &missing,
+                FAMILY,
+                &blob,
+                &Query::NotEq(NotEqQ {
+                    key: "a.b".into(),
+                    value: json!(5)
+                })
+            ),
+            "missing nested path must be included by NotEq (SQL parity)"
+        );
     }
 }
