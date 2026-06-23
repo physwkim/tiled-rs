@@ -2733,6 +2733,92 @@ pub async fn table_full_post(
 }
 
 // ---------------------------------------------------------------------------
+// PUT /api/v1/table/full/{*path} — overwrite a writable table's data
+// ---------------------------------------------------------------------------
+//
+// The write counterpart of `GET /table/full`. The body is an Arrow IPC FILE
+// stream (the canonical table interchange the read serializers also consume),
+// decoded into an `ArrowTable` and written whole. Only internally-managed
+// tables whose backing file lives under the server's writable storage are
+// writable — the resolver decides this, so a non-writable node answers 405
+// rather than the route silently not existing. Mirrors Python tiled's
+// `PUT /table/full` (router.py put_node_full), scoped to the whole-table case
+// the CSV backend supports.
+pub async fn table_full_put(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+    auth: crate::AuthContext,
+    body: bytes::Bytes,
+) -> Result<impl IntoResponse, ServerError> {
+    auth.require(tiled_auth::Scope::WriteData)?;
+    let segments = segments_from_uri(&uri, "/api/v1/table/full/");
+    // Per-node policy check, same as every other data handler.
+    let _ = resolve_entry(
+        &state,
+        auth.clone(),
+        &segments,
+        tiled_auth::Scope::WriteData,
+    )
+    .await?;
+
+    let adapter = core::walk_tree(state.root_tree.as_ref(), &segments).await?;
+    let table_adapter: Arc<dyn tiled_core::adapters::TableAdapterRead> =
+        adapter.as_table_arc().ok_or_else(|| {
+            ServerError::WrongType(format!("'{}' is not a table", segments.join("/")))
+        })?;
+    let writable = table_adapter.as_table_writable().ok_or_else(|| {
+        ServerError::MethodNotAllowed(
+            "this table node is not writable; only internally-managed tables under \
+             the server's writable storage accept writes"
+                .into(),
+        )
+    })?;
+
+    let table = decode_arrow_ipc_table(&body)?;
+
+    // The written schema must match the node's declared columns, so a later
+    // read (the CSV adapter re-infers the schema from the file) cannot
+    // contradict the catalog structure.
+    let declared = &table_adapter.structure().columns;
+    let incoming: Vec<String> = table
+        .schema
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect();
+    if &incoming != declared {
+        return Err(ServerError::Validation(format!(
+            "table write columns {incoming:?} do not match the node's columns {declared:?}"
+        )));
+    }
+
+    writable.write(table).await.map_err(ServerError::from)?;
+
+    let path = segments.join("/");
+    // Signal subscribers that the node's data changed (closest existing event).
+    state.streaming_bus.publish(
+        &path,
+        crate::streaming::UpdateKind::DataAppended { partition: None },
+    );
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+/// Decode an Arrow IPC FILE stream into an [`ArrowTable`]. This is the canonical
+/// table write interchange — the same IPC the read serializers consume.
+fn decode_arrow_ipc_table(body: &[u8]) -> Result<tiled_core::dtype::ArrowTable, ServerError> {
+    use arrow::ipc::reader::FileReader;
+    let cursor = std::io::Cursor::new(body.to_vec());
+    let reader = FileReader::try_new(cursor, None)
+        .map_err(|e| ServerError::Validation(format!("invalid Arrow IPC table body: {e}")))?;
+    let schema = reader.schema();
+    let mut batches = Vec::new();
+    for b in reader {
+        batches.push(b.map_err(|e| ServerError::Validation(format!("Arrow IPC batch: {e}")))?);
+    }
+    Ok(tiled_core::dtype::ArrowTable { batches, schema })
+}
+
+// ---------------------------------------------------------------------------
 // GET /documents/{*path} — Stream Bluesky documents (databroker compat)
 // ---------------------------------------------------------------------------
 
@@ -3121,9 +3207,13 @@ fn default_creation_mimetype(
         SF::Array => Ok("application/x-zarr"),
         #[cfg(not(feature = "zarr-adapter"))]
         SF::Array => Ok("application/x-npy"),
+        // Tables default to CSV — the table writer this build ships out of the
+        // box (csv-adapter is a default feature; parquet write is opt-in).
+        #[cfg(feature = "csv-adapter")]
+        SF::Table => Ok("text/csv"),
         other => Err(ServerError::UnsupportedMediaType(format!(
             "no managed-write backend for {} nodes in this build \
-             (array is writable via application/x-zarr or application/x-npy)",
+             (array: application/x-zarr or application/x-npy; table: text/csv)",
             ds_family_str(other)
         ))),
     }
@@ -3197,10 +3287,48 @@ fn managed_init_storage(
                 ))
             }
         }
+        "text/csv" => {
+            #[cfg(feature = "csv-adapter")]
+            {
+                let structure = managed_table_structure(ds, &mimetype)?;
+                let (_data_uri, assets) =
+                    tiled_adapters::init_storage_csv(writable_root, &path_parts, &structure)
+                        .map_err(ServerError::from)?;
+                Ok((mimetype, to_asset_specs(assets)))
+            }
+            #[cfg(not(feature = "csv-adapter"))]
+            {
+                Err(ServerError::UnsupportedMediaType(
+                    "csv support not built in".into(),
+                ))
+            }
+        }
         other => Err(ServerError::UnsupportedMediaType(format!(
             "managed writes are not supported for mimetype {other} in this build \
-             (supported: application/x-zarr, application/x-npy for array nodes)"
+             (supported: application/x-zarr, application/x-npy for array nodes; \
+             text/csv for table nodes)"
         ))),
+    }
+}
+
+/// Validate that a managed table-mimetype create carries a table structure and
+/// return it. The table analog of [`managed_array_structure`].
+#[cfg(feature = "csv-adapter")]
+fn managed_table_structure(
+    ds: &tiled_core::data_source::DataSource,
+    mimetype: &str,
+) -> Result<tiled_core::structures::TableStructure, ServerError> {
+    if ds.structure_family != tiled_core::structures::StructureFamily::Table {
+        return Err(ServerError::UnsupportedMediaType(format!(
+            "mimetype {mimetype} is only valid for table nodes, not {}",
+            ds_family_str(ds.structure_family)
+        )));
+    }
+    match &ds.structure {
+        Some(tiled_core::structures::AnyStructure::Table(t)) => Ok(t.clone()),
+        _ => Err(ServerError::Validation(
+            "a managed table create requires a table structure (schema + columns)".into(),
+        )),
     }
 }
 

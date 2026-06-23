@@ -98,9 +98,24 @@ pub trait TableAdapterRead: BaseAdapter {
         partition: usize,
         fields: Option<&'a [String]>,
     ) -> BoxFuture<'a, Result<ArrowTable>>;
+
+    /// Optional downcast to a write-capable view, mirroring
+    /// [`ArrayAdapterRead::as_writable`]. Adapters whose backing store can be
+    /// written (managed tables under the server's writable storage) override
+    /// this to return `Some(self)`; the rest leave it `None`, so a read-only
+    /// table answers 405 rather than the write route silently not existing.
+    fn as_table_writable(&self) -> Option<&dyn TableAdapterWrite> {
+        None
+    }
 }
 
 pub trait TableAdapterWrite: TableAdapterRead {
+    /// Overwrite the whole table with `data`. `PUT /table/full` routes here.
+    /// Kept distinct from `write_partition` so "full" never silently means
+    /// "partition 0" (the dual meaning removed on the array side).
+    fn write<'a>(&'a self, data: ArrowTable) -> BoxFuture<'a, Result<()>>;
+
+    /// Overwrite a single partition. `PUT /table/partition` routes here.
     fn write_partition<'a>(
         &'a self,
         data: ArrowTable,

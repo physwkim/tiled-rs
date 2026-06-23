@@ -264,8 +264,11 @@ fn build_leaf_adapter(
         "text/csv" => {
             #[cfg(feature = "csv-adapter")]
             {
-                let adapter = tiled_adapters::CsvAdapter::from_path(path, metadata)
+                let mut adapter = tiled_adapters::CsvAdapter::from_path(path, metadata)
                     .map_err(|e| CatalogError::Validation(e.to_string()))?;
+                if writable {
+                    adapter = adapter.into_writable();
+                }
                 AnyAdapter::Table(Arc::new(adapter))
             }
             #[cfg(not(feature = "csv-adapter"))]

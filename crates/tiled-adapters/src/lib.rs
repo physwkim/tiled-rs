@@ -28,7 +28,7 @@ pub use sequence_adapter::{FrameOpener, NpyFrameOpener, SequenceAdapter};
 pub use tiled_core::adapters::{RaggedAdapterRead, RaggedData};
 
 #[cfg(feature = "csv-adapter")]
-pub use csv_adapter::CsvAdapter;
+pub use csv_adapter::{CsvAdapter, init_storage_csv};
 #[cfg(feature = "hdf5")]
 pub use hdf5_adapter::{Hdf5Adapter, Hdf5Locking};
 #[cfg(feature = "parquet")]

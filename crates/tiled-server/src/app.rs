@@ -173,7 +173,10 @@ pub fn build_app(state: AppState) -> Router {
             "/api/v1/table/partition/{*path}",
             get(router::table_partition).post(router::post_table_partition),
         )
-        .route("/api/v1/table/full/{*path}", get(router::table_full))
+        .route(
+            "/api/v1/table/full/{*path}",
+            get(router::table_full).put(router::table_full_put),
+        )
         .route("/api/v1/table/full", post(router::table_full_post))
         // Ragged read path (Python router.py:838 `get_ragged_full`). GET-only:
         // Python serves no GET `/ragged/block` (the advertised `block` link

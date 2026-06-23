@@ -54,6 +54,7 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true }
+arrow = { workspace = true }
 tokio-tungstenite = "0.28"
 reqwest = { workspace = true }
 futures = { workspace = true }
