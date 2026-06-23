@@ -502,6 +502,113 @@ async fn restricted_delete_skips_absent_managed_file() {
     );
 }
 
+/// S2 source side: `validate_managed_data_uri` (the write/register gate) refuses
+/// a managed `file://` data_uri resolving OUTSIDE the allowed dirs, even though
+/// the target does not exist yet — the fail-fast counterpart of the delete-time
+/// check so an out-of-storage managed asset can never be registered.
+#[tokio::test]
+async fn write_validate_refuses_managed_uri_outside_allowed_dirs() {
+    use std::fs;
+    let dir = tempfile::tempdir().unwrap();
+    let allowed = dir.path().join("storage");
+    fs::create_dir_all(&allowed).unwrap();
+    let outside = dir.path().join("outside");
+    fs::create_dir_all(&outside).unwrap();
+
+    let cat = Catalog::connect("sqlite::memory:")
+        .await
+        .unwrap()
+        .with_managed_delete_dirs(vec![allowed]);
+
+    // Not-yet-created leaf under an out-of-storage dir.
+    let uri = format!("file://{}", outside.join("new.bin").display());
+    let err = cat.validate_managed_data_uri(&uri).unwrap_err();
+    assert!(
+        matches!(err, tiled_catalog::CatalogError::Validation(ref m) if m.contains("outside the configured storage")),
+        "out-of-storage managed register must be refused, got {err:?}"
+    );
+}
+
+/// Counterpart: a managed data_uri UNDER an allowed dir validates even when the
+/// file (and an intermediate dir) does not exist yet — registration precedes
+/// the write, so existence must not be required.
+#[tokio::test]
+async fn write_validate_allows_managed_uri_inside_allowed_dirs() {
+    use std::fs;
+    let dir = tempfile::tempdir().unwrap();
+    let allowed = dir.path().join("storage");
+    fs::create_dir_all(&allowed).unwrap();
+
+    let cat = Catalog::connect("sqlite::memory:")
+        .await
+        .unwrap()
+        .with_managed_delete_dirs(vec![allowed.clone()]);
+
+    let uri = format!("file://{}", allowed.join("sub/new.bin").display());
+    cat.validate_managed_data_uri(&uri)
+        .expect("in-storage not-yet-created managed asset must validate");
+}
+
+/// A `..` component is rejected outright (it could escape the allow-list once a
+/// non-existent tail is joined); a managed write path never needs one.
+#[tokio::test]
+async fn write_validate_rejects_parent_dir_escape() {
+    use std::fs;
+    let dir = tempfile::tempdir().unwrap();
+    let allowed = dir.path().join("storage");
+    fs::create_dir_all(&allowed).unwrap();
+
+    let cat = Catalog::connect("sqlite::memory:")
+        .await
+        .unwrap()
+        .with_managed_delete_dirs(vec![allowed.clone()]);
+
+    let uri = format!("file://{}", allowed.join("../secret.bin").display());
+    let err = cat.validate_managed_data_uri(&uri).unwrap_err();
+    assert!(
+        matches!(err, tiled_catalog::CatalogError::Validation(ref m) if m.contains("must not contain '..'")),
+        "a parent-dir escape must be refused, got {err:?}"
+    );
+}
+
+/// The default `Unrestricted` scope (bare/embedded catalog) accepts any managed
+/// data_uri — write-time containment is opt-in, mirroring deletion.
+#[tokio::test]
+async fn write_validate_unrestricted_accepts_anything() {
+    let cat = Catalog::connect("sqlite::memory:").await.unwrap();
+    cat.validate_managed_data_uri("file:///anywhere/at/all.bin")
+        .expect("Unrestricted scope must accept any managed data_uri");
+}
+
+/// Deny-by-default: an empty `Restricted` dir list refuses every managed
+/// data_uri at register time (same posture as the empty-list delete deny).
+#[tokio::test]
+async fn write_validate_empty_dirs_denies() {
+    let cat = Catalog::connect("sqlite::memory:")
+        .await
+        .unwrap()
+        .with_managed_delete_dirs(vec![]);
+    let err = cat
+        .validate_managed_data_uri("file:///some/where.bin")
+        .unwrap_err();
+    assert!(
+        matches!(err, tiled_catalog::CatalogError::Validation(_)),
+        "empty Restricted scope must deny managed register, got {err:?}"
+    );
+}
+
+/// A non-`file://` URI (e.g. an sqlite storage URI) is not a managed filesystem
+/// path and is never a physical-delete target, so it is accepted unchanged.
+#[tokio::test]
+async fn write_validate_non_file_uri_accepted() {
+    let cat = Catalog::connect("sqlite::memory:")
+        .await
+        .unwrap()
+        .with_managed_delete_dirs(vec![]);
+    cat.validate_managed_data_uri("sqlite:///var/lib/data.db")
+        .expect("non-file managed URI is not an fs path and must be accepted");
+}
+
 /// Server M3: `asset_by_id` is node-scoped — an asset id resolves only via the
 /// path of the node that owns it, so a foreign asset id returns None (404 at the
 /// HTTP layer), never another node's files.

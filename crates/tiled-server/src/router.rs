@@ -2755,6 +2755,20 @@ async fn create_node_core(
 
         // Persist any data sources sent with the create request.
         for ds in &req.data_sources {
+            // Write-time containment (S2 source side): a managed
+            // (`management != external`) asset's `file://` data_uri must
+            // resolve under the configured storage dirs, else reject the
+            // register up-front. External assets are read-only references the
+            // read resolver guards; only managed assets become physical-delete
+            // targets, so only they are validated here — matching the delete
+            // path's `management <> 'external'` filter.
+            if ds.management != tiled_core::data_source::Management::External {
+                for a in &ds.assets {
+                    catalog
+                        .validate_managed_data_uri(&a.data_uri)
+                        .map_err(map_catalog_err)?;
+                }
+            }
             let assets: Vec<tiled_catalog::data_source::AssetSpec> = ds
                 .assets
                 .iter()

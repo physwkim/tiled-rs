@@ -4,7 +4,7 @@
 //! don't have to think about dialect. SQLite stores JSON as `TEXT`, Postgres
 //! as `JSONB`; both branches return the same `Node` shape after decoding.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use serde_json::Value;
 use sqlx::Row;
@@ -164,16 +164,78 @@ fn resolve_contained_target(scope: &DeleteScope, path: &Path) -> Result<Option<P
             canonical.display()
         )));
     }
-    for dir in dirs {
-        // Resolve symlinks in the allow-listed dir too, matching `check_allowed`.
-        let dir_canon = dir.canonicalize().unwrap_or_else(|_| dir.clone());
-        if canonical.starts_with(&dir_canon) {
-            return Ok(Some(canonical));
-        }
+    if is_under_allowed(&canonical, dirs) {
+        return Ok(Some(canonical));
     }
     Err(CatalogError::Validation(format!(
         "refusing to delete managed asset {}: outside the configured managed-delete directories",
         canonical.display()
+    )))
+}
+
+/// True when `canonical` (an already-canonicalised path) lives under one of
+/// `dirs`. Each allow-listed dir is itself canonicalised so a symlinked storage
+/// root matches. Shared by the delete-time ([`resolve_contained_target`]) and
+/// write-time ([`resolve_write_target`]) containment checks so both consult one
+/// rule. Mirrors the read-side `check_allowed` in tiled-server `file_resolver.rs`.
+fn is_under_allowed(canonical: &Path, dirs: &[PathBuf]) -> bool {
+    dirs.iter().any(|dir| {
+        let dir_canon = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+        canonical.starts_with(&dir_canon)
+    })
+}
+
+/// Validate that a managed asset's `data_uri` *path* lies under one of `dirs`,
+/// for the write/register path where the file may not exist yet — the
+/// fail-fast counterpart of [`resolve_contained_target`] (S2 source side). A
+/// client posting a `DataSource` with a managed (`management != external`)
+/// `file://` asset must not be able to point it outside storage and later turn
+/// it into an arbitrary-file delete.
+///
+/// Unlike the delete path, a not-yet-created leaf is legitimate, so existence is
+/// NOT required. To stay symlink-safe without canonicalising a missing file:
+/// reject any `..` component outright (a managed write path never needs one),
+/// then canonicalise the deepest existing ancestor — resolving symlinks in the
+/// real portion — and re-attach the remaining components before the containment
+/// check. An empty `dirs` list permits nothing (deny-by-default).
+fn resolve_write_target(dirs: &[PathBuf], path: &Path) -> Result<PathBuf> {
+    if !path.is_absolute() {
+        return Err(CatalogError::Validation(format!(
+            "managed asset data_uri must be an absolute path, got {}",
+            path.display()
+        )));
+    }
+    // A `..` in the requested path could escape the allow-list once the
+    // non-existent tail is joined; managed write paths never need one.
+    if path.components().any(|c| matches!(c, Component::ParentDir)) {
+        return Err(CatalogError::Validation(format!(
+            "managed asset data_uri must not contain '..': {}",
+            path.display()
+        )));
+    }
+    // Walk up to the deepest ancestor that exists on disk so symlinks in the
+    // real prefix are resolved; the leaf (and possibly some parents) may be
+    // created later by the writer.
+    let mut existing = path;
+    while !existing.exists() {
+        match existing.parent() {
+            Some(parent) => existing = parent,
+            None => break,
+        }
+    }
+    let base = existing
+        .canonicalize()
+        .unwrap_or_else(|_| existing.to_path_buf());
+    let tail = path
+        .strip_prefix(existing)
+        .unwrap_or_else(|_| Path::new(""));
+    let candidate = base.join(tail);
+    if is_under_allowed(&candidate, dirs) {
+        return Ok(candidate);
+    }
+    Err(CatalogError::Validation(format!(
+        "refusing to register managed asset {}: outside the configured storage directories",
+        path.display()
     )))
 }
 
@@ -307,6 +369,28 @@ pub fn validate_structure(structure: &Value) -> Result<()> {
 }
 
 impl Catalog {
+    /// Reject, at register time, a managed asset whose `file://` `data_uri`
+    /// resolves outside the configured storage directories — the write-time,
+    /// fail-fast counterpart of the delete-time containment (S2). Callers (the
+    /// server `create_node` path) invoke this for every asset of a data source
+    /// whose `management != external` before persisting it.
+    ///
+    /// Honours the same [`DeleteScope`] as deletion (one source of truth):
+    /// `Unrestricted` accepts anything; `Restricted` requires the path under an
+    /// allowed dir (empty list denies all). A non-`file://` URI (e.g. an
+    /// sqlite/duckdb storage URI) is not a managed filesystem path and is
+    /// accepted — it is never a physical-delete target.
+    pub fn validate_managed_data_uri(&self, data_uri: &str) -> Result<()> {
+        let dirs = match self.delete_scope() {
+            DeleteScope::Unrestricted => return Ok(()),
+            DeleteScope::Restricted(dirs) => dirs,
+        };
+        let Some(path) = file_uri_to_path(data_uri) else {
+            return Ok(());
+        };
+        resolve_write_target(dirs, &path).map(|_| ())
+    }
+
     /// Find the node identified by `segments`. `[]` is the root sentinel and
     /// returns `None` (callers should special-case the catalog root, which
     /// is a virtual node, not a row).
