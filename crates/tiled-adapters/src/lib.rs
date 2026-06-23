@@ -20,7 +20,7 @@ pub mod zarr_adapter;
 pub use array_adapter::ArrayAdapter;
 pub use coo_adapter::CooAdapter;
 pub use map_adapter::MapAdapter;
-pub use npy_adapter::NpyAdapter;
+pub use npy_adapter::{NpyAdapter, init_storage_npy, npy_bytes};
 pub use ragged_adapter::RaggedAdapter;
 // `RaggedAdapterRead` and `RaggedData` now live in tiled-core (alongside
 // `AnyAdapter::Ragged`); re-export them here for source compatibility.

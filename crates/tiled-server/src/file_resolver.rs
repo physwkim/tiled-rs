@@ -119,6 +119,23 @@ fn check_allowed(scope: &ReadScope, path: &Path) -> std::result::Result<(), Cata
     )))
 }
 
+/// Whether `path` lives under one of the configured writable-storage
+/// directories. Empty list (the default) means nothing is writable, so a
+/// server with no `--writable-storage` serves every adapter read-only. Run on
+/// the blocking pool alongside [`check_allowed`] (it `canonicalize`s, a stat).
+fn is_writable_path(writable_storage: &[PathBuf], path: &Path) -> bool {
+    if writable_storage.is_empty() {
+        return false;
+    }
+    let Ok(canonical) = path.canonicalize() else {
+        return false;
+    };
+    writable_storage.iter().any(|dir| {
+        let dir_canon = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+        canonical.starts_with(&dir_canon)
+    })
+}
+
 impl Default for FileLeafResolver {
     /// The default is the safe deny-all: an empty
     /// [`Restricted`](ReadScope::Restricted) scope that serves no files until
@@ -150,6 +167,12 @@ impl LeafResolver for FileLeafResolver {
             })?;
             let path = uri_to_path(&asset.data_uri)?;
             let scope = self.scope.clone();
+            // Write-containment mirror of `scope`: an adapter is built writable
+            // only when its backing file lives under the catalog's configured
+            // writable storage. This is the single gate that decides
+            // writability, so `as_writable().is_some()` ⟹ the file is under
+            // writable storage (no per-endpoint path re-check needed).
+            let writable_storage = catalog.writable_storage().to_vec();
             let mimetype = ds.mimetype.clone();
             let parameters = ds.parameters.clone();
             let metadata = node.metadata.clone();
@@ -159,7 +182,8 @@ impl LeafResolver for FileLeafResolver {
             // `get` that awaits this never parks the executor.
             tokio::task::spawn_blocking(move || {
                 check_allowed(&scope, &path)?;
-                build_leaf_adapter(&mimetype, path, &parameters, metadata)
+                let writable = is_writable_path(&writable_storage, &path);
+                build_leaf_adapter(&mimetype, path, &parameters, metadata, writable)
             })
             .await
             .map_err(|e| CatalogError::Validation(format!("leaf resolve task failed: {e}")))?
@@ -178,11 +202,18 @@ fn build_leaf_adapter(
     #[cfg_attr(not(feature = "hdf5-adapter"), allow(unused_variables))]
     parameters: &serde_json::Value,
     metadata: serde_json::Value,
+    // Whether the resolver decided this backing file is under writable storage.
+    // Only adapters that implement a writer act on it; the rest are read-only
+    // regardless.
+    writable: bool,
 ) -> std::result::Result<AnyAdapter, CatalogError> {
     let any_adapter = match mimetype {
         "application/x-npy" | "application/x-numpy" | "npy" => {
-            let adapter = tiled_adapters::NpyAdapter::from_path(path, metadata)
+            let mut adapter = tiled_adapters::NpyAdapter::from_path(path, metadata)
                 .map_err(|e| CatalogError::Validation(e.to_string()))?;
+            if writable {
+                adapter = adapter.into_writable();
+            }
             AnyAdapter::Array(Arc::new(adapter))
         }
         "image/tiff" | "image/x-tiff" | "tiff" => {
@@ -343,6 +374,25 @@ mod tests {
     fn unrestricted_scope_permits_any_path() {
         // The explicit opt-out serves everything, no filesystem check.
         assert!(check_allowed(&ReadScope::Unrestricted, Path::new("/etc/passwd")).is_ok());
+    }
+
+    #[test]
+    fn writable_path_requires_containment_in_writable_storage() {
+        // Write-containment mirror of the read allow-list: a file is writable
+        // only when it lives under a configured writable-storage dir. Empty
+        // list = nothing writable (read-only server).
+        let writable = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let inside = writable.path().join("a.npy");
+        let outside = other.path().join("b.npy");
+        std::fs::write(&inside, b"x").unwrap();
+        std::fs::write(&outside, b"x").unwrap();
+
+        let dirs = vec![writable.path().to_path_buf()];
+        assert!(is_writable_path(&dirs, &inside));
+        assert!(!is_writable_path(&dirs, &outside));
+        // No writable storage configured → nothing is writable.
+        assert!(!is_writable_path(&[], &inside));
     }
 
     #[test]

@@ -72,6 +72,13 @@ pub struct Catalog {
     /// Containment policy for managed-asset physical deletion. See
     /// [`DeleteScope`]. Defaults to `Unrestricted`; the server restricts it.
     delete_scope: DeleteScope,
+    /// Directories under which the server may *create* managed storage for
+    /// internally-managed data sources (the `writable_storage` of Python
+    /// tiled). Empty (the default) means the server creates no managed
+    /// storage — `POST /metadata` with a managed data source is refused. The
+    /// CLI wires this from `--writable-storage`, and these dirs are also
+    /// folded into the read allow-list so a freshly-created file is readable.
+    writable_storage: Vec<std::path::PathBuf>,
 }
 
 impl Catalog {
@@ -80,6 +87,7 @@ impl Catalog {
         Self {
             pool,
             delete_scope: DeleteScope::Unrestricted,
+            writable_storage: Vec::new(),
         }
     }
 
@@ -98,6 +106,25 @@ impl Catalog {
     /// The managed-asset deletion containment policy. Read by `delete_node`.
     pub(crate) fn delete_scope(&self) -> &DeleteScope {
         &self.delete_scope
+    }
+
+    /// Configure the directories under which the server creates managed
+    /// storage (the `writable_storage` of Python tiled). The server wires
+    /// this from `--writable-storage`. Consuming builder so it composes with
+    /// [`Catalog::connect`]/[`Catalog::from_pool`] alongside
+    /// [`Catalog::with_managed_delete_dirs`].
+    pub fn with_writable_storage(mut self, dirs: Vec<std::path::PathBuf>) -> Self {
+        self.writable_storage = dirs;
+        self
+    }
+
+    /// Directories the server may create managed storage under. Empty means
+    /// managed-storage creation is disabled. Read by the create-node handler
+    /// (to generate `data_uri`s + skeletons) and the file leaf resolver (to
+    /// decide which resolved assets are writable). `pub` so the server crate's
+    /// resolver can consult it.
+    pub fn writable_storage(&self) -> &[std::path::PathBuf] {
+        &self.writable_storage
     }
 
     /// Connect to the catalog DB referenced by `uri`.
@@ -139,6 +166,7 @@ impl Catalog {
         Ok(Self {
             pool,
             delete_scope: DeleteScope::Unrestricted,
+            writable_storage: Vec::new(),
         })
     }
 

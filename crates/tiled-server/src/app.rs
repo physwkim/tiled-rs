@@ -155,7 +155,9 @@ pub fn build_app(state: AppState) -> Router {
         .route("/api/v1/array/block/{*path}", get(router::array_block))
         .route(
             "/api/v1/array/full/{*path}",
-            get(router::array_full).patch(router::array_append),
+            get(router::array_full)
+                .patch(router::array_append)
+                .put(router::array_full_put),
         )
         .route("/api/v1/container/full/", get(router::container_full_root))
         .route(

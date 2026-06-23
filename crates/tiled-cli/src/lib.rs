@@ -111,6 +111,16 @@ pub enum Command {
         #[arg(long)]
         allow_unrestricted_reads: bool,
 
+        /// Directories under which the server may *create* internally-managed
+        /// data when a client `POST`s to `/metadata` (repeatable). Without
+        /// this flag, managed creation is disabled and such requests fall back
+        /// to metadata-only nodes. Each directory is also folded into the read
+        /// allow-list so a freshly-created file is immediately readable
+        /// (writable ⊆ readable). Distinct from `--allowed-data-dir`, which
+        /// only governs which *existing* files may be read/registered.
+        #[arg(long = "writable-storage")]
+        writable_storage: Vec<std::path::PathBuf>,
+
         /// Disable the bundled WebUI shell. The API still works; only
         /// the `/`, `/static/*`, and `/admin/*` browser surface goes
         /// away. Useful for headless deployments.
@@ -430,6 +440,7 @@ pub async fn run(command: Command) -> Result<()> {
             proxied_auth_header,
             allowed_data_dirs,
             allow_unrestricted_reads,
+            writable_storage,
             no_web,
             web_assets_dir,
             webhooks_allow_http,
@@ -501,6 +512,30 @@ pub async fn run(command: Command) -> Result<()> {
                 api_key
             };
 
+            // Canonicalise the writable-storage roots to absolute paths,
+            // creating them if missing, so `init_storage` can build valid
+            // `file://` URIs and the read/delete/write containment checks
+            // compare against real paths. Empty without `--writable-storage`.
+            let mut writable_abs: Vec<std::path::PathBuf> =
+                Vec::with_capacity(writable_storage.len());
+            for dir in &writable_storage {
+                std::fs::create_dir_all(dir).map_err(|e| {
+                    anyhow::anyhow!("create writable-storage dir {}: {e}", dir.display())
+                })?;
+                let abs = dir.canonicalize().map_err(|e| {
+                    anyhow::anyhow!("canonicalize writable-storage dir {}: {e}", dir.display())
+                })?;
+                writable_abs.push(abs);
+            }
+            // Read + delete containment must also cover the writable-storage
+            // roots: a freshly-created managed file must be readable and
+            // (force-)deletable. writable ⊆ readable.
+            let read_dirs = {
+                let mut d = allowed_data_dirs.clone();
+                d.extend(writable_abs.iter().cloned());
+                d
+            };
+
             // Open the persistent catalog up-front (before the read tree) so
             // a misconfigured DB fails the start-up rather than the first
             // write request.
@@ -522,8 +557,11 @@ pub async fn run(command: Command) -> Result<()> {
                         let cat = if allow_unrestricted_reads {
                             cat
                         } else {
-                            cat.with_managed_delete_dirs(allowed_data_dirs.clone())
+                            cat.with_managed_delete_dirs(read_dirs.clone())
                         };
+                        // Where the server may create internally-managed
+                        // storage (independent of the read-containment opt-out).
+                        let cat = cat.with_writable_storage(writable_abs.clone());
                         cat.migrate()
                             .await
                             .map_err(|e| anyhow::anyhow!("catalog migrate: {e}"))?;
@@ -554,7 +592,7 @@ pub async fn run(command: Command) -> Result<()> {
                 let file_resolver = if allow_unrestricted_reads {
                     FileLeafResolver::unrestricted()
                 } else {
-                    FileLeafResolver::new(allowed_data_dirs.clone())
+                    FileLeafResolver::new(read_dirs.clone())
                 };
                 let resolver: Arc<dyn tiled_catalog::adapter::LeafResolver> =
                     Arc::new(file_resolver);

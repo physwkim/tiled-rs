@@ -1371,6 +1371,85 @@ pub async fn array_append(
 }
 
 // ---------------------------------------------------------------------------
+// PUT /api/v1/array/full/{*path} — overwrite a writable array's data
+// ---------------------------------------------------------------------------
+//
+// The write counterpart of `GET /array/full`. The body is the raw C-order
+// element buffer for the whole array, in the node's registered dtype/shape
+// (numpy's `ndarray.tobytes()`). Only internally-managed arrays whose backing
+// file lives under the server's writable storage are writable — the resolver
+// decides this, so a node that is not writable answers 405 rather than the
+// route silently not existing. Mirrors Python tiled's `PUT /array/full`
+// (router.py write_array), scoped here to the whole-array (single-block) case
+// the NPY backend supports.
+pub async fn array_full_put(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+    auth: crate::AuthContext,
+    body: bytes::Bytes,
+) -> Result<impl IntoResponse, ServerError> {
+    auth.require(tiled_auth::Scope::WriteData)?;
+    let segments = segments_from_uri(&uri, "/api/v1/array/full/");
+    // Per-node policy check, same as every other data handler.
+    let _ = resolve_entry(
+        &state,
+        auth.clone(),
+        &segments,
+        tiled_auth::Scope::WriteData,
+    )
+    .await?;
+
+    let adapter = core::walk_tree(state.root_tree.as_ref(), &segments).await?;
+    let array_adapter: Arc<dyn tiled_core::adapters::ArrayAdapterRead> =
+        adapter.as_array_arc().ok_or_else(|| {
+            ServerError::WrongType(format!("'{}' is not an array", segments.join("/")))
+        })?;
+    let writable = array_adapter.as_writable().ok_or_else(|| {
+        ServerError::MethodNotAllowed(
+            "this array node is not writable; only internally-managed arrays under \
+             the server's writable storage accept writes"
+                .into(),
+        )
+    })?;
+
+    let structure = array_adapter.structure();
+    let dtype = match &structure.data_type {
+        tiled_core::dtype::DType::Builtin(b) => b.clone(),
+        _ => {
+            return Err(ServerError::Validation(
+                "array write: only builtin (non-struct) dtypes are supported".into(),
+            ));
+        }
+    };
+    let elem = dtype.element_size();
+    let nelem: usize = structure.shape.iter().product();
+    let expected = nelem * elem;
+    if body.len() != expected {
+        return Err(ServerError::Validation(format!(
+            "array write: body is {} bytes but the array needs {expected} \
+             (shape {:?}, {elem}-byte elements)",
+            body.len(),
+            structure.shape
+        )));
+    }
+    let shape = structure.shape.clone();
+    let ndim = shape.len();
+    let payload = tiled_core::dtype::DynNDArray::new(body, dtype, shape);
+    writable
+        .write_block(payload, &vec![0usize; ndim])
+        .await
+        .map_err(ServerError::from)?;
+
+    let path = segments.join("/");
+    // Signal subscribers that the node's data changed (closest existing event).
+    state.streaming_bus.publish(
+        &path,
+        crate::streaming::UpdateKind::DataAppended { partition: None },
+    );
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+// ---------------------------------------------------------------------------
 // POST /api/v1/array/full — long-URL workaround for the GET counterpart
 // ---------------------------------------------------------------------------
 //
@@ -2633,7 +2712,9 @@ pub async fn register(
     auth.require(tiled_auth::Scope::CreateNode)?;
     auth.require(tiled_auth::Scope::Register)?;
     let segments = create_segments_from_uri(&uri);
-    create_node_core(state, segments, base_url, auth, req).await
+    // Register trusts the client-supplied assets (existing data); it does not
+    // generate storage.
+    create_node_core(state, segments, base_url, auth, req, false).await
 }
 
 // POST /api/v1/metadata/ — root variant of the asset-free creation alias.
@@ -2676,18 +2757,26 @@ pub async fn post_metadata(
         ));
     }
     let segments = create_segments_from_uri(&uri);
-    create_node_core(state, segments, base_url, auth, req).await
+    // Create generates managed storage server-side (init_storage) when
+    // writable storage is configured.
+    create_node_core(state, segments, base_url, auth, req, true).await
 }
 
 /// Shared node-creation core for `POST /register/{path}` and
 /// `POST /metadata/{path}` (Python `_create_node`, router.py:1852). Callers
 /// apply their own scope/asset gating before delegating here.
+///
+/// `generate_storage` selects the asset-handling mode: `false` (register)
+/// trusts the client's assets for already-existing data; `true` (metadata
+/// create) lets the server generate managed storage via `init_storage` when
+/// writable storage is configured.
 async fn create_node_core(
     state: AppState,
     segments: Vec<String>,
     base_url: String,
     auth: crate::AuthContext,
     req: tiled_core::schemas::PostMetadataRequest,
+    generate_storage: bool,
 ) -> Result<impl IntoResponse, ServerError> {
     let path = segments.join("/");
     // Prefer the top-level `key` (Python tiled wire format, used by cirrus),
@@ -2755,30 +2844,48 @@ async fn create_node_core(
 
         // Persist any data sources sent with the create request.
         for ds in &req.data_sources {
-            // Write-time containment (S2 source side): a managed
-            // (`management != external`) asset's `file://` data_uri must
-            // resolve under the configured storage dirs, else reject the
-            // register up-front. External assets are read-only references the
-            // read resolver guards; only managed assets become physical-delete
-            // targets, so only they are validated here — matching the delete
-            // path's `management <> 'external'` filter.
-            if ds.management != tiled_core::data_source::Management::External {
-                for a in &ds.assets {
-                    catalog
-                        .validate_managed_data_uri(&a.data_uri)
-                        .map_err(map_catalog_err)?;
+            // Two creation modes share this core:
+            //  * `/register` (generate_storage=false): the client supplies the
+            //    assets for already-existing data. A managed asset's `file://`
+            //    `data_uri` must resolve under the configured storage dirs (S2
+            //    write-time containment), so it is validated here; external
+            //    assets are read-only references the read resolver guards. Only
+            //    managed assets become physical-delete targets, matching the
+            //    delete path's `management <> 'external'` filter.
+            //  * `/metadata` create (generate_storage=true): the SERVER decides
+            //    where managed data lives. When writable storage is configured,
+            //    a non-external data source's storage is *generated* via
+            //    `init_storage` (URI + skeleton), replacing client input so the
+            //    managed `data_uri` can never be client-controlled. Without
+            //    writable storage configured, create falls back to the
+            //    register-style persistence (no generation).
+            let generate = generate_storage
+                && !catalog.writable_storage().is_empty()
+                && ds.management != tiled_core::data_source::Management::External;
+            let (mimetype, assets) = if generate {
+                managed_init_storage(catalog, ds, &segments, &node.key)?
+            } else {
+                if !generate_storage
+                    && ds.management != tiled_core::data_source::Management::External
+                {
+                    for a in &ds.assets {
+                        catalog
+                            .validate_managed_data_uri(&a.data_uri)
+                            .map_err(map_catalog_err)?;
+                    }
                 }
-            }
-            let assets: Vec<tiled_catalog::data_source::AssetSpec> = ds
-                .assets
-                .iter()
-                .map(|a| tiled_catalog::data_source::AssetSpec {
-                    data_uri: a.data_uri.clone(),
-                    is_directory: a.is_directory,
-                    parameter: a.parameter.clone().unwrap_or_else(|| "data_uri".into()),
-                    num: a.num.map(|n| n as i32),
-                })
-                .collect();
+                let assets: Vec<tiled_catalog::data_source::AssetSpec> = ds
+                    .assets
+                    .iter()
+                    .map(|a| tiled_catalog::data_source::AssetSpec {
+                        data_uri: a.data_uri.clone(),
+                        is_directory: a.is_directory,
+                        parameter: a.parameter.clone().unwrap_or_else(|| "data_uri".into()),
+                        num: a.num.map(|n| n as i32),
+                    })
+                    .collect();
+                (ds.mimetype.clone().unwrap_or_default(), assets)
+            };
             let structure_json = ds
                 .structure
                 .as_ref()
@@ -2787,7 +2894,7 @@ async fn create_node_core(
             let spec = tiled_catalog::data_source::DataSourceSpec {
                 structure_family: ds_family_str(ds.structure_family).to_string(),
                 structure: structure_json,
-                mimetype: ds.mimetype.clone().unwrap_or_default(),
+                mimetype,
                 parameters: ds.parameters.clone(),
                 management: format!("{:?}", ds.management).to_lowercase(),
                 assets,
@@ -2862,6 +2969,104 @@ fn ds_family_str(f: tiled_core::structures::StructureFamily) -> &'static str {
         SF::Sparse => "sparse",
         SF::Awkward => "awkward",
         SF::Ragged => "ragged",
+    }
+}
+
+/// The mimetype the server creates by default for a structure family when the
+/// client does not pin one — the port's `DEFAULT_CREATION_MIMETYPE`.
+///
+/// Python tiled maps array→ZARR (`adapters/__init__.py`); this port currently
+/// implements only the NPY array writer, so array→`application/x-npy` and every
+/// other family is rejected (415) until its writer lands.
+fn default_creation_mimetype(
+    family: tiled_core::structures::StructureFamily,
+) -> Result<&'static str, ServerError> {
+    use tiled_core::structures::StructureFamily as SF;
+    match family {
+        SF::Array => Ok("application/x-npy"),
+        other => Err(ServerError::UnsupportedMediaType(format!(
+            "no managed-write backend for {} nodes in this build \
+             (only array, via application/x-npy, is writable)",
+            ds_family_str(other)
+        ))),
+    }
+}
+
+/// Generate managed storage for a `/metadata` create: pick the write mimetype,
+/// dispatch to the matching `init_storage`, and return the chosen mimetype plus
+/// the server-generated assets (replacing any client input). The single place
+/// that turns a managed create into on-disk storage, so the generated
+/// `data_uri` is always under writable storage by construction.
+///
+/// Only `Writable` management is supported here: `Locked`/`Immutable` would be
+/// created under writable storage yet must stay read-only, which this build's
+/// containment (writable ⟺ under writable storage) cannot yet express, so they
+/// are refused rather than created writable-by-accident.
+fn managed_init_storage(
+    catalog: &tiled_catalog::Catalog,
+    ds: &tiled_core::data_source::DataSource,
+    parent_segments: &[String],
+    key: &str,
+) -> Result<(String, Vec<tiled_catalog::data_source::AssetSpec>), ServerError> {
+    use tiled_core::data_source::Management;
+
+    if ds.management != Management::Writable {
+        return Err(ServerError::UnsupportedMediaType(format!(
+            "creating {}-managed data is not supported in this build; use \
+             `writable` (server-generated storage) or `external` (POST /register \
+             with an existing data_uri)",
+            format!("{:?}", ds.management).to_lowercase()
+        )));
+    }
+
+    let writable_root = catalog
+        .writable_storage()
+        .first()
+        .ok_or_else(|| ServerError::Internal("writable storage vanished".into()))?;
+
+    // Choose the write mimetype: honour a client-pinned one, else the family
+    // default. Only mimetypes this port can write are accepted.
+    let mimetype = match ds.mimetype.as_deref() {
+        Some(m) => m.to_string(),
+        None => default_creation_mimetype(ds.structure_family)?.to_string(),
+    };
+
+    match mimetype.as_str() {
+        "application/x-npy" | "application/x-numpy" | "npy" => {
+            if ds.structure_family != tiled_core::structures::StructureFamily::Array {
+                return Err(ServerError::UnsupportedMediaType(format!(
+                    "mimetype {mimetype} is only valid for array nodes, not {}",
+                    ds_family_str(ds.structure_family)
+                )));
+            }
+            let structure = match &ds.structure {
+                Some(tiled_core::structures::AnyStructure::Array(a)) => a.clone(),
+                _ => {
+                    return Err(ServerError::Validation(
+                        "a managed array create requires an array structure (shape + dtype)".into(),
+                    ));
+                }
+            };
+            let mut path_parts: Vec<String> = parent_segments.to_vec();
+            path_parts.push(key.to_string());
+            let (_data_uri, assets) =
+                tiled_adapters::init_storage_npy(writable_root, &path_parts, &structure)
+                    .map_err(ServerError::from)?;
+            let asset_specs = assets
+                .into_iter()
+                .map(|a| tiled_catalog::data_source::AssetSpec {
+                    data_uri: a.data_uri,
+                    is_directory: a.is_directory,
+                    parameter: a.parameter.unwrap_or_else(|| "data_uri".into()),
+                    num: a.num.map(|n| n as i32),
+                })
+                .collect();
+            Ok((mimetype, asset_specs))
+        }
+        other => Err(ServerError::UnsupportedMediaType(format!(
+            "managed writes are not supported for mimetype {other} in this build \
+             (supported: application/x-npy for array nodes)"
+        ))),
     }
 }
 
