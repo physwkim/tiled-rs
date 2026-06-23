@@ -133,7 +133,15 @@ impl ContainerAdapter for MapAdapter {
             Ok(self
                 .mapping
                 .iter()
-                .filter(|(_, adapter)| queries.iter().all(|q| matches_query(adapter, q)))
+                .filter(|(key, adapter)| {
+                    queries.iter().all(|q| match q {
+                        // Tree-position filter: evaluated here where the node
+                        // key is in scope (parity with Python `keys_filter`).
+                        // An empty key list matches nothing.
+                        Query::KeysFilter(kf) => kf.keys.iter().any(|k| k == *key),
+                        _ => matches_query(adapter, q),
+                    })
+                })
                 .map(|(k, _)| k.clone())
                 .collect())
         })
@@ -141,20 +149,64 @@ impl ContainerAdapter for MapAdapter {
 }
 
 /// Single source of truth for which query variants this in-memory adapter can
-/// evaluate. `search` gates every query through this before calling
-/// `matches_query`. The map adapter evaluates every metadata predicate, plus
-/// `AccessBlobFilter` (via `include_untagged`); only the tree-position filters
-/// `Lookup`/`KeysFilter` have no in-memory evaluation here (the search
-/// endpoint resolves `Lookup` by direct key lookup; `KeysFilter` is not
-/// implemented). Those become `UnsupportedQuery` → HTTP 400 (parity: Python's
-/// `MapAdapter` registers neither `KeyLookup`) rather than silently passing
-/// every node through.
+/// evaluate. `search` gates every query through this before filtering. The map
+/// adapter evaluates every metadata predicate, `KeysFilter` (by node key, in
+/// `search`), and `AccessBlobFilter` (via `include_untagged`). Only `Lookup`
+/// (`KeyLookup`) has no in-memory evaluation — Python's `MapAdapter` registers
+/// no `KeyLookup` handler either (the search endpoint resolves it by direct key
+/// lookup) — so it becomes `UnsupportedQuery` → HTTP 400 rather than silently
+/// passing every node through.
 fn ensure_supported(query: &Query) -> Result<(), UnsupportedQuery> {
     match query {
-        Query::Lookup(_) | Query::KeysFilter(_) => {
-            Err(UnsupportedQuery(query.type_name().to_string()))
-        }
+        Query::Lookup(_) => Err(UnsupportedQuery(query.type_name().to_string())),
         _ => Ok(()),
+    }
+}
+
+/// Resolve a (possibly dotted) metadata key to its JSON value, walking nested
+/// objects: `"a.b"` descends `meta["a"]["b"]`. Returns `None` when any segment
+/// is absent (or an intermediate isn't an object). Mirrors Python
+/// `iter_child_metadata`, which splits the key on "." and only yields a child
+/// when the whole path resolves.
+fn nested_get<'a>(meta: &'a serde_json::Value, key: &str) -> Option<&'a serde_json::Value> {
+    let mut cur = meta;
+    for seg in key.split('.') {
+        cur = cur.get(seg)?;
+    }
+    Some(cur)
+}
+
+/// Whole-word, case-insensitive full-text match over the metadata's string
+/// values, mirroring Python `full_text_search` + `walk_string_values`: collect
+/// the lower-cased whitespace-delimited words of every string value (keys and
+/// non-string scalars are ignored; a list contributes only its direct string
+/// elements) and match if any query word appears among them. The query text is
+/// split but NOT lower-cased — faithful to Python's `set(text.split())` vs
+/// `s.lower().split()` — so an upper-cased query word will not match.
+fn full_text_matches(meta: &serde_json::Value, text: &str) -> bool {
+    let mut words: std::collections::HashSet<String> = std::collections::HashSet::new();
+    collect_string_words(meta, &mut words);
+    text.split_whitespace().any(|qw| words.contains(qw))
+}
+
+fn collect_string_words(v: &serde_json::Value, out: &mut std::collections::HashSet<String>) {
+    match v {
+        serde_json::Value::String(s) => {
+            out.extend(s.to_lowercase().split_whitespace().map(str::to_string));
+        }
+        serde_json::Value::Object(map) => {
+            for val in map.values() {
+                collect_string_words(val, out);
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for item in arr {
+                if let serde_json::Value::String(s) = item {
+                    out.extend(s.to_lowercase().split_whitespace().map(str::to_string));
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -162,30 +214,40 @@ fn ensure_supported(query: &Query) -> Result<(), UnsupportedQuery> {
 fn matches_query(adapter: &AnyAdapter, query: &Query) -> bool {
     let meta = adapter.metadata();
     match query {
-        Query::FullText(ft) => meta.to_string().contains(&ft.text),
-        Query::Eq(eq) => meta.get(&eq.key).is_some_and(|v| v == &eq.value),
-        Query::NotEq(neq) => meta.get(&neq.key).is_none_or(|v| v != &neq.value),
-        Query::KeyPresent(kp) => meta.get(&kp.key).is_some() == kp.exists,
-        Query::Contains(c) => meta
-            .get(&c.key)
+        // Word-set match over the string values of the metadata (parity with
+        // Python full_text_search + walk_string_values), not a raw substring.
+        Query::FullText(ft) => full_text_matches(meta, &ft.text),
+        // Metadata predicates address a (possibly dotted) nested path via
+        // `nested_get` and, mirroring Python's `iter_child_metadata`, match only
+        // when that path resolves — a node missing the key is excluded.
+        Query::Eq(eq) => nested_get(meta, &eq.key).is_some_and(|v| v == &eq.value),
+        Query::NotEq(neq) => nested_get(meta, &neq.key).is_some_and(|v| v != &neq.value),
+        // KeyPresent: presence of the nested path equals the requested flag.
+        // (Python's `key_present` handler is itself broken — it ignores `exists`
+        // and substring-checks the value against the key — so we implement the
+        // intended present/absent semantics rather than copying that bug.)
+        Query::KeyPresent(kp) => nested_get(meta, &kp.key).is_some() == kp.exists,
+        Query::Contains(c) => nested_get(meta, &c.key)
             .and_then(|v| v.as_array())
             .is_some_and(|arr| arr.contains(&c.value)),
         Query::StructureFamily(sf) => adapter.structure_family() == sf.value,
-        Query::Comparison(c) => meta
-            .get(&c.key)
-            .is_some_and(|v| compare_json(v, &c.value, c.operator)),
-        Query::In(q) => meta
-            .get(&q.key)
-            .is_some_and(|v| q.value.iter().any(|x| x == v)),
-        Query::NotIn(q) => meta
-            .get(&q.key)
-            .is_none_or(|v| !q.value.iter().any(|x| x == v)),
+        Query::Comparison(c) => {
+            nested_get(meta, &c.key).is_some_and(|v| compare_json(v, &c.value, c.operator))
+        }
+        Query::In(q) => nested_get(meta, &q.key).is_some_and(|v| q.value.iter().any(|x| x == v)),
+        // NotIn: an empty value list matches everything (Python returns the
+        // whole tree); otherwise the path must resolve and its value must be
+        // absent from the list (present-only, like the other predicates).
+        Query::NotIn(q) => {
+            q.value.is_empty()
+                || nested_get(meta, &q.key).is_some_and(|v| !q.value.iter().any(|x| x == v))
+        }
         Query::Like(l) => {
             let regex_pat = sql_like_to_regex(&l.pattern);
             regex::Regex::new(&regex_pat)
                 .ok()
                 .and_then(|re| {
-                    meta.get(&l.key)
+                    nested_get(meta, &l.key)
                         .and_then(|v| v.as_str())
                         .map(|s| re.is_match(s))
                 })
@@ -196,7 +258,7 @@ fn matches_query(adapter: &AnyAdapter, query: &Query) -> bool {
             .build()
             .ok()
             .and_then(|re| {
-                meta.get(&r.key)
+                nested_get(meta, &r.key)
                     .and_then(|v| v.as_str())
                     .map(|s| re.is_match(s))
             })
@@ -207,10 +269,9 @@ fn matches_query(adapter: &AnyAdapter, query: &Query) -> bool {
             s.include.iter().all(|n| names.contains(n.as_str()))
                 && !s.exclude.iter().any(|n| names.contains(n.as_str()))
         }
-        // Lookup/KeysFilter have no in-memory evaluation here; `search`
-        // rejects them up front via `ensure_supported` (→ HTTP 400), so this
-        // arm is unreachable through the normal path. Keep it as a defensive
-        // default for any direct caller.
+        // KeysFilter is evaluated in `search` (it needs the node key); Lookup is
+        // rejected by `ensure_supported`. Neither reaches here through the normal
+        // path — keep a defensive default for any direct caller.
         Query::Lookup(_) | Query::KeysFilter(_) => true,
         // AccessBlobFilter: in-memory nodes have no access_blob (untagged),
         // so they match only when include_untagged is true (fail-closed on
@@ -258,7 +319,9 @@ fn sql_like_to_regex(pat: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use tiled_core::queries::NotIn as NotInQ;
+    use tiled_core::queries::{
+        Eq as EqQ, FullText, KeyLookup, KeyPresent, KeysFilter, NotEq as NotEqQ, NotIn as NotInQ,
+    };
 
     use super::*;
 
@@ -266,19 +329,22 @@ mod tests {
         AnyAdapter::Container(Arc::new(MapAdapter::new(IndexMap::new(), meta, vec![])))
     }
 
-    // NotIn semantics: an adapter whose key is absent must be INCLUDED
-    // (mirrors MongoDB $nin and SQL "IS NULL OR NOT IN (...)").
+    // NotIn semantics (parity: Python MapAdapter `notin` via `iter_child_metadata`,
+    // which yields only present-path children): an adapter whose key is ABSENT is
+    // EXCLUDED. NotIn matches only nodes that have the key with a non-listed value.
+    // (This differs from the SQL catalog's `IS NULL OR NOT IN`, which includes
+    // missing — each backend matches its own upstream semantics.)
 
     #[test]
-    fn notin_includes_adapter_missing_key() {
+    fn notin_excludes_adapter_missing_key() {
         let a = leaf(serde_json::json!({"color": "red"}));
         let q = Query::NotIn(NotInQ {
             key: "shape".into(),
             value: vec![serde_json::json!("circle"), serde_json::json!("square")],
         });
         assert!(
-            matches_query(&a, &q),
-            "NotIn must include adapters that lack the queried key (missing ≠ excluded)"
+            !matches_query(&a, &q),
+            "NotIn must exclude adapters that lack the queried key (Python present-only)"
         );
     }
 
@@ -320,15 +386,15 @@ mod tests {
 
     #[tokio::test]
     async fn search_empty_container_still_errors_on_unsupported() {
-        // Up-front validation must fire even with no nodes to filter.
+        // Up-front validation must fire even with no nodes to filter. KeyLookup
+        // is the only query MapAdapter rejects (Python registers no handler for
+        // it); KeysFilter is now supported.
         let map = MapAdapter::new(IndexMap::new(), serde_json::json!({}), vec![]);
-        let q = Query::KeysFilter(tiled_core::queries::KeysFilter {
-            keys: vec!["k".into()],
-        });
+        let q = Query::Lookup(KeyLookup { key: "x".into() });
         let err = map.search(std::slice::from_ref(&q)).await.unwrap_err();
         assert!(
-            matches!(err, tiled_core::error::TiledError::UnsupportedQuery(ref s) if s == "The query type 'KeysFilter' is not supported on this node."),
-            "expected UnsupportedQuery for KeysFilter, got {err:?}"
+            matches!(err, tiled_core::error::TiledError::UnsupportedQuery(ref s) if s == "The query type 'KeyLookup' is not supported on this node."),
+            "expected UnsupportedQuery for KeyLookup, got {err:?}"
         );
     }
 
@@ -382,5 +448,156 @@ mod tests {
         // borrow cache is gone with the async trait); it must report the keys.
         let s = adapter.structure().await.unwrap();
         assert_eq!(s.keys, vec!["a"]);
+    }
+
+    // Parity with Python MapAdapter `iter_child_metadata` (key.split('.')): a
+    // dotted key addresses a nested path, not a flat top-level key named "a.b".
+
+    #[test]
+    fn eq_dotted_key_addresses_nested_value() {
+        let a = leaf(serde_json::json!({"a": {"b": 7}}));
+        assert!(matches_query(
+            &a,
+            &Query::Eq(EqQ {
+                key: "a.b".into(),
+                value: serde_json::json!(7)
+            })
+        ));
+        assert!(!matches_query(
+            &a,
+            &Query::Eq(EqQ {
+                key: "a.b".into(),
+                value: serde_json::json!(8)
+            })
+        ));
+        // Absent nested path → no match (present-only).
+        assert!(!matches_query(
+            &a,
+            &Query::Eq(EqQ {
+                key: "a.z".into(),
+                value: serde_json::json!(7)
+            })
+        ));
+    }
+
+    #[test]
+    fn key_present_dotted_key() {
+        let a = leaf(serde_json::json!({"a": {"b": 1}}));
+        assert!(matches_query(
+            &a,
+            &Query::KeyPresent(KeyPresent {
+                key: "a.b".into(),
+                exists: true
+            })
+        ));
+        assert!(matches_query(
+            &a,
+            &Query::KeyPresent(KeyPresent {
+                key: "a.c".into(),
+                exists: false
+            })
+        ));
+    }
+
+    #[test]
+    fn not_eq_excludes_missing_key() {
+        // Python present-only: a node lacking the key is NOT matched by NotEq.
+        let present_diff = leaf(serde_json::json!({"x": 1}));
+        let present_eq = leaf(serde_json::json!({"x": 2}));
+        let missing = leaf(serde_json::json!({"y": 1}));
+        let q = Query::NotEq(NotEqQ {
+            key: "x".into(),
+            value: serde_json::json!(2),
+        });
+        assert!(matches_query(&present_diff, &q));
+        assert!(!matches_query(&present_eq, &q));
+        assert!(
+            !matches_query(&missing, &q),
+            "NotEq must exclude a node missing the key (Python present-only)"
+        );
+    }
+
+    #[test]
+    fn not_in_empty_list_matches_all() {
+        let a = leaf(serde_json::json!({"x": 1}));
+        let missing = leaf(serde_json::json!({}));
+        let q = Query::NotIn(NotInQ {
+            key: "x".into(),
+            value: vec![],
+        });
+        assert!(matches_query(&a, &q));
+        assert!(
+            matches_query(&missing, &q),
+            "an empty NotIn list matches everything (Python returns the whole tree)"
+        );
+    }
+
+    #[test]
+    fn full_text_word_set_not_substring() {
+        let a = leaf(serde_json::json!({"material": "Copper Oxide", "n": 5}));
+        // Whole word, case-insensitive on the metadata side.
+        assert!(matches_query(
+            &a,
+            &Query::FullText(FullText {
+                text: "copper".into()
+            })
+        ));
+        assert!(matches_query(
+            &a,
+            &Query::FullText(FullText {
+                text: "oxide".into()
+            })
+        ));
+        // A token prefix is a word miss (not a substring match).
+        assert!(!matches_query(
+            &a,
+            &Query::FullText(FullText {
+                text: "copp".into()
+            })
+        ));
+        // Keys and non-string scalars are not indexed.
+        assert!(!matches_query(
+            &a,
+            &Query::FullText(FullText {
+                text: "material".into()
+            })
+        ));
+        assert!(!matches_query(
+            &a,
+            &Query::FullText(FullText { text: "5".into() })
+        ));
+        // The query side is not lower-cased (faithful to Python), so an
+        // upper-cased query word misses the lower-cased metadata words.
+        assert!(!matches_query(
+            &a,
+            &Query::FullText(FullText {
+                text: "Copper".into()
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn keys_filter_selects_by_node_key() {
+        let mut mapping = IndexMap::new();
+        mapping.insert("alpha".to_string(), leaf(serde_json::json!({})));
+        mapping.insert("beta".to_string(), leaf(serde_json::json!({})));
+        mapping.insert("gamma".to_string(), leaf(serde_json::json!({})));
+        let map = MapAdapter::new(mapping, serde_json::json!({}), vec![]);
+
+        let q = Query::KeysFilter(KeysFilter {
+            keys: vec!["alpha".into(), "gamma".into()],
+        });
+        let mut hits = map.search(std::slice::from_ref(&q)).await.unwrap();
+        hits.sort();
+        assert_eq!(hits, vec!["alpha".to_string(), "gamma".to_string()]);
+
+        // An empty key list matches nothing.
+        let q = Query::KeysFilter(KeysFilter { keys: vec![] });
+        assert!(
+            map.search(std::slice::from_ref(&q))
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 }
