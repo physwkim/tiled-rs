@@ -34,6 +34,11 @@ pub const MANAGED_ARRAY_PATH: &str = "/data";
 
 pub struct ZarrAdapter {
     array: Arc<Array<FilesystemStore>>,
+    /// Store root + array path, kept so `append` can re-open a *mutable* Array
+    /// (`zarrs::Array` is not `Clone` and `set_shape` needs `&mut`); the cached
+    /// `array` above is read-only-shared behind an `Arc`.
+    store_root: PathBuf,
+    array_path: String,
     structure: ArrayStructure,
     dtype: BuiltinDType,
     metadata: serde_json::Value,
@@ -76,6 +81,8 @@ impl ZarrAdapter {
         };
         Ok(Self {
             array: Arc::new(array),
+            store_root,
+            array_path: array_path.to_string(),
             structure,
             dtype,
             metadata,
@@ -235,6 +242,71 @@ impl ArrayAdapterWrite for ZarrAdapter {
             }
             let bytes = data.data.to_vec();
             store_subset_blocking(array, subset, bytes).await
+        })
+    }
+
+    fn append<'a>(&'a self, data: DynNDArray, axis: usize) -> BoxFuture<'a, Result<usize>> {
+        // Grow the array along `axis` by `data`'s extent on that axis. zarrs has
+        // no Clone and `set_shape` needs `&mut`, so re-open a fresh mutable
+        // Array from the store, resize + persist metadata, then write the new
+        // region. Mirrors upstream tiled PR #802's appendable zarr.
+        let store_root = self.store_root.clone();
+        let array_path = self.array_path.clone();
+        let old_shape = self.structure.shape.clone();
+        Box::pin(async move {
+            if axis >= old_shape.len() {
+                return Err(TiledError::Validation(format!(
+                    "append axis {axis} out of range (ndim={})",
+                    old_shape.len()
+                )));
+            }
+            if data.shape.len() != old_shape.len() {
+                return Err(TiledError::Validation(format!(
+                    "append data ndim {} does not match array ndim {}",
+                    data.shape.len(),
+                    old_shape.len()
+                )));
+            }
+            // Every non-append axis must match the existing extent.
+            for (ax, (&d, &o)) in data.shape.iter().zip(old_shape.iter()).enumerate() {
+                if ax != axis && d != o {
+                    return Err(TiledError::Validation(format!(
+                        "append: non-append axis {ax} length {d} does not match array length {o}"
+                    )));
+                }
+            }
+            let new_len = old_shape[axis] + data.shape[axis];
+            // Appended region starts at the old extent along `axis`; zarrs
+            // read-modify-writes any partially filled boundary chunk.
+            let start: Vec<u64> = old_shape
+                .iter()
+                .enumerate()
+                .map(|(ax, &o)| if ax == axis { o as u64 } else { 0 })
+                .collect();
+            let block_shape: Vec<u64> = data.shape.iter().map(|&d| d as u64).collect();
+            let mut new_shape_u64: Vec<u64> = old_shape.iter().map(|&d| d as u64).collect();
+            new_shape_u64[axis] = new_len as u64;
+            let bytes = data.data.to_vec();
+            tokio::task::spawn_blocking(move || {
+                let store = Arc::new(
+                    FilesystemStore::new(&store_root)
+                        .map_err(|e| TiledError::Internal(format!("zarr store: {e}")))?,
+                );
+                let mut array = Array::open(store, &array_path)
+                    .map_err(|e| TiledError::Internal(format!("zarr open: {e}")))?;
+                array.set_shape(new_shape_u64);
+                array
+                    .store_metadata()
+                    .map_err(|e| TiledError::Internal(format!("zarr store_metadata: {e}")))?;
+                let subset = ArraySubset::new_with_start_shape(start, block_shape)
+                    .map_err(|e| TiledError::Validation(format!("zarr subset: {e}")))?;
+                array
+                    .store_array_subset(&subset, bytes)
+                    .map_err(|e| TiledError::Internal(format!("zarr store: {e}")))?;
+                Ok::<usize, TiledError>(new_len)
+            })
+            .await
+            .map_err(|e| TiledError::Internal(format!("zarr append spawn: {e}")))?
         })
     }
 }
@@ -801,5 +873,82 @@ mod tests {
                 "expected rejection for {bad:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn append_grows_array_along_axis_and_persists() {
+        let root = tempfile::tempdir().unwrap();
+        let root_abs = root.path().canonicalize().unwrap();
+        // 1-D length 4, chunk size 2.
+        init_storage_zarr(
+            &root_abs,
+            &["arr".into()],
+            &f64_structure(vec![4], vec![vec![2, 2]]),
+        )
+        .unwrap();
+        let store_root = root_abs.join("arr.zarr");
+        let dt = || BuiltinDType::new(Endianness::native(), Kind::Float, 8);
+
+        let rw = ZarrAdapter::from_path(
+            store_root.clone(),
+            MANAGED_ARRAY_PATH,
+            serde_json::json!({}),
+        )
+        .unwrap()
+        .into_writable();
+        let w = rw.as_writable().unwrap();
+        w.write(DynNDArray::new(
+            f64_le(&[1.0, 2.0, 3.0, 4.0]),
+            dt(),
+            vec![4],
+        ))
+        .await
+        .unwrap();
+
+        // Append 2 elements along axis 0 → new length 6.
+        let new_len = w
+            .append(DynNDArray::new(f64_le(&[5.0, 6.0]), dt(), vec![2]), 0)
+            .await
+            .unwrap();
+        assert_eq!(new_len, 6);
+
+        // A freshly opened adapter reads the grown shape + all values from the store.
+        let fresh =
+            ZarrAdapter::from_path(store_root, MANAGED_ARRAY_PATH, serde_json::json!({})).unwrap();
+        assert_eq!(fresh.structure().shape, vec![6]);
+        let all = fresh
+            .read(&NDSlice::from_numpy_str("").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(read_f64(&all), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    }
+
+    #[tokio::test]
+    async fn append_rejects_axis_out_of_range_and_mismatched_width() {
+        let root = tempfile::tempdir().unwrap();
+        let root_abs = root.path().canonicalize().unwrap();
+        // 2x3 on a 1x3 chunk grid (chunk = one row).
+        init_storage_zarr(
+            &root_abs,
+            &["arr".into()],
+            &f64_structure(vec![2, 3], vec![vec![1, 1], vec![3]]),
+        )
+        .unwrap();
+        let rw = ZarrAdapter::from_path(
+            root_abs.join("arr.zarr"),
+            MANAGED_ARRAY_PATH,
+            serde_json::json!({}),
+        )
+        .unwrap()
+        .into_writable();
+        let w = rw.as_writable().unwrap();
+        let dt = || BuiltinDType::new(Endianness::native(), Kind::Float, 8);
+
+        // Axis out of range.
+        let row = DynNDArray::new(Bytes::from(vec![0u8; 24]), dt(), vec![1, 3]);
+        assert!(w.append(row, 5).await.is_err());
+        // Non-append axis width mismatch (width 2 != 3).
+        let bad = DynNDArray::new(Bytes::from(vec![0u8; 16]), dt(), vec![1, 2]);
+        assert!(w.append(bad, 0).await.is_err());
     }
 }

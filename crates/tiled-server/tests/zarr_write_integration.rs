@@ -345,3 +345,84 @@ async fn block_put_writes_one_chunk_leaving_others_intact() {
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
 }
+
+#[tokio::test]
+async fn append_grows_array_and_syncs_catalog_structure() {
+    let (app, _writable_dir, _db_dir) = build_write_app().await;
+    let ds = DataSource {
+        structure_family: StructureFamily::Array,
+        structure: Some(AnyStructure::Array(array_f64_multichunk())),
+        id: None,
+        mimetype: Some("application/x-zarr".into()),
+        parameters: serde_json::json!({}),
+        properties: serde_json::json!({}),
+        assets: vec![],
+        management: Management::Writable,
+    };
+    let (status, body) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/metadata/",
+        serde_json::json!({
+            "key": "arr", "structure_family": "array",
+            "metadata": {}, "specs": [], "data_sources": [ds],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create failed: {body}");
+
+    // Seed the original 4 elements.
+    let values = [1.5f64, 2.5, 3.5, 4.5];
+    let payload: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let (status, _) =
+        bytes_request(&app, Method::PUT, "/api/v1/array/full/arr", None, payload).await;
+    assert_eq!(status, StatusCode::OK, "seed write failed");
+
+    // PATCH /array/full?append_along=0 with 2 new f64 → new length 6.
+    let appended: Vec<u8> = [5.5f64, 6.5].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let req = Request::builder()
+        .method(Method::PATCH)
+        .uri("/api/v1/array/full/arr?append_along=0")
+        .body(Body::from(appended))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "append failed");
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(json["axis"], 0);
+    assert_eq!(json["new_size"], 6);
+
+    // GET /array/full returns all 6 values (data grew on disk).
+    let (status, back) = bytes_request(
+        &app,
+        Method::GET,
+        "/api/v1/array/full/arr",
+        Some("application/octet-stream"),
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "read-back failed");
+    let floats: Vec<f64> = back
+        .chunks_exact(8)
+        .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    assert_eq!(floats, vec![1.5, 2.5, 3.5, 4.5, 5.5, 6.5]);
+
+    // GET /metadata reflects the grown shape — the catalog structure was synced,
+    // so a metadata read does not contradict the data read.
+    let (status, meta) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/metadata/arr",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "metadata read failed: {meta}");
+    assert_eq!(
+        meta["data"]["attributes"]["structure"]["shape"],
+        serde_json::json!([6]),
+        "catalog structure shape not synced after append"
+    );
+}

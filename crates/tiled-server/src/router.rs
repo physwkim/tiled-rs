@@ -1357,6 +1357,32 @@ pub async fn array_append(
         .await
         .map_err(ServerError::from)?;
 
+    // Keep the catalog structure in sync with the grown store, so GET /metadata
+    // reports the new shape (Python tiled updates the DB on append too). Rather
+    // than recompute the chunk grid here, re-resolve and read the authoritative
+    // structure back from the store.
+    if let Some(catalog) = &state.catalog
+        && let Some(node) = catalog.lookup(&segments).await.map_err(map_catalog_err)?
+    {
+        let data_sources = catalog
+            .list_data_sources(node.id)
+            .await
+            .map_err(map_catalog_err)?;
+        if let Some(ds) = data_sources.first() {
+            let fresh = core::walk_tree(state.root_tree.as_ref(), &segments).await?;
+            if let Some(fresh_array) = fresh.as_array_arc() {
+                let new_structure = serde_json::to_value(
+                    tiled_core::structures::AnyStructure::Array(fresh_array.structure().clone()),
+                )
+                .map_err(|e| ServerError::Internal(format!("serialize structure: {e}")))?;
+                catalog
+                    .update_data_source(ds.id, new_structure, ds.parameters.clone())
+                    .await
+                    .map_err(map_catalog_err)?;
+            }
+        }
+    }
+
     let path = segments.join("/");
     state.streaming_bus.publish(
         &path,
