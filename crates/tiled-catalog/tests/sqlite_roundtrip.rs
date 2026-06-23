@@ -1,7 +1,7 @@
 //! SQLite round-trip — open in-memory, migrate, write, read.
 
 use serde_json::json;
-use tiled_core::queries::{Eq, In, Like, NotEq, NotIn, Query, SpecsQuery};
+use tiled_core::queries::{Eq, FullText, In, Like, NotEq, NotIn, Query, SpecsQuery};
 use tiled_core::schemas::SortDirection;
 
 use tiled_catalog::data_source::{AssetSpec, DataSourceSpec};
@@ -22,6 +22,7 @@ async fn migrate_create_lookup_delete() {
             "0002_webhooks".to_string(),
             "0003_revisions_access_blob".to_string(),
             "0004_metadata_fts".to_string(),
+            "0005_metadata_fts5".to_string(),
         ],
     );
 
@@ -799,5 +800,124 @@ async fn search_children_honors_sorting() {
         names(&nodes),
         vec!["alpha", "beta", "gamma"],
         "sort 'id' → key column (name) order"
+    );
+}
+
+/// FTS5 full-text search (catalog M2). Migration 0005 builds an external-content
+/// FTS5 index over `nodes.metadata` kept in sync by the AFTER INSERT/UPDATE/DELETE
+/// triggers. `FullText` must match whole tokens (case-insensitively), NOT `LIKE`
+/// substrings — the behaviour the old `metadata LIKE %term%` path got wrong.
+/// Mirrors Python `metadata_fts5.c.metadata.match(text)` (adapter.py:2014).
+#[tokio::test]
+async fn full_text_search_uses_fts5_token_match() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("sqlite://{}", dir.path().join("catalog.db").display());
+    let cat = Catalog::connect(&uri).await.unwrap();
+    cat.migrate().await.unwrap();
+
+    let parent = cat
+        .create_node(
+            None,
+            vec![],
+            RegisterRequest {
+                key: "runs".into(),
+                structure_family: "container".into(),
+                metadata: json!({}),
+                specs: json!([]),
+                access_blob: json!({}),
+            },
+        )
+        .await
+        .unwrap();
+
+    let child = |key: &str, meta: serde_json::Value| RegisterRequest {
+        key: key.into(),
+        structure_family: "array".into(),
+        metadata: meta,
+        specs: json!([]),
+        access_blob: json!({}),
+    };
+
+    // AFTER INSERT trigger populates the index for these two children.
+    let a = cat
+        .create_node(
+            Some(parent.id),
+            vec!["runs".into()],
+            child("a", json!({"material": "copper oxide", "scan": "alpha"})),
+        )
+        .await
+        .unwrap();
+    let b = cat
+        .create_node(
+            Some(parent.id),
+            vec!["runs".into()],
+            child("b", json!({"material": "iron", "scan": "beta"})),
+        )
+        .await
+        .unwrap();
+
+    // Collect the matching child keys (sorted) for a FullText query.
+    async fn hits(cat: &Catalog, parent_id: i64, text: &str) -> Vec<String> {
+        let (nodes, total) = cat
+            .search_children(
+                Some(parent_id),
+                &[Query::FullText(FullText { text: text.into() })],
+                &[],
+                0,
+                100,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            total as usize,
+            nodes.len(),
+            "total must equal page len here"
+        );
+        let mut keys: Vec<String> = nodes.into_iter().map(|n| n.key).collect();
+        keys.sort();
+        keys
+    }
+
+    // Whole-token match, and case-insensitive (FTS5 unicode61 folds case).
+    assert_eq!(hits(&cat, parent.id, "copper").await, vec!["a"]);
+    assert_eq!(hits(&cat, parent.id, "COPPER").await, vec!["a"]);
+    assert_eq!(hits(&cat, parent.id, "oxide").await, vec!["a"]);
+    assert_eq!(hits(&cat, parent.id, "iron").await, vec!["b"]);
+
+    // Token match, NOT substring: a token prefix does not match. The old
+    // `LIKE %copp%` path would have (wrongly) returned "a" here.
+    assert!(
+        hits(&cat, parent.id, "copp").await.is_empty(),
+        "FTS5 token match must not match a bare token prefix"
+    );
+    // Absent token → no match.
+    assert!(hits(&cat, parent.id, "zirconium").await.is_empty());
+
+    // AFTER UPDATE trigger re-indexes: change b's metadata from iron → copper.
+    cat.update_metadata(
+        b.id,
+        json!({"material": "copper foil", "scan": "beta"}),
+        json!([]),
+        /* drop_revision */ false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        hits(&cat, parent.id, "copper").await,
+        vec!["a", "b"],
+        "update trigger must add b to the copper results"
+    );
+    assert!(
+        hits(&cat, parent.id, "iron").await.is_empty(),
+        "update trigger must drop b's old 'iron' token"
+    );
+
+    // AFTER DELETE trigger removes a from the index (a is an array with no
+    // data source, so the external_only safety gate permits the delete).
+    cat.delete_node(a.id, true).await.unwrap();
+    assert_eq!(
+        hits(&cat, parent.id, "copper").await,
+        vec!["b"],
+        "delete trigger must drop a from the copper results"
     );
 }

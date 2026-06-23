@@ -116,13 +116,6 @@ fn key_path_to_json(key: &str, value: &Value) -> Value {
 }
 
 impl Dialect {
-    fn metadata_full_text(self) -> &'static str {
-        match self {
-            Self::Sqlite => "metadata",
-            Self::Postgres => "metadata::text",
-        }
-    }
-
     /// Build the `ORDER BY` clause body (without the leading `ORDER BY`),
     /// mirroring Python `construct_order_by_clauses` (adapter.py:1891-1923):
     ///
@@ -276,13 +269,19 @@ impl WhereBuilder {
                 self.bindings.push(Bind::Text(text.to_string()));
             }
             Dialect::Sqlite => {
-                // SQLite: portable `LIKE %term%` substring match. FTS5
-                // would be faster but requires a virtual-table mirror —
-                // separate port (upstream #723).
-                let col = self.dialect.metadata_full_text();
+                // SQLite FTS5: match whole tokens against the external-content
+                // `metadata_fts5` index (migration 0005), filtering nodes by id.
+                // This is a token/word match (case-insensitive), not a `LIKE`
+                // substring — mirrors Python `metadata_fts5.c.metadata.match(text)`
+                // joined on `rowid == nodes.id` (catalog/adapter.py:441-446, 2014).
+                // The `id IN (subquery)` form keeps this a single WHERE predicate
+                // with no JOIN, so the `metadata` column never becomes ambiguous
+                // between `nodes` and the index.
                 let p = self.dialect.placeholder(self.bindings.len());
-                self.pieces.push(format!("{col} LIKE {p}"));
-                self.bindings.push(Bind::Text(format!("%{text}%")));
+                self.pieces.push(format!(
+                    "id IN (SELECT rowid FROM metadata_fts5 WHERE metadata MATCH {p})"
+                ));
+                self.bindings.push(Bind::Text(text.to_string()));
             }
         }
     }
