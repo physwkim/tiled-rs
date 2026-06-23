@@ -2975,18 +2975,23 @@ fn ds_family_str(f: tiled_core::structures::StructureFamily) -> &'static str {
 /// The mimetype the server creates by default for a structure family when the
 /// client does not pin one — the port's `DEFAULT_CREATION_MIMETYPE`.
 ///
-/// Python tiled maps array→ZARR (`adapters/__init__.py`); this port currently
-/// implements only the NPY array writer, so array→`application/x-npy` and every
-/// other family is rejected (415) until its writer lands.
+/// Python tiled maps array→ZARR (`adapters/__init__.py`). This port matches
+/// that parity default when the zarr writer is built in (`zarr-adapter`
+/// feature), and otherwise falls back to its always-available NPY writer. Both
+/// are explicit mimetypes a client can still pin directly; every other family
+/// is rejected (415) until its writer lands.
 fn default_creation_mimetype(
     family: tiled_core::structures::StructureFamily,
 ) -> Result<&'static str, ServerError> {
     use tiled_core::structures::StructureFamily as SF;
     match family {
+        #[cfg(feature = "zarr-adapter")]
+        SF::Array => Ok("application/x-zarr"),
+        #[cfg(not(feature = "zarr-adapter"))]
         SF::Array => Ok("application/x-npy"),
         other => Err(ServerError::UnsupportedMediaType(format!(
             "no managed-write backend for {} nodes in this build \
-             (only array, via application/x-npy, is writable)",
+             (array is writable via application/x-zarr or application/x-npy)",
             ds_family_str(other)
         ))),
     }
@@ -3031,43 +3036,77 @@ fn managed_init_storage(
         None => default_creation_mimetype(ds.structure_family)?.to_string(),
     };
 
+    // The node's full path (ancestors + key); `init_storage` turns each part
+    // into one on-disk path component.
+    let mut path_parts: Vec<String> = parent_segments.to_vec();
+    path_parts.push(key.to_string());
+
     match mimetype.as_str() {
         "application/x-npy" | "application/x-numpy" | "npy" => {
-            if ds.structure_family != tiled_core::structures::StructureFamily::Array {
-                return Err(ServerError::UnsupportedMediaType(format!(
-                    "mimetype {mimetype} is only valid for array nodes, not {}",
-                    ds_family_str(ds.structure_family)
-                )));
-            }
-            let structure = match &ds.structure {
-                Some(tiled_core::structures::AnyStructure::Array(a)) => a.clone(),
-                _ => {
-                    return Err(ServerError::Validation(
-                        "a managed array create requires an array structure (shape + dtype)".into(),
-                    ));
-                }
-            };
-            let mut path_parts: Vec<String> = parent_segments.to_vec();
-            path_parts.push(key.to_string());
+            let structure = managed_array_structure(ds, &mimetype)?;
             let (_data_uri, assets) =
                 tiled_adapters::init_storage_npy(writable_root, &path_parts, &structure)
                     .map_err(ServerError::from)?;
-            let asset_specs = assets
-                .into_iter()
-                .map(|a| tiled_catalog::data_source::AssetSpec {
-                    data_uri: a.data_uri,
-                    is_directory: a.is_directory,
-                    parameter: a.parameter.unwrap_or_else(|| "data_uri".into()),
-                    num: a.num.map(|n| n as i32),
-                })
-                .collect();
-            Ok((mimetype, asset_specs))
+            Ok((mimetype, to_asset_specs(assets)))
+        }
+        "application/x-zarr" => {
+            #[cfg(feature = "zarr-adapter")]
+            {
+                let structure = managed_array_structure(ds, &mimetype)?;
+                let (_data_uri, assets) =
+                    tiled_adapters::init_storage_zarr(writable_root, &path_parts, &structure)
+                        .map_err(ServerError::from)?;
+                Ok((mimetype, to_asset_specs(assets)))
+            }
+            #[cfg(not(feature = "zarr-adapter"))]
+            {
+                Err(ServerError::UnsupportedMediaType(
+                    "zarr support not built in".into(),
+                ))
+            }
         }
         other => Err(ServerError::UnsupportedMediaType(format!(
             "managed writes are not supported for mimetype {other} in this build \
-             (supported: application/x-npy for array nodes)"
+             (supported: application/x-zarr, application/x-npy for array nodes)"
         ))),
     }
+}
+
+/// Validate that a managed array-mimetype create carries an array structure and
+/// return it. Shared by every array `init_storage` arm so the family check and
+/// the "needs shape + dtype" error stay identical across formats.
+fn managed_array_structure(
+    ds: &tiled_core::data_source::DataSource,
+    mimetype: &str,
+) -> Result<tiled_core::structures::ArrayStructure, ServerError> {
+    if ds.structure_family != tiled_core::structures::StructureFamily::Array {
+        return Err(ServerError::UnsupportedMediaType(format!(
+            "mimetype {mimetype} is only valid for array nodes, not {}",
+            ds_family_str(ds.structure_family)
+        )));
+    }
+    match &ds.structure {
+        Some(tiled_core::structures::AnyStructure::Array(a)) => Ok(a.clone()),
+        _ => Err(ServerError::Validation(
+            "a managed array create requires an array structure (shape + dtype)".into(),
+        )),
+    }
+}
+
+/// Map adapter-generated [`tiled_core::data_source::Asset`]s to the catalog's
+/// `AssetSpec` persistence shape. Shared by every `init_storage` arm.
+fn to_asset_specs(
+    assets: Vec<tiled_core::data_source::Asset>,
+) -> Vec<tiled_catalog::data_source::AssetSpec> {
+    assets
+        .into_iter()
+        .map(|a| tiled_catalog::data_source::AssetSpec {
+            data_uri: a.data_uri,
+            is_directory: a.is_directory,
+            parameter: a.parameter.unwrap_or_else(|| "data_uri".into()),
+            num: a.num.map(|n| n as i32),
+        })
+        .collect()
 }
 
 fn map_catalog_err(e: tiled_catalog::CatalogError) -> ServerError {

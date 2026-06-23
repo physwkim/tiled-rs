@@ -7,20 +7,30 @@
 
 #![cfg(feature = "zarr")]
 
-use std::path::PathBuf;
+use std::num::NonZeroU64;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use bytes::Bytes;
 use zarrs::array::Array;
 use zarrs::array::ArrayBytes;
+use zarrs::array::{ArrayBuilder, DataType, FillValue};
 use zarrs::array_subset::ArraySubset;
 use zarrs::filesystem::FilesystemStore;
 
-use tiled_core::adapters::{ArrayAdapterRead, BaseAdapter, BoxFuture};
+use tiled_core::adapters::{ArrayAdapterRead, ArrayAdapterWrite, BaseAdapter, BoxFuture};
+use tiled_core::data_source::Asset;
 use tiled_core::dtype::{BuiltinDType, DType, DynNDArray, Endianness, Kind};
 use tiled_core::error::{Result, TiledError};
 use tiled_core::ndslice::NDSlice;
 use tiled_core::structures::{ArrayStructure, Spec, StructureFamily};
+
+/// Relative path of the array inside a server-managed zarr store. `init_storage`
+/// always creates the array here, and the read resolver defaults to it, so a
+/// managed zarr round-trips without threading an `array_path` parameter through
+/// the catalog. Externally-registered stores can still override it via the
+/// `array_path` data-source parameter.
+pub const MANAGED_ARRAY_PATH: &str = "/data";
 
 pub struct ZarrAdapter {
     array: Arc<Array<FilesystemStore>>,
@@ -28,6 +38,11 @@ pub struct ZarrAdapter {
     dtype: BuiltinDType,
     metadata: serde_json::Value,
     specs: Vec<Spec>,
+    /// Set only by the resolver (via [`ZarrAdapter::into_writable`]) when the
+    /// backing store lives under the server's writable storage. Gates
+    /// [`ArrayAdapterRead::as_writable`] so a read-only store can never be
+    /// written through this adapter.
+    writable: bool,
 }
 
 impl ZarrAdapter {
@@ -65,7 +80,16 @@ impl ZarrAdapter {
             dtype,
             metadata,
             specs: vec![Spec::new("zarr")],
+            writable: false,
         })
+    }
+
+    /// Mark this adapter writable. The resolver calls this only when the store
+    /// is under the catalog's configured writable storage, so
+    /// `as_writable().is_some()` ⟹ the store is write-contained.
+    pub fn into_writable(mut self) -> Self {
+        self.writable = true;
+        self
     }
 
     fn array_subset_for_block(&self, block: &[usize]) -> Result<ArraySubset> {
@@ -109,6 +133,12 @@ impl BaseAdapter for ZarrAdapter {
 impl ArrayAdapterRead for ZarrAdapter {
     fn structure(&self) -> &ArrayStructure {
         &self.structure
+    }
+
+    fn as_writable(&self) -> Option<&dyn ArrayAdapterWrite> {
+        // Writable only when the resolver opted this store in (under writable
+        // storage). The single gate for write-containment.
+        if self.writable { Some(self) } else { None }
     }
 
     fn read<'a>(&'a self, slice: &'a NDSlice) -> BoxFuture<'a, Result<DynNDArray>> {
@@ -160,6 +190,184 @@ impl ArrayAdapterRead for ZarrAdapter {
             .map_err(|e| TiledError::Internal(format!("zarr spawn: {e}")))?
         })
     }
+}
+
+impl ArrayAdapterWrite for ZarrAdapter {
+    fn write_block<'a>(
+        &'a self,
+        data: DynNDArray,
+        block: &'a [usize],
+    ) -> BoxFuture<'a, Result<()>> {
+        // `/array/full` writes the whole array: the endpoint hands us the
+        // all-zero block plus full-shape data. zarr's `store_array_subset`
+        // splits that across the real chunk grid, so a managed zarr array is
+        // not capped at a single chunk (unlike npy).
+        Box::pin(async move {
+            for (axis, &b) in block.iter().enumerate() {
+                if b != 0 {
+                    return Err(TiledError::Validation(format!(
+                        "zarr full write expects the whole array (block all-zero); \
+                         block[{axis}] = {b}"
+                    )));
+                }
+            }
+            if data.shape != self.structure.shape {
+                return Err(TiledError::Validation(format!(
+                    "zarr write shape {:?} does not match the array shape {:?}",
+                    data.shape, self.structure.shape
+                )));
+            }
+            let array = self.array.clone();
+            let shape: Vec<u64> = self.structure.shape.iter().map(|&d| d as u64).collect();
+            // The body is already in the dtype's native byte order (what the
+            // read path also forwards verbatim), which is exactly what
+            // `store_array_subset` expects before it re-encodes to the store.
+            let bytes = data.data.to_vec();
+            tokio::task::spawn_blocking(move || {
+                let subset = ArraySubset::new_with_shape(shape);
+                array
+                    .store_array_subset(&subset, bytes)
+                    .map_err(|e| TiledError::Internal(format!("zarr store: {e}")))
+            })
+            .await
+            .map_err(|e| TiledError::Internal(format!("zarr write spawn: {e}")))?
+        })
+    }
+}
+
+/// Generate a `data_uri` and create a zero-filled zarr store skeleton under
+/// `writable_root` for a new internally-managed array node — the zarr analogue
+/// of [`crate::init_storage_npy`]. The server, not the client, decides the
+/// on-disk location, so a managed register cannot point physical storage at an
+/// arbitrary path. Each `path_parts` entry becomes exactly one path component
+/// (validated safe — no empty, `.`/`..`, or separator — so the result stays
+/// under `writable_root` by construction); the store directory is
+/// `<root>/<ancestors>/<key>.zarr` with the array at [`MANAGED_ARRAY_PATH`].
+/// Only metadata is written: a zero fill value means reads before the first
+/// write return zeros, and the declared chunk grid is preserved so multi-chunk
+/// arrays round-trip. Returns the store-root `data_uri` and its (directory)
+/// asset.
+pub fn init_storage_zarr(
+    writable_root: &Path,
+    path_parts: &[String],
+    structure: &ArrayStructure,
+) -> Result<(String, Vec<Asset>)> {
+    if !writable_root.is_absolute() {
+        return Err(TiledError::Internal(format!(
+            "writable storage root {} is not absolute",
+            writable_root.display()
+        )));
+    }
+    let dtype = match &structure.data_type {
+        DType::Builtin(b) => b.clone(),
+        _ => {
+            return Err(TiledError::Validation(
+                "zarr storage supports only builtin (non-struct) dtypes".into(),
+            ));
+        }
+    };
+    if path_parts.is_empty() {
+        return Err(TiledError::Validation(
+            "init_storage: node path is empty".into(),
+        ));
+    }
+    for part in path_parts {
+        if part.is_empty()
+            || part == "."
+            || part == ".."
+            || part.contains('/')
+            || part.contains('\\')
+            || part.contains('\0')
+        {
+            return Err(TiledError::Validation(format!(
+                "init_storage: unsafe path component {part:?}"
+            )));
+        }
+    }
+    let (key, ancestors) = path_parts.split_last().expect("non-empty checked above");
+    let mut store_root = writable_root.to_path_buf();
+    for a in ancestors {
+        store_root.push(a);
+    }
+    store_root.push(format!("{key}.zarr"));
+    std::fs::create_dir_all(&store_root).map_err(|e| {
+        TiledError::Internal(format!("init_storage mkdir {}: {e}", store_root.display()))
+    })?;
+
+    let data_type = to_zarr_data_type(&dtype)?;
+    let shape: Vec<u64> = structure.shape.iter().map(|&d| d as u64).collect();
+    let chunk_shape = regular_chunk_shape(&structure.shape, &structure.chunks);
+    let fill = FillValue::from(vec![0u8; dtype.element_size()]);
+
+    let store = Arc::new(
+        FilesystemStore::new(&store_root)
+            .map_err(|e| TiledError::Internal(format!("zarr store: {e}")))?,
+    );
+    let array = ArrayBuilder::new(shape, data_type, chunk_shape.into(), fill)
+        .build(store, MANAGED_ARRAY_PATH)
+        .map_err(|e| TiledError::Internal(format!("zarr build: {e}")))?;
+    array
+        .store_metadata()
+        .map_err(|e| TiledError::Internal(format!("zarr store_metadata: {e}")))?;
+
+    // `store_root` is under the absolute `writable_root`, so `display()` begins
+    // with `/` and yields the `file:///abs/...` form `uri_to_path` expects.
+    let data_uri = format!("file://{}", store_root.display());
+    let asset = Asset {
+        data_uri: data_uri.clone(),
+        is_directory: true,
+        parameter: Some("data_uri".into()),
+        num: None,
+        id: None,
+    };
+    Ok((data_uri, vec![asset]))
+}
+
+/// Map a tiled builtin dtype to the zarrs `DataType`. Inverse of
+/// [`parse_data_type`]; only the fixed-size numeric/bool types this adapter can
+/// round-trip are accepted.
+fn to_zarr_data_type(dt: &BuiltinDType) -> Result<DataType> {
+    Ok(match (dt.kind, dt.element_size()) {
+        (Kind::Boolean, 1) => DataType::Bool,
+        (Kind::Integer, 1) => DataType::Int8,
+        (Kind::Integer, 2) => DataType::Int16,
+        (Kind::Integer, 4) => DataType::Int32,
+        (Kind::Integer, 8) => DataType::Int64,
+        (Kind::UnsignedInteger, 1) => DataType::UInt8,
+        (Kind::UnsignedInteger, 2) => DataType::UInt16,
+        (Kind::UnsignedInteger, 4) => DataType::UInt32,
+        (Kind::UnsignedInteger, 8) => DataType::UInt64,
+        (Kind::Float, 4) => DataType::Float32,
+        (Kind::Float, 8) => DataType::Float64,
+        _ => {
+            return Err(TiledError::Validation(format!(
+                "zarr storage: unsupported dtype {}",
+                dt.to_numpy_str()
+            )));
+        }
+    })
+}
+
+/// Derive a regular (one-size-per-axis) zarr chunk shape from the tiled
+/// structure's chunk grid. tiled reports each axis as a list of per-chunk
+/// sizes; zarr's regular grid needs a single size per axis, so the first chunk
+/// along each axis is the regular size. Falls back to the full extent (a single
+/// chunk) when an axis declares no grid, and clamps to ≥1 so a zero-length axis
+/// still yields a valid `NonZeroU64`.
+fn regular_chunk_shape(shape: &[usize], chunks: &[Vec<usize>]) -> Vec<NonZeroU64> {
+    shape
+        .iter()
+        .enumerate()
+        .map(|(axis, &dim)| {
+            let regular = chunks
+                .get(axis)
+                .and_then(|sizes| sizes.first())
+                .copied()
+                .unwrap_or(dim)
+                .max(1) as u64;
+            NonZeroU64::new(regular).expect("chunk size clamped to >= 1")
+        })
+        .collect()
 }
 
 fn bytes_from_array_bytes(b: ArrayBytes<'_>) -> Result<Bytes> {
@@ -394,5 +602,144 @@ mod tests {
             Endianness::NotApplicable => panic!("f64 must report a byte order"),
         };
         assert_eq!(decoded, value);
+    }
+
+    fn f64_structure(shape: Vec<usize>, chunks: Vec<Vec<usize>>) -> ArrayStructure {
+        ArrayStructure {
+            data_type: DType::Builtin(BuiltinDType::new(Endianness::native(), Kind::Float, 8)),
+            chunks,
+            shape,
+            dims: None,
+            resizable: Default::default(),
+        }
+    }
+
+    fn f64_le(values: &[f64]) -> Bytes {
+        Bytes::from(
+            values
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<u8>>(),
+        )
+    }
+
+    fn read_f64(arr: &DynNDArray) -> Vec<f64> {
+        arr.data
+            .chunks_exact(8)
+            .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn init_storage_creates_store_skeleton_and_resolves_zeros() {
+        let root = tempfile::tempdir().unwrap();
+        let root_abs = root.path().canonicalize().unwrap();
+        let structure = f64_structure(vec![4], vec![vec![2, 2]]);
+        let (data_uri, assets) =
+            init_storage_zarr(&root_abs, &["grp".into(), "arr".into()], &structure).unwrap();
+
+        // store dir is <root>/grp/arr.zarr; the single asset points at it.
+        let store_root = root_abs.join("grp").join("arr.zarr");
+        assert!(store_root.is_dir(), "zarr store dir not created");
+        assert_eq!(assets.len(), 1);
+        assert!(assets[0].is_directory, "zarr asset must be a directory");
+        assert_eq!(data_uri, format!("file://{}", store_root.display()));
+
+        // Read back: zero fill, correct shape, and the multi-chunk grid recovered.
+        let adapter =
+            ZarrAdapter::from_path(store_root, MANAGED_ARRAY_PATH, serde_json::json!({})).unwrap();
+        assert_eq!(adapter.structure().shape, vec![4]);
+        assert_eq!(adapter.structure().chunks, vec![vec![2, 2]]);
+        let all = adapter
+            .read(&NDSlice::from_numpy_str("").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(read_f64(&all), vec![0.0; 4]);
+    }
+
+    #[tokio::test]
+    async fn write_block_persists_multi_chunk_array_gated_by_into_writable() {
+        let root = tempfile::tempdir().unwrap();
+        let root_abs = root.path().canonicalize().unwrap();
+        let structure = f64_structure(vec![4], vec![vec![2, 2]]);
+        init_storage_zarr(&root_abs, &["arr".into()], &structure).unwrap();
+        let store_root = root_abs.join("arr.zarr");
+
+        // Not opted in → not writable.
+        let ro = ZarrAdapter::from_path(
+            store_root.clone(),
+            MANAGED_ARRAY_PATH,
+            serde_json::json!({}),
+        )
+        .unwrap();
+        assert!(
+            ro.as_writable().is_none(),
+            "must not be writable by default"
+        );
+
+        // Opted in → writable; write the whole array (spans both chunks).
+        let rw = ZarrAdapter::from_path(store_root, MANAGED_ARRAY_PATH, serde_json::json!({}))
+            .unwrap()
+            .into_writable();
+        let writer = rw.as_writable().expect("writable after into_writable");
+        let values = [1.5f64, 2.5, 3.5, 4.5];
+        let data = DynNDArray::new(
+            f64_le(&values),
+            BuiltinDType::new(Endianness::native(), Kind::Float, 8),
+            vec![4],
+        );
+        writer.write_block(data, &[0usize]).await.unwrap();
+
+        let back = rw
+            .read(&NDSlice::from_numpy_str("").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(read_f64(&back), values.to_vec());
+    }
+
+    #[tokio::test]
+    async fn write_block_rejects_shape_mismatch_and_nonzero_block() {
+        let root = tempfile::tempdir().unwrap();
+        let root_abs = root.path().canonicalize().unwrap();
+        init_storage_zarr(
+            &root_abs,
+            &["arr".into()],
+            &f64_structure(vec![4], vec![vec![2, 2]]),
+        )
+        .unwrap();
+        let rw = ZarrAdapter::from_path(
+            root_abs.join("arr.zarr"),
+            MANAGED_ARRAY_PATH,
+            serde_json::json!({}),
+        )
+        .unwrap()
+        .into_writable();
+        let w = rw.as_writable().unwrap();
+        let dt = || BuiltinDType::new(Endianness::native(), Kind::Float, 8);
+
+        // Wrong shape (3 elements into a 4-element array).
+        let wrong = DynNDArray::new(Bytes::from(vec![0u8; 24]), dt(), vec![3]);
+        assert!(w.write_block(wrong, &[0usize]).await.is_err());
+        // Non-zero block index is not the whole-array write this path accepts.
+        let full = DynNDArray::new(Bytes::from(vec![0u8; 32]), dt(), vec![4]);
+        assert!(w.write_block(full, &[1usize]).await.is_err());
+    }
+
+    #[test]
+    fn init_storage_rejects_traversal_components() {
+        let root = tempfile::tempdir().unwrap();
+        let root_abs = root.path().canonicalize().unwrap();
+        let structure = f64_structure(vec![4], vec![vec![4]]);
+        for bad in [
+            vec!["..".to_string()],
+            vec!["a/b".to_string()],
+            vec![String::new()],
+            vec!["ok".to_string(), "..".to_string()],
+        ] {
+            assert!(
+                init_storage_zarr(&root_abs, &bad, &structure).is_err(),
+                "expected rejection for {bad:?}"
+            );
+        }
     }
 }

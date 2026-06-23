@@ -37,4 +37,4 @@ pub use png_jpeg_adapter::ImageAdapter;
 #[cfg(feature = "tiff")]
 pub use tiff_adapter::TiffAdapter;
 #[cfg(feature = "zarr")]
-pub use zarr_adapter::ZarrAdapter;
+pub use zarr_adapter::{MANAGED_ARRAY_PATH, ZarrAdapter, init_storage_zarr};

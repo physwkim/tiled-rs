@@ -197,9 +197,12 @@ impl LeafResolver for FileLeafResolver {
 fn build_leaf_adapter(
     mimetype: &str,
     path: PathBuf,
-    // Only the (feature-gated) hdf5 arm reads `parameters`; without that
-    // feature the binding is genuinely unused.
-    #[cfg_attr(not(feature = "hdf5-adapter"), allow(unused_variables))]
+    // Only the (feature-gated) hdf5 and zarr arms read `parameters`; without
+    // either feature the binding is genuinely unused.
+    #[cfg_attr(
+        not(any(feature = "hdf5-adapter", feature = "zarr-adapter")),
+        allow(unused_variables)
+    )]
     parameters: &serde_json::Value,
     metadata: serde_json::Value,
     // Whether the resolver decided this backing file is under writable storage.
@@ -282,6 +285,29 @@ fn build_leaf_adapter(
                 return Err(CatalogError::Validation(
                     "parquet support not built in".into(),
                 ));
+            }
+        }
+        "application/x-zarr" => {
+            #[cfg(feature = "zarr-adapter")]
+            {
+                // The store is a directory; the array lives at `array_path`
+                // (default `MANAGED_ARRAY_PATH`, what `init_storage_zarr`
+                // creates). An externally-registered store can override it.
+                let array_path = parameters
+                    .get("array_path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(tiled_adapters::MANAGED_ARRAY_PATH);
+                let mut adapter =
+                    tiled_adapters::ZarrAdapter::from_path(path, array_path, metadata)
+                        .map_err(|e| CatalogError::Validation(e.to_string()))?;
+                if writable {
+                    adapter = adapter.into_writable();
+                }
+                AnyAdapter::Array(Arc::new(adapter))
+            }
+            #[cfg(not(feature = "zarr-adapter"))]
+            {
+                return Err(CatalogError::Validation("zarr support not built in".into()));
             }
         }
         other => {
