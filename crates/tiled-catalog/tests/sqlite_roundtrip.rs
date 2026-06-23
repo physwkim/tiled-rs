@@ -343,6 +343,165 @@ async fn delete_reclaims_managed_files_keeps_external() {
     );
 }
 
+/// Register a leaf array node under a fresh catalog with a single `writable`
+/// (internally-managed) data source pointing at `data_uri`. Returns the node id.
+/// Used by the delete-containment boundary tests below.
+async fn register_managed_leaf(
+    cat: &Catalog,
+    key: &str,
+    data_uri: String,
+    is_directory: bool,
+) -> i64 {
+    let node = cat
+        .create_node(
+            None,
+            vec![],
+            RegisterRequest {
+                key: key.into(),
+                structure_family: "array".into(),
+                metadata: json!({}),
+                specs: json!([]),
+                access_blob: json!({}),
+            },
+        )
+        .await
+        .unwrap();
+    cat.create_data_source(
+        node.id,
+        DataSourceSpec {
+            structure_family: "array".into(),
+            structure: json!({
+                "shape": [1],
+                "data_type": {"endianness": "little", "kind": "f", "itemsize": 8},
+                "chunks": [[1]],
+            }),
+            mimetype: "application/x-hdf5".into(),
+            parameters: json!({}),
+            management: "writable".into(),
+            assets: vec![AssetSpec {
+                data_uri,
+                is_directory,
+                parameter: "data_uri".into(),
+                num: None,
+            }],
+        },
+    )
+    .await
+    .unwrap();
+    node.id
+}
+
+/// S2 (delete-side path traversal): with a `Restricted` delete scope, a forced
+/// delete REFUSES to remove a managed asset whose `data_uri` resolves OUTSIDE
+/// the allowed directories — a client can register a managed (default
+/// `writable`) data source with an arbitrary `file://` path, so the delete must
+/// not become an arbitrary-file delete. The out-of-storage file must survive.
+#[tokio::test]
+async fn restricted_delete_refuses_managed_asset_outside_allowed_dirs() {
+    use std::fs;
+    let dir = tempfile::tempdir().unwrap();
+    let allowed = dir.path().join("storage");
+    fs::create_dir_all(&allowed).unwrap();
+    let outside = dir.path().join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    let victim = outside.join("victim.bin");
+    fs::write(&victim, b"do-not-delete").unwrap();
+
+    let cat = Catalog::connect(&format!("sqlite://{}", dir.path().join("c.db").display()))
+        .await
+        .unwrap()
+        .with_managed_delete_dirs(vec![allowed.clone()]);
+    cat.migrate().await.unwrap();
+    let node_id =
+        register_managed_leaf(&cat, "leaf", format!("file://{}", victim.display()), false).await;
+
+    let err = cat.delete_node(node_id, false).await.unwrap_err();
+    assert!(
+        matches!(err, tiled_catalog::CatalogError::Validation(ref m) if m.contains("outside the configured managed-delete")),
+        "out-of-storage managed delete must be refused, got {err:?}"
+    );
+    assert!(
+        victim.exists(),
+        "a managed asset outside storage must NOT be deleted"
+    );
+}
+
+/// Counterpart: a managed asset whose file lives UNDER an allowed directory is
+/// reclaimed normally — containment permits in-storage paths.
+#[tokio::test]
+async fn restricted_delete_allows_managed_asset_inside_allowed_dirs() {
+    use std::fs;
+    let dir = tempfile::tempdir().unwrap();
+    let allowed = dir.path().join("storage");
+    fs::create_dir_all(&allowed).unwrap();
+    let managed = allowed.join("managed.bin");
+    fs::write(&managed, b"bytes").unwrap();
+
+    let cat = Catalog::connect(&format!("sqlite://{}", dir.path().join("c.db").display()))
+        .await
+        .unwrap()
+        .with_managed_delete_dirs(vec![allowed.clone()]);
+    cat.migrate().await.unwrap();
+    let node_id =
+        register_managed_leaf(&cat, "leaf", format!("file://{}", managed.display()), false).await;
+
+    cat.delete_node(node_id, false).await.unwrap();
+    assert!(
+        !managed.exists(),
+        "a managed asset inside storage must be reclaimed on forced delete"
+    );
+}
+
+/// Deny-by-default: an empty `Restricted` dir list refuses removal of any
+/// EXISTING managed file (mirrors the read-side empty allow-list serving
+/// nothing). The file must survive and the delete must error.
+#[tokio::test]
+async fn restricted_empty_dirs_denies_managed_delete() {
+    use std::fs;
+    let dir = tempfile::tempdir().unwrap();
+    let victim = dir.path().join("victim.bin");
+    fs::write(&victim, b"do-not-delete").unwrap();
+
+    let cat = Catalog::connect(&format!("sqlite://{}", dir.path().join("c.db").display()))
+        .await
+        .unwrap()
+        .with_managed_delete_dirs(vec![]);
+    cat.migrate().await.unwrap();
+    let node_id =
+        register_managed_leaf(&cat, "leaf", format!("file://{}", victim.display()), false).await;
+
+    let err = cat.delete_node(node_id, false).await.unwrap_err();
+    assert!(
+        matches!(err, tiled_catalog::CatalogError::Validation(ref m) if m.contains("no managed-delete directory")),
+        "empty Restricted scope must deny all managed deletes, got {err:?}"
+    );
+    assert!(victim.exists(), "deny-all must not remove the file");
+}
+
+/// Boundary: a managed asset whose backing file is ALREADY GONE is skipped, not
+/// an error, even under deny-all — `resolve_contained_target` returns `Ok(None)`
+/// for `NotFound` before the containment decision (you cannot destroy what is
+/// absent), so the node delete still succeeds.
+#[tokio::test]
+async fn restricted_delete_skips_absent_managed_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("never-created.bin");
+
+    let cat = Catalog::connect(&format!("sqlite://{}", dir.path().join("c.db").display()))
+        .await
+        .unwrap()
+        .with_managed_delete_dirs(vec![]);
+    cat.migrate().await.unwrap();
+    let node_id =
+        register_managed_leaf(&cat, "leaf", format!("file://{}", missing.display()), false).await;
+
+    cat.delete_node(node_id, false).await.unwrap();
+    assert!(
+        cat.lookup(&["leaf".into()]).await.unwrap().is_none(),
+        "node with an already-absent managed file must still delete cleanly"
+    );
+}
+
 /// Server M3: `asset_by_id` is node-scoped — an asset id resolves only via the
 /// path of the node that owns it, so a foreign asset id returns None (404 at the
 /// HTTP layer), never another node's files.

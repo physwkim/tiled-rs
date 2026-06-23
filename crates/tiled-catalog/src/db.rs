@@ -39,16 +39,65 @@ impl DbPool {
     }
 }
 
+/// Containment policy for the physical removal of internally-managed
+/// (`management != external`) `file://` assets during [`Catalog::delete_node`].
+///
+/// Mirrors the server read-side `FileLeafResolver` scope (tiled-server
+/// `file_resolver.rs`): the backing file of a managed asset may be removed only
+/// when it resolves — symlinks included — to a location under one of the
+/// configured storage directories. An empty [`Restricted`](DeleteScope::Restricted)
+/// list permits nothing (deny-by-default); [`Unrestricted`](DeleteScope::Unrestricted)
+/// is the explicit, audited opt-out.
+///
+/// The default for a bare [`Catalog`] (embedded / test use) is `Unrestricted`,
+/// preserving direct-library behaviour. The server narrows it via
+/// [`Catalog::with_managed_delete_dirs`], wired from the same
+/// `--allowed-data-dir` directories the read-side resolver allows, so a client
+/// cannot register a managed asset pointing outside storage and then delete an
+/// arbitrary file off disk.
+#[derive(Clone, Debug)]
+pub enum DeleteScope {
+    /// Remove any managed asset path with no containment check — the explicit
+    /// opt-out (server `--allow-unrestricted-reads`), never a server default.
+    Unrestricted,
+    /// Remove a managed asset's file only when it lives under one of these
+    /// directories. An empty list removes nothing (deny-by-default).
+    Restricted(Vec<std::path::PathBuf>),
+}
+
 /// Top-level catalog handle.
 #[derive(Clone, Debug)]
 pub struct Catalog {
     pool: DbPool,
+    /// Containment policy for managed-asset physical deletion. See
+    /// [`DeleteScope`]. Defaults to `Unrestricted`; the server restricts it.
+    delete_scope: DeleteScope,
 }
 
 impl Catalog {
     /// Open from a `DbPool` already prepared by the caller (tests).
     pub fn from_pool(pool: DbPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            delete_scope: DeleteScope::Unrestricted,
+        }
+    }
+
+    /// Restrict the physical deletion of internally-managed assets to files
+    /// under `dirs` (deny-by-default: an empty list permits no managed-file
+    /// removal). The server wires this from `--allowed-data-dir`, the same
+    /// directories the read-side resolver allows, so a managed asset registered
+    /// with a `data_uri` outside storage cannot be turned into an
+    /// arbitrary-file delete. Consuming builder so it composes with
+    /// [`Catalog::connect`]/[`Catalog::from_pool`].
+    pub fn with_managed_delete_dirs(mut self, dirs: Vec<std::path::PathBuf>) -> Self {
+        self.delete_scope = DeleteScope::Restricted(dirs);
+        self
+    }
+
+    /// The managed-asset deletion containment policy. Read by `delete_node`.
+    pub(crate) fn delete_scope(&self) -> &DeleteScope {
+        &self.delete_scope
     }
 
     /// Connect to the catalog DB referenced by `uri`.
@@ -87,7 +136,10 @@ impl Catalog {
             )));
         };
 
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            delete_scope: DeleteScope::Unrestricted,
+        })
     }
 
     pub fn pool(&self) -> &DbPool {

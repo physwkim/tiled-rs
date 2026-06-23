@@ -512,6 +512,18 @@ pub async fn run(command: Command) -> Result<()> {
                         let cat = tiled_catalog::Catalog::connect(uri)
                             .await
                             .map_err(|e| anyhow::anyhow!("catalog connect: {e}"))?;
+                        // Contain managed-asset physical deletion to the same
+                        // directories the read-side resolver allows. A client can
+                        // register an internally-managed data source with an
+                        // arbitrary file:// data_uri, so a forced DELETE must
+                        // refuse to remove a file outside storage rather than
+                        // delete whatever path the client chose.
+                        // --allow-unrestricted-reads opts out of both checks.
+                        let cat = if allow_unrestricted_reads {
+                            cat
+                        } else {
+                            cat.with_managed_delete_dirs(allowed_data_dirs.clone())
+                        };
                         cat.migrate()
                             .await
                             .map_err(|e| anyhow::anyhow!("catalog migrate: {e}"))?;

@@ -4,10 +4,12 @@
 //! don't have to think about dialect. SQLite stores JSON as `TEXT`, Postgres
 //! as `JSONB`; both branches return the same `Node` shape after decoding.
 
+use std::path::{Path, PathBuf};
+
 use serde_json::Value;
 use sqlx::Row;
 
-use crate::db::{Catalog, DbPool};
+use crate::db::{Catalog, DbPool, DeleteScope};
 use crate::error::{CatalogError, Result};
 use crate::orm::Node;
 
@@ -117,10 +119,62 @@ SELECT a.data_uri AS data_uri, a.is_directory AS is_directory
 /// cannot (and must not) remove — e.g. sqlite/duckdb/postgresql storage URIs,
 /// which this port never writes. No percent-decoding, matching the read-side
 /// resolver so a stored `data_uri` maps to the same path on delete as on read.
-fn file_uri_to_path(uri: &str) -> Option<std::path::PathBuf> {
+fn file_uri_to_path(uri: &str) -> Option<PathBuf> {
     let rest = uri.strip_prefix("file://")?;
     let i = rest.find('/')?;
-    Some(std::path::PathBuf::from(&rest[i..]))
+    Some(PathBuf::from(&rest[i..]))
+}
+
+/// Resolve the real filesystem path to remove for a managed asset, enforcing the
+/// deletion containment `scope`.
+///
+/// A client can register an internally-managed (`management != external`) data
+/// source with an arbitrary `file://` `data_uri` (the create path stores it
+/// verbatim, and `Management` defaults to writable), so the delete path must NOT
+/// trust that URI: without this gate a `DELETE …?external_only=false` would
+/// `remove_dir_all` whatever path the attacker chose. Mirrors the read-side
+/// `check_allowed` in tiled-server `file_resolver.rs`.
+///
+/// - [`Unrestricted`](DeleteScope::Unrestricted) → return the path unchanged,
+///   no filesystem check (the historical embedded behaviour).
+/// - [`Restricted`](DeleteScope::Restricted) → canonicalise the path (resolving
+///   symlinks so a link cannot escape) and require the real location to live
+///   under one of the configured dirs; refuse otherwise. An empty dir list
+///   refuses every existing path (deny-by-default). The canonical path is
+///   returned so the subsequent removal targets the resolved location, closing
+///   the validate-then-remove TOCTOU window.
+///
+/// Returns `Ok(None)` when the path does not exist (`NotFound`): there is
+/// nothing to remove, so a missing managed file is neither an error nor a
+/// containment decision — you cannot destroy what is absent.
+fn resolve_contained_target(scope: &DeleteScope, path: &Path) -> Result<Option<PathBuf>> {
+    let dirs = match scope {
+        DeleteScope::Unrestricted => return Ok(Some(path.to_path_buf())),
+        DeleteScope::Restricted(dirs) => dirs,
+    };
+    let canonical = match path.canonicalize() {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(CatalogError::Io(e)),
+    };
+    if dirs.is_empty() {
+        return Err(CatalogError::Validation(format!(
+            "refusing to delete managed asset {}: no managed-delete directory is configured \
+             (pass --allowed-data-dir, or --allow-unrestricted-reads to disable the check)",
+            canonical.display()
+        )));
+    }
+    for dir in dirs {
+        // Resolve symlinks in the allow-listed dir too, matching `check_allowed`.
+        let dir_canon = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+        if canonical.starts_with(&dir_canon) {
+            return Ok(Some(canonical));
+        }
+    }
+    Err(CatalogError::Validation(format!(
+        "refusing to delete managed asset {}: outside the configured managed-delete directories",
+        canonical.display()
+    )))
 }
 
 /// Remove the physical files backing internally-managed assets, after their
@@ -132,7 +186,15 @@ fn file_uri_to_path(uri: &str) -> Option<std::path::PathBuf> {
 /// success (the post-condition — file gone — already holds), but any other I/O
 /// error is surfaced so the caller learns the managed storage was not fully
 /// reclaimed.
-async fn delete_physical_managed_assets(assets: Vec<(String, bool)>) -> Result<()> {
+///
+/// Every path is first run through [`resolve_contained_target`] with `scope`, so
+/// a managed asset whose `data_uri` resolves outside the configured storage
+/// directories is refused (returns `Err`) instead of being removed — the
+/// destructive counterpart of the read-side containment.
+async fn delete_physical_managed_assets(
+    assets: Vec<(String, bool)>,
+    scope: DeleteScope,
+) -> Result<()> {
     if assets.is_empty() {
         return Ok(());
     }
@@ -141,10 +203,15 @@ async fn delete_physical_managed_assets(assets: Vec<(String, bool)>) -> Result<(
             let Some(path) = file_uri_to_path(&data_uri) else {
                 continue;
             };
+            // Containment gate: refuse out-of-storage paths, skip already-gone
+            // ones (Ok(None)), and remove the canonicalised target otherwise.
+            let Some(target) = resolve_contained_target(&scope, &path)? else {
+                continue;
+            };
             let result = if is_directory {
-                std::fs::remove_dir_all(&path)
+                std::fs::remove_dir_all(&target)
             } else {
-                std::fs::remove_file(&path)
+                std::fs::remove_file(&target)
             };
             if let Err(e) = result
                 && e.kind() != std::io::ErrorKind::NotFound
@@ -665,8 +732,10 @@ impl Catalog {
         }
         // Rows (incl. data_sources + assets via cascade) are gone; reclaim the
         // managed storage files. Done after the row delete, matching Python's
-        // out-of-transaction physical deletion.
-        delete_physical_managed_assets(to_remove).await
+        // out-of-transaction physical deletion. The configured delete scope
+        // contains each path so a client-registered managed `data_uri` outside
+        // storage cannot turn this into an arbitrary-file delete.
+        delete_physical_managed_assets(to_remove, self.delete_scope().clone()).await
     }
 
     /// List a node's metadata revisions, oldest first (ascending `revision`),
