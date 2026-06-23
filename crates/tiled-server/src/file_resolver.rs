@@ -279,8 +279,11 @@ fn build_leaf_adapter(
         "application/x-parquet" => {
             #[cfg(feature = "parquet-adapter")]
             {
-                let adapter = tiled_adapters::ParquetAdapter::from_path(path, metadata)
+                let mut adapter = tiled_adapters::ParquetAdapter::from_path(path, metadata)
                     .map_err(|e| CatalogError::Validation(e.to_string()))?;
+                if writable {
+                    adapter = adapter.into_writable();
+                }
                 AnyAdapter::Table(Arc::new(adapter))
             }
             #[cfg(not(feature = "parquet-adapter"))]

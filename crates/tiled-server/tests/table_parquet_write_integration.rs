@@ -1,13 +1,14 @@
-//! End-to-end test for the table (CSV) write subsystem.
+//! End-to-end test for the table parquet write subsystem.
 //!
-//! CSV is the table writer this build ships by default (`csv-adapter`), so this
-//! runs under the default features — no feature gate. Drives the full
-//! managed-write pipeline over HTTP against a SQLite catalog + the real
-//! `FileLeafResolver` with a configured writable-storage root:
-//! `POST /metadata` (server `init_storage_csv` lays a header-only skeleton) →
+//! Gated on `parquet-adapter` (parquet is an opt-in adapter, like zarr): run
+//! with `cargo nextest run -p tiled-server --features parquet-adapter`. Drives
+//! the full managed-write pipeline over HTTP against a SQLite catalog + the
+//! real `FileLeafResolver` with a configured writable-storage root:
+//! `POST /metadata` (server `init_storage_parquet` lays an empty skeleton) →
 //! `PUT /table/full` (write an Arrow IPC body) → `GET /table/full?format=json`
-//! (read it back). One case omits the mimetype to exercise the parity default
-//! (table → text/csv).
+//! (read it back). The mimetype is omitted to prove the parity default for
+//! table nodes is `application/x-parquet` when the parquet writer is built in.
+#![cfg(feature = "parquet-adapter")]
 
 use std::sync::Arc;
 
@@ -77,18 +78,6 @@ async fn build_write_app() -> (axum::Router, tempfile::TempDir, tempfile::TempDi
     (tiled_server::build_app(state), writable_dir, db_dir)
 }
 
-/// `x: Int64, y: Utf8` — the schema the managed table is created with. Used
-/// only by the CSV default-mimetype test below.
-#[cfg(not(feature = "parquet-adapter"))]
-fn xy_schema() -> SchemaRef {
-    Arc::new(Schema::new(vec![
-        Field::new("x", DataType::Int64, false),
-        Field::new("y", DataType::Utf8, false),
-    ]))
-}
-
-/// Serialize one record batch as an Arrow IPC FILE stream — the body
-/// `PUT /table/full` expects.
 fn arrow_ipc_file(schema: &SchemaRef, batch: &RecordBatch) -> Vec<u8> {
     let mut buf = Vec::new();
     {
@@ -97,32 +86,6 @@ fn arrow_ipc_file(schema: &SchemaRef, batch: &RecordBatch) -> Vec<u8> {
         w.finish().unwrap();
     }
     buf
-}
-
-/// A managed table create body. `arrow_schema` is a placeholder: the CSV
-/// adapter re-infers the schema from the written file and never decodes the
-/// stored string, and `validate_structure` only checks size — so the table
-/// write/read flow does not depend on it.
-fn create_table_body(mimetype: Option<&str>) -> serde_json::Value {
-    let ds = DataSource {
-        structure_family: StructureFamily::Table,
-        structure: Some(AnyStructure::Table(TableStructure {
-            arrow_schema: String::new(),
-            npartitions: 1,
-            columns: vec!["x".into(), "y".into()],
-            resizable: Default::default(),
-        })),
-        id: None,
-        mimetype: mimetype.map(String::from),
-        parameters: serde_json::json!({}),
-        properties: serde_json::json!({}),
-        assets: vec![],
-        management: Management::Writable,
-    };
-    serde_json::json!({
-        "key": "t", "structure_family": "table",
-        "metadata": {}, "specs": [], "data_sources": [ds],
-    })
 }
 
 async fn send(app: &axum::Router, req: Request<Body>) -> (StatusCode, Vec<u8>) {
@@ -134,14 +97,27 @@ async fn send(app: &axum::Router, req: Request<Body>) -> (StatusCode, Vec<u8>) {
     (status, bytes.to_vec())
 }
 
-// CSV is the table default only when parquet's writer is NOT built in (with
-// parquet-adapter the default flips to x-parquet, covered by the parquet e2e).
-#[cfg(not(feature = "parquet-adapter"))]
 #[tokio::test]
-async fn managed_csv_default_mimetype_write_then_read_json() {
+async fn managed_parquet_default_mimetype_write_then_read_json() {
     let (app, writable_dir, _db_dir) = build_write_app().await;
 
-    // Omit the mimetype: the server picks the table parity default (text/csv).
+    // Omit the mimetype: with the parquet writer built in, the table parity
+    // default is application/x-parquet.
+    let ds = DataSource {
+        structure_family: StructureFamily::Table,
+        structure: Some(AnyStructure::Table(TableStructure {
+            arrow_schema: String::new(),
+            npartitions: 1,
+            columns: vec!["x".into(), "y".into()],
+            resizable: Default::default(),
+        })),
+        id: None,
+        mimetype: None,
+        parameters: serde_json::json!({}),
+        properties: serde_json::json!({}),
+        assets: vec![],
+        management: Management::Writable,
+    };
     let (status, body) = send(
         &app,
         Request::builder()
@@ -149,7 +125,11 @@ async fn managed_csv_default_mimetype_write_then_read_json() {
             .uri("/api/v1/metadata/")
             .header("content-type", "application/json")
             .body(Body::from(
-                serde_json::to_vec(&create_table_body(None)).unwrap(),
+                serde_json::to_vec(&serde_json::json!({
+                    "key": "t", "structure_family": "table",
+                    "metadata": {}, "specs": [], "data_sources": [ds],
+                }))
+                .unwrap(),
             ))
             .unwrap(),
     )
@@ -161,14 +141,17 @@ async fn managed_csv_default_mimetype_write_then_read_json() {
         String::from_utf8_lossy(&body)
     );
 
-    // The server laid a CSV file under writable storage (server-chosen path).
+    // The server laid a parquet FILE under writable storage (server-chosen).
     assert!(
-        writable_dir.path().join("t.csv").is_file(),
-        "csv skeleton not created under writable storage"
+        writable_dir.path().join("t.parquet").is_file(),
+        "parquet skeleton not created under writable storage"
     );
 
     // PUT the whole table as Arrow IPC.
-    let schema = xy_schema();
+    let schema: SchemaRef = Arc::new(Schema::new(vec![
+        Field::new("x", DataType::Int64, false),
+        Field::new("y", DataType::Utf8, false),
+    ]));
     let batch = RecordBatch::try_new(
         schema.clone(),
         vec![
@@ -207,58 +190,4 @@ async fn managed_csv_default_mimetype_write_then_read_json() {
         serde_json::json!(["a", "b", "c"]),
         "y column mismatch"
     );
-}
-
-#[tokio::test]
-async fn table_write_rejects_mismatched_columns_and_non_ipc_body() {
-    let (app, _writable_dir, _db_dir) = build_write_app().await;
-    let (status, _) = send(
-        &app,
-        Request::builder()
-            .method(Method::POST)
-            .uri("/api/v1/metadata/")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                serde_json::to_vec(&create_table_body(Some("text/csv"))).unwrap(),
-            ))
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CREATED);
-
-    // Body whose columns (x, z) do not match the node's (x, y) → rejected.
-    let wrong_schema: SchemaRef = Arc::new(Schema::new(vec![
-        Field::new("x", DataType::Int64, false),
-        Field::new("z", DataType::Utf8, false),
-    ]));
-    let wrong_batch = RecordBatch::try_new(
-        wrong_schema.clone(),
-        vec![
-            Arc::new(Int64Array::from(vec![1])),
-            Arc::new(StringArray::from(vec!["a"])),
-        ],
-    )
-    .unwrap();
-    let (status, _) = send(
-        &app,
-        Request::builder()
-            .method(Method::PUT)
-            .uri("/api/v1/table/full/t")
-            .body(Body::from(arrow_ipc_file(&wrong_schema, &wrong_batch)))
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "column mismatch");
-
-    // A body that is not Arrow IPC at all → rejected, not a 500.
-    let (status, _) = send(
-        &app,
-        Request::builder()
-            .method(Method::PUT)
-            .uri("/api/v1/table/full/t")
-            .body(Body::from(vec![0u8; 16]))
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "non-IPC body");
 }

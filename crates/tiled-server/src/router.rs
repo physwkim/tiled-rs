@@ -3207,13 +3207,16 @@ fn default_creation_mimetype(
         SF::Array => Ok("application/x-zarr"),
         #[cfg(not(feature = "zarr-adapter"))]
         SF::Array => Ok("application/x-npy"),
-        // Tables default to CSV — the table writer this build ships out of the
-        // box (csv-adapter is a default feature; parquet write is opt-in).
-        #[cfg(feature = "csv-adapter")]
+        // Tables prefer parquet when its writer is built in (parity default),
+        // else CSV — the table writer this build ships by default (csv-adapter).
+        #[cfg(feature = "parquet-adapter")]
+        SF::Table => Ok("application/x-parquet"),
+        #[cfg(all(not(feature = "parquet-adapter"), feature = "csv-adapter"))]
         SF::Table => Ok("text/csv"),
         other => Err(ServerError::UnsupportedMediaType(format!(
             "no managed-write backend for {} nodes in this build \
-             (array: application/x-zarr or application/x-npy; table: text/csv)",
+             (array: application/x-zarr or application/x-npy; \
+             table: application/x-parquet or text/csv)",
             ds_family_str(other)
         ))),
     }
@@ -3303,17 +3306,33 @@ fn managed_init_storage(
                 ))
             }
         }
+        "application/x-parquet" => {
+            #[cfg(feature = "parquet-adapter")]
+            {
+                let structure = managed_table_structure(ds, &mimetype)?;
+                let (_data_uri, assets) =
+                    tiled_adapters::init_storage_parquet(writable_root, &path_parts, &structure)
+                        .map_err(ServerError::from)?;
+                Ok((mimetype, to_asset_specs(assets)))
+            }
+            #[cfg(not(feature = "parquet-adapter"))]
+            {
+                Err(ServerError::UnsupportedMediaType(
+                    "parquet support not built in".into(),
+                ))
+            }
+        }
         other => Err(ServerError::UnsupportedMediaType(format!(
             "managed writes are not supported for mimetype {other} in this build \
              (supported: application/x-zarr, application/x-npy for array nodes; \
-             text/csv for table nodes)"
+             application/x-parquet, text/csv for table nodes)"
         ))),
     }
 }
 
 /// Validate that a managed table-mimetype create carries a table structure and
 /// return it. The table analog of [`managed_array_structure`].
-#[cfg(feature = "csv-adapter")]
+#[cfg(any(feature = "csv-adapter", feature = "parquet-adapter"))]
 fn managed_table_structure(
     ds: &tiled_core::data_source::DataSource,
     mimetype: &str,

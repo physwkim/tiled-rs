@@ -32,7 +32,7 @@ pub use csv_adapter::{CsvAdapter, init_storage_csv};
 #[cfg(feature = "hdf5")]
 pub use hdf5_adapter::{Hdf5Adapter, Hdf5Locking};
 #[cfg(feature = "parquet")]
-pub use parquet_adapter::ParquetAdapter;
+pub use parquet_adapter::{ParquetAdapter, init_storage_parquet};
 pub use png_jpeg_adapter::ImageAdapter;
 #[cfg(feature = "tiff")]
 pub use tiff_adapter::TiffAdapter;
