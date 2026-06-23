@@ -444,7 +444,11 @@ async fn distinct_groups_metadata_structure_families_and_specs() {
 /// app.py:367-374). Passing `?external_only=false` forces the delete.
 #[tokio::test]
 async fn delete_internally_managed_requires_external_only_false() {
-    let (app, _dir) = build_test_app().await;
+    let (app, dir) = build_test_app().await;
+    // Asset path is under the test tempdir and never created on disk, so the
+    // forced delete below — which now reclaims managed file:// assets — has no
+    // real file to touch (keeps the test hermetic).
+    let data_uri = format!("file://{}", dir.path().join("frame.h5").display());
 
     // Register an array node carrying a *writable* data source.
     let register = |key: &str| {
@@ -458,7 +462,7 @@ async fn delete_internally_managed_requires_external_only_false() {
                 "mimetype": "application/x-hdf5",
                 "management": "writable",
                 "assets": [{
-                    "data_uri": "file:///tmp/frame.h5",
+                    "data_uri": data_uri.clone(),
                     "is_directory": false,
                     "parameter": "data_uri"
                 }]

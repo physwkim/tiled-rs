@@ -79,6 +79,89 @@ SELECT COUNT(*) FROM data_sources ds
   JOIN subtree s ON ds.node_id = s.id
  WHERE ds.management <> 'external'";
 
+/// List the assets in the subtree rooted at the bound node id (inclusive) that
+/// belong to a non-`external` (internally-managed) data source — the files
+/// Python's `delete()` reclaims after the rows are gone (the
+/// `if management != external: delete_physical_asset(...)` loop,
+/// adapter.py:1188-1191). External assets are deliberately excluded: the owner
+/// never handed their storage to tiled, so a delete must leave their files in
+/// place. The recursive CTE walks the same `parent_id` chain the FK
+/// `ON DELETE CASCADE` removes, so the set is exactly what the delete destroys.
+const SUBTREE_MANAGED_ASSETS_SQLITE: &str = "WITH RECURSIVE subtree(id) AS (
+    SELECT id FROM nodes WHERE id = ?
+    UNION ALL
+    SELECT n.id FROM nodes n JOIN subtree s ON n.parent_id = s.id
+)
+SELECT a.data_uri AS data_uri, a.is_directory AS is_directory
+  FROM assets a
+  JOIN data_sources ds ON ds.id = a.data_source_id
+  JOIN subtree s ON ds.node_id = s.id
+ WHERE ds.management <> 'external'";
+
+/// Postgres variant of [`SUBTREE_MANAGED_ASSETS_SQLITE`] (positional `$1`).
+const SUBTREE_MANAGED_ASSETS_POSTGRES: &str = "WITH RECURSIVE subtree(id) AS (
+    SELECT id FROM nodes WHERE id = $1
+    UNION ALL
+    SELECT n.id FROM nodes n JOIN subtree s ON n.parent_id = s.id
+)
+SELECT a.data_uri AS data_uri, a.is_directory AS is_directory
+  FROM assets a
+  JOIN data_sources ds ON ds.id = a.data_source_id
+  JOIN subtree s ON ds.node_id = s.id
+ WHERE ds.management <> 'external'";
+
+/// Decode a `file://` URI to its absolute path, matching the server's
+/// `uri_to_path` (tiled-server `file_resolver.rs`): strip the scheme and take
+/// everything from the first `/` after the authority. Returns `None` for any
+/// non-`file://` scheme or a URI with no path, so the caller skips assets it
+/// cannot (and must not) remove — e.g. sqlite/duckdb/postgresql storage URIs,
+/// which this port never writes. No percent-decoding, matching the read-side
+/// resolver so a stored `data_uri` maps to the same path on delete as on read.
+fn file_uri_to_path(uri: &str) -> Option<std::path::PathBuf> {
+    let rest = uri.strip_prefix("file://")?;
+    let i = rest.find('/')?;
+    Some(std::path::PathBuf::from(&rest[i..]))
+}
+
+/// Remove the physical files backing internally-managed assets, after their
+/// catalog rows have already been deleted. Mirrors Python `delete_physical_asset`
+/// for the `file://` scheme (adapter.py:1841-1850): a directory asset is removed
+/// recursively, a plain asset is unlinked. The `std::fs` calls run on a blocking
+/// thread — the workspace `tokio` has no `fs` feature, and this also keeps the
+/// I/O off the async runtime. A file that is already absent is treated as
+/// success (the post-condition — file gone — already holds), but any other I/O
+/// error is surfaced so the caller learns the managed storage was not fully
+/// reclaimed.
+async fn delete_physical_managed_assets(assets: Vec<(String, bool)>) -> Result<()> {
+    if assets.is_empty() {
+        return Ok(());
+    }
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        for (data_uri, is_directory) in assets {
+            let Some(path) = file_uri_to_path(&data_uri) else {
+                continue;
+            };
+            let result = if is_directory {
+                std::fs::remove_dir_all(&path)
+            } else {
+                std::fs::remove_file(&path)
+            };
+            if let Err(e) = result
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                return Err(CatalogError::Io(e));
+            }
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| {
+        CatalogError::Io(std::io::Error::other(format!(
+            "asset removal task failed: {e}"
+        )))
+    })?
+}
+
 /// Validate metadata + specs against the size limits Python tiled enforces
 /// (bluesky/tiled#342, #262). Caught early so a misbehaving client can't
 /// push a 100 MB blob through to disk.
@@ -499,7 +582,17 @@ impl Catalog {
     /// will remove. Mirrors Python
     /// `tiled.catalog.adapter.CatalogNodeAdapter.delete` (adapter.py:1037-1055,
     /// raising `WouldDeleteData`).
+    ///
+    /// When the delete does proceed (`external_only=false`, or no managed
+    /// sources are present), the physical files backing the internally-managed
+    /// `file://` assets are removed after the rows are gone — Python reclaims
+    /// them in the `if management != external: delete_physical_asset(...)` loop
+    /// (adapter.py:1188-1191). External assets are never touched. Dropping the
+    /// rows without this step left managed storage orphaned on disk (catalog
+    /// M5). The managed-asset set is read before the cascade removes the rows,
+    /// and the files are deleted only after the row delete succeeds.
     pub async fn delete_node(&self, node_id: i64, external_only: bool) -> Result<()> {
+        let to_remove: Vec<(String, bool)>;
         match self.pool() {
             DbPool::Sqlite(pool) => {
                 if external_only {
@@ -513,6 +606,21 @@ impl Catalog {
                         ));
                     }
                 }
+                // Capture the managed file:// assets BEFORE the cascade drops
+                // their rows; empty when external_only gated them out above.
+                let managed = sqlx::query(SUBTREE_MANAGED_ASSETS_SQLITE)
+                    .bind(node_id)
+                    .fetch_all(pool)
+                    .await?;
+                to_remove = managed
+                    .iter()
+                    .map(|r| {
+                        (
+                            r.get::<String, _>("data_uri"),
+                            r.get::<i64, _>("is_directory") != 0,
+                        )
+                    })
+                    .collect();
                 let res = sqlx::query("DELETE FROM nodes WHERE id = ?")
                     .bind(node_id)
                     .execute(pool)
@@ -533,6 +641,19 @@ impl Catalog {
                         ));
                     }
                 }
+                let managed = sqlx::query(SUBTREE_MANAGED_ASSETS_POSTGRES)
+                    .bind(node_id)
+                    .fetch_all(pool)
+                    .await?;
+                to_remove = managed
+                    .iter()
+                    .map(|r| {
+                        (
+                            r.get::<String, _>("data_uri"),
+                            r.get::<bool, _>("is_directory"),
+                        )
+                    })
+                    .collect();
                 let res = sqlx::query("DELETE FROM nodes WHERE id = $1")
                     .bind(node_id)
                     .execute(pool)
@@ -542,7 +663,10 @@ impl Catalog {
                 }
             }
         }
-        Ok(())
+        // Rows (incl. data_sources + assets via cascade) are gone; reclaim the
+        // managed storage files. Done after the row delete, matching Python's
+        // out-of-transaction physical deletion.
+        delete_physical_managed_assets(to_remove).await
     }
 
     /// List a node's metadata revisions, oldest first (ascending `revision`),

@@ -179,7 +179,10 @@ async fn delete_refuses_internally_managed_subtree() {
             parameters: json!({}),
             management: "writable".into(),
             assets: vec![AssetSpec {
-                data_uri: "file:///tmp/frame.h5".into(),
+                // Under the tempdir (never created on disk) so the forced delete
+                // below removes nothing real — keeps the test hermetic now that
+                // delete reclaims managed file:// assets.
+                data_uri: format!("file://{}", dir.path().join("frame.h5").display()),
                 is_directory: false,
                 parameter: "data_uri".into(),
                 num: None,
@@ -206,6 +209,136 @@ async fn delete_refuses_internally_managed_subtree() {
             .await
             .unwrap()
             .is_none()
+    );
+}
+
+/// Catalog M5: a forced delete (`external_only=false`) reclaims the physical
+/// files behind internally-managed `file://` assets — a plain file is unlinked,
+/// a directory asset is removed recursively — while external assets' files are
+/// left in place. Mirrors Python `delete()` (adapter.py:1188-1191): the
+/// `if management != external: delete_physical_asset(...)` loop runs after the
+/// rows are gone. Boundaries: management external vs managed, and
+/// is_directory false (remove_file) vs true (remove_dir_all).
+#[tokio::test]
+async fn delete_reclaims_managed_files_keeps_external() {
+    use std::fs;
+
+    let dir = tempfile::tempdir().unwrap();
+    let cat = Catalog::connect(&format!(
+        "sqlite://{}",
+        dir.path().join("catalog.db").display()
+    ))
+    .await
+    .unwrap();
+    cat.migrate().await.unwrap();
+
+    // Lay down three real assets on disk: a managed file, a managed directory
+    // (with a file inside, to exercise recursive removal), and an external file.
+    let storage = dir.path().join("storage");
+    fs::create_dir_all(&storage).unwrap();
+    let managed_file = storage.join("managed.bin");
+    fs::write(&managed_file, b"managed-bytes").unwrap();
+    let managed_dir = storage.join("managed_dir");
+    fs::create_dir_all(&managed_dir).unwrap();
+    fs::write(managed_dir.join("part-0"), b"chunk").unwrap();
+    let external_file = storage.join("external.bin");
+    fs::write(&external_file, b"external-bytes").unwrap();
+
+    let file_uri = |p: &std::path::Path| format!("file://{}", p.display());
+
+    // container/{mfile (writable file), mdir (writable dir), ext (external file)}
+    let container = cat
+        .create_node(
+            None,
+            vec![],
+            RegisterRequest {
+                key: "expt".into(),
+                structure_family: "container".into(),
+                metadata: json!({}),
+                specs: json!([]),
+                access_blob: json!({}),
+            },
+        )
+        .await
+        .unwrap();
+
+    let array_req = |key: &str| RegisterRequest {
+        key: key.into(),
+        structure_family: "array".into(),
+        metadata: json!({}),
+        specs: json!([]),
+        access_blob: json!({}),
+    };
+    let ds_spec = |management: &str, data_uri: String, is_directory: bool| DataSourceSpec {
+        structure_family: "array".into(),
+        structure: json!({
+            "shape": [1],
+            "data_type": {"endianness": "little", "kind": "f", "itemsize": 8},
+            "chunks": [[1]],
+        }),
+        mimetype: "application/x-hdf5".into(),
+        parameters: json!({}),
+        management: management.into(),
+        assets: vec![AssetSpec {
+            data_uri,
+            is_directory,
+            parameter: "data_uri".into(),
+            num: None,
+        }],
+    };
+
+    let mfile = cat
+        .create_node(Some(container.id), vec!["expt".into()], array_req("mfile"))
+        .await
+        .unwrap();
+    cat.create_data_source(
+        mfile.id,
+        ds_spec("writable", file_uri(&managed_file), false),
+    )
+    .await
+    .unwrap();
+    let mdir = cat
+        .create_node(Some(container.id), vec!["expt".into()], array_req("mdir"))
+        .await
+        .unwrap();
+    cat.create_data_source(mdir.id, ds_spec("writable", file_uri(&managed_dir), true))
+        .await
+        .unwrap();
+    let ext = cat
+        .create_node(Some(container.id), vec!["expt".into()], array_req("ext"))
+        .await
+        .unwrap();
+    cat.create_data_source(ext.id, ds_spec("external", file_uri(&external_file), false))
+        .await
+        .unwrap();
+
+    // external_only=true must refuse (managed sources present) and touch nothing.
+    let err = cat.delete_node(container.id, true).await.unwrap_err();
+    assert!(matches!(
+        err,
+        tiled_catalog::CatalogError::WouldDeleteData(_)
+    ));
+    assert!(
+        managed_file.exists(),
+        "refused delete must not remove files"
+    );
+    assert!(managed_dir.exists());
+    assert!(external_file.exists());
+
+    // Forced delete reclaims the managed files, keeps the external one.
+    cat.delete_node(container.id, false).await.unwrap();
+    assert!(cat.lookup(&["expt".into()]).await.unwrap().is_none());
+    assert!(
+        !managed_file.exists(),
+        "managed file must be unlinked on forced delete"
+    );
+    assert!(
+        !managed_dir.exists(),
+        "managed directory must be removed recursively"
+    );
+    assert!(
+        external_file.exists(),
+        "external asset file must be retained (management != external guard)"
     );
 }
 
