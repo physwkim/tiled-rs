@@ -230,7 +230,21 @@ pub fn build_app(state: AppState) -> Router {
             timeout_middleware,
         ))
         .layer(CompressionLayer::new())
-        .layer(TraceLayer::new_for_http())
+        // L2: the default request span records the full URI, including the
+        // query string — so a credential passed as `?api_key=...` (a supported
+        // auth form, see resolve_auth) would land in the trace/logs. Record
+        // only the path; the query never enters the span. (Header creds like
+        // `Authorization: Apikey/Bearer` are not recorded by the span at all.)
+        .layer(
+            TraceLayer::new_for_http().make_span_with(|request: &axum::extract::Request| {
+                tracing::info_span!(
+                    "request",
+                    method = %request.method(),
+                    path = %request.uri().path(),
+                    version = ?request.version(),
+                )
+            }),
+        )
         .layer(cors)
         .with_state(state.clone());
 
