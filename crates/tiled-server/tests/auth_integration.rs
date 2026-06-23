@@ -770,20 +770,32 @@ async fn create_service_principal_admin_succeeds() {
 /// Build an AppState + App with an ExternalOidcValidator wired in, using an
 /// HS256 key pre-seeded into the cache so no JWKS network call is needed.
 /// Returns (app, auth_db, validator) so tests can mint matching tokens.
-async fn build_oidc_app() -> (axum::Router, AuthDb, Arc<tiled_auth::ExternalOidcValidator>) {
-    let (state, auth_db, validator) = build_oidc_state(std::collections::HashMap::new()).await;
-    (tiled_server::build_app(state), auth_db, validator)
+async fn build_oidc_app() -> (
+    axum::Router,
+    AuthDb,
+    Arc<tiled_auth::ExternalOidcValidator>,
+    tempfile::TempDir,
+) {
+    let (state, auth_db, validator, dir) = build_oidc_state(std::collections::HashMap::new()).await;
+    (tiled_server::build_app(state), auth_db, validator, dir)
 }
 
 /// Same as [`build_oidc_app`] but returns the `AppState` (so a test can call
 /// `validate_bearer` directly) and lets the caller configure the provider's
 /// `scopes_map` for the Entra scope-translation path (#1360).
+///
+/// Returns the backing [`tempfile::TempDir`] so the caller can keep it alive:
+/// the catalog/auth SQLite pools open in WAL mode and grow connections lazily,
+/// so if the temp directory is dropped (deleted) while the app is live, the
+/// next pooled connection open fails with SQLITE_CANTOPEN (a load-dependent
+/// 500). The caller must bind it (e.g. `_dir`) for the test's duration.
 async fn build_oidc_state(
     scopes_map: std::collections::HashMap<String, Vec<tiled_auth::Scope>>,
 ) -> (
     tiled_server::AppState,
     AuthDb,
     Arc<tiled_auth::ExternalOidcValidator>,
+    tempfile::TempDir,
 ) {
     use jsonwebtoken::Algorithm;
     use tiled_auth::{ExternalOidcValidator, OidcProvider};
@@ -857,7 +869,7 @@ async fn build_oidc_state(
         request_timeout_secs: 30,
         expose_raw_assets: true,
     };
-    (state, auth_db, validator)
+    (state, auth_db, validator, dir)
 }
 
 /// Mint an HS256 OIDC token for the given subject using the test key.
@@ -926,7 +938,7 @@ async fn oidc_entra_scp_unions_into_session_scopes() {
         "api://tiled/admin.read".to_string(),
         vec![Scope::ReadPrincipals],
     );
-    let (state, _auth_db, _validator) = build_oidc_state(scopes_map).await;
+    let (state, _auth_db, _validator, _dir) = build_oidc_state(scopes_map).await;
 
     let token = mint_oidc_token_with_scp("entra-sub-1", "api://tiled/admin.read");
     let ctx = tiled_server::app::validate_bearer(&state, &token)
@@ -948,7 +960,8 @@ async fn oidc_entra_scp_unions_into_session_scopes() {
 /// `read:principals` under Entra confers nothing here.
 #[tokio::test]
 async fn oidc_plain_provider_ignores_scp_claim() {
-    let (state, _auth_db, _validator) = build_oidc_state(std::collections::HashMap::new()).await;
+    let (state, _auth_db, _validator, _dir) =
+        build_oidc_state(std::collections::HashMap::new()).await;
     let token = mint_oidc_token_with_scp("plain-sub-1", "api://tiled/admin.read");
     let ctx = tiled_server::app::validate_bearer(&state, &token)
         .await
@@ -969,7 +982,7 @@ async fn oidc_plain_provider_ignores_scp_claim() {
 /// client to poll a Granted status with access tokens.
 #[tokio::test]
 async fn device_approve_oidc_valid_creates_principal_and_approves() {
-    let (app, auth_db, _validator) = build_oidc_app().await;
+    let (app, auth_db, _validator, _dir) = build_oidc_app().await;
 
     // Initiate a device code.
     let (status, body) = json_request(
@@ -1025,7 +1038,7 @@ async fn device_approve_oidc_valid_creates_principal_and_approves() {
 /// a principal or approve the device code. The code must remain Pending.
 #[tokio::test]
 async fn device_approve_oidc_invalid_does_not_approve() {
-    let (app, auth_db, _validator) = build_oidc_app().await;
+    let (app, auth_db, _validator, _dir) = build_oidc_app().await;
 
     // Initiate.
     let (_, body) = json_request(
