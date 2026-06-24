@@ -5139,6 +5139,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tiled-adapters",
  "tiled-auth",
+ "tiled-catalog",
  "tiled-core",
  "tiled-serialization",
  "tiled-server",
