@@ -608,6 +608,18 @@ pub async fn run(command: Command) -> Result<()> {
 
             let registry = Arc::new(tiled_serialization::default_registry());
 
+            // CORS allowed origins: CLI `--allow-origin` takes precedence; when
+            // the flag is absent, fall back to the config file's `allow_origins:`
+            // (Python tiled config.py:281, previously dropped silently from YAML).
+            let allow_origins = if allow_origins.is_empty() {
+                file_config
+                    .as_ref()
+                    .map(|c| c.allow_origins().to_vec())
+                    .unwrap_or_default()
+            } else {
+                allow_origins
+            };
+
             // CORS: explicit '*' = permissive, explicit origins = allow-list,
             // default (nothing specified) = same-origin only.
             let cors_policy = if allow_origins.iter().any(|o| o == "*") {

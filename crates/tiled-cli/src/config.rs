@@ -50,6 +50,13 @@ pub struct TiledConfig {
     /// Python `expose_raw_assets`, which defaults to `True` (settings.py:57).
     #[serde(default = "default_expose_raw_assets")]
     pub expose_raw_assets: bool,
+    /// CORS allowed origins. Mirrors Python tiled's top-level
+    /// `allow_origins:` (`config.py:281`). A single `"*"` entry means
+    /// permissive (any origin). Empty → only same-origin requests pass.
+    /// The `--allow-origin` CLI flag, when given, takes precedence over
+    /// this list.
+    #[serde(default)]
+    pub allow_origins: Vec<String>,
 }
 
 /// Default for [`TiledConfig::response_bytesize_limit`] — 300 MB, matching
@@ -83,6 +90,7 @@ impl Default for TiledConfig {
             response_bytesize_limit: default_response_bytesize_limit(),
             request_timeout_secs: default_request_timeout_secs(),
             expose_raw_assets: default_expose_raw_assets(),
+            allow_origins: Vec::new(),
         }
     }
 }
@@ -286,8 +294,8 @@ impl TiledConfig {
 
         // Top-level keys whose list values concatenate across files — Python's
         // `mergeable_lists` (`config.py:484`) is {allow_origins, specs, trees};
-        // only `trees` is a top-level field of this Rust config.
-        const MERGEABLE: &[&str] = &["trees"];
+        // `specs` is not yet a field of this Rust config.
+        const MERGEABLE: &[&str] = &["allow_origins", "trees"];
 
         let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
             .with_context(|| format!("reading config directory {}", dir.display()))?
@@ -422,6 +430,11 @@ impl TiledConfig {
             .and_then(|a| a.single_user_api_key.clone())
             .or_else(|| std::env::var("TILED_SINGLE_USER_API_KEY").ok())
     }
+
+    /// CORS allowed origins declared in the config file (`allow_origins:`).
+    pub fn allow_origins(&self) -> &[String] {
+        &self.allow_origins
+    }
 }
 
 #[cfg(test)]
@@ -535,6 +548,49 @@ mod tests {
         assert_eq!(cfg.trees[0].args.uri.as_deref(), Some("mongodb://a/db"));
         assert_eq!(cfg.trees[1].args.uri.as_deref(), Some("mongodb://b/db"));
         assert_eq!(cfg.response_bytesize_limit, 99);
+    }
+
+    #[test]
+    fn allow_origins_parses_from_yaml() {
+        // Absent → empty (no CORS allow-list from config).
+        let cfg: TiledConfig = serde_yaml::from_str("trees: []").unwrap();
+        assert!(cfg.allow_origins().is_empty());
+        // Present → parsed into the field/accessor.
+        let cfg: TiledConfig =
+            serde_yaml::from_str("allow_origins:\n  - https://a.example\n  - https://b.example\n")
+                .unwrap();
+        assert_eq!(
+            cfg.allow_origins(),
+            [
+                "https://a.example".to_string(),
+                "https://b.example".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn allow_origins_concatenates_across_config_directory() {
+        // allow_origins is a mergeable list (Python config.py:484), so a
+        // config.d split across files concatenates instead of conflicting.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("10-a.yml"),
+            "allow_origins:\n  - https://a.example\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("20-b.yml"),
+            "allow_origins:\n  - https://b.example\n",
+        )
+        .unwrap();
+        let cfg = TiledConfig::from_file(dir.path().to_str().unwrap()).unwrap();
+        assert_eq!(
+            cfg.allow_origins(),
+            [
+                "https://a.example".to_string(),
+                "https://b.example".to_string()
+            ]
+        );
     }
 
     // cli-M6: a non-mergeable key duplicated across files is a conflict.
