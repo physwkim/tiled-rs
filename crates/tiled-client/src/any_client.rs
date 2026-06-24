@@ -11,7 +11,7 @@ use tiled_core::structures::StructureFamily;
 
 use crate::array::ArrayClient;
 use crate::awkward::AwkwardClient;
-use crate::base::Item;
+use crate::base::{BaseClient, Item};
 use crate::container::ContainerClient;
 use crate::context::Context;
 use crate::dataframe::TableClient;
@@ -139,6 +139,21 @@ impl AnyClient {
                 Err(a) => Err(Self::Custom(a)),
             },
             other => Err(other),
+        }
+    }
+
+    /// Borrow the `BaseClient` underlying this node, for metadata access and
+    /// write operations (`delete`, `patch_metadata`) common to all families.
+    /// Returns `None` only for the `Custom` variant.
+    pub fn base(&self) -> Option<&BaseClient> {
+        match self {
+            Self::Container(c) => Some(c.base()),
+            Self::Array(a) => Some(a.base()),
+            Self::Table(t) => Some(t.base()),
+            Self::Sparse(s) => Some(s.base()),
+            Self::Awkward(a) => Some(a.base()),
+            Self::Ragged(r) => Some(r.base()),
+            Self::Custom(_) => None,
         }
     }
 
