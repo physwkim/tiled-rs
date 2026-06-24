@@ -123,25 +123,21 @@ pub fn build_app(state: AppState) -> Router {
             get(auth_router::get_principal),
         );
 
-    // WebSocket subscribe routes are intentionally OUTSIDE the auth
+    // WebSocket subscribe route is intentionally OUTSIDE the auth
     // middleware — browsers can't set the `Authorization` header on
     // WebSocket connections, so we accept the upgrade unauthenticated
     // and run a first-message handshake inside the handler (tiled#1351).
     // Server-side auth still happens before any data flows; if the
     // handshake fails the socket is closed.
-    let ws = Router::new()
-        .route(
-            "/api/v1/array/subscribe/{*path}",
-            get(crate::streaming::ws_subscribe),
-        )
-        .route(
-            "/api/v1/container/subscribe/{*path}",
-            get(crate::streaming::ws_subscribe),
-        )
-        .route(
-            "/api/v1/table/subscribe/{*path}",
-            get(crate::streaming::ws_subscribe),
-        );
+    //
+    // Path mirrors upstream `tiled` exactly: a single family-agnostic
+    // `/api/v1/stream/single/{path}` (router.py:750). The node's
+    // structure family is derived from the catalog/tree lookup inside
+    // the handler, not from the URL — so one route serves every family.
+    let ws = Router::new().route(
+        "/api/v1/stream/single/{*path}",
+        get(crate::streaming::ws_subscribe),
+    );
 
     // Data API endpoints — auth middleware always runs and either
     // populates AuthContext or returns 401.

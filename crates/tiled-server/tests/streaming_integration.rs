@@ -90,7 +90,7 @@ async fn subscribe_then_register_emits_child_created() {
 
     // Connect a websocket subscriber to /expt.
     let ws_url = format!(
-        "{}/api/v1/container/subscribe/expt",
+        "{}/api/v1/stream/single/expt",
         base.replacen("http://", "ws://", 1)
     );
     let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url)
@@ -146,7 +146,7 @@ async fn unrelated_subtree_does_not_receive_publish() {
     // Subscribe at /unused — should not hear about a node registered at
     // the root.
     let ws_url = format!(
-        "{}/api/v1/container/subscribe/unused",
+        "{}/api/v1/stream/single/unused",
         base.replacen("http://", "ws://", 1).trim_end_matches('/')
     );
     let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
@@ -187,7 +187,7 @@ async fn unrelated_subtree_does_not_receive_publish() {
 // authorizes each delivered event against the node it actually concerns.
 //
 // Note on the root case (hole 1 in the finding): a literal root
-// subscription to `/api/v1/container/subscribe/` is not reachable — axum's
+// subscription to `/api/v1/stream/single/` is not reachable — axum's
 // `{*path}` catch-all rejects the empty path and no bare-root subscribe
 // route exists. The tests below exercise the reachable analog: a container
 // subscriber (`/pub`) receiving fanned descendant events. The fix still
@@ -309,7 +309,7 @@ async fn ws_subscriber_does_not_receive_denied_descendant_events() {
         .unwrap();
 
     let ws_url = format!(
-        "{}/api/v1/container/subscribe/pub",
+        "{}/api/v1/stream/single/pub",
         base.replacen("http://", "ws://", 1)
     );
     let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();
@@ -380,7 +380,7 @@ async fn ws_subscriber_does_not_receive_child_created_for_denied_child() {
         .unwrap();
 
     let ws_url = format!(
-        "{}/api/v1/container/subscribe/pub",
+        "{}/api/v1/stream/single/pub",
         base.replacen("http://", "ws://", 1)
     );
     let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url).await.unwrap();

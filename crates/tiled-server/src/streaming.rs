@@ -258,27 +258,24 @@ pub async fn ws_subscribe(
     // working.
     let header_auth = crate::app::resolve_header_auth(&state, &headers).await;
 
-    let prefix_starts = [
-        "/api/v1/array/subscribe/",
-        "/api/v1/container/subscribe/",
-        "/api/v1/table/subscribe/",
-    ];
+    // Path mirrors upstream: `/api/v1/stream/single/{path}`. Strip the
+    // prefix to recover the node-path segments (the family is resolved
+    // from the node lookup, not the URL).
+    const PREFIX: &str = "/api/v1/stream/single/";
     let path = uri.path();
-    let segments: Vec<String> = prefix_starts
-        .iter()
-        .find_map(|prefix| {
-            path.find(prefix).map(|idx| {
-                let after = &path[idx + prefix.len()..];
-                after
-                    .split('/')
-                    .filter(|s| !s.is_empty())
-                    .map(|s| {
-                        percent_encoding::percent_decode_str(s)
-                            .decode_utf8_lossy()
-                            .into_owned()
-                    })
-                    .collect()
-            })
+    let segments: Vec<String> = path
+        .find(PREFIX)
+        .map(|idx| {
+            let after = &path[idx + PREFIX.len()..];
+            after
+                .split('/')
+                .filter(|s| !s.is_empty())
+                .map(|s| {
+                    percent_encoding::percent_decode_str(s)
+                        .decode_utf8_lossy()
+                        .into_owned()
+                })
+                .collect()
         })
         .unwrap_or_default();
     let path_str = segments.join("/");

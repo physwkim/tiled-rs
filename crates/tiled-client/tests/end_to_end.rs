@@ -307,3 +307,24 @@ async fn match_on_any_client() {
     };
     assert!(count >= 2);
 }
+
+/// Regression: the client builds the upstream WebSocket path
+/// `/api/v1/stream/single/{path}`. The server previously served only
+/// `/api/v1/{family}/subscribe/{path}`, so the handshake 404'd and no
+/// `tiled-client` could subscribe to its own `tiled-server`. Now the
+/// server mirrors upstream's single family-agnostic route, so the
+/// `Subscription` handshake completes.
+#[tokio::test]
+async fn client_subscription_connects_to_server() {
+    let base = spawn_server(None).await;
+    let (ctx, _) = tiled_client::Context::from_uri(&base).unwrap();
+    let sub = tiled_client::stream::Subscription::new(ctx, vec!["subgroup".to_string()]);
+
+    let stream = tokio::time::timeout(std::time::Duration::from_secs(5), sub.connect(None))
+        .await
+        .expect("subscription connect timed out")
+        .expect("subscription handshake to /stream/single/ failed");
+
+    // Connection is live; close it cleanly.
+    stream.close().await.expect("ws close");
+}

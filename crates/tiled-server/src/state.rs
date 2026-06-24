@@ -69,7 +69,7 @@ pub struct AppState {
 
     /// In-process pub/sub bus for WebSocket subscribers. Write handlers
     /// publish to it after a successful catalog write; subscribers
-    /// connected to /api/v1/{family}/subscribe/{*path} receive matching
+    /// connected to /api/v1/stream/single/{*path} receive matching
     /// updates.
     pub streaming_bus: crate::streaming::StreamingBus,
     /// Optional AccessPolicy. When set, search/read handlers consult it
