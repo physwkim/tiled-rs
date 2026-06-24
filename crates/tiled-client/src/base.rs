@@ -7,6 +7,8 @@
 //! - the parsed structure (`ArrayStructure`, `TableStructure`, ...),
 //! - per-family helpers like `metadata`, `specs`, `uri`.
 
+use url::Url;
+
 use tiled_core::schemas::{NodeAttributes, Resource};
 use tiled_core::structures::{
     ArrayStructure, AwkwardStructure, ContainerStructure, RaggedStructure, SparseStructure, Spec,
@@ -15,6 +17,12 @@ use tiled_core::structures::{
 
 use crate::context::Context;
 use crate::error::{ClientError, Result};
+
+/// Content-type discriminator sent in the `PATCH /metadata` body — mirrors
+/// Python's `base.py:741-757` where the body `content-type` field selects
+/// the patch algorithm (RFC 6902 vs RFC 7396).
+pub const JSON_PATCH_MIME: &str = "application/json-patch+json";
+pub const MERGE_PATCH_MIME: &str = "application/merge-patch+json";
 
 /// The `data` field of a `/metadata/.../<path>` response. We carry it whole so
 /// the family-specific clients can reach for whatever attribute they need.
@@ -173,5 +181,44 @@ impl BaseClient {
     pub(crate) fn require_link(&self, name: &str) -> Result<&str> {
         self.link(name)
             .ok_or_else(|| ClientError::MissingLink(name.to_string()))
+    }
+
+    /// Delete this node via `DELETE /api/v1/metadata/{path}`.
+    ///
+    /// `external_only`: when `true` (default) the server refuses to delete a
+    /// node that has internally-managed storage. Pass `false` to also remove
+    /// managed storage files. Mirrors Python `BaseClient.delete`.
+    pub async fn delete(&self, external_only: bool) -> Result<()> {
+        let self_link = self.require_link("self")?;
+        let mut url = Url::parse(self_link)?;
+        if !external_only {
+            url.query_pairs_mut().append_pair("external_only", "false");
+        }
+        self.context.delete(&url).await.map(|_| ())
+    }
+
+    /// Apply a merge-patch (`RFC 7396`) to the node's metadata and/or specs.
+    ///
+    /// `metadata`: partial document to merge (null keys delete fields; absent
+    /// keys are unchanged). `specs`: new specs array, or `None` to leave
+    /// unchanged. Sends `PATCH /api/v1/metadata/{path}` with body
+    /// `{"content-type": "application/merge-patch+json", "metadata": ..., "specs": ...}`.
+    pub async fn patch_metadata(
+        &self,
+        metadata: serde_json::Value,
+        specs: Option<serde_json::Value>,
+    ) -> Result<()> {
+        let self_link = self.require_link("self")?;
+        let url = Url::parse(self_link)?;
+        let mut body = serde_json::json!({
+            "content-type": MERGE_PATCH_MIME,
+            "metadata": metadata,
+        });
+        if let Some(s) = specs {
+            body.as_object_mut()
+                .expect("body is object")
+                .insert("specs".into(), s);
+        }
+        self.context.patch_json(&url, &body).await.map(|_| ())
     }
 }
