@@ -149,6 +149,24 @@ impl TableAdapterWrite for ParquetAdapter {
             self.write(data).await
         })
     }
+
+    fn append_partition<'a>(
+        &'a self,
+        data: ArrowTable,
+        partition: usize,
+    ) -> BoxFuture<'a, Result<()>> {
+        let path = self.path.clone();
+        Box::pin(async move {
+            if partition != 0 {
+                return Err(TiledError::Validation(format!(
+                    "managed parquet table is single-partition; cannot append to partition {partition}"
+                )));
+            }
+            tokio::task::spawn_blocking(move || append_parquet(&path, data))
+                .await
+                .map_err(|e| TiledError::Internal(format!("parquet append spawn: {e}")))?
+        })
+    }
 }
 
 /// Per-process counter making temp filenames unique within this process
@@ -193,6 +211,19 @@ fn write_parquet_atomic(path: &Path, table: &ArrowTable) -> Result<()> {
         ))
     })?;
     Ok(())
+}
+
+/// Read all existing rows from `path`, concat with `data`, then atomically
+/// write the result back. Used by `PATCH /table/partition` to append rows.
+/// A zero-row-group file (the managed skeleton) is treated as empty.
+fn append_parquet(path: &Path, data: ArrowTable) -> Result<()> {
+    let existing = read_parquet_file(path.to_path_buf(), None)?;
+    let all_batches: Vec<RecordBatch> = existing.into_iter().chain(data.batches).collect();
+    let combined = ArrowTable {
+        schema: data.schema,
+        batches: all_batches,
+    };
+    write_parquet_atomic(path, &combined)
 }
 
 /// Create a managed parquet storage skeleton under `writable_root` and return

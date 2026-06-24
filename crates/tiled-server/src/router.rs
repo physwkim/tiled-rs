@@ -2775,11 +2775,27 @@ pub async fn table_full_put(
     })?;
 
     let table = decode_arrow_ipc_table(&body)?;
+    validate_table_columns(&table, table_adapter.structure())?;
 
-    // The written schema must match the node's declared columns, so a later
-    // read (the CSV adapter re-infers the schema from the file) cannot
-    // contradict the catalog structure.
-    let declared = &table_adapter.structure().columns;
+    writable.write(table).await.map_err(ServerError::from)?;
+
+    let path = segments.join("/");
+    // Signal subscribers that the node's data changed (closest existing event).
+    state.streaming_bus.publish(
+        &path,
+        crate::streaming::UpdateKind::DataAppended { partition: None },
+    );
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+/// Validate that `table`'s column names match the node's declared columns.
+/// Returns a 422 error when they disagree, preventing a later read from
+/// encountering a schema that contradicts the catalog structure.
+fn validate_table_columns(
+    table: &tiled_core::dtype::ArrowTable,
+    structure: &tiled_core::structures::TableStructure,
+) -> Result<(), ServerError> {
+    let declared = &structure.columns;
     let incoming: Vec<String> = table
         .schema
         .fields()
@@ -2791,16 +2807,7 @@ pub async fn table_full_put(
             "table write columns {incoming:?} do not match the node's columns {declared:?}"
         )));
     }
-
-    writable.write(table).await.map_err(ServerError::from)?;
-
-    let path = segments.join("/");
-    // Signal subscribers that the node's data changed (closest existing event).
-    state.streaming_bus.publish(
-        &path,
-        crate::streaming::UpdateKind::DataAppended { partition: None },
-    );
-    Ok(Json(serde_json::json!({ "ok": true })))
+    Ok(())
 }
 
 /// Decode an Arrow IPC FILE stream into an [`ArrowTable`]. This is the canonical
@@ -2816,6 +2823,134 @@ fn decode_arrow_ipc_table(body: &[u8]) -> Result<tiled_core::dtype::ArrowTable, 
         batches.push(b.map_err(|e| ServerError::Validation(format!("Arrow IPC batch: {e}")))?);
     }
     Ok(tiled_core::dtype::ArrowTable { batches, schema })
+}
+
+// ---------------------------------------------------------------------------
+// PUT /api/v1/table/partition/{*path} — overwrite one partition
+// ---------------------------------------------------------------------------
+//
+// Mirrors Python tiled `put_table_partition` (router.py:2194-2231). The body
+// is an Arrow IPC FILE stream. The `partition` index is read from the query
+// string (same key as the GET handler). The adapter's `write_partition` method
+// replaces the data for that partition index; a CSV/Parquet adapter that is
+// single-partition rejects any index other than 0.
+pub async fn table_partition_put(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+    Query(params): Query<Vec<(String, String)>>,
+    auth: crate::AuthContext,
+    body: bytes::Bytes,
+) -> Result<impl IntoResponse, ServerError> {
+    auth.require(tiled_auth::Scope::WriteData)?;
+    let segments = segments_from_uri(&uri, "/api/v1/table/partition/");
+    let partition = table_partition_index(&params);
+    let _ = resolve_entry(
+        &state,
+        auth.clone(),
+        &segments,
+        tiled_auth::Scope::WriteData,
+    )
+    .await?;
+
+    let adapter = core::walk_tree(state.root_tree.as_ref(), &segments).await?;
+    let table_adapter: Arc<dyn tiled_core::adapters::TableAdapterRead> =
+        adapter.as_table_arc().ok_or_else(|| {
+            ServerError::WrongType(format!("'{}' is not a table", segments.join("/")))
+        })?;
+    let writable = table_adapter.as_table_writable().ok_or_else(|| {
+        ServerError::MethodNotAllowed(
+            "this table node is not writable; only internally-managed tables under \
+             the server's writable storage accept writes"
+                .into(),
+        )
+    })?;
+
+    let table = decode_arrow_ipc_table(&body)?;
+    validate_table_columns(&table, table_adapter.structure())?;
+
+    let npartitions = table_adapter.structure().npartitions;
+    if partition >= npartitions {
+        return Err(ServerError::BadRequest(format!(
+            "Partition index {partition} out of range (table has {npartitions} partitions)"
+        )));
+    }
+
+    writable
+        .write_partition(table, partition)
+        .await
+        .map_err(ServerError::from)?;
+
+    let path = segments.join("/");
+    state.streaming_bus.publish(
+        &path,
+        crate::streaming::UpdateKind::DataAppended {
+            partition: Some(partition),
+        },
+    );
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+// ---------------------------------------------------------------------------
+// PATCH /api/v1/table/partition/{*path} — append rows to one partition
+// ---------------------------------------------------------------------------
+//
+// Mirrors Python tiled `patch_table_partition` (router.py:2233-2270). The body
+// is an Arrow IPC FILE stream whose rows are appended to the existing partition
+// data. The `partition` index is read from the query string.
+pub async fn table_partition_patch(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+    Query(params): Query<Vec<(String, String)>>,
+    auth: crate::AuthContext,
+    body: bytes::Bytes,
+) -> Result<impl IntoResponse, ServerError> {
+    auth.require(tiled_auth::Scope::WriteData)?;
+    let segments = segments_from_uri(&uri, "/api/v1/table/partition/");
+    let partition = table_partition_index(&params);
+    let _ = resolve_entry(
+        &state,
+        auth.clone(),
+        &segments,
+        tiled_auth::Scope::WriteData,
+    )
+    .await?;
+
+    let adapter = core::walk_tree(state.root_tree.as_ref(), &segments).await?;
+    let table_adapter: Arc<dyn tiled_core::adapters::TableAdapterRead> =
+        adapter.as_table_arc().ok_or_else(|| {
+            ServerError::WrongType(format!("'{}' is not a table", segments.join("/")))
+        })?;
+    let writable = table_adapter.as_table_writable().ok_or_else(|| {
+        ServerError::MethodNotAllowed(
+            "this table node is not writable; only internally-managed tables under \
+             the server's writable storage accept writes"
+                .into(),
+        )
+    })?;
+
+    let table = decode_arrow_ipc_table(&body)?;
+    validate_table_columns(&table, table_adapter.structure())?;
+
+    let npartitions = table_adapter.structure().npartitions;
+    if partition >= npartitions {
+        return Err(ServerError::BadRequest(format!(
+            "Partition index {partition} out of range (table has {npartitions} partitions)"
+        )));
+    }
+
+    writable
+        .append_partition(table, partition)
+        .await
+        .map_err(ServerError::from)?;
+
+    let path = segments.join("/");
+    state.streaming_bus.publish(
+        &path,
+        crate::streaming::UpdateKind::DataAppended {
+            partition: Some(partition),
+        },
+    );
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 // ---------------------------------------------------------------------------

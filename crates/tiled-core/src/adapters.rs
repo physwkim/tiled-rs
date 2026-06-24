@@ -11,7 +11,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::dtype::{ArrowTable, DynNDArray};
-use crate::error::Result;
+use crate::error::{Result, TiledError};
 use crate::ndslice::NDSlice;
 use crate::schemas::SortDirection;
 use crate::structures::{
@@ -121,6 +121,21 @@ pub trait TableAdapterWrite: TableAdapterRead {
         data: ArrowTable,
         partition: usize,
     ) -> BoxFuture<'a, Result<()>>;
+
+    /// Append rows to a single partition. `PATCH /table/partition` routes here.
+    /// Adapters that do not support row-level appends return a Validation error
+    /// by default; override to enable.
+    fn append_partition<'a>(
+        &'a self,
+        _data: ArrowTable,
+        _partition: usize,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            Err(TiledError::Validation(
+                "append_partition is not supported by this adapter".into(),
+            ))
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
