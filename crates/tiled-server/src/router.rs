@@ -294,6 +294,46 @@ fn apply_select_metadata(
     Ok(Some(serde_json::json!({"selected": selected})))
 }
 
+/// Apply the `?fields=` projection to one entry's attributes, mirroring Python
+/// `EntryFields` (`schemas.py`) as consumed by `construct_resource`
+/// (core.py:476-559) and the id-only `fields=""` shape (core.py:248).
+///
+/// `requested` is the set of `fields` query values the client sent. Each named
+/// attribute section is retained only when its `EntryFields` value is present;
+/// every other section is set to `None` and dropped by `skip_serializing_if`.
+/// `ancestors` is always kept (an id-only `fields=""` resource still carries it,
+/// core.py:248). Recognized names: `metadata`, `structure_family`, `structure`,
+/// `specs`, `sorting`, `access_blob`, `data_sources`. `count` and the empty
+/// value (`none`) request no attribute section; unknown names are ignored.
+///
+/// The caller MUST invoke this only when the client actually sent `fields` —
+/// an absent `fields` means "full entry" (the FastAPI default selects every
+/// `EntryFields`), which is the unpruned state and must not be pruned to nothing.
+fn prune_entry_fields(attrs: &mut tiled_core::schemas::NodeAttributes, requested: &[String]) {
+    let want = |f: &str| requested.iter().any(|r| r == f);
+    if !want("metadata") {
+        attrs.metadata = None;
+    }
+    if !want("structure_family") {
+        attrs.structure_family = None;
+    }
+    if !want("structure") {
+        attrs.structure = None;
+    }
+    if !want("specs") {
+        attrs.specs = None;
+    }
+    if !want("sorting") {
+        attrs.sorting = None;
+    }
+    if !want("access_blob") {
+        attrs.access_blob = None;
+    }
+    if !want("data_sources") {
+        attrs.data_sources = None;
+    }
+}
+
 pub async fn metadata(
     State(state): State<AppState>,
     OriginalUri(uri): OriginalUri,
@@ -450,6 +490,21 @@ pub async fn search(
     let omit_links = params
         .iter()
         .any(|(k, v)| k == "omit_links" && matches!(v.as_str(), "true" | "True" | "1"));
+    // ?fields= projection (Python `EntryFields`). ABSENT → full entry (FastAPI
+    // defaults `fields` to every EntryFields, router.py:458), so we do not prune.
+    // PRESENT → each entry keeps only the requested attribute sections. The Rust
+    // client sends `fields=""` (keys(): id-only, container.rs) and `fields=count`
+    // (len(): the total comes from the envelope meta, not the entries).
+    // `Query<Vec>` preserves repeated `fields=` keys, so a multi-section
+    // projection (`fields=metadata&fields=structure`) survives intact.
+    let fields: Option<Vec<String>> = {
+        let vals: Vec<String> = params
+            .iter()
+            .filter(|(k, _)| k == "fields")
+            .map(|(_, v)| v.clone())
+            .collect();
+        (!vals.is_empty()).then_some(vals)
+    };
 
     let filter_params: Vec<(String, String)> = params
         .into_iter()
@@ -513,12 +568,30 @@ pub async fn search(
         &sorting,
     )
     .await?;
-    if let Some(ref expr_str) = select_metadata
+    // `select_metadata` only applies within `metadata in fields` (core.py:479-485):
+    // when the projection excludes `metadata`, the expression is never evaluated,
+    // so a malformed one cannot 400 a request that wasn't asking for metadata.
+    let metadata_in_fields = fields
+        .as_ref()
+        .is_none_or(|f| f.iter().any(|r| r == "metadata"));
+    if metadata_in_fields
+        && let Some(ref expr_str) = select_metadata
         && let Some(ref mut items) = resp.data
     {
         for item in items.iter_mut() {
             item.attributes.metadata =
                 apply_select_metadata(Some(expr_str), item.attributes.metadata.take())?;
+        }
+    }
+    // Apply the `?fields=` projection last so it strips any section the
+    // select_metadata step populated but the client did not request. Links are
+    // untouched here — an id-only resource keeps its `self` link (core.py:248);
+    // `omit_links` below is the only switch that drops per-entry links.
+    if let Some(ref requested) = fields
+        && let Some(ref mut items) = resp.data
+    {
+        for item in items.iter_mut() {
+            prune_entry_fields(&mut item.attributes, requested);
         }
     }
     // Drop per-entry links when requested; the envelope pagination links remain.

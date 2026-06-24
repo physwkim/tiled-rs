@@ -1088,6 +1088,108 @@ async fn select_metadata_on_search_filters_each_item() {
     }
 }
 
+/// `?fields=` projection (Python `EntryFields`, core.py:248,476,604-620). An
+/// absent `fields` returns the full entry; `fields=""` (the Rust client's
+/// `keys()` hint, container.rs) returns id-only entries — `ancestors` and the
+/// self link kept, every other attribute section dropped; a named projection
+/// (`fields=metadata`) keeps only that section. The server used to ignore
+/// `fields`, so `keys()` over-fetched full metadata+structure for every child.
+#[tokio::test]
+async fn fields_projection_on_search_prunes_attributes() {
+    let (app, _dir) = build_test_app().await;
+
+    for key in ["a1", "a2"] {
+        let (status, _) = json_request(
+            &app,
+            Method::POST,
+            "/api/v1/register/",
+            serde_json::json!({
+                "key": key,
+                "structure_family": "container",
+                "metadata": {"plan_name": "count"},
+                "specs": [{"name": "s1"}],
+                "data_sources": [],
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+
+    // (a) fields="" → id-only: ancestors + self link retained, all other
+    // attribute sections dropped.
+    let (status, body) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/search/?fields=",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "fields=\"\": {body}");
+    let items = body["data"].as_array().expect("data is array");
+    assert_eq!(items.len(), 2, "{body}");
+    for item in items {
+        let attrs = &item["attributes"];
+        assert!(
+            attrs.get("ancestors").is_some(),
+            "id-only entry keeps ancestors, got {attrs}"
+        );
+        for dropped in [
+            "metadata",
+            "structure_family",
+            "structure",
+            "specs",
+            "sorting",
+        ] {
+            assert!(
+                attrs.get(dropped).is_none(),
+                "fields=\"\" must drop `{dropped}`, got {attrs}"
+            );
+        }
+        assert!(
+            item["links"]["self"].is_string(),
+            "id-only entry keeps its self link, got {}",
+            item["links"]
+        );
+    }
+
+    // (b) fields=metadata → keep metadata only; specs/structure_family dropped.
+    let (status, body) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/search/?fields=metadata",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "fields=metadata: {body}");
+    for item in body["data"].as_array().unwrap() {
+        let attrs = &item["attributes"];
+        assert_eq!(attrs["metadata"]["plan_name"], "count", "{attrs}");
+        assert!(attrs.get("specs").is_none(), "specs dropped: {attrs}");
+        assert!(
+            attrs.get("structure_family").is_none(),
+            "structure_family dropped: {attrs}"
+        );
+    }
+
+    // (c) no fields → full entry: metadata AND specs both present.
+    let (status, body) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/search/",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "no fields: {body}");
+    for item in body["data"].as_array().unwrap() {
+        let attrs = &item["attributes"];
+        assert_eq!(attrs["metadata"]["plan_name"], "count");
+        assert!(
+            attrs.get("specs").is_some(),
+            "full entry keeps specs: {attrs}"
+        );
+    }
+}
+
 /// Server M1: `PUT /api/v1/metadata/{path}` wholesale-replaces metadata + specs
 /// (distinct from PATCH's partial json-patch/merge-patch), unblocking the Python
 /// client's `replace_metadata()` (405 today). Mirrors Python `put_metadata`
