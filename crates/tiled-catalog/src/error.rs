@@ -25,6 +25,12 @@ pub enum CatalogError {
     #[error("validation: {0}")]
     Validation(String),
 
+    /// A query variant the SQL search path cannot evaluate (e.g. `Regex` on
+    /// SQLite, which has no native regex operator). Mirrors Python tiled's
+    /// `UnsupportedQueryType` → HTTP 400.
+    #[error("unsupported query: {0}")]
+    UnsupportedQuery(String),
+
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
 
@@ -49,6 +55,7 @@ impl From<CatalogError> for tiled_core::TiledError {
             CatalogError::Conflict(m) => TE::Validation(m),
             CatalogError::WouldDeleteData(m) => TE::Validation(m),
             CatalogError::Validation(m) => TE::Validation(m),
+            CatalogError::UnsupportedQuery(m) => TE::UnsupportedQuery(m),
             CatalogError::Json(e) => TE::Json(e),
             CatalogError::Io(e) => TE::Io(e),
         }

@@ -455,22 +455,19 @@ impl WhereBuilder {
 
     /// `Regex(key, pattern, case_sensitive)` — regex match on `metadata.key`.
     ///
-    /// Postgres: `~` (case-sensitive) or `~*` (case-insensitive).
-    /// SQLite: no native regex operator; the condition is a no-op (passes all
-    /// rows through). A future port could register a custom function via sqlx.
+    /// Postgres: `~` (case-sensitive) or `~*` (case-insensitive). SQLite has no
+    /// native regex operator and is rejected with an error before reaching this
+    /// builder (see [`apply_queries`]), so only Postgres ever gets here.
     fn push_regex(&mut self, key: &str, pattern: &str, case_sensitive: bool) {
-        match self.dialect {
-            Dialect::Postgres => {
-                let lhs = self.dialect.json_text("metadata", key);
-                let op = if case_sensitive { "~" } else { "~*" };
-                let p = self.dialect.placeholder(self.bindings.len());
-                self.pieces.push(format!("{lhs} {op} {p}"));
-                self.bindings.push(Bind::Text(pattern.to_string()));
-            }
-            Dialect::Sqlite => {
-                // SQLite has no native regex operator; leave as no-op.
-            }
-        }
+        debug_assert!(
+            matches!(self.dialect, Dialect::Postgres),
+            "SQLite Regex must be rejected in apply_queries, not pushed"
+        );
+        let lhs = self.dialect.json_text("metadata", key);
+        let op = if case_sensitive { "~" } else { "~*" };
+        let p = self.dialect.placeholder(self.bindings.len());
+        self.pieces.push(format!("{lhs} {op} {p}"));
+        self.bindings.push(Bind::Text(pattern.to_string()));
     }
 
     /// `Specs(include, exclude)` — filter by the `specs` JSONB/text column.
@@ -660,7 +657,7 @@ fn value_to_bind(v: &Value) -> Bind {
 /// offset ([`Catalog::search_children`]) and keyset
 /// ([`Catalog::search_children_cursor`]) paths so both apply an identical
 /// WHERE clause.
-fn apply_queries(builder: &mut WhereBuilder, queries: &[Query]) {
+fn apply_queries(builder: &mut WhereBuilder, queries: &[Query]) -> Result<()> {
     for q in queries {
         match q {
             Query::Eq(eq) => builder.push_eq(&eq.key, &eq.value),
@@ -689,11 +686,24 @@ fn apply_queries(builder: &mut WhereBuilder, queries: &[Query]) {
             Query::NotIn(nin) => builder.push_not_in(&nin.key, &nin.value),
             Query::Contains(c) => builder.push_contains(&c.key, &c.value),
             Query::Like(l) => builder.push_like(&l.key, &l.pattern),
-            Query::Regex(r) => builder.push_regex(&r.key, &r.pattern, r.case_sensitive),
+            Query::Regex(r) => {
+                // SQLite has no native regex operator. Upstream tiled's SQL
+                // catalog raises UnsupportedQueryType for Regex on a SQL
+                // backend; mirror that (→ HTTP 400) rather than silently
+                // returning unfiltered rows. Postgres has native `~` / `~*`.
+                if matches!(builder.dialect, Dialect::Sqlite) {
+                    return Err(crate::error::CatalogError::UnsupportedQuery(format!(
+                        "Regex query is not supported on the SQLite catalog backend (key {:?})",
+                        r.key
+                    )));
+                }
+                builder.push_regex(&r.key, &r.pattern, r.case_sensitive);
+            }
             Query::Specs(s) => builder.push_specs(&s.include, &s.exclude),
             Query::AccessBlobFilter(f) => builder.push_access_blob_filter(f),
         }
     }
+    Ok(())
 }
 
 /// Whether the trailing `id` tiebreaker (and therefore the keyset cursor
@@ -728,7 +738,7 @@ impl Catalog {
     ) -> Result<(Vec<Node>, i64, Option<i64>)> {
         let dialect = Dialect::for_pool(self.pool());
         let mut builder = WhereBuilder::new(dialect);
-        apply_queries(&mut builder, queries);
+        apply_queries(&mut builder, queries)?;
         let (where_clause, bindings) = builder.finish();
         let order_by = dialect.order_by(sorting);
         let cursor_op = if default_sort_descending(sorting) {
@@ -865,7 +875,7 @@ impl Catalog {
     ) -> Result<(Vec<Node>, i64)> {
         let dialect = Dialect::for_pool(self.pool());
         let mut builder = WhereBuilder::new(dialect);
-        apply_queries(&mut builder, queries);
+        apply_queries(&mut builder, queries)?;
         let (where_clause, bindings) = builder.finish();
         // ORDER BY is parameter-free (sanitized keys + literal direction), so
         // it does not affect the LIMIT/OFFSET placeholder numbering below.
@@ -982,7 +992,7 @@ impl Catalog {
     ) -> Result<tiled_core::schemas::GetDistinctResponse> {
         let dialect = Dialect::for_pool(self.pool());
         let mut builder = WhereBuilder::new(dialect);
-        apply_queries(&mut builder, queries);
+        apply_queries(&mut builder, queries)?;
         let (where_clause, bindings) = builder.finish();
         // parent_id placeholder is numbered after the WHERE bindings, exactly
         // as in `search_children`: SQLite binds it first (positional `?`),
@@ -1291,6 +1301,33 @@ mod tests {
         let (sql, n) = build(Dialect::Sqlite, &[q]);
         assert!(sql.contains("TRUE"));
         assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn sqlite_regex_is_rejected_postgres_emits_predicate() {
+        let q = Query::Regex(tiled_core::queries::Regex {
+            key: "sample".into(),
+            pattern: "Cu.*".into(),
+            case_sensitive: true,
+        });
+
+        // SQLite: rejected with a Validation error (upstream raises
+        // UnsupportedQueryType) instead of silently returning all rows.
+        let mut sqlite = WhereBuilder::new(Dialect::Sqlite);
+        let err = apply_queries(&mut sqlite, std::slice::from_ref(&q)).unwrap_err();
+        assert!(matches!(
+            err,
+            crate::error::CatalogError::UnsupportedQuery(_)
+        ));
+
+        // Postgres: emits a native `~` predicate.
+        let mut pg = WhereBuilder::new(Dialect::Postgres);
+        apply_queries(&mut pg, std::slice::from_ref(&q)).unwrap();
+        let (sql, _) = pg.finish();
+        assert!(
+            sql.contains(" ~ "),
+            "expected postgres regex operator, got: {sql}"
+        );
     }
 
     #[test]
