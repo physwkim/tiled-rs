@@ -3,6 +3,7 @@ pub mod auth_context;
 pub mod auth_router;
 pub mod core;
 pub mod error;
+pub mod etag;
 pub mod extractors;
 pub mod file_resolver;
 pub mod router;

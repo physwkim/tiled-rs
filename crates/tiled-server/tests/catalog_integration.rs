@@ -1190,6 +1190,93 @@ async fn fields_projection_on_search_prunes_attributes() {
     }
 }
 
+/// Conditional GET: a JSON metadata response carries a strong (quoted) `ETag`,
+/// and a follow-up `If-None-Match` carrying that value returns `304 Not
+/// Modified` with an empty body (ETag retained) — activating the client's
+/// revalidation cache (tiled-client cache.rs). A non-matching validator falls
+/// back to `200` with the full body. Mirrors upstream's md5(content) ETag on
+/// metadata responses (core.py:728-735).
+#[tokio::test]
+async fn metadata_emits_etag_and_honours_if_none_match() {
+    let (app, _dir) = build_test_app().await;
+
+    let (status, _) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/register/",
+        serde_json::json!({
+            "key": "e1",
+            "structure_family": "container",
+            "metadata": {"a": 1},
+            "specs": [],
+            "data_sources": [],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // First GET → 200 with a strong (quoted) ETag.
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/api/v1/metadata/e1")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let etag = resp
+        .headers()
+        .get("etag")
+        .expect("response carries an ETag")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        etag.starts_with('"') && etag.ends_with('"'),
+        "strong quoted ETag, got {etag}"
+    );
+
+    // Second GET with the matching validator → 304, empty body, ETag retained.
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/api/v1/metadata/e1")
+        .header("if-none-match", &etag)
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+    assert_eq!(
+        resp.headers().get("etag").and_then(|v| v.to_str().ok()),
+        Some(etag.as_str()),
+        "304 retains the ETag validator"
+    );
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(
+        body.is_empty(),
+        "304 carries no body, got {} bytes",
+        body.len()
+    );
+
+    // A stale validator → full 200 response again.
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/api/v1/metadata/e1")
+        .header("if-none-match", "\"stale\"")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "non-matching validator → 200"
+    );
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(!body.is_empty(), "200 carries the full body");
+}
+
 /// Server M1: `PUT /api/v1/metadata/{path}` wholesale-replaces metadata + specs
 /// (distinct from PATCH's partial json-patch/merge-patch), unblocking the Python
 /// client's `replace_metadata()` (405 today). Mirrors Python `put_metadata`
