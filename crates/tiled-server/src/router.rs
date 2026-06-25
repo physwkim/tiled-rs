@@ -529,7 +529,12 @@ pub async fn search(
         let principal_ref = auth.principal.as_deref();
         let requested = tiled_auth::ScopeSet::from_iter([tiled_auth::Scope::ReadMetadata]);
         if let Some(f) = policy
-            .list_filter(principal_ref, &auth.scopes, &requested)
+            .list_filter(
+                principal_ref,
+                &auth.scopes,
+                &requested,
+                auth.authn_access_tags.as_deref(),
+            )
             .await
         {
             queries.insert(0, tiled_core::queries::Query::AccessBlobFilter(f));
@@ -674,7 +679,12 @@ pub async fn distinct(
         let principal_ref = auth.principal.as_deref();
         let requested = tiled_auth::ScopeSet::from_iter([tiled_auth::Scope::ReadMetadata]);
         if let Some(f) = policy
-            .list_filter(principal_ref, &auth.scopes, &requested)
+            .list_filter(
+                principal_ref,
+                &auth.scopes,
+                &requested,
+                auth.authn_access_tags.as_deref(),
+            )
             .await
         {
             queries.insert(0, tiled_core::queries::Query::AccessBlobFilter(f));
@@ -1818,7 +1828,12 @@ pub async fn container_full(
     let access_filter = if let Some(ref policy) = state.access_policy {
         let requested = tiled_auth::ScopeSet::from_iter([tiled_auth::Scope::ReadData]);
         policy
-            .list_filter(auth.principal.as_deref(), &auth.scopes, &requested)
+            .list_filter(
+                auth.principal.as_deref(),
+                &auth.scopes,
+                &requested,
+                auth.authn_access_tags.as_deref(),
+            )
             .await
     } else {
         None

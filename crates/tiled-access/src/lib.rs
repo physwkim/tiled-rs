@@ -78,6 +78,7 @@ pub trait AccessPolicy: Send + Sync {
         _principal: Option<&Principal>,
         _session_scopes: &ScopeSet,
         _requested_scopes: &ScopeSet,
+        _authn_access_tags: Option<&[String]>,
     ) -> Option<AccessBlobFilter> {
         None
     }
@@ -279,6 +280,7 @@ impl AccessPolicy for TagBasedPolicy {
         principal: Option<&Principal>,
         session_scopes: &ScopeSet,
         requested_scopes: &ScopeSet,
+        authn_access_tags: Option<&[String]>,
     ) -> Option<AccessBlobFilter> {
         // NO_ACCESS: the requested scopes must be grantable by this policy.
         // Mirrors Python filters() line 378-379
@@ -303,11 +305,22 @@ impl AccessPolicy for TagBasedPolicy {
                 // scopes, filters() line 391-398) reduces to the principal's
                 // full granted-tag set once the subset gate above confirmed
                 // every requested scope is grantable.
-                let granted = self
+                let mut granted = self
                     .auth_db
                     .get_principal_tags(&p.uuid)
                     .await
                     .unwrap_or_default();
+                // authn_access_tags narrowing: when the API key carries its
+                // own tag restriction, the effective grant is the intersection
+                // of the principal's DB tags and the key's tags.
+                // Mirrors Python access_policies.py:409-411:
+                //   if authn_access_tags is not None:
+                //       access_tags = access_tags & authn_access_tags
+                if let Some(key_tags) = authn_access_tags {
+                    let key_set: std::collections::HashSet<&str> =
+                        key_tags.iter().map(|s| s.as_str()).collect();
+                    granted.retain(|t| key_set.contains(t.as_str()));
+                }
                 (Some(p.uuid.clone()), granted)
             }
         };
@@ -388,7 +401,7 @@ mod tests {
         let db = setup_auth_db().await;
         let policy = TagBasedPolicy::new(Arc::new(db), ScopeSet::full());
         let f = policy
-            .list_filter(None, &ScopeSet::default(), &read_metadata())
+            .list_filter(None, &ScopeSet::default(), &read_metadata(), None)
             .await
             .unwrap();
         assert_eq!(f.user_id, None);
@@ -403,7 +416,12 @@ mod tests {
         let policy = TagBasedPolicy::new(Arc::new(db), ScopeSet::full());
         let session = ScopeSet::for_role("user");
         let f = policy
-            .list_filter(Some(&principal_from(&alice)), &session, &read_metadata())
+            .list_filter(
+                Some(&principal_from(&alice)),
+                &session,
+                &read_metadata(),
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(f.user_id.as_deref(), Some(alice.uuid.as_str()));
@@ -419,7 +437,7 @@ mod tests {
         let admin = admin_like("admin-uuid");
         let session = ScopeSet::full();
         let f = policy
-            .list_filter(Some(&admin), &session, &read_metadata())
+            .list_filter(Some(&admin), &session, &read_metadata(), None)
             .await;
         assert!(f.is_none(), "admin must get ALL_ACCESS (no row filter)");
     }
@@ -432,7 +450,7 @@ mod tests {
         let session = ScopeSet::for_role("user");
         let write = ScopeSet::from_iter([Scope::WriteData]);
         let f = policy
-            .list_filter(Some(&principal_from(&alice)), &session, &write)
+            .list_filter(Some(&principal_from(&alice)), &session, &write, None)
             .await
             .unwrap();
         assert_eq!(f.user_id, None);
@@ -448,7 +466,7 @@ mod tests {
         let session = ScopeSet::for_role("user");
         let write = ScopeSet::from_iter([Scope::WriteData]);
         let f = policy
-            .list_filter(Some(&principal_from(&alice)), &session, &write)
+            .list_filter(Some(&principal_from(&alice)), &session, &write, None)
             .await
             .unwrap();
         assert_eq!(f.user_id.as_deref(), Some(alice.uuid.as_str()));
@@ -609,7 +627,12 @@ mod tests {
 
         // list_filter for alice must include "team-a"; for bob it must not.
         let fa = policy
-            .list_filter(Some(&principal_from(&alice)), &session, &read_metadata())
+            .list_filter(
+                Some(&principal_from(&alice)),
+                &session,
+                &read_metadata(),
+                None,
+            )
             .await
             .unwrap();
         assert!(
@@ -622,7 +645,12 @@ mod tests {
         );
 
         let fb = policy
-            .list_filter(Some(&principal_from(&bob)), &session, &read_metadata())
+            .list_filter(
+                Some(&principal_from(&bob)),
+                &session,
+                &read_metadata(),
+                None,
+            )
             .await
             .unwrap();
         assert!(
@@ -632,6 +660,81 @@ mod tests {
         assert!(
             !fb.tags.contains(&"team-a".to_string()),
             "bob filter has no team-a"
+        );
+    }
+
+    /// An API key with a narrower `access_tags` restriction produces a smaller
+    /// effective tag set than the principal alone, so it sees fewer tagged nodes.
+    /// alice has [team-a, team-b] in the DB.
+    /// Key 1: no tag restriction (empty access_tags) → sees both tags.
+    /// Key 2: access_tags = [team-a]                → intersection = [team-a] only.
+    /// Key 3: access_tags = [team-c] (no overlap)   → intersection = [] (nothing
+    ///   tagged). Only untagged / public nodes would show.
+    #[tokio::test]
+    async fn apikey_with_narrower_access_tags_sees_fewer_nodes_than_its_principal() {
+        let db = setup_auth_db().await;
+        let alice = principal_with_tags(&db, &["team-a", "team-b"]).await;
+        let policy = TagBasedPolicy::new(Arc::new(db), ScopeSet::full());
+        let session = ScopeSet::for_role("user");
+
+        // Key 1: unrestricted (no authn_access_tags).
+        let f_full = policy
+            .list_filter(
+                Some(&principal_from(&alice)),
+                &session,
+                &read_metadata(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            f_full.tags.contains(&"team-a".to_string()),
+            "unrestricted key sees team-a"
+        );
+        assert!(
+            f_full.tags.contains(&"team-b".to_string()),
+            "unrestricted key sees team-b"
+        );
+
+        // Key 2: restricted to [team-a].
+        let key_tags_a: Vec<String> = vec!["team-a".to_string()];
+        let f_narrow = policy
+            .list_filter(
+                Some(&principal_from(&alice)),
+                &session,
+                &read_metadata(),
+                Some(&key_tags_a),
+            )
+            .await
+            .unwrap();
+        assert!(
+            f_narrow.tags.contains(&"team-a".to_string()),
+            "narrowed key sees team-a"
+        );
+        assert!(
+            !f_narrow.tags.contains(&"team-b".to_string()),
+            "narrowed key must NOT see team-b (out of intersection)"
+        );
+
+        // Key 3: restricted to [team-c] — no overlap with principal's [team-a, team-b].
+        let key_tags_c: Vec<String> = vec!["team-c".to_string()];
+        let f_empty = policy
+            .list_filter(
+                Some(&principal_from(&alice)),
+                &session,
+                &read_metadata(),
+                Some(&key_tags_c),
+            )
+            .await
+            .unwrap();
+        // Intersection is empty, so only untagged + public tags appear.
+        assert!(
+            !f_empty.tags.contains(&"team-a".to_string()),
+            "disjoint key sees no team-a"
+        );
+        assert!(
+            !f_empty.tags.contains(&"team-b".to_string()),
+            "disjoint key sees no team-b"
         );
     }
 }

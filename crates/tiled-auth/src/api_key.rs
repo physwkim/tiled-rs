@@ -28,6 +28,11 @@ pub struct ApiKeyRecord {
     pub expiration_time: Option<chrono::DateTime<chrono::Utc>>,
     pub time_created: chrono::DateTime<chrono::Utc>,
     pub latest_activity: Option<chrono::DateTime<chrono::Utc>>,
+    /// Optional tag restriction for this key. When non-empty the key's
+    /// effective tag grant is the INTERSECTION of the principal's tags and
+    /// this set (authn_access_tags narrowing, Python access_policies.py:409).
+    /// An empty vec means "no restriction" — principal's full tag set applies.
+    pub access_tags: Vec<String>,
 }
 
 /// What the caller passes when creating a key.
@@ -76,7 +81,8 @@ impl AuthDb {
                                             note, scopes, expiration_time)
                      VALUES (?, ?, ?, ?, ?, ?)
                      RETURNING id, principal_id, first_eight, note, scopes,
-                               expiration_time, time_created, latest_activity",
+                               expiration_time, time_created, latest_activity,
+                               access_tags",
                 )
                 .bind(req.principal_id)
                 .bind(&hash)
@@ -94,7 +100,8 @@ impl AuthDb {
                                             note, scopes, expiration_time)
                      VALUES ($1, $2, $3, $4, $5::jsonb, $6::timestamptz)
                      RETURNING id, principal_id, first_eight, note, scopes,
-                               expiration_time, time_created, latest_activity",
+                               expiration_time, time_created, latest_activity,
+                               access_tags",
                 )
                 .bind(req.principal_id)
                 .bind(&hash)
@@ -117,7 +124,8 @@ impl AuthDb {
                 let rows = if let Some(pid) = principal_id {
                     sqlx::query(
                         "SELECT id, principal_id, first_eight, note, scopes,
-                                expiration_time, time_created, latest_activity
+                                expiration_time, time_created, latest_activity,
+                                access_tags
                            FROM api_keys WHERE principal_id = ? ORDER BY id",
                     )
                     .bind(pid)
@@ -126,7 +134,8 @@ impl AuthDb {
                 } else {
                     sqlx::query(
                         "SELECT id, principal_id, first_eight, note, scopes,
-                                expiration_time, time_created, latest_activity
+                                expiration_time, time_created, latest_activity,
+                                access_tags
                            FROM api_keys ORDER BY id",
                     )
                     .fetch_all(pool)
@@ -138,7 +147,8 @@ impl AuthDb {
                 let rows = if let Some(pid) = principal_id {
                     sqlx::query(
                         "SELECT id, principal_id, first_eight, note, scopes,
-                                expiration_time, time_created, latest_activity
+                                expiration_time, time_created, latest_activity,
+                                access_tags
                            FROM api_keys WHERE principal_id = $1 ORDER BY id",
                     )
                     .bind(pid)
@@ -147,7 +157,8 @@ impl AuthDb {
                 } else {
                     sqlx::query(
                         "SELECT id, principal_id, first_eight, note, scopes,
-                                expiration_time, time_created, latest_activity
+                                expiration_time, time_created, latest_activity,
+                                access_tags
                            FROM api_keys ORDER BY id",
                     )
                     .fetch_all(pool)
@@ -178,7 +189,8 @@ impl AuthDb {
                         "DELETE FROM api_keys
                          WHERE first_eight = ? AND principal_id = ?
                          RETURNING id, principal_id, first_eight, note, scopes,
-                                   expiration_time, time_created, latest_activity",
+                                   expiration_time, time_created, latest_activity,
+                                   access_tags",
                     )
                     .bind(first_eight)
                     .bind(pid)
@@ -188,7 +200,8 @@ impl AuthDb {
                     sqlx::query(
                         "DELETE FROM api_keys WHERE first_eight = ?
                          RETURNING id, principal_id, first_eight, note, scopes,
-                                   expiration_time, time_created, latest_activity",
+                                   expiration_time, time_created, latest_activity,
+                                   access_tags",
                     )
                     .bind(first_eight)
                     .fetch_optional(pool)
@@ -205,7 +218,8 @@ impl AuthDb {
                         "DELETE FROM api_keys
                          WHERE first_eight = $1 AND principal_id = $2
                          RETURNING id, principal_id, first_eight, note, scopes,
-                                   expiration_time, time_created, latest_activity",
+                                   expiration_time, time_created, latest_activity,
+                                   access_tags",
                     )
                     .bind(first_eight)
                     .bind(pid)
@@ -215,7 +229,8 @@ impl AuthDb {
                     sqlx::query(
                         "DELETE FROM api_keys WHERE first_eight = $1
                          RETURNING id, principal_id, first_eight, note, scopes,
-                                   expiration_time, time_created, latest_activity",
+                                   expiration_time, time_created, latest_activity,
+                                   access_tags",
                     )
                     .bind(first_eight)
                     .fetch_optional(pool)
@@ -242,7 +257,8 @@ impl AuthDb {
             AuthPool::Sqlite(pool) => {
                 let rows = sqlx::query(
                     "SELECT id, principal_id, first_eight, note, scopes,
-                            expiration_time, time_created, latest_activity, secret_hash
+                            expiration_time, time_created, latest_activity,
+                            access_tags, secret_hash
                        FROM api_keys WHERE first_eight = ?",
                 )
                 .bind(&first_eight)
@@ -259,7 +275,8 @@ impl AuthDb {
             AuthPool::Postgres(pool) => {
                 let rows = sqlx::query(
                     "SELECT id, principal_id, first_eight, note, scopes,
-                            expiration_time, time_created, latest_activity, secret_hash
+                            expiration_time, time_created, latest_activity,
+                            access_tags, secret_hash
                        FROM api_keys WHERE first_eight = $1",
                 )
                 .bind(&first_eight)
@@ -333,6 +350,8 @@ fn hex_encode(bytes: &[u8]) -> String {
 fn api_key_from_sqlite(row: &sqlx::sqlite::SqliteRow) -> Result<ApiKeyRecord> {
     use crate::principal::parse_dt_sqlite;
     let scopes_text: String = row.get("scopes");
+    let access_tags_text: String = row.try_get("access_tags").unwrap_or_default();
+    let access_tags: Vec<String> = serde_json::from_str(&access_tags_text).unwrap_or_default();
     Ok(ApiKeyRecord {
         id: row.get("id"),
         principal_id: row.get("principal_id"),
@@ -348,12 +367,18 @@ fn api_key_from_sqlite(row: &sqlx::sqlite::SqliteRow) -> Result<ApiKeyRecord> {
             .try_get::<String, _>("latest_activity")
             .ok()
             .and_then(|s| parse_dt_sqlite(s).ok()),
+        access_tags,
     })
 }
 
 fn api_key_from_postgres(row: &sqlx::postgres::PgRow) -> Result<ApiKeyRecord> {
     let scopes_value: serde_json::Value = row.get("scopes");
     let scopes: ScopeSet = serde_json::from_value(scopes_value)?;
+    let access_tags: Vec<String> = row
+        .try_get::<serde_json::Value, _>("access_tags")
+        .ok()
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default();
     Ok(ApiKeyRecord {
         id: row.get("id"),
         principal_id: row.get("principal_id"),
@@ -363,5 +388,6 @@ fn api_key_from_postgres(row: &sqlx::postgres::PgRow) -> Result<ApiKeyRecord> {
         expiration_time: row.try_get("expiration_time").ok(),
         time_created: row.get("time_created"),
         latest_activity: row.try_get("latest_activity").ok(),
+        access_tags,
     })
 }

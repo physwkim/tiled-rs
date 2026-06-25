@@ -19,6 +19,12 @@ pub struct AuthContext {
     pub principal: Option<Arc<Principal>>,
     pub scopes: ScopeSet,
     pub kind: AuthKind,
+    /// API-key tag restriction. When `Some`, the key's `access_tags` were
+    /// non-empty; the effective tag grant is the intersection of the
+    /// principal's DB tags and this set (authn_access_tags narrowing).
+    /// `None` means the credential carries no tag restriction (session,
+    /// single-user key, proxied auth, or an API key with empty access_tags).
+    pub authn_access_tags: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,6 +42,7 @@ impl AuthContext {
             principal: None,
             scopes: ScopeSet::default(),
             kind: AuthKind::Anonymous,
+            authn_access_tags: None,
         }
     }
 
@@ -74,6 +81,7 @@ impl AuthContext {
             principal: self.principal.clone(),
             scopes: decision.scopes,
             kind: self.kind.clone(),
+            authn_access_tags: self.authn_access_tags.clone(),
         }
     }
 }
