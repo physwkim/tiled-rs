@@ -683,6 +683,34 @@ mod tests {
         );
     }
 
+    // catalog.writable_storage and catalog.readable_storage parse into the
+    // CatalogConfig fields (config.py:64-65) and do NOT appear in the
+    // unknown catch-all — they are modelled and wired.
+    #[test]
+    fn catalog_storage_fields_parse_and_are_not_unknown() {
+        let cfg: TiledConfig = serde_yaml::from_str(
+            "catalog:\n  uri: sqlite:///c.db\n  writable_storage:\n    - /data/write\n  readable_storage:\n    - /data/read\n  init_if_not_exists: true\n",
+        )
+        .unwrap();
+        let catalog = cfg.catalog.as_ref().expect("catalog block present");
+        assert_eq!(catalog.writable_storage, ["/data/write"]);
+        assert_eq!(catalog.readable_storage, ["/data/read"]);
+        assert!(catalog.init_if_not_exists);
+        // These modelled keys must NOT appear in the unknown catch-all.
+        assert!(
+            !catalog.unknown.contains_key("writable_storage"),
+            "writable_storage is modelled — must not appear in catch-all"
+        );
+        assert!(
+            !catalog.unknown.contains_key("readable_storage"),
+            "readable_storage is modelled — must not appear in catch-all"
+        );
+        assert!(
+            !catalog.unknown.contains_key("init_if_not_exists"),
+            "init_if_not_exists is modelled — must not appear in catch-all"
+        );
+    }
+
     // Structural: unknown top-level config keys must land in the catch-all
     // `unknown` map instead of being silently dropped (config-parity guard).
     #[test]

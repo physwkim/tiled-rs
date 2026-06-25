@@ -512,14 +512,36 @@ pub async fn run(command: Command) -> Result<()> {
                 api_key
             };
 
+            // Collect config-file catalog storage paths (config.py:64-65).
+            // CLI flags and config-file paths are unioned; CLI takes no
+            // precedence over config — both sets are honoured.
+            let config_cat = file_config.as_ref().and_then(|c| c.catalog.as_ref());
+            let config_writable_dirs: Vec<std::path::PathBuf> = config_cat
+                .map(|c| {
+                    c.writable_storage
+                        .iter()
+                        .map(std::path::PathBuf::from)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let config_readable_dirs: Vec<std::path::PathBuf> = config_cat
+                .map(|c| {
+                    c.readable_storage
+                        .iter()
+                        .map(std::path::PathBuf::from)
+                        .collect()
+                })
+                .unwrap_or_default();
+
             // Canonicalise the writable-storage roots to absolute paths,
             // creating them if missing, so `init_storage` can build valid
             // `file://` URIs and the read/delete/write containment checks
-            // compare against real paths. Empty without `--writable-storage`.
-            let mut writable_abs: Vec<std::path::PathBuf> =
-                Vec::with_capacity(writable_storage.len());
-            for dir in &writable_storage {
-                std::fs::create_dir_all(dir).map_err(|e| {
+            // compare against real paths. Sources: CLI `--writable-storage`
+            // and config `catalog.writable_storage`.
+            let all_writable_dirs = writable_storage.iter().cloned().chain(config_writable_dirs);
+            let mut writable_abs: Vec<std::path::PathBuf> = Vec::new();
+            for dir in all_writable_dirs {
+                std::fs::create_dir_all(&dir).map_err(|e| {
                     anyhow::anyhow!("create writable-storage dir {}: {e}", dir.display())
                 })?;
                 let abs = dir.canonicalize().map_err(|e| {
@@ -527,11 +549,13 @@ pub async fn run(command: Command) -> Result<()> {
                 })?;
                 writable_abs.push(abs);
             }
-            // Read + delete containment must also cover the writable-storage
-            // roots: a freshly-created managed file must be readable and
-            // (force-)deletable. writable ⊆ readable.
+            // Read + delete containment covers: CLI `--allowed-data-dir`,
+            // config `catalog.readable_storage`, and writable roots
+            // (writable ⊆ readable — a freshly-created managed file must be
+            // immediately readable and force-deletable).
             let read_dirs = {
                 let mut d = allowed_data_dirs.clone();
+                d.extend(config_readable_dirs);
                 d.extend(writable_abs.iter().cloned());
                 d
             };
