@@ -16,7 +16,7 @@ use axum::extract::Request;
 use axum::http::header;
 use axum::middleware::Next;
 use axum::response::Response;
-use blosc2_pure_rs::{BLOSC2_MAX_OVERHEAD, BLOSC_NOSHUFFLE, blosc1_compress, blosc1_decompress};
+use blosc2_pure_rs::{BLOSC_NOSHUFFLE, BLOSC2_MAX_OVERHEAD, blosc1_compress, blosc1_decompress};
 
 /// Minimum response body size (bytes) to trigger blosc2 compression.
 /// Mirrors Python's `CompressionMiddleware(minimum_size=500)`.
