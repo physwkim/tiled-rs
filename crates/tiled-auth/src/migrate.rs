@@ -22,6 +22,10 @@ const SQLITE_MIGRATIONS: &[(&str, &str)] = &[
         "0004_add_access_tags",
         include_str!("../migrations/sqlite/0004_add_access_tags.sql"),
     ),
+    (
+        "0005_tag_registry",
+        include_str!("../migrations/sqlite/0005_tag_registry.sql"),
+    ),
 ];
 
 const POSTGRES_MIGRATIONS: &[(&str, &str)] = &[
@@ -40,6 +44,10 @@ const POSTGRES_MIGRATIONS: &[(&str, &str)] = &[
     (
         "0004_add_access_tags",
         include_str!("../migrations/postgres/0004_add_access_tags.sql"),
+    ),
+    (
+        "0005_tag_registry",
+        include_str!("../migrations/postgres/0005_tag_registry.sql"),
     ),
 ];
 

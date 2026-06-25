@@ -1,4 +1,5 @@
-//! Per-principal and per-API-key access-tag CRUD.
+//! Per-principal and per-API-key access-tag CRUD, plus the tag registry
+//! and per-tag scope assignments introduced by migration 0005.
 //!
 //! `access_tags` is a JSON array of tag strings stored on `principals` and
 //! `api_keys`. For principals it represents the full set of tags a user may
@@ -6,12 +7,15 @@
 //!
 //! Mirrors Python `TagBasedAccessPolicy` / `get_tags_from_scope` semantics:
 //! every tag in `principal.access_tags` confers the policy's `default_scopes`
-//! to that principal (access_policies.py:391-398).
+//! to that principal (access_policies.py:391-398), unless per-tag scopes are
+//! configured in the `tag_scopes` table (migration 0005).
 
 use crate::db::{AuthDb, AuthPool};
 use crate::error::Result;
 
 impl AuthDb {
+    // ---- Principal / API-key access-tag CRUD --------------------------------
+
     /// Return the access tags granted to a principal (looked up by UUID).
     /// Returns an empty vec when no principal has that UUID or when no tags
     /// have been granted.
@@ -140,6 +144,138 @@ impl AuthDb {
                     .await?;
             }
         }
+        Ok(())
+    }
+
+    // ---- Tag registry (migration 0005) --------------------------------------
+
+    /// True if `tag` has been registered in the `tags` table.
+    /// The "public" built-in is NOT stored in the registry; callers must
+    /// special-case it before calling this method.
+    pub async fn is_tag_defined(&self, tag: &str) -> Result<bool> {
+        match self.pool() {
+            AuthPool::Sqlite(pool) => {
+                let row: Option<String> =
+                    sqlx::query_scalar("SELECT name FROM tags WHERE name = ?")
+                        .bind(tag)
+                        .fetch_optional(pool)
+                        .await?;
+                Ok(row.is_some())
+            }
+            AuthPool::Postgres(pool) => {
+                let row: Option<String> =
+                    sqlx::query_scalar("SELECT name FROM tags WHERE name = $1")
+                        .bind(tag)
+                        .fetch_optional(pool)
+                        .await?;
+                Ok(row.is_some())
+            }
+        }
+    }
+
+    /// Insert `tag` into the registry. No-op if already present.
+    pub async fn define_tag(&self, tag: &str) -> Result<()> {
+        match self.pool() {
+            AuthPool::Sqlite(pool) => {
+                sqlx::query("INSERT OR IGNORE INTO tags (name) VALUES (?)")
+                    .bind(tag)
+                    .execute(pool)
+                    .await?;
+            }
+            AuthPool::Postgres(pool) => {
+                sqlx::query("INSERT INTO tags (name) VALUES ($1) ON CONFLICT (name) DO NOTHING")
+                    .bind(tag)
+                    .execute(pool)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Return all registered tag names in alphabetical order.
+    pub async fn list_tags(&self) -> Result<Vec<String>> {
+        match self.pool() {
+            AuthPool::Sqlite(pool) => {
+                let rows: Vec<String> = sqlx::query_scalar("SELECT name FROM tags ORDER BY name")
+                    .fetch_all(pool)
+                    .await?;
+                Ok(rows)
+            }
+            AuthPool::Postgres(pool) => {
+                let rows: Vec<String> = sqlx::query_scalar("SELECT name FROM tags ORDER BY name")
+                    .fetch_all(pool)
+                    .await?;
+                Ok(rows)
+            }
+        }
+    }
+
+    // ---- Per-tag scope assignments (migration 0005) -------------------------
+
+    /// Return the scope strings assigned to `tag` in `tag_scopes`.
+    /// An empty return means no rows exist for this tag — the caller should
+    /// fall back to the policy's `default_scopes` for backward compatibility.
+    pub async fn get_tag_scopes(&self, tag: &str) -> Result<Vec<String>> {
+        match self.pool() {
+            AuthPool::Sqlite(pool) => {
+                let rows: Vec<String> =
+                    sqlx::query_scalar("SELECT scope FROM tag_scopes WHERE tag = ?")
+                        .bind(tag)
+                        .fetch_all(pool)
+                        .await?;
+                Ok(rows)
+            }
+            AuthPool::Postgres(pool) => {
+                let rows: Vec<String> =
+                    sqlx::query_scalar("SELECT scope FROM tag_scopes WHERE tag = $1")
+                        .bind(tag)
+                        .fetch_all(pool)
+                        .await?;
+                Ok(rows)
+            }
+        }
+    }
+
+    /// Replace all scope assignments for `tag`. The tag must already exist in
+    /// the registry. Passing an empty slice clears all scopes (= use default).
+    pub async fn set_tag_scopes(&self, tag: &str, scopes: &[String]) -> Result<()> {
+        match self.pool() {
+            AuthPool::Sqlite(pool) => {
+                sqlx::query("DELETE FROM tag_scopes WHERE tag = ?")
+                    .bind(tag)
+                    .execute(pool)
+                    .await?;
+                for scope in scopes {
+                    sqlx::query("INSERT INTO tag_scopes (tag, scope) VALUES (?, ?)")
+                        .bind(tag)
+                        .bind(scope)
+                        .execute(pool)
+                        .await?;
+                }
+            }
+            AuthPool::Postgres(pool) => {
+                sqlx::query("DELETE FROM tag_scopes WHERE tag = $1")
+                    .bind(tag)
+                    .execute(pool)
+                    .await?;
+                for scope in scopes {
+                    sqlx::query("INSERT INTO tag_scopes (tag, scope) VALUES ($1, $2)")
+                        .bind(tag)
+                        .bind(scope)
+                        .execute(pool)
+                        .await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Upsert a tag with its scope assignments. Creates the tag in the registry
+    /// if absent, then replaces its scopes. Used for seeding in tests and
+    /// static config (`seed_tag("team-a", &["read:metadata", "write:metadata"])`).
+    pub async fn seed_tag(&self, tag: &str, scopes: &[String]) -> Result<()> {
+        self.define_tag(tag).await?;
+        self.set_tag_scopes(tag, scopes).await?;
         Ok(())
     }
 }

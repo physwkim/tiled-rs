@@ -285,23 +285,39 @@ impl AccessPolicy for TagBasedPolicy {
         // direct path. Untagged/public/owned grants below are intentionally NOT
         // narrowed (uniform with list_filter's include_untagged + public tag).
         Self::narrow_by_key(&mut granted, authn_access_tags);
-        // Untagged nodes and granted-tag matches confer the policy's default
-        // scopes; the literal "public" tag confers read scopes to everyone
-        // (is_tag_public, access_policies.py:354-356). Union the two grants,
-        // each already capped at the principal's session (never widened).
-        let granted_or_untagged =
-            node_tags.is_empty() || node_tags.iter().any(|t| granted.contains(t));
-        let mut scopes = if granted_or_untagged {
-            session_scopes.intersect(&self.default_scopes)
+        // Compute effective scopes as union of per-tag scope grants.
+        // Untagged nodes: grant default_scopes to everyone (backward-compat).
+        // "public" tag: grants read_only scopes to everyone.
+        // For each other node tag the principal owns: look up tag_scopes;
+        // if no rows exist fall back to default_scopes (backward-compat).
+        // Mirrors access_policies.py allowed_scopes (354-370).
+        let mut effective = ScopeSet::default();
+        if node_tags.is_empty() {
+            for s in self.default_scopes.iter() {
+                effective.insert(s);
+            }
         } else {
-            ScopeSet::default()
-        };
-        if node_tags.iter().any(|t| t == PUBLIC_TAG) {
-            for s in session_scopes.intersect(&ScopeSet::read_only()).iter() {
-                scopes.insert(s);
+            for tag in &node_tags {
+                if tag == PUBLIC_TAG {
+                    for s in ScopeSet::read_only().iter() {
+                        effective.insert(s);
+                    }
+                } else if granted.contains(tag) {
+                    let scope_strs = self.auth_db.get_tag_scopes(tag).await.unwrap_or_default();
+                    let tag_scopes = if scope_strs.is_empty() {
+                        self.default_scopes.clone()
+                    } else {
+                        ScopeSet::from_iter(scope_strs.iter().filter_map(|s| Scope::parse(s)))
+                    };
+                    for s in tag_scopes.iter() {
+                        effective.insert(s);
+                    }
+                }
             }
         }
-        Decision { scopes }
+        Decision {
+            scopes: session_scopes.intersect(&effective),
+        }
     }
 
     async fn init_node(
@@ -368,10 +384,9 @@ impl AccessPolicy for TagBasedPolicy {
         let mut include_public_tag = false;
 
         // Per-tag checks. Mirrors access_policies.py:133-156.
-        // Note: is_tag_defined and invalid_tag_names checks are omitted — no
-        // tag registry exists in the Rust auth DB (see module-level comment).
         for tag in &access_tags {
             // API key restriction applies to all tags, including for admins.
+            // Checked first, before is_tag_defined, matching Python order.
             if let Some(key_tags) = authn_access_tags
                 && !key_tags.iter().any(|k| k == tag)
             {
@@ -389,11 +404,27 @@ impl AccessPolicy for TagBasedPolicy {
                             .to_string(),
                     );
                 }
-            } else if !is_admin && !granted.contains(tag) {
-                return Err(format!(
-                    "Cannot apply tag to node: user='{}' is not an owner of tag={tag:?}",
-                    principal.uuid
-                ));
+            } else {
+                // is_tag_defined: ALL principals (including admin) must only
+                // assign tags that exist in the registry.
+                // Mirrors access_policies.py:145-146.
+                let defined = self
+                    .auth_db
+                    .is_tag_defined(tag)
+                    .await
+                    .map_err(|e| format!("failed to check tag registry: {e}"))?;
+                if !defined {
+                    return Err(format!(
+                        "Cannot apply tag to node: tag={tag:?} is not defined"
+                    ));
+                }
+                // Ownership check — admin bypasses. Mirrors access_policies.py:147-152.
+                if !is_admin && !granted.contains(tag) {
+                    return Err(format!(
+                        "Cannot apply tag to node: user='{}' is not an owner of tag={tag:?}",
+                        principal.uuid
+                    ));
+                }
             }
         }
 
@@ -406,6 +437,37 @@ impl AccessPolicy for TagBasedPolicy {
             .collect();
         if include_public_tag {
             tags_from_policy.push(PUBLIC_TAG.to_string());
+        }
+
+        // Unremovable scopes: non-admin must retain read:metadata + write:metadata
+        // on the new node after tag assignment. Mirrors access_policies.py:168-177.
+        if !is_admin {
+            let mut effective = ScopeSet::default();
+            for tag in &tags_from_policy {
+                if tag == PUBLIC_TAG {
+                    for s in ScopeSet::read_only().iter() {
+                        effective.insert(s);
+                    }
+                } else {
+                    let scope_strs = self.auth_db.get_tag_scopes(tag).await.unwrap_or_default();
+                    let tag_scopes = if scope_strs.is_empty() {
+                        self.default_scopes.clone()
+                    } else {
+                        ScopeSet::from_iter(scope_strs.iter().filter_map(|s| Scope::parse(s)))
+                    };
+                    for s in tag_scopes.iter() {
+                        effective.insert(s);
+                    }
+                }
+            }
+            if !effective.contains(Scope::ReadMetadata) || !effective.contains(Scope::WriteMetadata)
+            {
+                return Err(
+                    "Cannot init node: tag configuration would remove a required scope \
+                     (read:metadata and write:metadata must remain accessible)"
+                        .to_string(),
+                );
+            }
         }
 
         let input_set: std::collections::HashSet<&str> =
@@ -513,11 +575,26 @@ impl AccessPolicy for TagBasedPolicy {
                             .to_string(),
                     );
                 }
-            } else if !is_admin && !granted.contains(tag) {
-                return Err(format!(
-                    "Cannot apply tag to node: user='{}' is not an owner of tag={tag:?}",
-                    principal.uuid
-                ));
+            } else {
+                // is_tag_defined: all principals (including admin) may only
+                // assign defined tags. Mirrors access_policies.py:248-249.
+                let defined = self
+                    .auth_db
+                    .is_tag_defined(tag)
+                    .await
+                    .map_err(|e| format!("failed to check tag registry: {e}"))?;
+                if !defined {
+                    return Err(format!(
+                        "Cannot apply tag to node: tag={tag:?} is not defined"
+                    ));
+                }
+                // Ownership check — admin bypasses. Mirrors access_policies.py:250-255.
+                if !is_admin && !granted.contains(tag) {
+                    return Err(format!(
+                        "Cannot apply tag to node: user='{}' is not an owner of tag={tag:?}",
+                        principal.uuid
+                    ));
+                }
             }
         }
 
@@ -558,11 +635,54 @@ impl AccessPolicy for TagBasedPolicy {
                             .to_string(),
                     );
                 }
-            } else if !is_admin && !granted.contains(tag) {
-                return Err(format!(
-                    "Cannot remove tag from node: user='{}' is not an owner of tag={tag:?}",
-                    principal.uuid
-                ));
+            } else {
+                // is_tag_defined for removal too. Mirrors access_policies.py:283-285.
+                let defined = self
+                    .auth_db
+                    .is_tag_defined(tag)
+                    .await
+                    .map_err(|e| format!("failed to check tag registry: {e}"))?;
+                if !defined {
+                    return Err(format!(
+                        "Cannot remove tag from node: tag={tag:?} is not defined"
+                    ));
+                }
+                // Ownership check — admin bypasses. Mirrors access_policies.py:286-291.
+                if !is_admin && !granted.contains(tag) {
+                    return Err(format!(
+                        "Cannot remove tag from node: user='{}' is not an owner of tag={tag:?}",
+                        principal.uuid
+                    ));
+                }
+            }
+        }
+
+        // Unremovable scopes: non-admin must retain read:metadata + write:metadata
+        // after the tag change. Mirrors access_policies.py:296-310.
+        if !is_admin {
+            let mut effective = ScopeSet::default();
+            for tag in &tags_from_policy {
+                if tag == PUBLIC_TAG {
+                    for s in ScopeSet::read_only().iter() {
+                        effective.insert(s);
+                    }
+                } else {
+                    let scope_strs = self.auth_db.get_tag_scopes(tag).await.unwrap_or_default();
+                    let tag_scopes = if scope_strs.is_empty() {
+                        self.default_scopes.clone()
+                    } else {
+                        ScopeSet::from_iter(scope_strs.iter().filter_map(|s| Scope::parse(s)))
+                    };
+                    for s in tag_scopes.iter() {
+                        effective.insert(s);
+                    }
+                }
+            }
+            if !effective.contains(Scope::ReadMetadata) || !effective.contains(Scope::WriteMetadata)
+            {
+                return Err("Cannot change node tags: would remove a required scope \
+                     (read:metadata and write:metadata must remain accessible)"
+                    .to_string());
             }
         }
 
@@ -594,15 +714,9 @@ impl AccessPolicy for TagBasedPolicy {
             return None;
         }
 
-        let (user_id, mut tags) = match principal {
+        let (user_id, granted) = match principal {
             None => (None, vec![]),
             Some(p) => {
-                // Each granted tag confers `default_scopes` in this built-in,
-                // so Python's per-scope tag intersection
-                // (`∩ get_tags_from_scope(scope, id)` over the requested
-                // scopes, filters() line 391-398) reduces to the principal's
-                // full granted-tag set once the subset gate above confirmed
-                // every requested scope is grantable.
                 let mut granted = self
                     .auth_db
                     .get_principal_tags(&p.uuid)
@@ -616,6 +730,25 @@ impl AccessPolicy for TagBasedPolicy {
                 (Some(p.uuid.clone()), granted)
             }
         };
+
+        // Per-tag scope filtering: include only tags that grant ALL requested
+        // scopes. Tags with no tag_scopes rows fall back to default_scopes.
+        // The NO_ACCESS guard above confirmed requested_scopes ⊆ default_scopes,
+        // so fallback tags always pass (backward-compat: empty tag_scopes = same
+        // behaviour as before migration 0005). Mirrors Python
+        // `get_tags_from_scope` / set intersection (filters() line 391-398).
+        let mut tags: Vec<String> = Vec::new();
+        for t in granted {
+            let scope_strs = self.auth_db.get_tag_scopes(&t).await.unwrap_or_default();
+            let effective_tag_scopes = if scope_strs.is_empty() {
+                self.default_scopes.clone()
+            } else {
+                ScopeSet::from_iter(scope_strs.iter().filter_map(|s| Scope::parse(s)))
+            };
+            if requested_scopes.is_subset(&effective_tag_scopes) {
+                tags.push(t);
+            }
+        }
 
         // The public surface is read-only: the untagged rows and the literal
         // "public" tag appear only when every requested scope is a read scope.
@@ -1057,6 +1190,9 @@ mod tests {
     #[tokio::test]
     async fn tag_based_policy_init_node_unowned_tag_rejected() {
         let db = setup_auth_db().await;
+        // Define both tags in the registry so the ownership check is reached.
+        db.define_tag("team-a").await.unwrap();
+        db.define_tag("team-b").await.unwrap();
         let alice = principal_with_tags(&db, &["team-a"]).await;
         let policy = TagBasedPolicy::new(Arc::new(db), ScopeSet::full());
         let session = ScopeSet::for_role("user");
@@ -1078,6 +1214,7 @@ mod tests {
     #[tokio::test]
     async fn tag_based_policy_init_node_owned_tag_accepted() {
         let db = setup_auth_db().await;
+        db.define_tag("team-a").await.unwrap();
         let alice = principal_with_tags(&db, &["team-a"]).await;
         let policy = TagBasedPolicy::new(Arc::new(db), ScopeSet::full());
         let session = ScopeSet::for_role("user");
@@ -1097,6 +1234,8 @@ mod tests {
     #[tokio::test]
     async fn tag_based_policy_init_node_admin_bypasses_ownership() {
         let db = setup_auth_db().await;
+        // Admin bypasses OWNERSHIP but not is_tag_defined — tag must exist.
+        db.define_tag("team-x").await.unwrap();
         let admin = admin_like("admin-uuid");
         let policy = TagBasedPolicy::new(Arc::new(db), ScopeSet::full());
         let session = ScopeSet::full(); // contains AdminApiKeys
@@ -1106,6 +1245,48 @@ mod tests {
             .await
             .expect("admin must bypass ownership check");
         assert_eq!(result, serde_json::json!({"tags": ["team-x"]}));
+    }
+
+    #[tokio::test]
+    async fn tag_based_policy_init_node_undefined_tag_rejected_for_non_admin() {
+        let db = setup_auth_db().await;
+        // "new-tag" is NOT in the registry.
+        let alice = principal_with_tags(&db, &["new-tag"]).await;
+        let policy = TagBasedPolicy::new(Arc::new(db), ScopeSet::full());
+        let session = ScopeSet::for_role("user");
+        let blob = serde_json::json!({"tags": ["new-tag"]});
+        let result = policy
+            .init_node(&principal_from(&alice), None, &session, Some(&blob))
+            .await;
+        assert!(
+            result.is_err(),
+            "undefined tag must be rejected for non-admin"
+        );
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("is not defined"),
+            "error must name registry failure, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tag_based_policy_init_node_undefined_tag_rejected_for_admin() {
+        let db = setup_auth_db().await;
+        // "ghost-tag" is NOT in the registry. Even admin cannot bypass this.
+        let admin = admin_like("admin-uuid");
+        let policy = TagBasedPolicy::new(Arc::new(db), ScopeSet::full());
+        let session = ScopeSet::full();
+        let blob = serde_json::json!({"tags": ["ghost-tag"]});
+        let result = policy.init_node(&admin, None, &session, Some(&blob)).await;
+        assert!(
+            result.is_err(),
+            "undefined tag must be rejected even for admin"
+        );
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("is not defined"),
+            "error must name registry failure, got: {msg}"
+        );
     }
 
     #[tokio::test]
@@ -1159,6 +1340,9 @@ mod tests {
     #[tokio::test]
     async fn tag_based_policy_modify_node_unauthorized_retag_rejected() {
         let db = setup_auth_db().await;
+        // Both tags must exist in registry so ownership check is reached.
+        db.define_tag("team-a").await.unwrap();
+        db.define_tag("team-b").await.unwrap();
         let alice = principal_with_tags(&db, &["team-a"]).await;
         let policy = TagBasedPolicy::new(Arc::new(db), ScopeSet::full());
         let session = ScopeSet::for_role("user");
@@ -1187,6 +1371,9 @@ mod tests {
     #[tokio::test]
     async fn tag_based_policy_modify_node_removing_unowned_tag_rejected() {
         let db = setup_auth_db().await;
+        // Both tags must exist in registry so ownership check is reached.
+        db.define_tag("team-a").await.unwrap();
+        db.define_tag("team-b").await.unwrap();
         // alice only owns team-a; node has team-a AND team-b
         let alice = principal_with_tags(&db, &["team-a"]).await;
         let policy = TagBasedPolicy::new(Arc::new(db), ScopeSet::full());
@@ -1214,6 +1401,8 @@ mod tests {
     #[tokio::test]
     async fn tag_based_policy_modify_node_owner_preserving_change_allowed() {
         let db = setup_auth_db().await;
+        db.define_tag("team-a").await.unwrap();
+        db.define_tag("team-b").await.unwrap();
         let alice = principal_with_tags(&db, &["team-a", "team-b"]).await;
         let policy = TagBasedPolicy::new(Arc::new(db), ScopeSet::full());
         let session = ScopeSet::for_role("user");
@@ -1232,7 +1421,10 @@ mod tests {
             )
             .await
             .expect("adding an owned tag must be allowed");
-        assert!(!modified, "proposed blob passed through unchanged by policy");
+        assert!(
+            !modified,
+            "proposed blob passed through unchanged by policy"
+        );
         let out_tags = result["tags"].as_array().unwrap();
         assert!(
             out_tags.iter().any(|v| v == "team-a"),
@@ -1247,6 +1439,9 @@ mod tests {
     #[tokio::test]
     async fn tag_based_policy_modify_node_admin_bypasses_ownership() {
         let db = setup_auth_db().await;
+        // Admin bypasses OWNERSHIP but not is_tag_defined — all tags must exist.
+        db.define_tag("team-a").await.unwrap();
+        db.define_tag("team-x").await.unwrap();
         let admin = admin_like("admin-uuid");
         let policy = TagBasedPolicy::new(Arc::new(db), ScopeSet::full());
         let session = ScopeSet::full();
@@ -1353,5 +1548,179 @@ mod tests {
             !f_empty.tags.contains(&"team-b".to_string()),
             "disjoint key sees no team-b"
         );
+    }
+
+    // ---- per-tag scope resolution (commit c) ----
+
+    /// A tag configured with only read:metadata must NOT grant write:metadata
+    /// in principal_decision. This verifies per-tag scope resolution replaces
+    /// the uniform default_scopes behaviour.
+    #[tokio::test]
+    async fn per_tag_scope_read_only_tag_does_not_grant_write() {
+        let db = setup_auth_db().await;
+        db.seed_tag("team-a", &["read:metadata".to_string()])
+            .await
+            .unwrap();
+        let alice = principal_with_tags(&db, &["team-a"]).await;
+        // Policy has full default_scopes, but tag_scopes limits team-a to read:metadata.
+        let policy = TagBasedPolicy::new(Arc::new(db), ScopeSet::full());
+        // Use user (not admin) session to avoid admin short-circuit.
+        let session = ScopeSet::for_role("user");
+        let blob = serde_json::json!({"tags": ["team-a"]});
+        let meta = serde_json::json!({});
+        let decision = policy
+            .principal_decision(&principal_from(&alice), &session, None, ctx(&blob, &meta))
+            .await;
+        assert!(
+            decision.scopes.contains(Scope::ReadMetadata),
+            "read:metadata must be granted"
+        );
+        assert!(
+            !decision.scopes.contains(Scope::WriteMetadata),
+            "write:metadata must NOT be granted when tag only has read:metadata"
+        );
+    }
+
+    /// A tag configured with only read:metadata must be EXCLUDED from
+    /// list_filter when write:metadata is requested.
+    #[tokio::test]
+    async fn per_tag_scope_list_filter_excludes_tag_that_does_not_grant_write() {
+        let db = setup_auth_db().await;
+        db.seed_tag("team-a", &["read:metadata".to_string()])
+            .await
+            .unwrap();
+        let alice = principal_with_tags(&db, &["team-a"]).await;
+        // Policy default_scopes = full so NO_ACCESS guard passes for write:metadata.
+        let policy = TagBasedPolicy::new(Arc::new(db), ScopeSet::full());
+        // Use user (not admin) session to avoid admin ALL_ACCESS short-circuit.
+        let session = ScopeSet::for_role("user");
+        let write_meta = ScopeSet::from_iter([Scope::WriteMetadata]);
+        let f = policy
+            .list_filter(Some(&principal_from(&alice)), &session, &write_meta, None)
+            .await
+            .unwrap();
+        assert!(
+            !f.tags.contains(&"team-a".to_string()),
+            "team-a only grants read:metadata so it must not appear in a write:metadata filter"
+        );
+    }
+
+    /// Tags with NO tag_scopes rows must fall back to default_scopes.
+    /// Backward-compat: existing deployments without tag_scopes data must
+    /// continue to work as before migration 0005.
+    #[tokio::test]
+    async fn backward_compat_empty_tag_scopes_falls_back_to_default() {
+        let db = setup_auth_db().await;
+        // define_tag only — no set_tag_scopes call, so tag_scopes has no rows.
+        db.define_tag("team-a").await.unwrap();
+        let alice = principal_with_tags(&db, &["team-a"]).await;
+        // Policy default_scopes = full (write-capable).
+        let policy = TagBasedPolicy::new(Arc::new(db), ScopeSet::full());
+        // Use user (not admin) session to avoid admin short-circuits.
+        let session = ScopeSet::for_role("user");
+
+        // principal_decision: empty tag_scopes → fallback to default_scopes=full
+        let blob = serde_json::json!({"tags": ["team-a"]});
+        let meta = serde_json::json!({});
+        let decision = policy
+            .principal_decision(&principal_from(&alice), &session, None, ctx(&blob, &meta))
+            .await;
+        assert!(
+            decision.scopes.contains(Scope::WriteMetadata),
+            "write:metadata must be granted via default_scopes fallback when tag_scopes is empty"
+        );
+
+        // list_filter: empty tag_scopes → fallback to default_scopes=full →
+        // tag passes any write-scope requested_scopes filter.
+        let write_meta = ScopeSet::from_iter([Scope::WriteMetadata]);
+        let f = policy
+            .list_filter(Some(&principal_from(&alice)), &session, &write_meta, None)
+            .await
+            .unwrap();
+        assert!(
+            f.tags.contains(&"team-a".to_string()),
+            "team-a with empty tag_scopes must appear in write:metadata filter via default_scopes fallback"
+        );
+    }
+
+    // ---- unremovable_scopes (commit d) ----
+
+    /// Non-admin retagging a node to a read-only-only tag configuration must be
+    /// rejected: write:metadata would be lost (self-lockout guard).
+    /// Mirrors access_policies.py unremovable_scopes check.
+    #[tokio::test]
+    async fn unremovable_scopes_blocks_self_lockout_modify() {
+        let db = setup_auth_db().await;
+        // team-a: read-only. team-b: full scopes (via default fallback).
+        db.seed_tag("team-a", &["read:metadata".to_string()])
+            .await
+            .unwrap();
+        db.define_tag("team-b").await.unwrap(); // no tag_scopes → fallback to default=full
+        let alice = principal_with_tags(&db, &["team-a", "team-b"]).await;
+        // Policy default_scopes=full so team-b fallback includes write:metadata.
+        let policy = TagBasedPolicy::new(Arc::new(db), ScopeSet::full());
+        let session = ScopeSet::for_role("user");
+
+        // Node currently tagged with both. Alice proposes to drop team-b,
+        // leaving only team-a (read:metadata). This removes write:metadata → lockout.
+        let current = serde_json::json!({"tags": ["team-a", "team-b"]});
+        let proposed = serde_json::json!({"tags": ["team-a"]});
+        let result = policy
+            .modify_node(
+                &current,
+                &principal_from(&alice),
+                None,
+                &session,
+                Some(&proposed),
+            )
+            .await;
+        assert!(result.is_err(), "lockout retag must be rejected");
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("required scope"),
+            "error must name unremovable scope violation, got: {msg}"
+        );
+    }
+
+    /// Non-admin creating a node with only a read-only tag is also rejected
+    /// by unremovable_scopes (init_node path).
+    #[tokio::test]
+    async fn unremovable_scopes_blocks_read_only_init() {
+        let db = setup_auth_db().await;
+        db.seed_tag("team-a", &["read:metadata".to_string()])
+            .await
+            .unwrap();
+        let alice = principal_with_tags(&db, &["team-a"]).await;
+        let policy = TagBasedPolicy::new(Arc::new(db), ScopeSet::full());
+        let session = ScopeSet::for_role("user");
+        let blob = serde_json::json!({"tags": ["team-a"]});
+        let result = policy
+            .init_node(&principal_from(&alice), None, &session, Some(&blob))
+            .await;
+        assert!(result.is_err(), "read-only-tag init must be rejected");
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("required scope"),
+            "error must name unremovable scope violation, got: {msg}"
+        );
+    }
+
+    /// Admin is exempt from the unremovable_scopes check — they can assign
+    /// any tag combination, including read-only-only.
+    #[tokio::test]
+    async fn unremovable_scopes_admin_exempt() {
+        let db = setup_auth_db().await;
+        db.seed_tag("team-a", &["read:metadata".to_string()])
+            .await
+            .unwrap();
+        let admin = admin_like("admin-uuid");
+        let policy = TagBasedPolicy::new(Arc::new(db), ScopeSet::full());
+        let session = ScopeSet::full();
+        let blob = serde_json::json!({"tags": ["team-a"]});
+        let (_, result) = policy
+            .init_node(&admin, None, &session, Some(&blob))
+            .await
+            .expect("admin must bypass unremovable_scopes check");
+        assert_eq!(result, serde_json::json!({"tags": ["team-a"]}));
     }
 }
