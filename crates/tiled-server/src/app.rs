@@ -99,6 +99,13 @@ pub fn build_app(state: AppState) -> Router {
         .route(
             "/api/v1/auth/device/approve",
             post(auth_router::device_approve),
+        )
+        // Session revoke by refresh token: the refresh token IS the ownership
+        // proof, so this endpoint sits in public_auth (same pattern as /refresh).
+        // Mirrors Python authentication.py:1437 which has no auth dependency.
+        .route(
+            "/api/v1/auth/session/revoke",
+            post(auth_router::session_revoke_by_token),
         );
 
     // Authenticated auth endpoints — must run inside the auth middleware
@@ -114,13 +121,31 @@ pub fn build_app(state: AppState) -> Router {
             "/api/v1/auth/apikeys/{first_eight}",
             delete(auth_router::api_key_revoke),
         )
+        // GET /auth/apikey — info about the API key used in the current request
+        // (mirrors Python current_apikey_info, authentication.py:1584).
+        // DELETE /auth/apikey?first_eight=... — revoke own API key by query param
+        // (mirrors Python revoke_apikey, authentication.py:1621; note: singular
+        // /apikey vs plural /apikeys/{first_eight} which is also kept for compat).
+        .route("/api/v1/auth/apikey", get(auth_router::current_apikey_info))
+        // Session revoke by UUID (own session only, requires auth).
+        .route(
+            "/api/v1/auth/session/revoke/{session_id}",
+            delete(auth_router::session_revoke_by_id),
+        )
+        // Principal list + create (admin-gated).
         .route(
             "/api/v1/auth/principal",
-            post(auth_router::create_service_principal),
+            get(auth_router::list_principals).post(auth_router::create_service_principal),
         )
         .route(
             "/api/v1/auth/principal/{uuid}",
             get(auth_router::get_principal),
+        )
+        // Admin per-principal API key management.
+        .route(
+            "/api/v1/auth/principal/{uuid}/apikey",
+            delete(auth_router::admin_revoke_principal_apikey)
+                .post(auth_router::admin_create_principal_apikey),
         );
 
     // WebSocket subscribe route is intentionally OUTSIDE the auth

@@ -1266,6 +1266,462 @@ async fn device_approve_session_bearer_still_works() {
     assert!(body["access_token"].is_string(), "missing access_token");
 }
 
+// ---------------------------------------------------------------------------
+// New endpoint tests: session revoke, apikey info, list principals,
+// admin per-principal apikey management
+// ---------------------------------------------------------------------------
+
+/// `POST /api/v1/auth/session/revoke` with a valid refresh token revokes the
+/// session so subsequent refreshes fail (Python authentication.py:1437 parity).
+/// The refresh token itself IS the ownership proof — no Bearer header required.
+#[tokio::test]
+async fn session_revoke_by_token_revokes_session() {
+    let (app, _dir, _cat, _auth_db) = build_test_app().await;
+
+    let (_, body) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/auth/dummy/login",
+        &[],
+        Some(json!({"username": "alice", "password": "wonderland"})),
+    )
+    .await;
+    let refresh = body["refresh_token"].as_str().unwrap().to_string();
+
+    // Revoke via POST (no auth header needed).
+    let (status, _) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/auth/session/revoke",
+        &[],
+        Some(json!({"refresh_token": refresh})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "revoke must return 204");
+
+    // Refreshing a revoked session → 401.
+    let (status, _) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/auth/refresh",
+        &[],
+        Some(json!({"refresh_token": refresh})),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "refresh on revoked session must be 401"
+    );
+
+    // Second revoke call must also return an error (already revoked).
+    let (status, _) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/auth/session/revoke",
+        &[],
+        Some(json!({"refresh_token": refresh})),
+    )
+    .await;
+    assert_ne!(
+        status,
+        StatusCode::NO_CONTENT,
+        "second revoke on already-revoked session must not succeed silently"
+    );
+}
+
+/// `DELETE /api/v1/auth/session/revoke/{session_id}` allows an authenticated
+/// principal to revoke their own session by UUID (Python authentication.py:1432).
+/// Attempting to revoke another principal's session returns 404 (not 403 —
+/// opaque to avoid leaking existence of the session).
+#[tokio::test]
+async fn session_revoke_by_id_own_session_and_ownership_check() {
+    let (app, _dir, _cat, auth_db) = build_test_app().await;
+
+    // alice logs in.
+    let (_, body) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/auth/dummy/login",
+        &[],
+        Some(json!({"username": "alice", "password": "wonderland"})),
+    )
+    .await;
+    let alice_bearer = format!("Bearer {}", body["access_token"].as_str().unwrap());
+    let alice_refresh = body["refresh_token"].as_str().unwrap().to_string();
+    let alice_sub = body["identity"]["id"].as_str().unwrap().to_string();
+    // ensure_principal so `_alice` keeps the record (ensure is idempotent).
+    let (_alice, _) = auth_db.ensure_principal("dummy", &alice_sub).await.unwrap();
+
+    // Decode the refresh token to extract the session UUID (sid field).
+    let issuer = tiled_auth::Issuer::new(b"this-is-a-test-secret-32-bytes-long!!").unwrap();
+    let claims = issuer.verify_refresh(&alice_refresh).unwrap();
+    let session_uuid = claims.sid.clone();
+
+    // bob gets a principal directly (no login flow needed — just need a session).
+    let (bob_p, _) = auth_db.ensure_principal("dummy", "bob").await.unwrap();
+    let bob_session = auth_db
+        .create_session(
+            bob_p.id,
+            tiled_auth::ScopeSet::full(),
+            chrono::Utc::now() + chrono::Duration::hours(1),
+        )
+        .await
+        .unwrap();
+    let issuer = tiled_auth::Issuer::new(b"this-is-a-test-secret-32-bytes-long!!").unwrap();
+    let bob_access = issuer
+        .issue_access(&bob_p.uuid, &bob_session.uuid, tiled_auth::ScopeSet::full())
+        .unwrap();
+    let bob_bearer = format!("Bearer {bob_access}");
+
+    // bob tries to revoke alice's session → 404 (opaque).
+    let (status, _) = json_request(
+        &app,
+        Method::DELETE,
+        &format!("/api/v1/auth/session/revoke/{session_uuid}"),
+        &[("authorization", &bob_bearer)],
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "cross-principal session revoke must be 404 (opaque)"
+    );
+
+    // alice revokes her own session.
+    let (status, _) = json_request(
+        &app,
+        Method::DELETE,
+        &format!("/api/v1/auth/session/revoke/{session_uuid}"),
+        &[("authorization", &alice_bearer)],
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "own-session revoke must be 204"
+    );
+
+    // Refresh with alice's token on the now-revoked session → 401.
+    let (status, _) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/auth/refresh",
+        &[],
+        Some(json!({"refresh_token": alice_refresh})),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "refreshing revoked session must 401"
+    );
+}
+
+/// `GET /api/v1/auth/apikey` returns info about the API key used in the
+/// current request (Python current_apikey_info, authentication.py:1584).
+/// Using a Bearer token (non-API-key auth) must return 401.
+#[tokio::test]
+async fn current_apikey_info_returns_key_metadata() {
+    let (app, _dir, _cat, _auth_db) = build_test_app().await;
+
+    let (_, body) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/auth/dummy/login",
+        &[],
+        Some(json!({"username": "alice", "password": "wonderland"})),
+    )
+    .await;
+    let bearer = format!("Bearer {}", body["access_token"].as_str().unwrap());
+
+    // Create a read-only API key.
+    let (status, body) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/auth/apikeys",
+        &[("authorization", &bearer)],
+        Some(json!({"note": "info-test", "scopes": ["read:metadata"]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let secret = body["secret"].as_str().unwrap().to_string();
+    let first_eight = body["first_eight"].as_str().unwrap().to_string();
+    let apikey_header = format!("Apikey {secret}");
+
+    // GET /auth/apikey with the API key — must return key metadata.
+    let (status, info) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/auth/apikey",
+        &[("authorization", &apikey_header)],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{info}");
+    assert_eq!(info["first_eight"], first_eight);
+    assert_eq!(info["note"], "info-test");
+    let scopes = info["scopes"].as_array().unwrap();
+    assert_eq!(scopes.len(), 1);
+    assert_eq!(scopes[0], "read:metadata");
+
+    // GET /auth/apikey with a Bearer token (not an API key) → 401.
+    let (status, _) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/auth/apikey",
+        &[("authorization", &bearer)],
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "non-apikey auth must be rejected at GET /auth/apikey"
+    );
+}
+
+/// `GET /api/v1/auth/principal` (list) requires `read:principals` scope (admin
+/// role only). A user-role caller → 403. An admin caller receives a paginated
+/// list of all principals (Python authentication.py:1247-1286 parity).
+#[tokio::test]
+async fn list_principals_admin_only_and_paginated() {
+    let (app, _dir, _cat, auth_db) = build_test_app().await;
+
+    // alice logs in as user (no read:principals).
+    let (_, body) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/auth/dummy/login",
+        &[],
+        Some(json!({"username": "alice", "password": "wonderland"})),
+    )
+    .await;
+    let alice_sub = body["identity"]["id"].as_str().unwrap().to_string();
+    let user_bearer = format!("Bearer {}", body["access_token"].as_str().unwrap());
+    let (alice, _) = auth_db.ensure_principal("dummy", &alice_sub).await.unwrap();
+
+    // User role → 403.
+    let (status, _) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/auth/principal",
+        &[("authorization", &user_bearer)],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "user must be 403 on list");
+
+    // Promote alice to admin, re-login.
+    auth_db
+        .update_principal_role(alice.id, "admin")
+        .await
+        .unwrap();
+    let (_, body) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/auth/dummy/login",
+        &[],
+        Some(json!({"username": "alice", "password": "wonderland"})),
+    )
+    .await;
+    let admin_bearer = format!("Bearer {}", body["access_token"].as_str().unwrap());
+
+    // Admin list → 200, at least one principal (alice herself).
+    let (status, body) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/auth/principal",
+        &[("authorization", &admin_bearer)],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let principals = body.as_array().expect("list response must be an array");
+    assert!(
+        !principals.is_empty(),
+        "list must contain at least alice's principal"
+    );
+    let found_alice = principals.iter().any(|p| p["uuid"] == alice.uuid);
+    assert!(found_alice, "alice's principal must appear in the list");
+
+    // Each entry must NOT leak internal fields.
+    for p in principals {
+        assert!(
+            p.get("id").is_none(),
+            "internal id must not appear in list response"
+        );
+    }
+
+    // Pagination: offset=1 should return one fewer entry.
+    let (status, page2) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/auth/principal?page%5Boffset%5D=1",
+        &[("authorization", &admin_bearer)],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page2}");
+    let page2_arr = page2.as_array().unwrap();
+    assert_eq!(
+        page2_arr.len() + 1,
+        principals.len(),
+        "offset=1 must return one fewer entry than the full list"
+    );
+}
+
+/// Admin can create an API key for another principal
+/// (`POST /api/v1/auth/principal/{uuid}/apikey`) and then revoke it
+/// (`DELETE /api/v1/auth/principal/{uuid}/apikey?first_eight=...`).
+/// Attempting the same operations as a non-admin → 403.
+/// Attempting to revoke a key that doesn't belong to the target principal → 404.
+#[tokio::test]
+async fn admin_create_and_revoke_principal_apikey() {
+    let (app, _dir, _cat, auth_db) = build_test_app().await;
+
+    // alice promotes herself to admin.
+    let (_, body) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/auth/dummy/login",
+        &[],
+        Some(json!({"username": "alice", "password": "wonderland"})),
+    )
+    .await;
+    let alice_sub = body["identity"]["id"].as_str().unwrap().to_string();
+    let (alice, _) = auth_db.ensure_principal("dummy", &alice_sub).await.unwrap();
+    let user_bearer = format!("Bearer {}", body["access_token"].as_str().unwrap());
+
+    // Non-admin creates a service principal — must fail.
+    let (status, _) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/auth/principal?role=user",
+        &[("authorization", &user_bearer)],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    auth_db
+        .update_principal_role(alice.id, "admin")
+        .await
+        .unwrap();
+    let (_, body) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/auth/dummy/login",
+        &[],
+        Some(json!({"username": "alice", "password": "wonderland"})),
+    )
+    .await;
+    let admin_bearer = format!("Bearer {}", body["access_token"].as_str().unwrap());
+
+    // Create a service principal (bot).
+    let (status, bot) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/auth/principal?role=user",
+        &[("authorization", &admin_bearer)],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{bot}");
+    let bot_uuid = bot["uuid"].as_str().unwrap().to_string();
+
+    // Non-admin cannot create a key for bot.
+    let (status, _) = json_request(
+        &app,
+        Method::POST,
+        &format!("/api/v1/auth/principal/{bot_uuid}/apikey"),
+        &[("authorization", &user_bearer)],
+        Some(json!({"note": "bot-key", "scopes": ["read:metadata"]})),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "non-admin must not create keys for other principals"
+    );
+
+    // Admin creates a key for bot.
+    let (status, key) = json_request(
+        &app,
+        Method::POST,
+        &format!("/api/v1/auth/principal/{bot_uuid}/apikey"),
+        &[("authorization", &admin_bearer)],
+        Some(json!({"note": "bot-key", "scopes": ["read:metadata"]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{key}");
+    let bot_secret = key["secret"].as_str().unwrap().to_string();
+    let bot_first_eight = key["first_eight"].as_str().unwrap().to_string();
+
+    // The key actually works.
+    let bot_apikey = format!("Apikey {bot_secret}");
+    let (status, _) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/metadata/",
+        &[("authorization", &bot_apikey)],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "bot key must grant access");
+
+    // Admin revokes alice's OWN key from bot's endpoint → 404 (key doesn't
+    // belong to bot).
+    let alice_key = {
+        let (_, k) = json_request(
+            &app,
+            Method::POST,
+            "/api/v1/auth/apikeys",
+            &[("authorization", &admin_bearer)],
+            Some(json!({"note": "alice-key"})),
+        )
+        .await;
+        k["first_eight"].as_str().unwrap().to_string()
+    };
+    let (status, _) = json_request(
+        &app,
+        Method::DELETE,
+        &format!("/api/v1/auth/principal/{bot_uuid}/apikey?first_eight={alice_key}"),
+        &[("authorization", &admin_bearer)],
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "revoking alice's key on bot's endpoint must 404"
+    );
+
+    // Admin revokes bot's key correctly.
+    let (status, _) = json_request(
+        &app,
+        Method::DELETE,
+        &format!("/api/v1/auth/principal/{bot_uuid}/apikey?first_eight={bot_first_eight}"),
+        &[("authorization", &admin_bearer)],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "admin revoke must succeed");
+
+    // The key is now dead.
+    let (status, _) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/metadata/",
+        &[("authorization", &bot_apikey)],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "revoked key must be 401");
+}
+
 /// auth H2: `GET /api/v1/auth/principal/{uuid}` returns the principal with its
 /// linked identities (Python `schemas.Principal.identities` via
 /// `selectinload`, authentication.py:1325-1361). The identity `id` is the
