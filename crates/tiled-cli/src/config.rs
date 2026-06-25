@@ -148,7 +148,10 @@ pub struct AccessControlArgs {
 impl AccessControlConfig {
     /// Construct the configured policy. Returns a clear error for an unknown
     /// policy name or for `tag_based` missing its required `args`.
-    pub fn build(&self) -> anyhow::Result<Arc<dyn AccessPolicy>> {
+    ///
+    /// For `tag_based`: creates an in-memory SQLite `AuthDb`, seeds it with
+    /// the static grants from the YAML config, and wraps it in `TagBasedPolicy`.
+    pub async fn build(&self) -> anyhow::Result<Arc<dyn AccessPolicy>> {
         match self.access_policy.as_str() {
             "passthrough" | "none" => Ok(Arc::new(PassthroughPolicy)),
             "tag_based" => {
@@ -163,13 +166,26 @@ impl AccessControlConfig {
                     .default_scopes
                     .clone()
                     .unwrap_or_else(ScopeSet::read_only);
-                let mut policy = TagBasedPolicy::new(default_scopes);
+                let auth_db = tiled_auth::AuthDb::connect("sqlite::memory:")
+                    .await
+                    .context("tag_based policy: failed to open in-memory auth DB")?;
+                auth_db
+                    .migrate()
+                    .await
+                    .context("tag_based policy: migration failed")?;
                 for (uuid, tags) in grants {
-                    for tag in tags {
-                        policy.grant(uuid, tag);
-                    }
+                    let tag_strs: Vec<String> = tags.clone();
+                    auth_db
+                        .seed_principal_tags(uuid, &tag_strs)
+                        .await
+                        .with_context(|| {
+                            format!("tag_based policy: failed to seed tags for {uuid}")
+                        })?;
                 }
-                Ok(Arc::new(policy))
+                Ok(Arc::new(TagBasedPolicy::new(
+                    Arc::new(auth_db),
+                    default_scopes,
+                )))
             }
             other => Err(anyhow::anyhow!(
                 "access_control: unknown access_policy '{other}' \

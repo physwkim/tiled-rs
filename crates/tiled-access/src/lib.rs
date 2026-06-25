@@ -156,32 +156,25 @@ impl AccessPolicy for PassthroughPolicy {
     }
 }
 
-/// Built-in: tag-based policy.
+/// Built-in: tag-based policy backed by the auth database.
 ///
-/// Each principal owns a set of tags (typically supplied through the
-/// constructor or an out-of-band sync). A node is visible iff its
-/// `access_blob.tags` array intersects the principal's tag set, OR the
-/// node has no tags (treated as public).
+/// A principal's access_tags are stored in the `principals.access_tags` DB
+/// column (a JSON array of tag strings). A node is visible iff its
+/// `access_blob.tags` intersects the principal's DB-stored tag set, OR the
+/// node has no tags (treated as public). "public" is universally readable.
 pub struct TagBasedPolicy {
-    /// Map from principal UUID → granted tags.
-    pub principal_tags: std::collections::HashMap<String, Vec<String>>,
+    /// Auth DB used to load per-principal tag grants at request time.
+    pub auth_db: std::sync::Arc<tiled_auth::AuthDb>,
     /// Default scopes when a tagged node matches.
     pub default_scopes: ScopeSet,
 }
 
 impl TagBasedPolicy {
-    pub fn new(default_scopes: ScopeSet) -> Self {
+    pub fn new(auth_db: std::sync::Arc<tiled_auth::AuthDb>, default_scopes: ScopeSet) -> Self {
         Self {
-            principal_tags: std::collections::HashMap::new(),
+            auth_db,
             default_scopes,
         }
-    }
-
-    pub fn grant(&mut self, principal_uuid: &str, tag: &str) {
-        self.principal_tags
-            .entry(principal_uuid.to_string())
-            .or_default()
-            .push(tag.to_string());
     }
 
     fn node_tags(ctx: &NodeContext<'_>) -> Vec<String> {
@@ -258,9 +251,9 @@ impl AccessPolicy for TagBasedPolicy {
         }
         let node_tags = Self::node_tags(&ctx);
         let granted = self
-            .principal_tags
-            .get(&principal.uuid)
-            .cloned()
+            .auth_db
+            .get_principal_tags(&principal.uuid)
+            .await
             .unwrap_or_default();
         // Untagged nodes and granted-tag matches confer the policy's default
         // scopes; the literal "public" tag confers read scopes to everyone
@@ -311,9 +304,9 @@ impl AccessPolicy for TagBasedPolicy {
                 // full granted-tag set once the subset gate above confirmed
                 // every requested scope is grantable.
                 let granted = self
-                    .principal_tags
-                    .get(&p.uuid)
-                    .cloned()
+                    .auth_db
+                    .get_principal_tags(&p.uuid)
+                    .await
                     .unwrap_or_default();
                 (Some(p.uuid.clone()), granted)
             }
@@ -341,14 +334,20 @@ impl AccessPolicy for TagBasedPolicy {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
 
-    fn principal(uuid: &str) -> Principal {
+    fn principal_from(p: &tiled_auth::Principal) -> Principal {
+        p.clone()
+    }
+
+    fn admin_like(uuid: &str) -> Principal {
         serde_json::from_value(serde_json::json!({
-            "id": 1,
+            "id": 999,
             "uuid": uuid,
             "type": "user",
-            "role": "user",
+            "role": "admin",
             "time_created": "2020-01-01T00:00:00Z",
         }))
         .unwrap()
@@ -358,30 +357,56 @@ mod tests {
         ScopeSet::from_iter([Scope::ReadMetadata])
     }
 
+    async fn setup_auth_db() -> tiled_auth::AuthDb {
+        let db = tiled_auth::AuthDb::connect("sqlite::memory:")
+            .await
+            .expect("in-memory sqlite");
+        db.migrate().await.expect("migrations");
+        db
+    }
+
+    async fn principal_with_tags(db: &tiled_auth::AuthDb, tags: &[&str]) -> tiled_auth::Principal {
+        let p = db.create_principal("user").await.expect("create principal");
+        let tag_strs: Vec<String> = tags.iter().map(|s| s.to_string()).collect();
+        db.set_principal_tags(p.id, &tag_strs)
+            .await
+            .expect("set tags");
+        p
+    }
+
+    fn ctx<'a>(access_blob: &'a serde_json::Value, meta: &'a serde_json::Value) -> NodeContext<'a> {
+        NodeContext {
+            path: &[],
+            structure_family: "container",
+            metadata: meta,
+            access_blob,
+        }
+    }
+
     #[tokio::test]
     async fn list_filter_anonymous_lists_untagged_and_public_tag() {
-        let policy = TagBasedPolicy::new(ScopeSet::full());
+        let db = setup_auth_db().await;
+        let policy = TagBasedPolicy::new(Arc::new(db), ScopeSet::full());
         let f = policy
             .list_filter(None, &ScopeSet::default(), &read_metadata())
             .await
             .unwrap();
         assert_eq!(f.user_id, None);
-        // Read listing surfaces both untagged rows and the literal "public" tag.
         assert_eq!(f.tags, vec!["public".to_string()]);
         assert!(f.include_untagged);
     }
 
     #[tokio::test]
     async fn list_filter_principal_includes_granted_owned_and_public() {
-        let mut policy = TagBasedPolicy::new(ScopeSet::full());
-        policy.grant("alice", "team-a");
-        let alice = principal("alice");
+        let db = setup_auth_db().await;
+        let alice = principal_with_tags(&db, &["team-a"]).await;
+        let policy = TagBasedPolicy::new(Arc::new(db), ScopeSet::full());
         let session = ScopeSet::for_role("user");
         let f = policy
-            .list_filter(Some(&alice), &session, &read_metadata())
+            .list_filter(Some(&principal_from(&alice)), &session, &read_metadata())
             .await
             .unwrap();
-        assert_eq!(f.user_id.as_deref(), Some("alice"));
+        assert_eq!(f.user_id.as_deref(), Some(alice.uuid.as_str()));
         assert!(f.tags.contains(&"team-a".to_string()));
         assert!(f.tags.contains(&"public".to_string()));
         assert!(f.include_untagged);
@@ -389,9 +414,9 @@ mod tests {
 
     #[tokio::test]
     async fn list_filter_admin_gets_all_access() {
-        let policy = TagBasedPolicy::new(ScopeSet::full());
-        let admin = principal("admin-uuid");
-        // An admin session (role "admin" → full scopes) carries admin:apikeys.
+        let db = setup_auth_db().await;
+        let policy = TagBasedPolicy::new(Arc::new(db), ScopeSet::full());
+        let admin = admin_like("admin-uuid");
         let session = ScopeSet::full();
         let f = policy
             .list_filter(Some(&admin), &session, &read_metadata())
@@ -401,16 +426,15 @@ mod tests {
 
     #[tokio::test]
     async fn list_filter_denies_when_requested_scope_exceeds_policy() {
-        // Policy can grant only read scopes; a write listing is NO_ACCESS.
-        let policy = TagBasedPolicy::new(ScopeSet::read_only());
-        let alice = principal("alice");
+        let db = setup_auth_db().await;
+        let alice = principal_with_tags(&db, &["team-a"]).await;
+        let policy = TagBasedPolicy::new(Arc::new(db), ScopeSet::read_only());
         let session = ScopeSet::for_role("user");
         let write = ScopeSet::from_iter([Scope::WriteData]);
         let f = policy
-            .list_filter(Some(&alice), &session, &write)
+            .list_filter(Some(&principal_from(&alice)), &session, &write)
             .await
             .unwrap();
-        // Deny-all: no user arm, no tags, no untagged-public arm.
         assert_eq!(f.user_id, None);
         assert!(f.tags.is_empty());
         assert!(!f.include_untagged);
@@ -418,18 +442,16 @@ mod tests {
 
     #[tokio::test]
     async fn list_filter_write_scope_excludes_untagged_public() {
-        let mut policy = TagBasedPolicy::new(ScopeSet::full());
-        policy.grant("alice", "team-a");
-        let alice = principal("alice");
+        let db = setup_auth_db().await;
+        let alice = principal_with_tags(&db, &["team-a"]).await;
+        let policy = TagBasedPolicy::new(Arc::new(db), ScopeSet::full());
         let session = ScopeSet::for_role("user");
         let write = ScopeSet::from_iter([Scope::WriteData]);
         let f = policy
-            .list_filter(Some(&alice), &session, &write)
+            .list_filter(Some(&principal_from(&alice)), &session, &write)
             .await
             .unwrap();
-        // Owned + granted rows still match, but untagged-public and the
-        // "public" tag must NOT be exposed on a non-read listing.
-        assert_eq!(f.user_id.as_deref(), Some("alice"));
+        assert_eq!(f.user_id.as_deref(), Some(alice.uuid.as_str()));
         assert_eq!(f.tags, vec!["team-a".to_string()]);
         assert!(!f.include_untagged);
     }
@@ -439,9 +461,10 @@ mod tests {
     #[tokio::test]
     async fn init_node_default_passes_blob_through() {
         let policy = PassthroughPolicy;
-        let p = principal("alice");
+        let db = setup_auth_db().await;
+        let p = db.create_principal("user").await.unwrap();
         let session = ScopeSet::for_role("user");
-        let proposed = serde_json::json!({"user": "alice"});
+        let proposed = serde_json::json!({"user": p.uuid});
         let (modified, result) = policy
             .init_node(&p, None, &session, Some(&proposed))
             .await
@@ -456,7 +479,8 @@ mod tests {
     #[tokio::test]
     async fn init_node_default_empty_blob_produces_empty_object() {
         let policy = PassthroughPolicy;
-        let p = principal("alice");
+        let db = setup_auth_db().await;
+        let p = db.create_principal("user").await.unwrap();
         let session = ScopeSet::for_role("user");
         let (modified, result) = policy.init_node(&p, None, &session, None).await.unwrap();
         assert!(!modified);
@@ -466,15 +490,15 @@ mod tests {
     #[tokio::test]
     async fn modify_node_default_keeps_current_blob() {
         let policy = PassthroughPolicy;
-        let p = principal("alice");
+        let db = setup_auth_db().await;
+        let p = db.create_principal("user").await.unwrap();
         let session = ScopeSet::for_role("user");
-        let current = serde_json::json!({"user": "alice"});
+        let current = serde_json::json!({"user": p.uuid});
         let proposed = serde_json::json!({"tags": ["secret"]});
         let (modified, result) = policy
             .modify_node(&current, &p, None, &session, Some(&proposed))
             .await
             .unwrap();
-        // Default impl must keep the current blob — it ignores the proposed change.
         assert!(
             !modified,
             "default modify_node must not signal modification"
@@ -485,18 +509,10 @@ mod tests {
         );
     }
 
-    fn ctx<'a>(access_blob: &'a serde_json::Value, meta: &'a serde_json::Value) -> NodeContext<'a> {
-        NodeContext {
-            path: &[],
-            structure_family: "container",
-            metadata: meta,
-            access_blob,
-        }
-    }
-
     #[tokio::test]
     async fn anonymous_decision_reads_public_tagged_node() {
-        let policy = TagBasedPolicy::new(ScopeSet::full());
+        let db = setup_auth_db().await;
+        let policy = TagBasedPolicy::new(Arc::new(db), ScopeSet::full());
         let blob = serde_json::json!({"tags": ["public"]});
         let meta = serde_json::json!({});
         let d = policy.anonymous_decision(ctx(&blob, &meta)).await;
@@ -506,7 +522,8 @@ mod tests {
 
     #[tokio::test]
     async fn anonymous_decision_hides_non_public_tagged_node() {
-        let policy = TagBasedPolicy::new(ScopeSet::full());
+        let db = setup_auth_db().await;
+        let policy = TagBasedPolicy::new(Arc::new(db), ScopeSet::full());
         let blob = serde_json::json!({"tags": ["secret"]});
         let meta = serde_json::json!({});
         let d = policy.anonymous_decision(ctx(&blob, &meta)).await;
@@ -515,48 +532,106 @@ mod tests {
 
     #[tokio::test]
     async fn principal_decision_admin_bypasses_tags_and_ownership() {
-        let policy = TagBasedPolicy::new(ScopeSet::read_only());
-        let admin = principal("admin-uuid");
-        let session = ScopeSet::full(); // admin session carries admin:apikeys
-        // A node owned by someone else and tagged with an ungranted tag.
+        let db = setup_auth_db().await;
+        let policy = TagBasedPolicy::new(Arc::new(db), ScopeSet::read_only());
+        let admin = admin_like("admin-uuid");
+        let session = ScopeSet::full();
         let blob = serde_json::json!({"user": "other-uuid", "tags": ["secret"]});
         let meta = serde_json::json!({});
         let d = policy
             .principal_decision(&admin, &session, ctx(&blob, &meta))
             .await;
-        // Admin keeps the full session scopes, unrestricted.
         assert_eq!(d.scopes, session);
     }
 
     #[tokio::test]
     async fn principal_decision_reads_public_tagged_node_without_grant() {
-        // A non-admin principal with no matching tag grant still reads a
-        // "public"-tagged node (read scopes only).
-        let policy = TagBasedPolicy::new(ScopeSet::full());
-        let bob = principal("bob");
+        let db = setup_auth_db().await;
+        let bob = principal_with_tags(&db, &[]).await;
+        let policy = TagBasedPolicy::new(Arc::new(db), ScopeSet::full());
         let session = ScopeSet::for_role("user");
         let blob = serde_json::json!({"tags": ["public"]});
         let meta = serde_json::json!({});
         let d = policy
-            .principal_decision(&bob, &session, ctx(&blob, &meta))
+            .principal_decision(&principal_from(&bob), &session, ctx(&blob, &meta))
             .await;
         assert!(d.scopes.contains(Scope::ReadMetadata));
         assert!(d.scopes.contains(Scope::ReadData));
-        // Public-tag grant is read-only: no write scope even though the
-        // session and default scopes include write.
         assert!(!d.scopes.contains(Scope::WriteData));
     }
 
     #[tokio::test]
     async fn principal_decision_hides_ungranted_non_public_tag() {
-        let policy = TagBasedPolicy::new(ScopeSet::full());
-        let bob = principal("bob");
+        let db = setup_auth_db().await;
+        let bob = principal_with_tags(&db, &[]).await;
+        let policy = TagBasedPolicy::new(Arc::new(db), ScopeSet::full());
         let session = ScopeSet::for_role("user");
         let blob = serde_json::json!({"tags": ["secret"]});
         let meta = serde_json::json!({});
         let d = policy
-            .principal_decision(&bob, &session, ctx(&blob, &meta))
+            .principal_decision(&principal_from(&bob), &session, ctx(&blob, &meta))
             .await;
         assert!(!d.scopes.contains(Scope::ReadMetadata));
+    }
+
+    /// Store-backed tag intersection: a principal sees only nodes whose
+    /// `access_blob.tags` intersect the DB-stored principal tags.
+    #[tokio::test]
+    async fn store_backed_tag_intersection_filters_nodes() {
+        let db = setup_auth_db().await;
+        // alice has "team-a" in the DB; bob has "team-b".
+        let alice = principal_with_tags(&db, &["team-a"]).await;
+        let bob = principal_with_tags(&db, &["team-b"]).await;
+        let db_arc = Arc::new(db);
+        let policy = TagBasedPolicy::new(db_arc.clone(), ScopeSet::full());
+        let session = ScopeSet::for_role("user");
+
+        let blob_team_a = serde_json::json!({"tags": ["team-a"]});
+        let meta = serde_json::json!({});
+
+        // Alice can see team-a nodes.
+        let d_alice = policy
+            .principal_decision(&principal_from(&alice), &session, ctx(&blob_team_a, &meta))
+            .await;
+        assert!(
+            d_alice.scopes.contains(Scope::ReadMetadata),
+            "alice must see team-a nodes"
+        );
+
+        // Bob cannot see team-a nodes.
+        let d_bob = policy
+            .principal_decision(&principal_from(&bob), &session, ctx(&blob_team_a, &meta))
+            .await;
+        assert!(
+            !d_bob.scopes.contains(Scope::ReadMetadata),
+            "bob must not see team-a nodes (only has team-b)"
+        );
+
+        // list_filter for alice must include "team-a"; for bob it must not.
+        let fa = policy
+            .list_filter(Some(&principal_from(&alice)), &session, &read_metadata())
+            .await
+            .unwrap();
+        assert!(
+            fa.tags.contains(&"team-a".to_string()),
+            "alice filter has team-a"
+        );
+        assert!(
+            !fa.tags.contains(&"team-b".to_string()),
+            "alice filter has no team-b"
+        );
+
+        let fb = policy
+            .list_filter(Some(&principal_from(&bob)), &session, &read_metadata())
+            .await
+            .unwrap();
+        assert!(
+            fb.tags.contains(&"team-b".to_string()),
+            "bob filter has team-b"
+        );
+        assert!(
+            !fb.tags.contains(&"team-a".to_string()),
+            "bob filter has no team-a"
+        );
     }
 }

@@ -114,9 +114,12 @@ async fn search_respects_tag_based_access_policy() {
         .await
         .unwrap();
 
-    // Build policy: alice has "team-a" access.
-    let mut policy = TagBasedPolicy::new(ScopeSet::full());
-    policy.grant(&alice.uuid, "team-a");
+    // Build policy: alice has "team-a" access (set via the DB).
+    auth_db
+        .set_principal_tags(alice.id, &["team-a".to_string()])
+        .await
+        .unwrap();
+    let policy = TagBasedPolicy::new(Arc::new(auth_db.clone()), ScopeSet::full());
     let access_policy: Arc<dyn tiled_access::AccessPolicy> = Arc::new(policy);
 
     let resolver: Arc<dyn tiled_catalog::adapter::LeafResolver> =
@@ -237,7 +240,7 @@ async fn admin_search_sees_all_nodes() {
         .unwrap();
 
     // No tag grants — admin must see everything regardless.
-    let policy = TagBasedPolicy::new(ScopeSet::full());
+    let policy = TagBasedPolicy::new(Arc::new(auth_db.clone()), ScopeSet::full());
     let access_policy: Arc<dyn tiled_access::AccessPolicy> = Arc::new(policy);
 
     let resolver: Arc<dyn tiled_catalog::adapter::LeafResolver> =
@@ -362,7 +365,7 @@ async fn array_append_denied_by_tag_policy_returns_404() {
 
     // TagBasedPolicy with NO grants → principal_decision for alice returns empty
     // scopes for any node tagged "restricted".
-    let policy = TagBasedPolicy::new(ScopeSet::full());
+    let policy = TagBasedPolicy::new(Arc::new(auth_db.clone()), ScopeSet::full());
     let access_policy: Arc<dyn tiled_access::AccessPolicy> = Arc::new(policy);
 
     let resolver: Arc<dyn tiled_catalog::adapter::LeafResolver> =
@@ -452,7 +455,9 @@ async fn anonymous_search_shows_only_public_nodes() {
         .await
         .unwrap();
 
-    let policy = TagBasedPolicy::new(ScopeSet::full());
+    let anon_auth_db = AuthDb::connect("sqlite::memory:").await.unwrap();
+    anon_auth_db.migrate().await.unwrap();
+    let policy = TagBasedPolicy::new(Arc::new(anon_auth_db), ScopeSet::full());
     let access_policy: Arc<dyn tiled_access::AccessPolicy> = Arc::new(policy);
 
     let resolver: Arc<dyn tiled_catalog::adapter::LeafResolver> =
@@ -549,7 +554,9 @@ async fn public_tagged_node_is_listable_and_readable_by_anonymous() {
         .await
         .unwrap();
 
-    let policy = TagBasedPolicy::new(ScopeSet::full());
+    let anon_auth_db = AuthDb::connect("sqlite::memory:").await.unwrap();
+    anon_auth_db.migrate().await.unwrap();
+    let policy = TagBasedPolicy::new(Arc::new(anon_auth_db), ScopeSet::full());
     let access_policy: Arc<dyn tiled_access::AccessPolicy> = Arc::new(policy);
 
     let resolver: Arc<dyn tiled_catalog::adapter::LeafResolver> =
@@ -656,7 +663,9 @@ async fn anonymous_search_excludes_user_owned_nodes() {
         .await
         .unwrap();
 
-    let policy = TagBasedPolicy::new(ScopeSet::full());
+    let anon_auth_db = AuthDb::connect("sqlite::memory:").await.unwrap();
+    anon_auth_db.migrate().await.unwrap();
+    let policy = TagBasedPolicy::new(Arc::new(anon_auth_db), ScopeSet::full());
     let access_policy: Arc<dyn tiled_access::AccessPolicy> = Arc::new(policy);
 
     let resolver: Arc<dyn tiled_catalog::adapter::LeafResolver> =
@@ -759,7 +768,7 @@ async fn cross_user_search_excludes_other_users_owned_nodes() {
         .await
         .unwrap();
 
-    let policy = TagBasedPolicy::new(ScopeSet::full());
+    let policy = TagBasedPolicy::new(Arc::new(auth_db.clone()), ScopeSet::full());
     let access_policy: Arc<dyn tiled_access::AccessPolicy> = Arc::new(policy);
 
     let resolver: Arc<dyn tiled_catalog::adapter::LeafResolver> =
@@ -872,7 +881,7 @@ async fn metadata_read_excludes_other_users_owned_node() {
         .await
         .unwrap();
 
-    let policy = TagBasedPolicy::new(ScopeSet::full());
+    let policy = TagBasedPolicy::new(Arc::new(auth_db.clone()), ScopeSet::full());
     let access_policy: Arc<dyn tiled_access::AccessPolicy> = Arc::new(policy);
 
     let resolver: Arc<dyn tiled_catalog::adapter::LeafResolver> =

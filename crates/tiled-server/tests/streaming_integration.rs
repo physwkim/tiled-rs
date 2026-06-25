@@ -205,8 +205,14 @@ async fn spawn_server_with_tag_policy() -> (String, Catalog, StreamingBus, tempf
     let catalog = Catalog::connect(&uri).await.unwrap();
     catalog.migrate().await.unwrap();
 
-    let access_policy: Arc<dyn tiled_access::AccessPolicy> =
-        Arc::new(TagBasedPolicy::new(ScopeSet::full()));
+    let streaming_auth_db = tiled_auth::AuthDb::connect("sqlite::memory:")
+        .await
+        .unwrap();
+    streaming_auth_db.migrate().await.unwrap();
+    let access_policy: Arc<dyn tiled_access::AccessPolicy> = Arc::new(TagBasedPolicy::new(
+        Arc::new(streaming_auth_db),
+        ScopeSet::full(),
+    ));
 
     let resolver: Arc<dyn tiled_catalog::adapter::LeafResolver> = Arc::new(UnresolvedLeaf);
     let root_tree: Arc<dyn ContainerAdapter> = Arc::new(tiled_catalog::CatalogAdapter::root(

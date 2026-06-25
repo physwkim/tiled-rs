@@ -13,6 +13,7 @@
 //!   user list) + `ProxiedHeaderAuthenticator` (trusted proxy header).
 //! - [`device_code`] — OAuth2 device-code grant state machine.
 
+pub mod access_tags;
 pub mod api_key;
 pub mod authenticator;
 pub mod db;

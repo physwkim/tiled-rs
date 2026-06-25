@@ -18,6 +18,10 @@ const SQLITE_MIGRATIONS: &[(&str, &str)] = &[
         "0003_add_session_refresh_count",
         include_str!("../migrations/sqlite/0003_add_session_refresh_count.sql"),
     ),
+    (
+        "0004_add_access_tags",
+        include_str!("../migrations/sqlite/0004_add_access_tags.sql"),
+    ),
 ];
 
 const POSTGRES_MIGRATIONS: &[(&str, &str)] = &[
@@ -32,6 +36,10 @@ const POSTGRES_MIGRATIONS: &[(&str, &str)] = &[
     (
         "0003_add_session_refresh_count",
         include_str!("../migrations/postgres/0003_add_session_refresh_count.sql"),
+    ),
+    (
+        "0004_add_access_tags",
+        include_str!("../migrations/postgres/0004_add_access_tags.sql"),
     ),
 ];
 
