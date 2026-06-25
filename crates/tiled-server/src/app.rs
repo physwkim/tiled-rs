@@ -178,6 +178,18 @@ pub fn build_app(state: AppState) -> Router {
         // Python serves no GET `/ragged/block` (the advertised `block` link
         // targets the PUT-only write route).
         .route("/api/v1/ragged/full/{*path}", get(router::ragged_full))
+        // Awkward array read+write paths (Python router.py:1704/2272).
+        // GET/PUT /awkward/full — full array read or write.
+        // GET+POST /awkward/buffers — filtered buffer fetch (GET uses ?form_key=
+        // query params; POST uses a JSON-array body for large key sets).
+        .route(
+            "/api/v1/awkward/full/{*path}",
+            get(router::awkward_full).put(router::put_awkward_full),
+        )
+        .route(
+            "/api/v1/awkward/buffers/{*path}",
+            get(router::awkward_buffers).post(router::post_awkward_buffers),
+        )
         .route("/api/v1/register/", post(router::register_root))
         .route("/api/v1/register/{*path}", post(router::register))
         .route("/api/v1/metadata/{*path}", patch(router::patch_metadata))
