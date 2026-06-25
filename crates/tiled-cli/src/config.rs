@@ -711,6 +711,31 @@ mod tests {
         );
     }
 
+    // authentication.secret_keys parses into AuthConfig.secret_keys and does
+    // NOT appear in the unknown catch-all (it is modelled and wired to Issuer).
+    #[test]
+    fn auth_secret_keys_parse_and_are_not_unknown() {
+        let cfg: TiledConfig = serde_yaml::from_str(
+            "trees: []\nauthentication:\n  secret_keys:\n    - aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n    - bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n",
+        )
+        .unwrap();
+        let auth = cfg
+            .authentication
+            .as_ref()
+            .expect("authentication block present");
+        let keys = auth.secret_keys.as_ref().expect("secret_keys present");
+        assert_eq!(keys.len(), 2);
+        assert_eq!(
+            keys[0],
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        // Must not land in the catch-all.
+        assert!(
+            !auth.unknown.contains_key("secret_keys"),
+            "secret_keys is modelled — must not appear in catch-all"
+        );
+    }
+
     // Structural: unknown top-level config keys must land in the catch-all
     // `unknown` map instead of being silently dropped (config-parity guard).
     #[test]

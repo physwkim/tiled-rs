@@ -665,6 +665,10 @@ pub async fn run(command: Command) -> Result<()> {
                 build_auth_state(
                     auth_db_uri.as_deref(),
                     jwt_secret.as_deref(),
+                    file_config
+                        .as_ref()
+                        .and_then(|c| c.authentication.as_ref())
+                        .and_then(|a| a.secret_keys.as_deref()),
                     &users,
                     &auth_provider_name,
                     proxied_auth_header,
@@ -1019,9 +1023,16 @@ pub async fn run(command: Command) -> Result<()> {
 
 /// Wire up the multi-user auth pieces from the supplied flags. Returns
 /// the AppState fields the caller needs.
+///
+/// Secret precedence (highest to lowest):
+/// 1. `TILED_SECRET_KEYS` env (JSON array) — key-rotation list.
+/// 2. `config_secret_keys` — `authentication.secret_keys` from the YAML
+///    config file, same rotation semantics.
+/// 3. `jwt_secret` — the `--jwt-secret` / `TILED_JWT_SECRET` single key.
 async fn build_auth_state(
     auth_db_uri: Option<&str>,
     jwt_secret: Option<&str>,
+    config_secret_keys: Option<&[String]>,
     users: &[String],
     provider_name: &str,
     proxied_auth_header: bool,
@@ -1041,8 +1052,8 @@ async fn build_auth_state(
     })?;
     // JWT signing secret(s). Python tiled supports key rotation via a list of
     // secrets (`secret_keys` / `TILED_SECRET_KEYS`, a JSON list of strings): the
-    // first signs new tokens, all are tried when verifying. Honor that env when
-    // present; otherwise fall back to the single `--jwt-secret` / TILED_JWT_SECRET.
+    // first signs new tokens, all are tried when verifying.
+    // Precedence: env TILED_SECRET_KEYS > config authentication.secret_keys > --jwt-secret.
     let issuer = match std::env::var("TILED_SECRET_KEYS") {
         Ok(json) => {
             let keys: Vec<String> = serde_json::from_str(&json).map_err(|e| {
@@ -1052,15 +1063,24 @@ async fn build_auth_state(
             tiled_auth::Issuer::with_secrets(&refs)
                 .map_err(|e| anyhow::anyhow!("jwt secret: {e}"))?
         }
-        Err(_) => {
-            let secret_str = jwt_secret.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "--auth-db-uri requires --jwt-secret (or TILED_SECRET_KEYS for key rotation)"
-                )
-            })?;
-            tiled_auth::Issuer::new(secret_str.as_bytes())
-                .map_err(|e| anyhow::anyhow!("jwt secret: {e}"))?
-        }
+        Err(_) => match config_secret_keys.filter(|ks| !ks.is_empty()) {
+            Some(keys) => {
+                let refs: Vec<&[u8]> = keys.iter().map(|s| s.as_bytes()).collect();
+                tiled_auth::Issuer::with_secrets(&refs)
+                    .map_err(|e| anyhow::anyhow!("authentication.secret_keys: {e}"))?
+            }
+            None => {
+                let secret_str = jwt_secret.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "--auth-db-uri requires --jwt-secret, \
+                         'authentication.secret_keys' in config, \
+                         or TILED_SECRET_KEYS for key rotation"
+                    )
+                })?;
+                tiled_auth::Issuer::new(secret_str.as_bytes())
+                    .map_err(|e| anyhow::anyhow!("jwt secret: {e}"))?
+            }
+        },
     };
     let db = tiled_auth::AuthDb::connect(auth_uri)
         .await
