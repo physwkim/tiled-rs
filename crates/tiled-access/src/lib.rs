@@ -439,6 +439,37 @@ impl AccessPolicy for TagBasedPolicy {
             tags_from_policy.push(PUBLIC_TAG.to_string());
         }
 
+        // Unremovable scopes: non-admin must retain read:metadata + write:metadata
+        // on the new node after tag assignment. Mirrors access_policies.py:168-177.
+        if !is_admin {
+            let mut effective = ScopeSet::default();
+            for tag in &tags_from_policy {
+                if tag == PUBLIC_TAG {
+                    for s in ScopeSet::read_only().iter() {
+                        effective.insert(s);
+                    }
+                } else {
+                    let scope_strs = self.auth_db.get_tag_scopes(tag).await.unwrap_or_default();
+                    let tag_scopes = if scope_strs.is_empty() {
+                        self.default_scopes.clone()
+                    } else {
+                        ScopeSet::from_iter(scope_strs.iter().filter_map(|s| Scope::parse(s)))
+                    };
+                    for s in tag_scopes.iter() {
+                        effective.insert(s);
+                    }
+                }
+            }
+            if !effective.contains(Scope::ReadMetadata) || !effective.contains(Scope::WriteMetadata)
+            {
+                return Err(
+                    "Cannot init node: tag configuration would remove a required scope \
+                     (read:metadata and write:metadata must remain accessible)"
+                        .to_string(),
+                );
+            }
+        }
+
         let input_set: std::collections::HashSet<&str> =
             access_tags.iter().map(String::as_str).collect();
         let output_set: std::collections::HashSet<&str> =
@@ -623,6 +654,35 @@ impl AccessPolicy for TagBasedPolicy {
                         principal.uuid
                     ));
                 }
+            }
+        }
+
+        // Unremovable scopes: non-admin must retain read:metadata + write:metadata
+        // after the tag change. Mirrors access_policies.py:296-310.
+        if !is_admin {
+            let mut effective = ScopeSet::default();
+            for tag in &tags_from_policy {
+                if tag == PUBLIC_TAG {
+                    for s in ScopeSet::read_only().iter() {
+                        effective.insert(s);
+                    }
+                } else {
+                    let scope_strs = self.auth_db.get_tag_scopes(tag).await.unwrap_or_default();
+                    let tag_scopes = if scope_strs.is_empty() {
+                        self.default_scopes.clone()
+                    } else {
+                        ScopeSet::from_iter(scope_strs.iter().filter_map(|s| Scope::parse(s)))
+                    };
+                    for s in tag_scopes.iter() {
+                        effective.insert(s);
+                    }
+                }
+            }
+            if !effective.contains(Scope::ReadMetadata) || !effective.contains(Scope::WriteMetadata)
+            {
+                return Err("Cannot change node tags: would remove a required scope \
+                     (read:metadata and write:metadata must remain accessible)"
+                    .to_string());
             }
         }
 
@@ -1581,5 +1641,86 @@ mod tests {
             f.tags.contains(&"team-a".to_string()),
             "team-a with empty tag_scopes must appear in write:metadata filter via default_scopes fallback"
         );
+    }
+
+    // ---- unremovable_scopes (commit d) ----
+
+    /// Non-admin retagging a node to a read-only-only tag configuration must be
+    /// rejected: write:metadata would be lost (self-lockout guard).
+    /// Mirrors access_policies.py unremovable_scopes check.
+    #[tokio::test]
+    async fn unremovable_scopes_blocks_self_lockout_modify() {
+        let db = setup_auth_db().await;
+        // team-a: read-only. team-b: full scopes (via default fallback).
+        db.seed_tag("team-a", &["read:metadata".to_string()])
+            .await
+            .unwrap();
+        db.define_tag("team-b").await.unwrap(); // no tag_scopes → fallback to default=full
+        let alice = principal_with_tags(&db, &["team-a", "team-b"]).await;
+        // Policy default_scopes=full so team-b fallback includes write:metadata.
+        let policy = TagBasedPolicy::new(Arc::new(db), ScopeSet::full());
+        let session = ScopeSet::for_role("user");
+
+        // Node currently tagged with both. Alice proposes to drop team-b,
+        // leaving only team-a (read:metadata). This removes write:metadata → lockout.
+        let current = serde_json::json!({"tags": ["team-a", "team-b"]});
+        let proposed = serde_json::json!({"tags": ["team-a"]});
+        let result = policy
+            .modify_node(
+                &current,
+                &principal_from(&alice),
+                None,
+                &session,
+                Some(&proposed),
+            )
+            .await;
+        assert!(result.is_err(), "lockout retag must be rejected");
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("required scope"),
+            "error must name unremovable scope violation, got: {msg}"
+        );
+    }
+
+    /// Non-admin creating a node with only a read-only tag is also rejected
+    /// by unremovable_scopes (init_node path).
+    #[tokio::test]
+    async fn unremovable_scopes_blocks_read_only_init() {
+        let db = setup_auth_db().await;
+        db.seed_tag("team-a", &["read:metadata".to_string()])
+            .await
+            .unwrap();
+        let alice = principal_with_tags(&db, &["team-a"]).await;
+        let policy = TagBasedPolicy::new(Arc::new(db), ScopeSet::full());
+        let session = ScopeSet::for_role("user");
+        let blob = serde_json::json!({"tags": ["team-a"]});
+        let result = policy
+            .init_node(&principal_from(&alice), None, &session, Some(&blob))
+            .await;
+        assert!(result.is_err(), "read-only-tag init must be rejected");
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("required scope"),
+            "error must name unremovable scope violation, got: {msg}"
+        );
+    }
+
+    /// Admin is exempt from the unremovable_scopes check — they can assign
+    /// any tag combination, including read-only-only.
+    #[tokio::test]
+    async fn unremovable_scopes_admin_exempt() {
+        let db = setup_auth_db().await;
+        db.seed_tag("team-a", &["read:metadata".to_string()])
+            .await
+            .unwrap();
+        let admin = admin_like("admin-uuid");
+        let policy = TagBasedPolicy::new(Arc::new(db), ScopeSet::full());
+        let session = ScopeSet::full();
+        let blob = serde_json::json!({"tags": ["team-a"]});
+        let (_, result) = policy
+            .init_node(&admin, None, &session, Some(&blob))
+            .await
+            .expect("admin must bypass unremovable_scopes check");
+        assert_eq!(result, serde_json::json!({"tags": ["team-a"]}));
     }
 }
