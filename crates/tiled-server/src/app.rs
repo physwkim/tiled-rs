@@ -88,8 +88,20 @@ pub fn build_app(state: AppState) -> Router {
     // #1377). The handler resolves the credential itself via
     // `resolve_header_auth` / `external_oidc`, so it does not need the
     // auth middleware to gate it.
+    //
+    // OIDC code-flow endpoints (tiled#1178) are also public: the browser
+    // must reach /authorize before any session exists, and /callback is
+    // the IdP redirect target (no prior credential).
     let public_auth = Router::new()
         .route("/api/v1/auth/{provider}/login", post(auth_router::login))
+        .route(
+            "/api/v1/auth/provider/{provider}/authorize",
+            get(auth_router::oidc_authorize),
+        )
+        .route(
+            "/api/v1/auth/provider/{provider}/callback",
+            get(auth_router::oidc_callback),
+        )
         .route("/api/v1/auth/refresh", post(auth_router::refresh))
         .route(
             "/api/v1/auth/device/initiate",

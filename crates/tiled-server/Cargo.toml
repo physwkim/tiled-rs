@@ -73,3 +73,4 @@ tower = { workspace = true }
 bytes = { workspace = true }
 jsonwebtoken = { workspace = true }
 chrono = { workspace = true }
+form_urlencoded = "1"

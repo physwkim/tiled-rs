@@ -12,7 +12,7 @@ use axum::{
     Json,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
-    response::IntoResponse,
+    response::{IntoResponse, Redirect},
 };
 use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
@@ -806,6 +806,154 @@ pub async fn get_principal(
         .map_err(map_auth_err)?
         .ok_or_else(|| ServerError::NotFound(format!("No such Principal {uuid}")))?;
     Ok(Json(detail))
+}
+
+// ---------------------------------------------------------------------------
+// OIDC authorization-code flow (#1178)
+// ---------------------------------------------------------------------------
+
+/// `GET /api/v1/auth/provider/{provider}/authorize`
+///
+/// Redirect the browser to the IdP's authorization endpoint with PKCE S256,
+/// nonce, and state. Pending state is stored server-side for consumption by
+/// the `/callback` route. Mirrors Python `authorize_redirect_route`
+/// (authentication.py:954-976).
+pub async fn oidc_authorize(
+    State(state): State<AppState>,
+    Path(provider): Path<String>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ServerError> {
+    let validator = state.external_oidc.as_ref().ok_or_else(|| {
+        ServerError::Validation(
+            "OIDC code flow requested but no external_oidc is configured".into(),
+        )
+    })?;
+    let base = state.resolve_base_url(&headers);
+    let redirect_uri = format!(
+        "{}/api/v1/auth/provider/{}/callback",
+        base.trim_end_matches('/'),
+        provider
+    );
+    let authorize_url = validator
+        .build_authorize_url(&provider, &redirect_uri)
+        .map_err(map_auth_err)?;
+    Ok(Redirect::to(&authorize_url))
+}
+
+/// Query parameters received on the callback URL.
+#[derive(Debug, Deserialize)]
+pub struct OidcCallbackParams {
+    pub code: Option<String>,
+    pub state: Option<String>,
+    /// IdP-reported error (e.g. `access_denied`).
+    pub error: Option<String>,
+    pub error_description: Option<String>,
+}
+
+/// `GET /api/v1/auth/provider/{provider}/callback`
+///
+/// Receives the authorization code from the IdP, exchanges it for an
+/// id_token at `token_endpoint`, validates the id_token (same JWKS
+/// machinery + nonce check), upserts the principal, and issues tiled
+/// access + refresh tokens. Mirrors Python `auth_code_route`
+/// (authentication.py:977-1049).
+pub async fn oidc_callback(
+    State(state): State<AppState>,
+    Path(provider): Path<String>,
+    Query(params): Query<OidcCallbackParams>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ServerError> {
+    // Handle IdP-reported errors (e.g. user denied the authorization).
+    if let Some(ref err) = params.error {
+        let desc = params
+            .error_description
+            .as_deref()
+            .unwrap_or("no description");
+        return Err(ServerError::Unauthorized(format!(
+            "IdP returned error '{err}': {desc}"
+        )));
+    }
+
+    let code = params.code.as_deref().ok_or_else(|| {
+        ServerError::Validation("callback is missing the 'code' parameter".into())
+    })?;
+    let state_param = params.state.as_deref().ok_or_else(|| {
+        ServerError::Validation("callback is missing the 'state' parameter".into())
+    })?;
+
+    let validator = state.external_oidc.as_ref().ok_or_else(|| {
+        ServerError::Validation("OIDC code flow used but no external_oidc is configured".into())
+    })?;
+    let (db, issuer) = require_auth_db(&state)?;
+
+    let base = state.resolve_base_url(&headers);
+    let redirect_uri = format!(
+        "{}/api/v1/auth/provider/{}/callback",
+        base.trim_end_matches('/'),
+        provider
+    );
+
+    let validated = validator
+        .exchange_code_flow(state_param, code, &redirect_uri)
+        .await
+        .map_err(map_auth_err)?;
+
+    let (principal, identity) = db
+        .ensure_principal(&validated.provider, &validated.sub)
+        .await
+        .map_err(map_auth_err)?;
+    db.touch_identity_login(identity.id).await.ok();
+
+    let role_scopes = tiled_auth::ScopeSet::for_role(&principal.role);
+    let scopes = role_scopes.intersect(&state.default_login_scopes);
+
+    let session = db
+        .create_session(
+            principal.id,
+            scopes.clone(),
+            Utc::now() + issuer.refresh_ttl,
+        )
+        .await
+        .map_err(map_auth_err)?;
+    let access = issuer
+        .issue_access(&principal.uuid, &session.uuid, scopes)
+        .map_err(map_auth_err)?;
+    let refresh = issuer
+        .issue_refresh(&principal.uuid, &session.uuid)
+        .map_err(map_auth_err)?;
+
+    let tokens = TokensResponse {
+        access_token: access.clone(),
+        refresh_token: refresh.clone(),
+        token_type: "Bearer",
+        expires_in: issuer.access_ttl.num_seconds(),
+        identity: Some(IdentityPayload {
+            id: validated.sub.clone(),
+            provider: validated.provider.clone(),
+        }),
+    };
+
+    // redirect_on_success: redirect the browser back to the UI with tokens
+    // as query params. Mirrors Python OIDCAuthenticator behaviour
+    // (authentication.py:1023-1041).
+    let redirect_on_success = validator
+        .providers()
+        .iter()
+        .find(|p| p.name == provider)
+        .and_then(|p| p.redirect_on_success.clone());
+
+    if let Some(base_redir) = redirect_on_success {
+        use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
+        let encoded_access = utf8_percent_encode(&access, NON_ALPHANUMERIC).to_string();
+        let encoded_refresh = utf8_percent_encode(&refresh, NON_ALPHANUMERIC).to_string();
+        let redir = format!(
+            "{}?access_token={}&refresh_token={}",
+            base_redir, encoded_access, encoded_refresh
+        );
+        return Ok(Redirect::to(&redir).into_response());
+    }
+
+    Ok(Json(tokens).into_response())
 }
 
 fn map_auth_err(e: tiled_auth::AuthError) -> ServerError {
