@@ -18,6 +18,8 @@ pub mod hdf5_adapter;
 #[cfg(feature = "parquet")]
 pub mod parquet_adapter;
 pub mod png_jpeg_adapter;
+#[cfg(feature = "parquet")]
+pub mod sparse_blocks_parquet_adapter;
 #[cfg(feature = "sql-adapter")]
 pub mod sql_adapter;
 #[cfg(feature = "tiff")]
@@ -48,6 +50,8 @@ pub use hdf5_adapter::{Hdf5Adapter, Hdf5Locking};
 #[cfg(feature = "parquet")]
 pub use parquet_adapter::{ParquetAdapter, init_storage_parquet};
 pub use png_jpeg_adapter::ImageAdapter;
+#[cfg(feature = "parquet")]
+pub use sparse_blocks_parquet_adapter::SparseBlocksParquetAdapter;
 #[cfg(feature = "sql-adapter")]
 pub use sql_adapter::SqlTableAdapter;
 #[cfg(feature = "tiff")]
