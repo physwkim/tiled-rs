@@ -151,6 +151,24 @@ impl TableAdapterWrite for CsvAdapter {
             self.write(data).await
         })
     }
+
+    fn append_partition<'a>(
+        &'a self,
+        data: ArrowTable,
+        partition: usize,
+    ) -> BoxFuture<'a, Result<()>> {
+        let path = self.path.clone();
+        Box::pin(async move {
+            if partition != 0 {
+                return Err(TiledError::Validation(format!(
+                    "csv adapter has 1 partition; cannot append to partition {partition}"
+                )));
+            }
+            tokio::task::spawn_blocking(move || append_csv(&path, data))
+                .await
+                .map_err(|e| TiledError::Internal(format!("csv append spawn: {e}")))?
+        })
+    }
 }
 
 /// Per-process counter making temp filenames unique within this process
@@ -193,6 +211,35 @@ fn write_csv_atomic(path: &Path, table: &ArrowTable) -> Result<()> {
         ))
     })?;
     Ok(())
+}
+
+/// Read `path` as a CSV using `schema` (from the incoming Arrow IPC batch),
+/// concat with `data`, then atomically write the result back. Reading with
+/// the incoming schema ensures all batches share the same column types so
+/// the combined write is schema-consistent. If the file is empty or has only
+/// a header with no data rows, the existing content is treated as empty.
+fn append_csv(path: &Path, data: ArrowTable) -> Result<()> {
+    let existing_batches: Vec<RecordBatch> = if path.exists() {
+        let file = std::fs::File::open(path)
+            .map_err(|e| TiledError::Internal(format!("open {}: {e}", path.display())))?;
+        let reader = ReaderBuilder::new(data.schema.clone())
+            .with_header(true)
+            .build(file)
+            .map_err(|e| TiledError::Internal(format!("csv build: {e}")))?;
+        let mut batches = Vec::new();
+        for b in reader {
+            batches.push(b.map_err(|e| TiledError::Internal(format!("csv read: {e}")))?);
+        }
+        batches
+    } else {
+        Vec::new()
+    };
+    let all_batches: Vec<RecordBatch> = existing_batches.into_iter().chain(data.batches).collect();
+    let combined = ArrowTable {
+        schema: data.schema,
+        batches: all_batches,
+    };
+    write_csv_atomic(path, &combined)
 }
 
 /// Create a managed CSV storage skeleton under `writable_root` and return its
