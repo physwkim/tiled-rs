@@ -48,6 +48,12 @@ pub struct AppState {
     /// (tiled#1364, #1343). When validation succeeds, the matching
     /// principal is upserted into `auth_db` automatically.
     pub external_oidc: Option<Arc<tiled_auth::ExternalOidcValidator>>,
+    /// SAML 2.0 SP-initiated providers. Each entry exposes
+    /// `GET /api/v1/auth/saml/{name}/login` (redirect to IdP) and
+    /// `POST /api/v1/auth/saml/{name}/acs` (validate Response + mint session).
+    /// Requires the `saml` feature.
+    #[cfg(feature = "saml")]
+    pub saml_providers: Vec<Arc<tiled_auth::SamlProvider>>,
     /// CIDR/IP list permitted to set X-Forwarded-* headers when
     /// `trust_forwarded_headers` is on. `None` = trust the headers from
     /// any peer (only safe when the listener is bound to a private

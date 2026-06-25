@@ -956,6 +956,114 @@ pub async fn oidc_callback(
     Ok(Json(tokens).into_response())
 }
 
+// ---------------------------------------------------------------------------
+// SAML 2.0 SP-initiated routes
+// ---------------------------------------------------------------------------
+
+/// `GET /api/v1/auth/saml/{provider}/login`
+///
+/// Builds an SP-initiated `AuthnRequest` and HTTP-Redirect-binds it to the
+/// configured IdP SSO URL.  The generated request ID is stored in the
+/// `PendingSamlStore` so the corresponding ACS callback can verify
+/// `InResponseTo` (anti-replay).
+///
+/// Mirrors Python `SAMLAuthenticator` login route (authenticators.py:558-564).
+#[cfg(feature = "saml")]
+pub async fn saml_login(
+    State(state): State<AppState>,
+    Path(provider): Path<String>,
+) -> Result<impl IntoResponse, ServerError> {
+    let sp = state
+        .saml_providers
+        .iter()
+        .find(|p| p.name == provider)
+        .cloned()
+        .ok_or_else(|| {
+            ServerError::NotFound(format!("SAML provider '{provider}' is not configured"))
+        })?;
+
+    let (redirect_url, _request_id) = sp.build_redirect_url().map_err(map_auth_err)?;
+
+    Ok(Redirect::to(&redirect_url))
+}
+
+/// Form body received on the SAML Assertion Consumer Service endpoint.
+#[cfg(feature = "saml")]
+#[derive(Debug, serde::Deserialize)]
+pub struct AcsFormBody {
+    /// Base64-encoded `<samlp:Response>` element posted by the IdP.
+    #[serde(rename = "SAMLResponse")]
+    pub saml_response: String,
+}
+
+/// `POST /api/v1/auth/saml/{provider}/acs`
+///
+/// Assertion Consumer Service endpoint.  Receives the IdP-posted
+/// `SAMLResponse`, enforces XML signature validation against the configured
+/// IdP certificate, checks `InResponseTo` against the pending request store
+/// (anti-replay / CSRF), extracts the configured attribute as the principal
+/// identifier, upserts the principal, and issues tiled access + refresh tokens.
+///
+/// Mirrors Python `SAMLAuthenticator.authenticate` (authenticators.py:566-579).
+#[cfg(feature = "saml")]
+pub async fn saml_acs(
+    State(state): State<AppState>,
+    Path(provider): Path<String>,
+    axum::Form(body): axum::Form<AcsFormBody>,
+) -> Result<impl IntoResponse, ServerError> {
+    let sp = state
+        .saml_providers
+        .iter()
+        .find(|p| p.name == provider)
+        .cloned()
+        .ok_or_else(|| {
+            ServerError::NotFound(format!("SAML provider '{provider}' is not configured"))
+        })?;
+
+    let (db, issuer) = require_auth_db(&state)?;
+
+    let subject = sp
+        .validate_response(&body.saml_response)
+        .map_err(map_auth_err)?;
+
+    let (principal, identity) = db
+        .ensure_principal(&subject.provider, &subject.sub)
+        .await
+        .map_err(map_auth_err)?;
+    db.touch_identity_login(identity.id).await.ok();
+
+    let role_scopes = tiled_auth::ScopeSet::for_role(&principal.role);
+    let scopes = role_scopes.intersect(&state.default_login_scopes);
+
+    let session = db
+        .create_session(
+            principal.id,
+            scopes.clone(),
+            Utc::now() + issuer.refresh_ttl,
+        )
+        .await
+        .map_err(map_auth_err)?;
+    let access = issuer
+        .issue_access(&principal.uuid, &session.uuid, scopes)
+        .map_err(map_auth_err)?;
+    let refresh = issuer
+        .issue_refresh(&principal.uuid, &session.uuid)
+        .map_err(map_auth_err)?;
+
+    let tokens = TokensResponse {
+        access_token: access,
+        refresh_token: refresh,
+        token_type: "Bearer",
+        expires_in: issuer.access_ttl.num_seconds(),
+        identity: Some(IdentityPayload {
+            id: subject.sub.clone(),
+            provider: subject.provider.clone(),
+        }),
+    };
+
+    Ok(Json(tokens).into_response())
+}
+
 fn map_auth_err(e: tiled_auth::AuthError) -> ServerError {
     use tiled_auth::AuthError as AE;
     match e {
