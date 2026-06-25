@@ -205,6 +205,34 @@ impl AuthDb {
         }
     }
 
+    /// Look up a principal by its public `uuid`. Returns the full [`Principal`]
+    /// row (including the internal `id`) so callers that need the integer FK
+    /// (e.g. to create or revoke API keys on behalf of an admin) can proceed
+    /// without a second round-trip. Returns `None` when no principal has the
+    /// given uuid.
+    pub async fn get_principal_by_uuid(&self, uuid: &str) -> Result<Option<Principal>> {
+        match self.pool() {
+            AuthPool::Sqlite(pool) => {
+                let row = sqlx::query(
+                    "SELECT id, uuid, type, role, time_created FROM principals WHERE uuid = ?",
+                )
+                .bind(uuid)
+                .fetch_optional(pool)
+                .await?;
+                row.map(|r| principal_from_sqlite(&r)).transpose()
+            }
+            AuthPool::Postgres(pool) => {
+                let row = sqlx::query(
+                    "SELECT id, uuid, type, role, time_created FROM principals WHERE uuid = $1",
+                )
+                .bind(uuid)
+                .fetch_optional(pool)
+                .await?;
+                row.map(|r| principal_from_postgres(&r)).transpose()
+            }
+        }
+    }
+
     /// List every identity linked to a principal — the
     /// `selectinload(Principal.identities)` equivalent
     /// (`authentication.py:1345`). Ordered by `(provider, sub)` for a stable

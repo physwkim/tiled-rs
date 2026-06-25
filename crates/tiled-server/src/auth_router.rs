@@ -488,8 +488,156 @@ pub async fn api_key_revoke(
 }
 
 // ---------------------------------------------------------------------------
+// Session management
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct SessionRevokeByTokenRequest {
+    pub refresh_token: String,
+}
+
+/// `POST /api/v1/auth/session/revoke`
+///
+/// Revoke a session identified by the supplied refresh token without requiring
+/// a full Bearer/Apikey credential — the signed refresh token IS the ownership
+/// proof (mirrors Python's `revoke_session`, `authentication.py:1437`).
+/// Mounted in `public_auth` so it is reachable without a prior session
+/// (same pattern as `POST /auth/refresh`).
+pub async fn session_revoke_by_token(
+    State(state): State<AppState>,
+    Json(body): Json<SessionRevokeByTokenRequest>,
+) -> Result<impl IntoResponse, ServerError> {
+    let (db, issuer) = require_auth_db(&state)?;
+    let claims = issuer
+        .verify_refresh(&body.refresh_token)
+        .map_err(map_auth_err)?;
+    let session = db.lookup_session(&claims.sid).await.map_err(|e| match e {
+        tiled_auth::AuthError::NotFound(_) => {
+            ServerError::Validation(format!("No session {}", claims.sid))
+        }
+        other => map_auth_err(other),
+    })?;
+    if session.revoked {
+        return Err(ServerError::Validation(format!(
+            "No session {}",
+            claims.sid
+        )));
+    }
+    db.revoke_session(&claims.sid).await.map_err(map_auth_err)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `DELETE /api/v1/auth/session/revoke/{session_id}`
+///
+/// Revoke a specific session by its UUID. The caller must own the session
+/// (their principal UUID must match the session's principal). Mirrors Python's
+/// `revoke_session_by_id` (`authentication.py:1462`). 404 when the session
+/// does not exist or belongs to another principal.
+pub async fn session_revoke_by_id(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Path(session_id): Path<String>,
+) -> Result<impl IntoResponse, ServerError> {
+    let (db, _) = require_auth_db(&state)?;
+    let principal = auth
+        .principal
+        .ok_or_else(|| ServerError::Unauthorized("login required to revoke a session".into()))?;
+    let session = db.lookup_session(&session_id).await.map_err(|e| match e {
+        tiled_auth::AuthError::NotFound(_) => ServerError::NotFound(
+            "Session does not exist or requester has insufficient permissions".into(),
+        ),
+        other => map_auth_err(other),
+    })?;
+    if session.principal_id != principal.id {
+        return Err(ServerError::NotFound(
+            "Session does not exist or requester has insufficient permissions".into(),
+        ));
+    }
+    db.revoke_session(&session_id).await.map_err(map_auth_err)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------------------------------------------------------------------------
+// Current API key info
+// ---------------------------------------------------------------------------
+
+/// `GET /api/v1/auth/apikey`
+///
+/// Return metadata about the API key used to authenticate the current request.
+/// Mirrors Python's `current_apikey_info` (`authentication.py:1584`). Returns
+/// 401 when the request was not authenticated via an API key.
+pub async fn current_apikey_info(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ServerError> {
+    if auth.kind != crate::auth_context::AuthKind::ApiKey {
+        return Err(ServerError::Unauthorized(
+            "No API key was provided with this request.".into(),
+        ));
+    }
+    let (db, _) = require_auth_db(&state)?;
+    // Re-extract the raw key from the Authorization header (same key the
+    // middleware already verified — re-verification is the parity-correct
+    // approach used by Python's lookup_valid_api_key).
+    let key = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Apikey "))
+        .ok_or_else(|| {
+            ServerError::Unauthorized("No API key was provided with this request.".into())
+        })?
+        .to_string();
+    let record = db
+        .verify_api_key(&key)
+        .await
+        .map_err(|_| ServerError::Unauthorized("Invalid API key".into()))?;
+    Ok(Json(serde_json::json!({
+        "id": record.id,
+        "first_eight": record.first_eight,
+        "note": record.note,
+        "scopes": record.scopes.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        "expiration_time": record.expiration_time,
+        "time_created": record.time_created,
+        "latest_activity": record.latest_activity,
+    })))
+}
+
+// ---------------------------------------------------------------------------
 // Principal CRUD (multi-user mode, admin-gated)
 // ---------------------------------------------------------------------------
+
+/// `GET /api/v1/auth/principal`
+///
+/// List all principals (users and services), paginated. Requires the
+/// `read:principals` scope — mirrors Python's `principal_list`
+/// (`authentication.py:1243`).
+#[derive(Debug, Deserialize)]
+pub struct PrincipalListQuery {
+    #[serde(rename = "page[offset]", default)]
+    pub offset: i64,
+    #[serde(rename = "page[limit]", default = "default_page_limit")]
+    pub limit: i64,
+}
+
+fn default_page_limit() -> i64 {
+    100
+}
+
+pub async fn list_principals(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Query(q): Query<PrincipalListQuery>,
+) -> Result<impl IntoResponse, ServerError> {
+    auth.require(tiled_auth::Scope::ReadPrincipals)?;
+    let (db, _) = require_auth_db(&state)?;
+    let limit = q.limit.min(200);
+    let principals = db
+        .list_principals(q.offset, limit)
+        .await
+        .map_err(map_auth_err)?;
+    Ok(Json(principals))
+}
 
 #[derive(Debug, Deserialize)]
 pub struct CreateServicePrincipalQuery {
@@ -525,6 +673,118 @@ pub async fn create_service_principal(
         principal,
         Vec::new(),
     )))
+}
+
+// ---------------------------------------------------------------------------
+// Admin per-principal API key management
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct AdminApiKeyRevokeQuery {
+    pub first_eight: String,
+}
+
+/// `DELETE /api/v1/auth/principal/{uuid}/apikey?first_eight=...`
+///
+/// Allow admins to delete any user's API key. Requires `admin:apikeys` scope.
+/// Mirrors Python's `revoke_apikey_for_principal` (`authentication.py:1363`).
+/// Returns 404 when the principal doesn't exist or has no key with that prefix.
+pub async fn admin_revoke_principal_apikey(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Path(uuid): Path<String>,
+    Query(q): Query<AdminApiKeyRevokeQuery>,
+) -> Result<impl IntoResponse, ServerError> {
+    auth.require(tiled_auth::Scope::AdminApiKeys)?;
+    let (db, _) = require_auth_db(&state)?;
+    // Get the full Principal row (including internal id) to scope the DELETE.
+    let principal = db
+        .get_principal_by_uuid(&uuid)
+        .await
+        .map_err(map_auth_err)?
+        .ok_or_else(|| {
+            ServerError::NotFound(format!("The principal {uuid} has no such API key."))
+        })?;
+    // Revoke the key scoped to this principal's id so we only delete keys
+    // that actually belong to them (mirrors Python: `api_key_orm.principal.uuid != uuid`).
+    let _ = db
+        .revoke_api_key(&q.first_eight, Some(principal.id))
+        .await
+        .map_err(|e| match e {
+            tiled_auth::AuthError::NotFound(_) => {
+                ServerError::NotFound(format!("The principal {uuid} has no such API key."))
+            }
+            other => map_auth_err(other),
+        })?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `POST /api/v1/auth/principal/{uuid}/apikey`
+///
+/// Generate an API key for an arbitrary principal. Requires `admin:apikeys`
+/// scope. Mirrors Python's `apikey_for_principal` (`authentication.py:1394`).
+/// Validates that the requested scopes are a subset of the target principal's
+/// role scopes (just as `api_key_create` validates against the caller's scopes).
+pub async fn admin_create_principal_apikey(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Path(uuid): Path<String>,
+    Json(req): Json<ApiKeyCreateRequest>,
+) -> Result<impl IntoResponse, ServerError> {
+    auth.require(tiled_auth::Scope::AdminApiKeys)?;
+    let (db, _) = require_auth_db(&state)?;
+    let target_principal = db
+        .get_principal_by_uuid(&uuid)
+        .await
+        .map_err(map_auth_err)?
+        .ok_or_else(|| {
+            ServerError::NotFound(format!(
+                "Principal {uuid} does not exist or insufficient permissions."
+            ))
+        })?;
+    // Validate requested scopes against target principal's role ceiling
+    // (mirrors Python generate_apikey: `scopes must be a subset of principal_scopes | {"inherit"}`).
+    let role_scopes = tiled_auth::ScopeSet::for_role(&target_principal.role);
+    let scopes = match req.scopes {
+        None => {
+            // Default: inherit — expands to role scopes at use time.
+            let mut set = ScopeSet::default();
+            set.insert(tiled_auth::Scope::Inherit);
+            set
+        }
+        Some(names) => {
+            let mut set = ScopeSet::default();
+            for name in names {
+                let s = tiled_auth::Scope::parse(&name)
+                    .ok_or_else(|| ServerError::Validation(format!("unknown scope: {name}")))?;
+                if s != tiled_auth::Scope::Inherit && !role_scopes.contains(s) {
+                    return Err(ServerError::Forbidden(format!(
+                        "Requested scopes {name:?} must be a subset of the principal's scopes."
+                    )));
+                }
+                set.insert(s);
+            }
+            set
+        }
+    };
+    let exp = req
+        .expires_in_seconds
+        .map(|s| chrono::Utc::now() + Duration::seconds(s));
+    let material = db
+        .create_api_key(tiled_auth::ApiKeyCreate {
+            principal_id: target_principal.id,
+            note: req.note,
+            scopes,
+            expiration_time: exp,
+        })
+        .await
+        .map_err(map_auth_err)?;
+    Ok(Json(serde_json::json!({
+        "secret": material.secret,
+        "first_eight": material.record.first_eight,
+        "scopes": material.record.scopes.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        "expiration_time": material.record.expiration_time,
+    })))
 }
 
 /// `GET /api/v1/auth/principal/{uuid}`
