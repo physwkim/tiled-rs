@@ -335,6 +335,20 @@ fn build_leaf_adapter(
                 return Err(CatalogError::Validation("zarr support not built in".into()));
             }
         }
+        "application/x-netcdf" | "application/netcdf" => {
+            #[cfg(feature = "netcdf-adapter")]
+            {
+                let adapter = tiled_adapters::netcdf_from_path(path, metadata)
+                    .map_err(|e| CatalogError::Validation(e.to_string()))?;
+                AnyAdapter::Container(Arc::new(adapter))
+            }
+            #[cfg(not(feature = "netcdf-adapter"))]
+            {
+                return Err(CatalogError::Validation(
+                    "netcdf support not built in".into(),
+                ));
+            }
+        }
         other => {
             return Err(CatalogError::Validation(format!(
                 "no built-in adapter for mimetype: {other}"

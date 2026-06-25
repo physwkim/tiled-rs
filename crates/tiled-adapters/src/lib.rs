@@ -16,6 +16,8 @@ pub mod csv_array_adapter;
 pub mod excel_adapter;
 #[cfg(feature = "hdf5")]
 pub mod hdf5_adapter;
+#[cfg(feature = "netcdf-adapter")]
+pub mod netcdf_adapter;
 #[cfg(feature = "parquet")]
 pub mod parquet_adapter;
 pub mod png_jpeg_adapter;
@@ -49,6 +51,8 @@ pub use csv_array_adapter::CsvArrayAdapter;
 pub use excel_adapter::ExcelAdapter;
 #[cfg(feature = "hdf5")]
 pub use hdf5_adapter::{Hdf5Adapter, Hdf5Locking};
+#[cfg(feature = "netcdf-adapter")]
+pub use netcdf_adapter::netcdf_from_path;
 #[cfg(feature = "parquet")]
 pub use parquet_adapter::{ParquetAdapter, init_storage_parquet};
 pub use png_jpeg_adapter::ImageAdapter;
