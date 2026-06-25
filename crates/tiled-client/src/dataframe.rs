@@ -1,12 +1,14 @@
-//! `TableClient` — read tabular data via the Arrow IPC partition endpoint.
+//! `TableClient` — read and write tabular data via `/api/v1/table/`.
 //!
 //! Mirrors `tiled/client/dataframe.py`. The Python client switches between
 //! pandas and dask; we hand back Arrow `RecordBatch`es so the caller picks
-//! their own format (polars, datafusion, ndarray::ArrowArray, …).
+//! their own format. `write` uploads an Arrow IPC FILE stream to
+//! `PUT /api/v1/table/full`.
 
 use std::io::Cursor;
 
 use arrow::array::RecordBatch;
+use arrow::datatypes::SchemaRef;
 use arrow::ipc::reader::FileReader;
 use tiled_core::structures::TableStructure;
 use url::Url;
@@ -143,6 +145,53 @@ impl TableClient {
             batches.push(batch?);
         }
         Ok(TablePartition { schema, batches })
+    }
+
+    /// Write the table. Encodes `batches` as an Arrow IPC FILE stream and sends
+    /// it to `PUT /api/v1/table/full`. All batches must share `schema`; the
+    /// server validates that the column names match the node's declared columns.
+    pub async fn write(&self, schema: &SchemaRef, batches: &[RecordBatch]) -> Result<()> {
+        let link = self.base.require_link("full")?;
+        let url = Url::parse(link)?;
+
+        let mut buf = Vec::new();
+        {
+            let mut writer = arrow::ipc::writer::FileWriter::try_new(&mut buf, schema.as_ref())
+                .map_err(|e| ClientError::Invalid(format!("Arrow IPC writer: {e}")))?;
+            for batch in batches {
+                writer
+                    .write(batch)
+                    .map_err(|e| ClientError::Invalid(format!("Arrow IPC write: {e}")))?;
+            }
+            writer
+                .finish()
+                .map_err(|e| ClientError::Invalid(format!("Arrow IPC finish: {e}")))?;
+        }
+        let body = bytes::Bytes::from(buf);
+
+        let _permit = self.base.context.data_fetch_permit().await;
+        retry(|| async {
+            self.base
+                .context
+                .put_bytes(&url, body.clone())
+                .await
+                .map(|_| ())
+        })
+        .await
+    }
+
+    /// Export the whole table to a file at `dest` in the requested `format`
+    /// (e.g. `"csv"`, `"json"`, `"parquet"`). Sends
+    /// `GET /api/v1/table/full/{path}?format=<fmt>` and writes the body to
+    /// `dest`, mirroring Python `DataFrameClient.export`.
+    pub async fn export(&self, dest: &std::path::Path, format: &str) -> Result<()> {
+        let link = self.base.require_link("full")?;
+        let mut url = Url::parse(link)?;
+        url.query_pairs_mut().append_pair("format", format);
+        let _permit = self.base.context.data_fetch_permit().await;
+        let bytes = retry(|| async { self.base.context.get_bytes(&url, "*/*").await }).await?;
+        std::fs::write(dest, &bytes)
+            .map_err(|e| ClientError::Invalid(format!("write {}: {e}", dest.display())))
     }
 
     /// Read every partition, in order.

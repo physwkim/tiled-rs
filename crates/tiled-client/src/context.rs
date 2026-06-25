@@ -538,6 +538,27 @@ impl Context {
         Ok(resp)
     }
 
+    /// PUT or PATCH a raw-bytes body; shared by array/table write paths.
+    async fn bytes_write(&self, method: Method, url: &Url, body: bytes::Bytes) -> Result<Response> {
+        let req = self.request(method, url).await?.body(body);
+        let req = self.add_csrf(req).await;
+        let resp = self.send_with_auth(req).await?;
+        self.maybe_capture_csrf(&resp).await;
+        let resp = handle_error(resp).await?;
+        if let Some(cache) = self.cache() {
+            cache.invalidate(url).await?;
+        }
+        Ok(resp)
+    }
+
+    pub async fn put_bytes(&self, url: &Url, body: bytes::Bytes) -> Result<Response> {
+        self.bytes_write(Method::PUT, url, body).await
+    }
+
+    pub async fn patch_bytes(&self, url: &Url, body: bytes::Bytes) -> Result<Response> {
+        self.bytes_write(Method::PATCH, url, body).await
+    }
+
     pub async fn delete(&self, url: &Url) -> Result<Response> {
         let req = self.request(Method::DELETE, url).await?;
         let req = self.add_csrf(req).await;

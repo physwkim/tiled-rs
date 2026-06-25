@@ -25,6 +25,10 @@ const PATH_SEGMENT: &AsciiSet = &CONTROLS
     .add(b'/')
     .add(b'%');
 
+use tiled_core::data_source::DataSource;
+use tiled_core::schemas::PostMetadataResponse;
+use tiled_core::structures::StructureFamily;
+
 use crate::any_client::AnyClient;
 use crate::base::{BaseClient, Item};
 use crate::context::Context;
@@ -251,6 +255,59 @@ impl ContainerClient {
     pub fn search(mut self, query: tiled_core::queries::Query) -> Self {
         self.queries.extend(query.encode());
         self
+    }
+
+    /// Create a new child node via `POST /api/v1/metadata/{parent-path}`.
+    ///
+    /// Returns the key (id) assigned by the server. `data_sources` may be
+    /// empty for a pure-metadata or server-managed node.
+    pub async fn create_node(
+        &self,
+        key: &str,
+        structure_family: StructureFamily,
+        metadata: serde_json::Value,
+        specs: Vec<serde_json::Value>,
+        data_sources: Vec<DataSource>,
+    ) -> Result<String> {
+        let self_link = self.base.require_link("self")?;
+        let url = Url::parse(self_link)?;
+        let body = serde_json::json!({
+            "key": key,
+            "structure_family": structure_family,
+            "metadata": metadata,
+            "specs": specs,
+            "data_sources": data_sources,
+        });
+        let resp = self.base.context.post_json(&url, &body).await?;
+        let created = decode_response::<PostMetadataResponse>(resp).await?;
+        Ok(created.id)
+    }
+
+    /// Convenience: create an empty container child.
+    pub async fn create_container(
+        &self,
+        key: &str,
+        metadata: serde_json::Value,
+    ) -> Result<ContainerClient> {
+        self.create_node(key, StructureFamily::Container, metadata, vec![], vec![])
+            .await?;
+        // Fetch the newly-created child and return it as a ContainerClient.
+        self.get(key).await?.into_container()
+    }
+
+    /// Delete every immediate child of this container (to empty it before
+    /// deleting the container itself). Children that are themselves containers
+    /// must already be empty or have their own children deleted first, since
+    /// the server refuses to delete non-empty containers.
+    pub async fn delete_contents(&self, external_only: bool) -> Result<()> {
+        let keys = self.keys().await?;
+        for key in keys {
+            let child = self.get(&key).await?;
+            if let Some(b) = child.base() {
+                b.delete(external_only).await?;
+            }
+        }
+        Ok(())
     }
 
     /// Add a raw `key=value` filter pair to subsequent searches.

@@ -44,6 +44,7 @@ tiled-server = { workspace = true }
 tiled-adapters = { workspace = true }
 tiled-serialization = { workspace = true }
 tiled-auth = { workspace = true }
+tiled-catalog = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tempfile = { workspace = true }
 indexmap = { workspace = true }

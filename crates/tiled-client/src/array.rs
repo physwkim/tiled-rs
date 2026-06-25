@@ -1,10 +1,10 @@
-//! `ArrayClient` — read array data from `/api/v1/array/block/<path>`.
+//! `ArrayClient` — read and write array data via `/api/v1/array/`.
 //!
 //! Mirrors `tiled/client/array.py::ArrayClient`. The Python client juggles
 //! dask + numpy + slicing; here we expose the wire-level moves: `read_block`
-//! to fetch one chunk, and `read` to concatenate everything as raw bytes.
-//! Higher-level numpy/ndarray reshaping is left to the caller — same shape
-//! the Python `_get_block` returns before NumPy assembly.
+//! to fetch one chunk, `read` to concatenate everything as raw bytes, `write`
+//! to overwrite the whole array, `write_block` to overwrite one chunk, and
+//! `append` to grow an axis. Higher-level reshaping is left to the caller.
 
 use tiled_core::structures::ArrayStructure;
 use url::Url;
@@ -12,7 +12,14 @@ use url::Url;
 use crate::base::{BaseClient, Item, ParsedStructure};
 use crate::context::Context;
 use crate::error::{ClientError, Result};
-use crate::utils::{OCTET_STREAM_MIME_TYPE, retry};
+use crate::utils::{OCTET_STREAM_MIME_TYPE, decode_response, retry};
+
+/// Returned by `ArrayClient::append`.
+#[derive(Debug, Clone)]
+pub struct AppendResult {
+    pub axis: usize,
+    pub new_size: usize,
+}
 
 /// A single block of array bytes plus the dtype/shape needed to interpret it.
 #[derive(Debug, Clone)]
@@ -128,6 +135,85 @@ impl ArrayClient {
                 block[axis] = 0;
             }
         }
+    }
+
+    /// Overwrite the whole array. `data` is the C-order element buffer —
+    /// `nelem * dtype.element_size()` bytes, matching `PUT /api/v1/array/full`.
+    pub async fn write(&self, data: bytes::Bytes) -> Result<()> {
+        let link = self.base.require_link("full")?;
+        let url = Url::parse(link)?;
+        let _permit = self.base.context.data_fetch_permit().await;
+        retry(|| async {
+            self.base
+                .context
+                .put_bytes(&url, data.clone())
+                .await
+                .map(|_| ())
+        })
+        .await
+    }
+
+    /// Overwrite one chunk. `block` is the per-axis chunk index; `data` is
+    /// the C-order buffer for that chunk — matches `PUT /api/v1/array/block`.
+    pub async fn write_block(&self, block: &[usize], data: bytes::Bytes) -> Result<()> {
+        let link = self.base.require_link("block")?;
+        let mut url = Url::parse(link)?;
+        let block_str = block
+            .iter()
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        url.query_pairs_mut().append_pair("block", &block_str);
+        let _permit = self.base.context.data_fetch_permit().await;
+        retry(|| async {
+            self.base
+                .context
+                .put_bytes(&url, data.clone())
+                .await
+                .map(|_| ())
+        })
+        .await
+    }
+
+    /// Append rows along `append_along` (default 0). `data` is the C-order
+    /// buffer for the new rows — matches `PATCH /api/v1/array/full?append_along=N`.
+    pub async fn append(&self, data: bytes::Bytes, append_along: usize) -> Result<AppendResult> {
+        let link = self.base.require_link("full")?;
+        let mut url = Url::parse(link)?;
+        url.query_pairs_mut()
+            .append_pair("append_along", &append_along.to_string());
+        let _permit = self.base.context.data_fetch_permit().await;
+        retry(|| async {
+            let resp = self.base.context.patch_bytes(&url, data.clone()).await?;
+            let v = decode_response::<serde_json::Value>(resp).await?;
+            Ok(AppendResult {
+                axis: v
+                    .get("axis")
+                    .and_then(|x| x.as_u64())
+                    .unwrap_or(append_along as u64) as usize,
+                new_size: v
+                    .get("new_size")
+                    .and_then(|x| x.as_u64())
+                    .ok_or_else(|| ClientError::Invalid("append: missing new_size".into()))?
+                    as usize,
+            })
+        })
+        .await
+    }
+
+    /// Export the whole array to a file at `dest` in the requested `format`
+    /// (e.g. `"npy"`, `"csv"`, `"json"`). Mirrors Python `ArrayClient.export`:
+    /// sends `GET /api/v1/array/full/{path}?format=<ext>` and streams the
+    /// response bytes to `dest`. The server resolves `format` as an alias or
+    /// media-type; passing an unsupported format returns a server error.
+    pub async fn export(&self, dest: &std::path::Path, format: &str) -> Result<()> {
+        let link = self.base.require_link("full")?;
+        let mut url = Url::parse(link)?;
+        url.query_pairs_mut().append_pair("format", format);
+        let _permit = self.base.context.data_fetch_permit().await;
+        let bytes = retry(|| async { self.base.context.get_bytes(&url, "*/*").await }).await?;
+        std::fs::write(dest, &bytes)
+            .map_err(|e| ClientError::Invalid(format!("write {}: {e}", dest.display())))
     }
 
     fn block_shape(&self, block: &[usize]) -> Result<Vec<usize>> {

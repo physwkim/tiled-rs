@@ -42,13 +42,13 @@ pub mod utils;
 pub mod xarray_client;
 
 pub use any_client::AnyClient;
-pub use array::{ArrayBlock, ArrayClient};
+pub use array::{AppendResult, ArrayBlock, ArrayClient};
 pub use auth::{
     AuthProvider, ProviderMode, TiledAuth, TokenStore, Tokens, WhoAmI, default_token_cache_dir,
     device_code_grant, password_grant, prompt_for_credentials, token_directory_for_server,
 };
 pub use awkward::{AwkwardBuffers, AwkwardClient};
-pub use base::{BaseClient, Item, ParsedStructure};
+pub use base::{BaseClient, Item, JSON_PATCH_MIME, MERGE_PATCH_MIME, ParsedStructure};
 pub use cache::{CacheControl, CacheEntry, HttpCache};
 pub use composite::{CompositeClient, CompositePart};
 pub use constructors::{from_context, from_uri, from_uri_with_options};
