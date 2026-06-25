@@ -298,6 +298,11 @@ pub struct PostMetadataRequest {
     pub data_sources: Vec<DataSource>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
+    /// Optional access blob the client wants to attach to this node.
+    /// Passed to `AccessPolicy::init_node` for validation / modification
+    /// before being stored. Mirrors Python `PostMetadataRequest.access_blob`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_blob: Option<serde_json::Value>,
 }
 
 /// Response for creating a new node.

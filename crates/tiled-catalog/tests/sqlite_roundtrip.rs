@@ -102,6 +102,7 @@ async fn migrate_create_lookup_delete() {
             container.id,
             json!({"description": "second"}),
             json!([{"name": "BlueskyRun", "version": "2"}]),
+            None,
             /* drop_revision */ false,
         )
         .await
@@ -1164,6 +1165,7 @@ async fn full_text_search_uses_fts5_token_match() {
         b.id,
         json!({"material": "copper foil", "scan": "beta"}),
         json!([]),
+        None,
         /* drop_revision */ false,
     )
     .await

@@ -81,6 +81,54 @@ pub trait AccessPolicy: Send + Sync {
     ) -> Option<AccessBlobFilter> {
         None
     }
+
+    /// Called when a new node is being created. The policy may validate
+    /// and/or replace the client-supplied (or server-generated) `access_blob`.
+    /// Returns `(modified, final_blob)`:
+    ///   - `modified = true` → the returned blob differs from the input.
+    ///   - `modified = false` → the blob is used as-is.
+    ///
+    /// Errors are surfaced as HTTP 422 (validation error), mirroring Python's
+    /// `ValueError` path in `TagBasedAccessPolicy.init_node`
+    /// (access_policies.py:108-193).
+    ///
+    /// Default: pass the supplied blob through unchanged (no policy
+    /// validation). Mirrors `DummyAccessPolicy.init_node`.
+    async fn init_node(
+        &self,
+        _principal: &Principal,
+        _authn_access_tags: Option<&[String]>,
+        _session_scopes: &ScopeSet,
+        access_blob: Option<&serde_json::Value>,
+    ) -> Result<(bool, serde_json::Value), String> {
+        Ok((
+            false,
+            access_blob
+                .cloned()
+                .unwrap_or(serde_json::Value::Object(Default::default())),
+        ))
+    }
+
+    /// Called when a node's `access_blob` is being updated via PATCH/PUT.
+    /// Returns `(modified, final_blob)`:
+    ///   - `modified = true` → the returned blob should replace the stored one.
+    ///   - `modified = false` → the stored blob is kept unchanged.
+    ///
+    /// `node_access_blob` is the current stored blob; `proposed_access_blob` is
+    /// what the client sent. Errors are surfaced as HTTP 422.
+    ///
+    /// Default: keep the current blob unchanged (no mutation). Mirrors the base
+    /// `modify_node` in `AccessPolicy` (protocols.py:20-28).
+    async fn modify_node(
+        &self,
+        node_access_blob: &serde_json::Value,
+        _principal: &Principal,
+        _authn_access_tags: Option<&[String]>,
+        _session_scopes: &ScopeSet,
+        _proposed_access_blob: Option<&serde_json::Value>,
+    ) -> Result<(bool, serde_json::Value), String> {
+        Ok((false, node_access_blob.clone()))
+    }
 }
 
 /// Built-in: trust the session — anonymous gets read-only metadata,
@@ -384,6 +432,57 @@ mod tests {
         assert_eq!(f.user_id.as_deref(), Some("alice"));
         assert_eq!(f.tags, vec!["team-a".to_string()]);
         assert!(!f.include_untagged);
+    }
+
+    // ---- init_node / modify_node default behaviour ----
+
+    #[tokio::test]
+    async fn init_node_default_passes_blob_through() {
+        let policy = PassthroughPolicy;
+        let p = principal("alice");
+        let session = ScopeSet::for_role("user");
+        let proposed = serde_json::json!({"user": "alice"});
+        let (modified, result) = policy
+            .init_node(&p, None, &session, Some(&proposed))
+            .await
+            .unwrap();
+        assert!(!modified, "default init_node must not signal modification");
+        assert_eq!(
+            result, proposed,
+            "default init_node must return supplied blob"
+        );
+    }
+
+    #[tokio::test]
+    async fn init_node_default_empty_blob_produces_empty_object() {
+        let policy = PassthroughPolicy;
+        let p = principal("alice");
+        let session = ScopeSet::for_role("user");
+        let (modified, result) = policy.init_node(&p, None, &session, None).await.unwrap();
+        assert!(!modified);
+        assert_eq!(result, serde_json::Value::Object(Default::default()));
+    }
+
+    #[tokio::test]
+    async fn modify_node_default_keeps_current_blob() {
+        let policy = PassthroughPolicy;
+        let p = principal("alice");
+        let session = ScopeSet::for_role("user");
+        let current = serde_json::json!({"user": "alice"});
+        let proposed = serde_json::json!({"tags": ["secret"]});
+        let (modified, result) = policy
+            .modify_node(&current, &p, None, &session, Some(&proposed))
+            .await
+            .unwrap();
+        // Default impl must keep the current blob — it ignores the proposed change.
+        assert!(
+            !modified,
+            "default modify_node must not signal modification"
+        );
+        assert_eq!(
+            result, current,
+            "default modify_node must return the current node blob, not the proposed one"
+        );
     }
 
     fn ctx<'a>(access_blob: &'a serde_json::Value, meta: &'a serde_json::Value) -> NodeContext<'a> {

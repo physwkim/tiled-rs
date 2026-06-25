@@ -3557,6 +3557,30 @@ async fn create_node_core(
             Some(parent.id)
         };
 
+        // Compute the initial access_blob. The client may supply one in the
+        // request; otherwise derive it from the creator principal. Then let
+        // the policy validate/rewrite it via init_node before storing.
+        let initial_blob = req
+            .access_blob
+            .clone()
+            .unwrap_or_else(|| creator_access_blob(auth.principal.as_deref()));
+        let final_access_blob = if let (Some(policy), Some(principal)) =
+            (state.access_policy.as_deref(), auth.principal.as_deref())
+        {
+            let (_, blob) = policy
+                .init_node(
+                    principal,
+                    None, // authn_access_tags: populated in sub-part 3
+                    &auth.scopes,
+                    Some(&initial_blob),
+                )
+                .await
+                .map_err(ServerError::Validation)?;
+            blob
+        } else {
+            initial_blob
+        };
+
         let node = catalog
             .create_node(
                 parent_id,
@@ -3566,7 +3590,7 @@ async fn create_node_core(
                     structure_family: structure_family.clone(),
                     metadata: req.metadata.clone(),
                     specs: serde_json::to_value(&req.specs).unwrap_or_default(),
-                    access_blob: creator_access_blob(auth.principal.as_deref()),
+                    access_blob: final_access_blob,
                 },
             )
             .await
@@ -4013,7 +4037,9 @@ pub async fn patch_metadata(
     }
     // Per-ancestor auth gate: narrows at every prefix and requires
     // WriteMetadata on the narrowed set — same invariant as the read gate.
-    resolve_entry(&state, auth, &segments, tiled_auth::Scope::WriteMetadata).await?;
+    // Capture the narrowed auth so its principal + scopes are available for
+    // the modify_node call below.
+    let auth = resolve_entry(&state, auth, &segments, tiled_auth::Scope::WriteMetadata).await?;
     let node = catalog
         .lookup(&segments)
         .await
@@ -4107,14 +4133,35 @@ pub async fn patch_metadata(
         }
     }
 
-    // NOTE: the `access_blob` patch document and the policy.modify_node hook
-    // are intentionally not applied — see the UNFIXED note in the worker
-    // report. Python discards the access_blob patch whenever no access policy
-    // exposes modify_node (router.py:2401-2404), which is exactly this crate's
-    // configuration (tiled-access AccessPolicy has no modify_node), so the
-    // stored access_blob is returned unchanged either way.
+    // access_blob patch: extract any proposed access_blob from the request
+    // body and run it through policy.modify_node. Mirrors Python
+    // router.py:2401-2404: modify_node is called when the policy exposes it;
+    // if no policy is wired (or the policy's default impl keeps the current
+    // blob), the stored access_blob is unchanged. Errors from the policy map
+    // to 422 (matching Python's ValueError path).
+    let proposed_access_blob = req.get("access_blob").filter(|v| !v.is_null()).cloned();
+    let new_access_blob = if let (Some(policy), Some(principal), Some(proposed)) = (
+        state.access_policy.as_deref(),
+        auth.principal.as_deref(),
+        proposed_access_blob.as_ref(),
+    ) {
+        let (modified, blob) = policy
+            .modify_node(
+                &node.access_blob,
+                principal,
+                None, // authn_access_tags: populated in sub-part 3
+                &auth.scopes,
+                Some(proposed),
+            )
+            .await
+            .map_err(ServerError::Validation)?;
+        if modified { Some(blob) } else { None }
+    } else {
+        None
+    };
+
     let updated = catalog
-        .update_metadata(node.id, metadata, specs, drop_revision)
+        .update_metadata(node.id, metadata, specs, new_access_blob, drop_revision)
         .await
         .map_err(map_catalog_err)?;
     let path = segments.join("/");
@@ -4176,7 +4223,7 @@ pub async fn put_metadata(
     }
     // Per-ancestor auth gate: narrows at every prefix and requires
     // WriteMetadata on the narrowed set — same invariant as PATCH.
-    resolve_entry(&state, auth, &segments, tiled_auth::Scope::WriteMetadata).await?;
+    let auth = resolve_entry(&state, auth, &segments, tiled_auth::Scope::WriteMetadata).await?;
     let node = catalog
         .lookup(&segments)
         .await
@@ -4217,23 +4264,51 @@ pub async fn put_metadata(
         }
     }
 
+    // access_blob: run the proposed blob through policy.modify_node.
+    // Mirrors Python router.py:2484-2487: when modify_node signals a change
+    // the new blob is written; otherwise the stored blob is preserved.
+    let proposed_access_blob = req.get("access_blob").filter(|v| !v.is_null()).cloned();
+    let new_access_blob = if let (Some(policy), Some(principal), Some(proposed)) = (
+        state.access_policy.as_deref(),
+        auth.principal.as_deref(),
+        proposed_access_blob.as_ref(),
+    ) {
+        let (modified, blob) = policy
+            .modify_node(
+                &node.access_blob,
+                principal,
+                None, // authn_access_tags: populated in sub-part 3
+                &auth.scopes,
+                Some(proposed),
+            )
+            .await
+            .map_err(ServerError::Validation)?;
+        if modified { Some(blob) } else { None }
+    } else {
+        None
+    };
+
     let updated = catalog
-        .update_metadata(node.id, metadata, specs, drop_revision)
+        .update_metadata(
+            node.id,
+            metadata,
+            specs,
+            new_access_blob.clone(),
+            drop_revision,
+        )
         .await
         .map_err(map_catalog_err)?;
 
-    // access_blob: this crate has no access policy that exposes `modify_node`,
-    // so the stored access_blob is never changed (Python's `else` branch,
-    // router.py:2484-2487). `access_blob_modified` is true only when the client
-    // SENT an access_blob differing from the (unchanged) stored one; the
-    // response then echoes the unchanged value to signal the change was not
-    // applied. `update_metadata` preserves access_blob, so `updated.access_blob`
-    // is the current value.
-    let access_blob_modified = req
-        .get("access_blob")
-        .filter(|v| !v.is_null())
-        .map(|v| v != &updated.access_blob)
-        .unwrap_or(false);
+    // `access_blob_modified` is true when the stored blob changed (policy
+    // modified it) or when the client sent a blob that differs from what is
+    // stored (policy kept the original). The response echoes the final value
+    // when it differs from what was stored before the call. Matches Python:
+    // only emit access_blob in the response when it changed.
+    let access_blob_modified = new_access_blob.is_some()
+        || proposed_access_blob
+            .as_ref()
+            .map(|v| v != &updated.access_blob)
+            .unwrap_or(false);
 
     let path = segments.join("/");
     state.streaming_bus.publish(
@@ -4245,10 +4320,7 @@ pub async fn put_metadata(
     );
 
     // Response mirrors Python `json_or_msgpack(response_data)`: `{id}` plus
-    // `access_blob` only when modified. Python includes `metadata` only when a
-    // spec validator mutated it; this crate runs no spec validators, so metadata
-    // is never modified here and is omitted. No `links` / `data_sources` (the
-    // Python handler's response dict sets neither).
+    // `access_blob` only when modified.
     Ok(Json(tiled_core::schemas::PostMetadataResponse {
         id: updated.key,
         links: None,
