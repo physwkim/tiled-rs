@@ -1,15 +1,33 @@
-//! External OIDC bearer-token validation.
+//! External OIDC bearer-token validation + authorization-code flow (#1178).
+//!
+//! ## Bearer validation
 //!
 //! Plugs Microsoft Entra ID, Auth0, Keycloak, etc. in front of tiled
 //! without storing user credentials in the auth DB. The server fetches
 //! the IdP's JWKS once (cached for the lifetime of the process by
 //! default), and verifies incoming bearer JWTs against the matching
 //! public key. Successful validation produces a `(provider, sub)`
-//! identity that `AuthDb::ensure_principal` upserts on first sight —
-//! same code path the password / device flows use.
+//! identity that `AuthDb::ensure_principal` upserts on first sight.
 //!
 //! Mirrors tiled#1364 (EntraAuthenticator) + tiled#1343
 //! (ProxiedOIDCAuthenticator).
+//!
+//! ## Authorization-code + PKCE flow (#1178)
+//!
+//! `OidcProvider` may carry code-flow config (`client_id`,
+//! `authorization_endpoint`, `token_endpoint`). When those fields are
+//! set, `ExternalOidcValidator::build_authorize_url` builds a
+//! browser-redirect URL with PKCE S256 + nonce (OIDC Core §3.1.2.1).
+//! After the IdP redirects back with `?code=…&state=…`,
+//! `exchange_code_flow` exchanges the code at `token_endpoint`, validates
+//! the returned `id_token` (same JWKS machinery + nonce check per OIDC
+//! Core §3.1.3.7 #11), and returns the principal identity.
+//!
+//! **Single-process limitation**: `PendingAuthStore` is an in-memory
+//! `Mutex<HashMap>`. The `/authorize` and `/callback` requests MUST land
+//! on the same process. A horizontally-scaled deployment needs a shared
+//! external store (e.g. Redis) to avoid "unknown state" errors on the
+//! callback.
 
 #![cfg(feature = "oidc")]
 
@@ -19,6 +37,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Duration, Utc};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 
 use crate::error::{AuthError, Result};
@@ -59,6 +78,31 @@ pub struct OidcProvider {
     ///   granted the union of every mapped scope — Entra would not have
     ///   issued the token had the user lacked the requested scopes.
     pub scopes_map: HashMap<String, Vec<Scope>>,
+
+    // ---- Authorization-code + PKCE flow (optional, tiled#1178) ----
+    //
+    // When `client_id`, `authorization_endpoint`, and `token_endpoint` are
+    // all `Some`, the provider also supports the browser-redirect
+    // authorization-code flow. `None` on any keeps it bearer-only.
+    /// OAuth2 `client_id` registered at the IdP. Required for code flow.
+    /// `None` = bearer-only provider.
+    pub client_id: Option<String>,
+    /// OAuth2 `client_secret`. `None` or `Some("")` → PKCE-only public-
+    /// client mode (no secret sent to the token endpoint). Confidential
+    /// clients set this alongside PKCE.
+    pub client_secret: Option<String>,
+    /// IdP's authorization endpoint URL. Required for code flow.
+    pub authorization_endpoint: Option<String>,
+    /// IdP's token endpoint URL. Required for code flow.
+    pub token_endpoint: Option<String>,
+    /// After a successful code-flow callback, redirect the browser here
+    /// with `access_token` and `refresh_token` as query params.
+    /// `None` → return the tokens as JSON (API-client mode).
+    /// Mirrors Python `OIDCAuthenticator.redirect_on_success`.
+    pub redirect_on_success: Option<String>,
+    /// On authentication failure in the code-flow callback, redirect here.
+    /// `None` → return HTTP 401 JSON.
+    pub redirect_on_failure: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -87,6 +131,73 @@ struct CachedKeys {
     expires_at: DateTime<Utc>,
 }
 
+// ---------------------------------------------------------------------------
+// Pending authorization-code state store
+// ---------------------------------------------------------------------------
+
+/// Server-side state kept between the `/authorize` redirect (generated)
+/// and the `/callback` completion (consumed). Expires after 10 minutes.
+///
+/// The `state` key is a 16-byte cryptographically random token, so
+/// guessing it is infeasible — this also provides CSRF protection per
+/// OAuth 2.0 §10.12 / RFC 6819 §4.4.1.8.
+pub struct PendingAuth {
+    /// Name of the OIDC provider that initiated the flow.
+    pub provider: String,
+    /// PKCE code verifier (43 base64url chars, RFC 7636 §4.1).
+    /// Sent to the token endpoint so the IdP can verify the S256
+    /// `code_challenge` from the authorization request.
+    pub code_verifier: String,
+    /// OIDC nonce embedded in the authorization URL and expected in the
+    /// returned `id_token` (OIDC Core §3.1.3.7 #11).
+    pub nonce: String,
+    /// Absolute expiry. Entries past this are rejected and lazily purged.
+    pub expires_at: DateTime<Utc>,
+}
+
+/// In-memory pending-auth state store.
+///
+/// **Single-process limitation**: does not survive restarts or survive
+/// load-balanced deployments where the `/callback` may land on a
+/// different process than `/authorize`. Wire a Redis / DB-backed store
+/// for multi-process deployments.
+pub struct PendingAuthStore {
+    inner: std::sync::Mutex<HashMap<String, PendingAuth>>,
+}
+
+impl PendingAuthStore {
+    fn new() -> Self {
+        Self {
+            inner: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn insert(&self, state: String, pending: PendingAuth) {
+        let mut map = self.inner.lock().expect("pending auth store poisoned");
+        map.insert(state, pending);
+    }
+
+    /// Remove and return the pending auth for `state`. Returns `None` when
+    /// the state is unknown or has expired. Lazily purges other stale
+    /// entries on every call.
+    pub fn take(&self, state: &str) -> Option<PendingAuth> {
+        let mut map = self.inner.lock().expect("pending auth store poisoned");
+        // Always consume — prevents replay even for expired entries.
+        let entry = map.remove(state)?;
+        // Lazily purge other stale entries while we hold the lock.
+        let now = Utc::now();
+        map.retain(|_, v| v.expires_at > now);
+        if entry.expires_at <= now {
+            return None;
+        }
+        Some(entry)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ExternalOidcValidator
+// ---------------------------------------------------------------------------
+
 /// Resolves bearer tokens against one or more external IdPs. Cheap to
 /// clone — keys are stored behind an `Arc<RwLock>`.
 #[derive(Clone)]
@@ -95,6 +206,10 @@ pub struct ExternalOidcValidator {
     cache: Arc<RwLock<HashMap<String, CachedKeys>>>,
     cache_ttl: Duration,
     http: reqwest::Client,
+    /// In-memory store for pending authorization-code states. Shared
+    /// across clones via `Arc` so the `/authorize` handler and the
+    /// `/callback` handler see the same store.
+    pub flow_store: Arc<PendingAuthStore>,
 }
 
 impl std::fmt::Debug for ExternalOidcValidator {
@@ -126,6 +241,7 @@ impl ExternalOidcValidator {
             cache: Arc::new(RwLock::new(HashMap::new())),
             cache_ttl: Duration::hours(1),
             http: reqwest::Client::new(),
+            flow_store: Arc::new(PendingAuthStore::new()),
         })
     }
 
@@ -159,6 +275,24 @@ impl ExternalOidcValidator {
             .await
             .insert(provider_name.to_string(), cached);
     }
+
+    /// Pre-insert a known `PendingAuth` entry. For tests only — allows
+    /// the test to inject a known state + nonce so the mock token endpoint
+    /// can embed the correct nonce in the id_token.
+    #[doc(hidden)]
+    pub fn inject_pending_auth_for_test(&self, state: String, pending: PendingAuth) {
+        self.flow_store.insert(state, pending);
+    }
+
+    /// Return the configured providers. Used by server routes that need
+    /// to look up per-provider code-flow config (e.g. `redirect_on_success`).
+    pub fn providers(&self) -> &[OidcProvider] {
+        &self.providers
+    }
+
+    // ---------------------------------------------------------------------------
+    // Bearer validation
+    // ---------------------------------------------------------------------------
 
     /// Try each configured provider's `iss` claim against the token; on
     /// match, fetch the JWKS (cached) and validate the signature. Returns
@@ -224,6 +358,231 @@ impl ExternalOidcValidator {
         })
     }
 
+    // ---------------------------------------------------------------------------
+    // Authorization-code + PKCE flow (#1178)
+    // ---------------------------------------------------------------------------
+
+    /// Build the authorization redirect URL for a code-flow provider.
+    ///
+    /// Generates a PKCE code verifier + S256 challenge, a random OAuth2
+    /// `state` parameter, and a random OIDC `nonce`. The pending state is
+    /// stored in `flow_store` with a 10-minute expiry; `exchange_code_flow`
+    /// retrieves and consumes it on the callback.
+    ///
+    /// Returns the full redirect URL (to be sent as `Location: …` in a 302).
+    pub fn build_authorize_url(&self, provider_name: &str, redirect_uri: &str) -> Result<String> {
+        let provider = self
+            .providers
+            .iter()
+            .find(|p| p.name == provider_name)
+            .ok_or_else(|| {
+                AuthError::Validation(format!("unknown OIDC provider '{provider_name}'"))
+            })?;
+        let client_id = provider.client_id.as_deref().ok_or_else(|| {
+            AuthError::Validation(format!(
+                "provider '{provider_name}' is not configured for the authorization-code flow \
+                 (client_id is required)"
+            ))
+        })?;
+        let auth_endpoint = provider.authorization_endpoint.as_deref().ok_or_else(|| {
+            AuthError::Validation(format!(
+                "provider '{provider_name}': authorization_endpoint is not configured"
+            ))
+        })?;
+
+        let (code_verifier, code_challenge) = gen_pkce_pair();
+        let nonce = gen_nonce();
+        let state = gen_state();
+
+        self.flow_store.insert(
+            state.clone(),
+            PendingAuth {
+                provider: provider_name.to_string(),
+                code_verifier,
+                nonce: nonce.clone(),
+                expires_at: Utc::now() + Duration::minutes(10),
+            },
+        );
+
+        let mut url = reqwest::Url::parse(auth_endpoint).map_err(|e| {
+            AuthError::Validation(format!("bad authorization_endpoint '{auth_endpoint}': {e}"))
+        })?;
+        url.query_pairs_mut()
+            .append_pair("response_type", "code")
+            .append_pair("client_id", client_id)
+            .append_pair("redirect_uri", redirect_uri)
+            .append_pair("scope", "openid offline_access")
+            .append_pair("state", &state)
+            .append_pair("code_challenge", &code_challenge)
+            .append_pair("code_challenge_method", "S256")
+            .append_pair("nonce", &nonce)
+            .append_pair("prompt", "login");
+
+        Ok(url.to_string())
+    }
+
+    /// Exchange an authorization code for tokens, validate the `id_token`,
+    /// and return the principal identity.
+    ///
+    /// Consumes the pending state keyed by `state_param`. Returns an error
+    /// when `state_param` is unknown, expired, or has already been used —
+    /// the entry is removed from the store even on failure so replayed
+    /// callbacks cannot succeed on retry.
+    pub async fn exchange_code_flow(
+        &self,
+        state_param: &str,
+        code: &str,
+        redirect_uri: &str,
+    ) -> Result<ValidatedToken> {
+        // Consume (and validate) the pending state.
+        let pending = self.flow_store.take(state_param).ok_or_else(|| {
+            AuthError::Unauthorized(
+                "unknown or expired authorization state — the state parameter was tampered \
+                 with, the 10-minute authorize window elapsed, or the callback was replayed"
+                    .into(),
+            )
+        })?;
+
+        let provider = self
+            .providers
+            .iter()
+            .find(|p| p.name == pending.provider)
+            .ok_or_else(|| {
+                AuthError::Validation(format!(
+                    "OIDC provider '{}' disappeared from config",
+                    pending.provider
+                ))
+            })?;
+
+        let client_id = provider.client_id.as_deref().ok_or_else(|| {
+            AuthError::Validation("client_id not configured for code flow".into())
+        })?;
+        let token_endpoint = provider.token_endpoint.as_deref().ok_or_else(|| {
+            AuthError::Validation("token_endpoint not configured for code flow".into())
+        })?;
+
+        // Build the token-endpoint form. Always include PKCE verifier; add
+        // client_secret only when non-empty (confidential-client mode).
+        let secret_clone = provider.client_secret.clone().filter(|s| !s.is_empty());
+        let mut form: Vec<(&str, &str)> = vec![
+            ("grant_type", "authorization_code"),
+            ("client_id", client_id),
+            ("redirect_uri", redirect_uri),
+            ("code", code),
+            ("code_verifier", &pending.code_verifier),
+        ];
+        if let Some(ref secret) = secret_clone {
+            form.push(("client_secret", secret.as_str()));
+        }
+
+        let resp = self
+            .http
+            .post(token_endpoint)
+            .form(&form)
+            .send()
+            .await
+            .map_err(|e| AuthError::Validation(format!("token endpoint request failed: {e}")))?;
+
+        let status = resp.status();
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| AuthError::Validation(format!("failed to parse token response: {e}")))?;
+
+        if !status.is_success() {
+            let err_msg = body["error"].as_str().unwrap_or("unknown_error");
+            let err_desc = body["error_description"].as_str().unwrap_or("");
+            return Err(AuthError::Unauthorized(format!(
+                "token endpoint returned {status}: {err_msg} — {err_desc}"
+            )));
+        }
+
+        let id_token = body["id_token"].as_str().ok_or_else(|| {
+            AuthError::Validation("token response is missing the 'id_token' field".into())
+        })?;
+
+        self.validate_id_token(provider, id_token, &pending.nonce)
+            .await
+    }
+
+    /// Validate an id_token returned from the token endpoint.
+    ///
+    /// Applies the same iss / aud / exp / nbf / alg checks as bearer
+    /// validation, plus a `nonce` claim check (OIDC Core §3.1.3.7 #11).
+    /// The `kid` header field is required; IdPs that omit it are not
+    /// supported.
+    async fn validate_id_token(
+        &self,
+        provider: &OidcProvider,
+        id_token: &str,
+        expected_nonce: &str,
+    ) -> Result<ValidatedToken> {
+        let header = decode_header(id_token).map_err(AuthError::from)?;
+        let kid = header.kid.ok_or_else(|| {
+            AuthError::Unauthorized(
+                "id_token has no 'kid' header — the IdP must include a key ID for \
+                 signature-key selection; kid-less id_tokens are not supported"
+                    .into(),
+            )
+        })?;
+
+        let (key, jwk_alg) = self.fetch_key(provider, &kid).await?;
+        let algorithms = if provider.algorithms.is_empty() {
+            vec![jwk_alg]
+        } else {
+            provider.algorithms.clone()
+        };
+        let validation = build_validation(provider, algorithms);
+
+        let claims = decode::<serde_json::Value>(id_token, &key, &validation)
+            .map_err(AuthError::from)?
+            .claims;
+
+        // OIDC Core §3.1.3.7 #11: the nonce MUST be present and MUST equal
+        // the value sent in the authorization request.
+        let nonce_claim = claims
+            .get("nonce")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                AuthError::Unauthorized("id_token is missing the 'nonce' claim".into())
+            })?;
+        if nonce_claim != expected_nonce {
+            return Err(AuthError::Unauthorized(
+                "id_token nonce does not match the nonce sent in the authorization \
+                 request — possible replay or CSRF attempt"
+                    .into(),
+            ));
+        }
+
+        let sub = claims
+            .get(&provider.subject_claim)
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                AuthError::Unauthorized(format!(
+                    "id_token missing claim '{}'",
+                    provider.subject_claim
+                ))
+            })?
+            .to_string();
+
+        let scopes = if provider.scopes_map.is_empty() {
+            None
+        } else {
+            Some(translate_scp(&provider.scopes_map, &claims))
+        };
+
+        Ok(ValidatedToken {
+            provider: provider.name.clone(),
+            sub,
+            claims,
+            scopes,
+        })
+    }
+
+    // ---------------------------------------------------------------------------
+    // JWKS key cache
+    // ---------------------------------------------------------------------------
+
     async fn fetch_key(
         &self,
         provider: &OidcProvider,
@@ -271,6 +630,10 @@ impl ExternalOidcValidator {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Public result type
+// ---------------------------------------------------------------------------
+
 /// Result of a successful external-OIDC validation.
 #[derive(Debug, Clone, Serialize)]
 pub struct ValidatedToken {
@@ -285,6 +648,10 @@ pub struct ValidatedToken {
     /// `token_scopes | role_scopes`, `authentication.py:434`).
     pub scopes: Option<ScopeSet>,
 }
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
 /// Translate a token's `scp` claim into tiled scopes via a provider's
 /// `scopes_map`. Mirrors `EntraAuthenticator.decode_token`
@@ -380,6 +747,40 @@ fn base64_url_decode(s: &str) -> Result<Vec<u8>> {
         .map_err(|e| AuthError::Validation(format!("base64: {e}")))
 }
 
+// ---------------------------------------------------------------------------
+// PKCE helpers
+// ---------------------------------------------------------------------------
+
+/// Generate a PKCE code verifier (43 URL-safe base64 chars, RFC 7636 §4.1)
+/// and its S256 code challenge (SHA-256 of the verifier, base64url-encoded).
+fn gen_pkce_pair() -> (String, String) {
+    use base64::Engine;
+    let buf: [u8; 32] = rand::random();
+    let verifier = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf);
+    let hash = Sha256::digest(verifier.as_bytes());
+    let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hash);
+    (verifier, challenge)
+}
+
+/// Generate a cryptographically random OIDC nonce (base64url of 16 bytes).
+fn gen_nonce() -> String {
+    use base64::Engine;
+    let buf: [u8; 16] = rand::random();
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf)
+}
+
+/// Generate a cryptographically random OAuth2 `state` parameter
+/// (base64url of 16 bytes).
+fn gen_state() -> String {
+    use base64::Engine;
+    let buf: [u8; 16] = rand::random();
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -394,6 +795,30 @@ mod tests {
             subject_claim: "sub".into(),
             algorithms: vec![Algorithm::HS256],
             scopes_map: HashMap::new(),
+            client_id: None,
+            client_secret: None,
+            authorization_endpoint: None,
+            token_endpoint: None,
+            redirect_on_success: None,
+            redirect_on_failure: None,
+        }
+    }
+
+    fn code_flow_provider() -> OidcProvider {
+        OidcProvider {
+            name: "code-idp".into(),
+            jwks_url: "https://code-idp.test/jwks".into(),
+            issuer: "https://code-idp.test/".into(),
+            audiences: vec!["tiled-code-client".into()],
+            subject_claim: "sub".into(),
+            algorithms: vec![Algorithm::HS256],
+            scopes_map: HashMap::new(),
+            client_id: Some("tiled-code-client".into()),
+            client_secret: None,
+            authorization_endpoint: Some("https://code-idp.test/authorize".into()),
+            token_endpoint: Some("https://code-idp.test/token".into()),
+            redirect_on_success: None,
+            redirect_on_failure: None,
         }
     }
 
@@ -443,6 +868,143 @@ mod tests {
         map.insert("api://app/write".to_string(), vec![Scope::WriteData]);
         map
     }
+
+    // -----------------------------------------------------------------------
+    // Pending auth store
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pending_auth_store_round_trip() {
+        let store = PendingAuthStore::new();
+        store.insert(
+            "state-abc".into(),
+            PendingAuth {
+                provider: "idp".into(),
+                code_verifier: "verifier".into(),
+                nonce: "nonce123".into(),
+                expires_at: Utc::now() + Duration::minutes(10),
+            },
+        );
+        let got = store.take("state-abc").expect("entry should be present");
+        assert_eq!(got.provider, "idp");
+        assert_eq!(got.nonce, "nonce123");
+        // Second take must return None (consumed).
+        assert!(store.take("state-abc").is_none());
+    }
+
+    #[test]
+    fn pending_auth_store_unknown_state() {
+        let store = PendingAuthStore::new();
+        assert!(store.take("no-such-state").is_none());
+    }
+
+    #[test]
+    fn pending_auth_store_expired_entry() {
+        let store = PendingAuthStore::new();
+        store.insert(
+            "expired-state".into(),
+            PendingAuth {
+                provider: "idp".into(),
+                code_verifier: "v".into(),
+                nonce: "n".into(),
+                // Already expired.
+                expires_at: Utc::now() - Duration::seconds(1),
+            },
+        );
+        assert!(
+            store.take("expired-state").is_none(),
+            "expired entry must be rejected"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // build_authorize_url
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn build_authorize_url_structure() {
+        let validator = ExternalOidcValidator::new(vec![code_flow_provider()]).unwrap();
+        let url_str = validator
+            .build_authorize_url("code-idp", "https://tiled.example.com/callback")
+            .unwrap();
+        let url = reqwest::Url::parse(&url_str).expect("returned URL must be valid");
+
+        assert_eq!(url.scheme(), "https");
+        assert_eq!(url.host_str(), Some("code-idp.test"));
+        assert_eq!(url.path(), "/authorize");
+
+        let params: HashMap<_, _> = url.query_pairs().collect();
+        assert_eq!(
+            params.get("response_type").map(|s| s.as_ref()),
+            Some("code")
+        );
+        assert_eq!(
+            params.get("client_id").map(|s| s.as_ref()),
+            Some("tiled-code-client")
+        );
+        assert_eq!(
+            params.get("redirect_uri").map(|s| s.as_ref()),
+            Some("https://tiled.example.com/callback")
+        );
+        assert_eq!(
+            params.get("code_challenge_method").map(|s| s.as_ref()),
+            Some("S256")
+        );
+        assert!(
+            params.contains_key("code_challenge"),
+            "code_challenge must be present"
+        );
+        assert!(params.contains_key("state"), "state must be present");
+        assert!(params.contains_key("nonce"), "nonce must be present");
+        assert_eq!(params.get("prompt").map(|s| s.as_ref()), Some("login"));
+    }
+
+    #[test]
+    fn build_authorize_url_rejects_bearer_only_provider() {
+        let validator = ExternalOidcValidator::new(vec![test_provider()]).unwrap();
+        let err = validator
+            .build_authorize_url("test", "https://tiled.example.com/callback")
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("client_id"),
+            "error should mention missing client_id"
+        );
+    }
+
+    #[test]
+    fn build_authorize_url_stores_pending_state() {
+        let validator = ExternalOidcValidator::new(vec![code_flow_provider()]).unwrap();
+        let url_str = validator
+            .build_authorize_url("code-idp", "https://tiled.example.com/callback")
+            .unwrap();
+        let url = reqwest::Url::parse(&url_str).unwrap();
+        let params: HashMap<_, _> = url.query_pairs().collect();
+        let state = params
+            .get("state")
+            .expect("state must be in URL")
+            .to_string();
+        // The pending entry must be in the store under that state key.
+        let pending = validator
+            .flow_store
+            .take(&state)
+            .expect("pending auth must be stored");
+        assert_eq!(pending.provider, "code-idp");
+        assert!(!pending.code_verifier.is_empty());
+        assert!(!pending.nonce.is_empty());
+    }
+
+    #[test]
+    fn pkce_pair_challenge_is_s256_of_verifier() {
+        use base64::Engine;
+        let (verifier, challenge) = gen_pkce_pair();
+        let hash = Sha256::digest(verifier.as_bytes());
+        let expected = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hash);
+        assert_eq!(challenge, expected, "code_challenge must be S256(verifier)");
+    }
+
+    // -----------------------------------------------------------------------
+    // Bearer validation (existing tests, preserved)
+    // -----------------------------------------------------------------------
 
     /// #1360: `translate_scp` mirrors `EntraAuthenticator.decode_token`
     /// (`authenticators.py:404-422`) at its three boundaries: a present `scp`

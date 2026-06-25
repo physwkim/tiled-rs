@@ -820,6 +820,12 @@ async fn build_oidc_state(
             subject_claim: "sub".into(),
             algorithms: vec![Algorithm::HS256],
             scopes_map,
+            client_id: None,
+            client_secret: None,
+            authorization_endpoint: None,
+            token_endpoint: None,
+            redirect_on_success: None,
+            redirect_on_failure: None,
         }])
         .unwrap(),
     );
@@ -1805,4 +1811,433 @@ async fn get_principal_returns_identities_admin_only() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// ---------------------------------------------------------------------------
+// OIDC authorization-code flow tests (#1178)
+// ---------------------------------------------------------------------------
+
+/// Build an AppState and Router wired with a code-flow-capable OIDC provider.
+/// The provider uses HS256 with a pre-injected test key so no JWKS fetch is
+/// needed.
+async fn build_code_flow_app(
+    token_endpoint: &str,
+) -> (
+    axum::Router,
+    Arc<tiled_auth::ExternalOidcValidator>,
+    tempfile::TempDir,
+) {
+    use jsonwebtoken::Algorithm;
+    use tiled_auth::{AuthDb, ExternalOidcValidator, Issuer, OidcProvider};
+
+    let dir = tempfile::tempdir().unwrap();
+    let auth_uri = format!("sqlite://{}", dir.path().join("auth.db").display());
+    let auth_db = AuthDb::connect(&auth_uri).await.unwrap();
+    auth_db.migrate().await.unwrap();
+
+    let issuer = Issuer::new(b"code-flow-test-secret-32bytes!!!").unwrap();
+
+    let validator = Arc::new(
+        ExternalOidcValidator::new(vec![OidcProvider {
+            name: "mock-idp".into(),
+            jwks_url: "https://mock-idp.test/jwks".into(), // pre-seeded; never fetched
+            issuer: "https://mock-idp.test/".into(),
+            audiences: vec!["tiled-code-client".into()],
+            subject_claim: "sub".into(),
+            algorithms: vec![Algorithm::HS256],
+            scopes_map: std::collections::HashMap::new(),
+            client_id: Some("tiled-code-client".into()),
+            client_secret: None,
+            authorization_endpoint: Some("https://mock-idp.test/authorize".into()),
+            token_endpoint: Some(token_endpoint.to_string()),
+            redirect_on_success: None,
+            redirect_on_failure: None,
+        }])
+        .unwrap(),
+    );
+    // Pre-seed the JWKS cache so id_token validation skips the HTTP fetch.
+    validator
+        .inject_key_for_test(
+            "mock-idp",
+            "test-kid",
+            jsonwebtoken::DecodingKey::from_secret(b"mock-idp-secret!!"),
+            Algorithm::HS256,
+        )
+        .await;
+
+    let cat_uri = format!("sqlite://{}", dir.path().join("cat.db").display());
+    let catalog = tiled_catalog::Catalog::connect(&cat_uri).await.unwrap();
+    catalog.migrate().await.unwrap();
+    let resolver: Arc<dyn tiled_catalog::adapter::LeafResolver> =
+        Arc::new(tiled_catalog::adapter::UnresolvedLeaf);
+    let root_tree: Arc<dyn tiled_core::adapters::ContainerAdapter> =
+        Arc::new(tiled_catalog::CatalogAdapter::root(catalog.clone(), resolver));
+    let registry = Arc::new(tiled_serialization::default_registry());
+    let state = tiled_server::AppState {
+        root_tree,
+        serialization_registry: registry,
+        query_names: vec![],
+        base_url: Some("http://localhost:8000".into()),
+        cors_policy: tiled_server::state::CorsOriginPolicy::Permissive,
+        trust_forwarded_headers: false,
+        api_key: None,
+        catalog: Some(catalog.clone()),
+        auth_db: Some(auth_db),
+        issuer: Some(issuer),
+        authenticators: vec![],
+        proxied_header_auth: None,
+        external_oidc: Some(validator.clone()),
+        forwarded_allow_ips: None,
+        max_request_body_bytes: 10 * 1024 * 1024,
+        response_bytesize_limit: 300_000_000,
+        streaming_bus: tiled_server::streaming::StreamingBus::new(),
+        access_policy: None,
+        default_login_scopes: tiled_auth::ScopeSet::full(),
+        enable_web: false,
+        web_assets_dir: None,
+        spec_views: vec![],
+        webhook_config: None,
+        request_timeout_secs: 30,
+        expose_raw_assets: true,
+        exact_count_limit: u64::MAX,
+    };
+    let app = tiled_server::build_app(state);
+    (app, validator, dir)
+}
+
+/// Mint an HS256 id_token for code-flow tests with the mock-idp key.
+fn mint_code_flow_id_token(sub: &str, nonce: &str) -> String {
+    use chrono::Utc;
+    use jsonwebtoken::{Algorithm, EncodingKey, Header};
+    let now = Utc::now().timestamp();
+    let claims = serde_json::json!({
+        "iss": "https://mock-idp.test/",
+        "aud": "tiled-code-client",
+        "sub": sub,
+        "exp": now + 3600,
+        "nbf": now - 60,
+        "iat": now - 60,
+        "nonce": nonce,
+    });
+    let mut header = Header::new(Algorithm::HS256);
+    header.kid = Some("test-kid".into());
+    jsonwebtoken::encode(
+        &header,
+        &claims,
+        &EncodingKey::from_secret(b"mock-idp-secret!!"),
+    )
+    .unwrap()
+}
+
+/// GET /api/v1/auth/provider/mock-idp/authorize → 302 to IdP with
+/// code_challenge + state in the Location header.
+#[tokio::test]
+async fn oidc_authorize_302_with_pkce_params() {
+    let (app, _validator, _dir) = build_code_flow_app("https://mock-idp.test/token").await;
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/api/v1/auth/provider/mock-idp/authorize")
+        .header("host", "localhost:8000")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER, "must redirect");
+
+    let location = resp
+        .headers()
+        .get("location")
+        .expect("Location header must be set")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let url = reqwest::Url::parse(&location).expect("Location must be a valid URL");
+    assert_eq!(url.host_str(), Some("mock-idp.test"));
+    assert_eq!(url.path(), "/authorize");
+
+    let params: std::collections::HashMap<_, _> = url.query_pairs().collect();
+    assert_eq!(
+        params.get("response_type").map(|s| s.as_ref()),
+        Some("code"),
+        "response_type=code required"
+    );
+    assert_eq!(
+        params.get("client_id").map(|s| s.as_ref()),
+        Some("tiled-code-client")
+    );
+    assert!(
+        params.contains_key("code_challenge"),
+        "PKCE code_challenge must be present"
+    );
+    assert_eq!(
+        params.get("code_challenge_method").map(|s| s.as_ref()),
+        Some("S256"),
+        "S256 method required"
+    );
+    assert!(
+        params.contains_key("state"),
+        "state parameter must be present"
+    );
+    assert!(
+        params.contains_key("nonce"),
+        "nonce parameter must be present"
+    );
+}
+
+/// GET /authorize for an unknown provider → Validation error (not 302).
+#[tokio::test]
+async fn oidc_authorize_unknown_provider_returns_error() {
+    let (app, _validator, _dir) = build_code_flow_app("https://mock-idp.test/token").await;
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/api/v1/auth/provider/no-such-provider/authorize")
+        .header("host", "localhost:8000")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_ne!(
+        resp.status(),
+        StatusCode::SEE_OTHER,
+        "unknown provider must not redirect"
+    );
+}
+
+/// GET /callback with an unknown state → 401.
+#[tokio::test]
+async fn oidc_callback_unknown_state_rejected() {
+    let (app, _validator, _dir) = build_code_flow_app("https://mock-idp.test/token").await;
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/api/v1/auth/provider/mock-idp/callback?code=bogus-code&state=no-such-state")
+        .header("host", "localhost:8000")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "unknown state must be rejected with 401"
+    );
+}
+
+/// GET /callback with expired state → 401.
+#[tokio::test]
+async fn oidc_callback_expired_state_rejected() {
+    use chrono::{Duration, Utc};
+    let (app, validator, _dir) = build_code_flow_app("https://mock-idp.test/token").await;
+
+    // Inject an already-expired pending auth.
+    validator.inject_pending_auth_for_test(
+        "expired-state".into(),
+        tiled_auth::PendingAuth {
+            provider: "mock-idp".into(),
+            code_verifier: "some-verifier".into(),
+            nonce: "some-nonce".into(),
+            expires_at: Utc::now() - Duration::seconds(1),
+        },
+    );
+
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri("/api/v1/auth/provider/mock-idp/callback?code=any-code&state=expired-state")
+        .header("host", "localhost:8000")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "expired state must be rejected with 401"
+    );
+}
+
+/// Full /authorize → /callback flow with a mock token endpoint.
+///
+/// The mock serves a signed id_token with the correct nonce. The
+/// callback handler exchanges the code, validates the id_token, and
+/// returns tiled access + refresh tokens.
+#[tokio::test]
+async fn oidc_callback_with_mock_idp_mints_session() {
+    use axum::Router;
+    use axum::body::Bytes;
+    use axum::routing::post;
+    use chrono::{Duration, Utc};
+    use std::collections::HashMap;
+
+    // Spin up a local mock token endpoint.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let token_endpoint = format!("http://127.0.0.1:{port}/token");
+
+    let known_nonce = "test-nonce-value-abc";
+    let known_state = "test-state-value-xyz";
+
+    // The mock returns a signed id_token embedding the known nonce.
+    let id_token = mint_code_flow_id_token("bob", known_nonce);
+    let id_token_clone = id_token.clone();
+    let mock_app = Router::new().route(
+        "/token",
+        post(move |body: Bytes| {
+            let token = id_token_clone.clone();
+            async move {
+                // Verify that PKCE verifier and grant_type are present.
+                let form: HashMap<String, String> =
+                    form_urlencoded::parse(body.as_ref()).into_owned().collect();
+                assert_eq!(
+                    form.get("grant_type").map(String::as_str),
+                    Some("authorization_code")
+                );
+                assert!(
+                    form.contains_key("code_verifier"),
+                    "mock IdP: code_verifier must be sent"
+                );
+                axum::Json(serde_json::json!({
+                    "id_token": token,
+                    "access_token": "mock-access-token",
+                    "token_type": "Bearer",
+                }))
+            }
+        }),
+    );
+    tokio::spawn(async move {
+        axum::serve(listener, mock_app).await.unwrap();
+    });
+
+    let (app, validator, _dir) = build_code_flow_app(&token_endpoint).await;
+
+    // Pre-inject the known pending auth with our known state + nonce.
+    validator.inject_pending_auth_for_test(
+        known_state.into(),
+        tiled_auth::PendingAuth {
+            provider: "mock-idp".into(),
+            code_verifier: "known-verifier".into(),
+            nonce: known_nonce.into(),
+            expires_at: Utc::now() + Duration::minutes(10),
+        },
+    );
+
+    let callback_uri =
+        format!("/api/v1/auth/provider/mock-idp/callback?code=mock-code&state={known_state}");
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(&callback_uri)
+        .header("host", "localhost:8000")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "callback must return 200 with tokens"
+    );
+    let body_bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert!(
+        body.get("access_token").is_some(),
+        "response must contain access_token"
+    );
+    assert!(
+        body.get("refresh_token").is_some(),
+        "response must contain refresh_token"
+    );
+    assert_eq!(
+        body.get("token_type").and_then(|v| v.as_str()),
+        Some("Bearer")
+    );
+    assert_eq!(
+        body.pointer("/identity/provider").and_then(|v| v.as_str()),
+        Some("mock-idp")
+    );
+    assert_eq!(
+        body.pointer("/identity/id").and_then(|v| v.as_str()),
+        Some("bob"),
+        "identity.id must be the sub from the id_token"
+    );
+}
+
+/// State is consumed on callback — replaying the same state is rejected.
+#[tokio::test]
+async fn oidc_callback_state_not_replayable() {
+    use axum::Router;
+    use axum::body::Bytes;
+    use axum::routing::post;
+    use chrono::{Duration, Utc};
+    use tower::ServiceExt as _; // second oneshot
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let token_endpoint = format!("http://127.0.0.1:{port}/token");
+
+    let known_nonce = "replay-nonce";
+    let known_state = "replay-state";
+
+    let id_token = mint_code_flow_id_token("carol", known_nonce);
+    let id_token_clone = id_token.clone();
+    let mock_app = Router::new().route(
+        "/token",
+        post(move |_body: Bytes| {
+            let token = id_token_clone.clone();
+            async move {
+                axum::Json(serde_json::json!({
+                    "id_token": token,
+                    "access_token": "mock-at",
+                    "token_type": "Bearer",
+                }))
+            }
+        }),
+    );
+    tokio::spawn(async move {
+        axum::serve(listener, mock_app).await.unwrap();
+    });
+
+    let (app, validator, _dir) = build_code_flow_app(&token_endpoint).await;
+
+    validator.inject_pending_auth_for_test(
+        known_state.into(),
+        tiled_auth::PendingAuth {
+            provider: "mock-idp".into(),
+            code_verifier: "verifier".into(),
+            nonce: known_nonce.into(),
+            expires_at: Utc::now() + Duration::minutes(10),
+        },
+    );
+
+    let callback_uri =
+        format!("/api/v1/auth/provider/mock-idp/callback?code=c&state={known_state}");
+
+    // First request should succeed.
+    let resp1 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(&callback_uri)
+                .header("host", "localhost:8000")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp1.status(), StatusCode::OK);
+
+    // Second request with the same state must be rejected (state consumed).
+    let resp2 = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(&callback_uri)
+                .header("host", "localhost:8000")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp2.status(), StatusCode::UNAUTHORIZED);
 }
