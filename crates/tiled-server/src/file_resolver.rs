@@ -266,6 +266,20 @@ fn build_leaf_adapter(
                 .map_err(|e| CatalogError::Validation(e.to_string()))?;
             AnyAdapter::Table(Arc::new(adapter))
         }
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => {
+            #[cfg(feature = "excel-adapter")]
+            {
+                let adapter = tiled_adapters::ExcelAdapter::from_path(path, metadata)
+                    .map_err(|e| CatalogError::Validation(e.to_string()))?;
+                AnyAdapter::Table(Arc::new(adapter))
+            }
+            #[cfg(not(feature = "excel-adapter"))]
+            {
+                return Err(CatalogError::Validation(
+                    "excel (.xlsx) support not built in".into(),
+                ));
+            }
+        }
         "text/csv" => {
             #[cfg(feature = "csv-adapter")]
             {

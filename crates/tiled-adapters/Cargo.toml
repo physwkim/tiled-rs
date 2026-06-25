@@ -8,6 +8,7 @@ default = ["csv-adapter", "parquet", "arrow-ipc"]
 csv-adapter = ["dep:csv"]
 parquet = ["dep:parquet"]
 arrow-ipc = []
+excel-adapter = ["dep:calamine"]
 hdf5 = ["dep:rust-hdf5"]
 tiff = ["dep:tiff", "dep:image"]
 zarr = ["dep:zarrs", "dep:object_store"]
@@ -33,7 +34,9 @@ tiff = { workspace = true, optional = true }
 image = { workspace = true, optional = true }
 zarrs = { workspace = true, optional = true }
 object_store = { workspace = true, optional = true }
+calamine = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+zip = "2"
