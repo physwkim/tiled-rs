@@ -715,6 +715,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "blosc2-pure-rs"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e8c480a5f547dc795da409a61d030108755f0b2ca67108054fc7abb7b4e8c0fe"
+dependencies = [
+ "flate2",
+ "lz4-pure-rs",
+ "rayon",
+ "zfp-rs",
+ "zstd-pure-rs",
+]
+
+[[package]]
 name = "brotli"
 version = "7.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2759,6 +2772,15 @@ name = "lru-slab"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
+
+[[package]]
+name = "lz4-pure-rs"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c9999337316af402052119585343e87a43d4d549b08cf51f53670a187c7c153a"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "lz4-sys"
@@ -5119,6 +5141,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
  "subtle",
  "tempfile",
@@ -5293,9 +5316,11 @@ dependencies = [
  "arrow",
  "axum",
  "base64",
+ "blosc2-pure-rs",
  "bytes",
  "chrono",
  "dashmap",
+ "form_urlencoded",
  "futures",
  "hmac",
  "indexmap",
@@ -6784,6 +6809,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "zfp-rs"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "07c1848c699b72e8c5d89f7fe45a81165cb931e260b094470d458973cd80f449"
+dependencies = [
+ "bitflags 2.11.0",
+ "bytemuck",
+ "libm",
+]
+
+[[package]]
 name = "zip"
 version = "2.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6859,6 +6895,12 @@ checksum = "e91ee311a569c327171651566e07972200e76fcfe2242a4fa446149a3881c08a"
 dependencies = [
  "zstd-safe",
 ]
+
+[[package]]
+name = "zstd-pure-rs"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4f5e05972e1a97c5261f46a9bb305fc2076171c3cf42033d4bf0b6c1942f7f8a"
 
 [[package]]
 name = "zstd-safe"

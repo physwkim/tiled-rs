@@ -289,6 +289,9 @@ pub fn build_app(state: AppState) -> Router {
             state.clone(),
             timeout_middleware,
         ))
+        .layer(axum::middleware::from_fn(
+            crate::blosc2::blosc2_compress_middleware,
+        ))
         .layer(CompressionLayer::new())
         // L2: the default request span records the full URI, including the
         // query string — so a credential passed as `?api_key=...` (a supported

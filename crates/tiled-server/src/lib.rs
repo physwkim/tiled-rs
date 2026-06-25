@@ -1,6 +1,7 @@
 pub mod app;
 pub mod auth_context;
 pub mod auth_router;
+pub mod blosc2;
 pub mod core;
 pub mod error;
 pub mod etag;
