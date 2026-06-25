@@ -11,7 +11,7 @@ arrow-ipc = []
 excel-adapter = ["dep:calamine"]
 sql-adapter = ["dep:sqlx"]
 hdf5 = ["dep:rust-hdf5"]
-netcdf-adapter = ["dep:rust-hdf5"]
+netcdf-adapter = ["dep:rust-hdf5", "dep:netcdf3"]
 tiff = ["dep:tiff", "dep:image"]
 zarr = ["dep:zarrs", "dep:object_store"]
 
@@ -37,6 +37,7 @@ image = { workspace = true, optional = true }
 zarrs = { workspace = true, optional = true }
 object_store = { workspace = true, optional = true }
 calamine = { workspace = true, optional = true }
+netcdf3 = { workspace = true, optional = true }
 sqlx = { workspace = true, optional = true }
 
 [dev-dependencies]

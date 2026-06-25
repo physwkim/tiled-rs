@@ -120,6 +120,9 @@ csv = "1"
 # Excel (pure-Rust xlsx/xls/ods reader — no system deps)
 calamine = "0.35"
 
+# NetCDF-3 classic (pure Rust, no system deps)
+netcdf3 = "0.6"
+
 # Ordered maps
 indexmap = { version = "2", features = ["serde"] }
 
