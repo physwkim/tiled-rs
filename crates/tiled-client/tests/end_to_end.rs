@@ -801,3 +801,180 @@ async fn table_export_to_file() {
     assert!(content.contains("x") && content.contains("y"), "csv header");
     assert!(content.contains('1') && content.contains('z'), "csv data");
 }
+
+// ---------------------------------------------------------------------------
+// Blosc2 content-encoding tests
+// ---------------------------------------------------------------------------
+
+/// Build a catalog containing one large array (200 f64 = 1 600 bytes) that
+/// exceeds the 500-byte minimum for blosc2 compression.
+fn build_large_array_catalog() -> MapAdapter {
+    let data: Vec<f64> = (0..200).map(|i| i as f64 * 1.5).collect();
+    let arr = ArrayAdapter::from_f64_1d(&data, serde_json::json!({}));
+    let mut mapping = IndexMap::new();
+    mapping.insert("big".into(), AnyAdapter::Array(Arc::new(arr)));
+    MapAdapter::new(mapping, serde_json::json!({}), vec![])
+}
+
+/// Spin up a server whose root contains only the large array.
+async fn spawn_blosc2_server() -> String {
+    let root_tree: Arc<dyn ContainerAdapter> = Arc::new(build_large_array_catalog());
+    let registry = Arc::new(tiled_serialization::default_registry());
+
+    let state = tiled_server::AppState {
+        root_tree,
+        serialization_registry: registry,
+        query_names: tiled_core::queries::Query::all_query_names()
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        base_url: None,
+        cors_policy: tiled_server::state::CorsOriginPolicy::Permissive,
+        trust_forwarded_headers: false,
+        api_key: None,
+        catalog: None,
+        auth_db: None,
+        issuer: None,
+        authenticators: vec![],
+        proxied_header_auth: None,
+        external_oidc: None,
+        forwarded_allow_ips: None,
+        max_request_body_bytes: 10 * 1024 * 1024,
+        response_bytesize_limit: 300_000_000,
+        streaming_bus: tiled_server::streaming::StreamingBus::new(),
+        access_policy: None,
+        default_login_scopes: tiled_auth::ScopeSet::full(),
+        enable_web: false,
+        web_assets_dir: None,
+        spec_views: Vec::new(),
+        webhook_config: None,
+        request_timeout_secs: 30,
+        expose_raw_assets: true,
+        exact_count_limit: u64::MAX,
+    };
+
+    let app = tiled_server::build_app(state);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}");
+
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    base_url
+}
+
+/// Key test: round-trip.  Client advertises blosc2, server compresses the
+/// large array (1 600 bytes > 500 minimum), client decompresses, decoded
+/// bytes equal the original f64 values.
+#[tokio::test]
+async fn blosc2_round_trip_decoded_bytes_equal_original() {
+    let base = spawn_blosc2_server().await;
+    let client = from_uri(&base).await.unwrap();
+    let root = client.into_container().unwrap();
+
+    let arr = root.get("big").await.unwrap().into_array().unwrap();
+    let block = arr.read_block(&[0]).await.unwrap();
+
+    // 200 f64 × 8 bytes = 1 600 bytes.
+    assert_eq!(
+        block.data.len(),
+        200 * 8,
+        "decoded length must match original"
+    );
+
+    let values: Vec<f64> = block
+        .data
+        .chunks_exact(8)
+        .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    let expected: Vec<f64> = (0..200).map(|i| i as f64 * 1.5).collect();
+    assert_eq!(values, expected, "decoded values must equal originals");
+}
+
+/// Verify the server actually sends `Content-Encoding: blosc2` when the
+/// client advertises it and the body is large enough.
+#[tokio::test]
+async fn blosc2_server_sets_content_encoding_for_large_body() {
+    let base = spawn_blosc2_server().await;
+
+    // Make a raw HTTP request with Accept-Encoding: blosc2.
+    let url = format!("{base}/api/v1/array/block/big?block=0");
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .header("Accept", "application/octet-stream")
+        .header("Accept-Encoding", "blosc2")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let enc = resp
+        .headers()
+        .get("content-encoding")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert_eq!(enc, "blosc2", "server must set Content-Encoding: blosc2");
+}
+
+/// Small body (< 500 bytes) must NOT be blosc2-encoded even when the client
+/// accepts it.  The existing `some_array` with 10 f64 = 80 bytes is used.
+#[tokio::test]
+async fn blosc2_small_body_not_encoded() {
+    let base = spawn_server(None).await;
+
+    let url = format!("{base}/api/v1/array/block/some_array?block=0");
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .header("Accept", "application/octet-stream")
+        .header("Accept-Encoding", "blosc2")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let enc = resp
+        .headers()
+        .get("content-encoding")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("none");
+    assert_ne!(
+        enc, "blosc2",
+        "80-byte body (< 500 minimum) must NOT be blosc2-encoded"
+    );
+    // Body must still be the raw f64 bytes.
+    let bytes = resp.bytes().await.unwrap();
+    assert_eq!(bytes.len(), 80, "raw 10×f64 body");
+}
+
+/// A client that does NOT advertise blosc2 must receive the raw uncompressed
+/// body regardless of body size.
+#[tokio::test]
+async fn blosc2_not_requested_gets_uncompressed_body() {
+    let base = spawn_blosc2_server().await;
+
+    let url = format!("{base}/api/v1/array/block/big?block=0");
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .header("Accept", "application/octet-stream")
+        // No Accept-Encoding header → server must not blosc2-compress.
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let enc = resp
+        .headers()
+        .get("content-encoding")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("none");
+    assert_ne!(
+        enc, "blosc2",
+        "server must not apply blosc2 when client did not request it"
+    );
+    // Body is the raw 200 f64 bytes.
+    let bytes = resp.bytes().await.unwrap();
+    assert_eq!(bytes.len(), 200 * 8);
+}

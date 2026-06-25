@@ -63,6 +63,7 @@ bytes = "1"
 flate2 = "1"
 zstd = "0.13"
 lz4_flex = "0.11"
+blosc2-pure-rs = "0.2.4"
 
 # Metrics
 metrics = "0.24"

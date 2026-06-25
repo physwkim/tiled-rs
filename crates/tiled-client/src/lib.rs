@@ -24,6 +24,7 @@ pub mod array;
 pub mod auth;
 pub mod awkward;
 pub mod base;
+pub mod blosc2;
 pub mod cache;
 pub mod composite;
 pub mod constructors;

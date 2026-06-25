@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use reqwest::header::{HeaderMap, HeaderValue};
+use reqwest::header::{ACCEPT_ENCODING, HeaderMap, HeaderValue};
 use reqwest::{Client, Method, RequestBuilder, Response};
 use tokio::sync::{Mutex, RwLock};
 use url::Url;
@@ -469,10 +469,21 @@ impl Context {
                 req = req.headers(cond);
             }
         }
-        let req = req.header(reqwest::header::ACCEPT, accept);
+        let req = req
+            .header(reqwest::header::ACCEPT, accept)
+            .header(ACCEPT_ENCODING, crate::blosc2::ACCEPT_ENCODING_BLOSC2);
         let resp = self.send_with_auth(req).await?;
         self.maybe_capture_csrf(&resp).await;
         let resp = handle_error(resp).await?;
+
+        // Read Content-Encoding before the body is consumed.
+        let is_blosc2 = resp
+            .headers()
+            .get("content-encoding")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.eq_ignore_ascii_case("blosc2"))
+            .unwrap_or(false);
+
         if resp.status().as_u16() == 304 {
             if let Some(cache) = self.cache()
                 && let Some(refreshed) = cache.revalidate_existing(url, accept, &resp).await?
@@ -483,6 +494,15 @@ impl Context {
                 "server returned 304 but no cached entry exists".into(),
             ));
         }
+
+        // Blosc2 responses: decode without caching to avoid storing compressed
+        // bytes under an unencoded cache key (which would confuse callers that
+        // don't send Accept-Encoding: blosc2 but hit the same cache entry).
+        if is_blosc2 {
+            let bytes = resp.bytes().await?;
+            return crate::blosc2::decompress(&bytes);
+        }
+
         if let Some(cache) = self.cache() {
             let (_rebuilt, bytes) = cache.store_response(url, accept, resp).await?;
             return Ok(bytes);
@@ -518,12 +538,26 @@ impl Context {
             .request(Method::POST, url)
             .await?
             .header(reqwest::header::ACCEPT, accept)
+            .header(ACCEPT_ENCODING, crate::blosc2::ACCEPT_ENCODING_BLOSC2)
             .json(body);
         let req = self.add_csrf(req).await;
         let resp = self.send_with_auth(req).await?;
         self.maybe_capture_csrf(&resp).await;
         let resp = handle_error(resp).await?;
-        Ok(resp.bytes().await?)
+
+        let is_blosc2 = resp
+            .headers()
+            .get("content-encoding")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.eq_ignore_ascii_case("blosc2"))
+            .unwrap_or(false);
+
+        let bytes = resp.bytes().await?;
+        if is_blosc2 {
+            crate::blosc2::decompress(&bytes)
+        } else {
+            Ok(bytes)
+        }
     }
 
     pub async fn patch_json(&self, url: &Url, body: &serde_json::Value) -> Result<Response> {
