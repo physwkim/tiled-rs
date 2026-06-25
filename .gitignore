@@ -4,3 +4,8 @@ tools/
 # The committed source-of-truth fallback lives in assets/spa-placeholder/.
 crates/tiled-web/assets/spa/
 kodex-out/
+# caucus session state + sub-agent git worktrees (embedded repos): never commit.
+.caucus/
+# local review scratch + macOS finder cruft.
+review/
+.DS_Store
