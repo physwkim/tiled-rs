@@ -5210,6 +5210,7 @@ dependencies = [
  "arrow",
  "async-trait",
  "axum",
+ "blosc2-pure-rs",
  "bytes",
  "chrono",
  "csv",
