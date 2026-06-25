@@ -56,6 +56,7 @@ pub trait AccessPolicy: Send + Sync {
         &self,
         principal: &Principal,
         session_scopes: &ScopeSet,
+        authn_access_tags: Option<&[String]>,
         ctx: NodeContext<'_>,
     ) -> Decision;
 
@@ -149,8 +150,12 @@ impl AccessPolicy for PassthroughPolicy {
         &self,
         _principal: &Principal,
         session_scopes: &ScopeSet,
+        _authn_access_tags: Option<&[String]>,
         _ctx: NodeContext<'_>,
     ) -> Decision {
+        // Passthrough trusts the session verbatim and is intentionally
+        // tag-agnostic: an API key's `authn_access_tags` restriction is only
+        // meaningful to a tag-aware policy, so it is ignored here.
         Decision {
             scopes: session_scopes.clone(),
         }
@@ -197,6 +202,22 @@ impl TagBasedPolicy {
     fn node_owner<'a>(ctx: &NodeContext<'a>) -> Option<&'a str> {
         ctx.access_blob.get("user").and_then(|v| v.as_str())
     }
+
+    /// Narrow a principal's granted tag set by an API key's `authn_access_tags`
+    /// restriction: the effective grant is the intersection. `None` (no key
+    /// restriction) leaves the set unchanged. This is the SINGLE owner of the
+    /// key-narrowing rule, shared by `list_filter` (listing visibility) and
+    /// `principal_decision` (per-node direct-access gate) so the two stay
+    /// uniform — a key cannot reach by direct path what it cannot see in a
+    /// listing. Mirrors Python access_policies.py:409-411
+    /// (`access_tags = access_tags & authn_access_tags`).
+    fn narrow_by_key(granted: &mut Vec<String>, authn_access_tags: Option<&[String]>) {
+        if let Some(key_tags) = authn_access_tags {
+            let key_set: std::collections::HashSet<&str> =
+                key_tags.iter().map(|s| s.as_str()).collect();
+            granted.retain(|t| key_set.contains(t.as_str()));
+        }
+    }
 }
 
 #[async_trait]
@@ -229,6 +250,7 @@ impl AccessPolicy for TagBasedPolicy {
         &self,
         principal: &Principal,
         session_scopes: &ScopeSet,
+        authn_access_tags: Option<&[String]>,
         ctx: NodeContext<'_>,
     ) -> Decision {
         // Admin short-circuit: admins keep their full session scopes,
@@ -251,11 +273,18 @@ impl AccessPolicy for TagBasedPolicy {
             return Decision { scopes };
         }
         let node_tags = Self::node_tags(&ctx);
-        let granted = self
+        let mut granted = self
             .auth_db
             .get_principal_tags(&principal.uuid)
             .await
             .unwrap_or_default();
+        // authn_access_tags narrowing: an API key's tag restriction narrows the
+        // principal's effective grant to the intersection — the SAME rule
+        // list_filter applies (via narrow_by_key), so this per-node gate matches
+        // listing visibility and a narrow key cannot reach an out-of-tag node by
+        // direct path. Untagged/public/owned grants below are intentionally NOT
+        // narrowed (uniform with list_filter's include_untagged + public tag).
+        Self::narrow_by_key(&mut granted, authn_access_tags);
         // Untagged nodes and granted-tag matches confer the policy's default
         // scopes; the literal "public" tag confers read scopes to everyone
         // (is_tag_public, access_policies.py:354-356). Union the two grants,
@@ -310,17 +339,11 @@ impl AccessPolicy for TagBasedPolicy {
                     .get_principal_tags(&p.uuid)
                     .await
                     .unwrap_or_default();
-                // authn_access_tags narrowing: when the API key carries its
-                // own tag restriction, the effective grant is the intersection
-                // of the principal's DB tags and the key's tags.
-                // Mirrors Python access_policies.py:409-411:
-                //   if authn_access_tags is not None:
-                //       access_tags = access_tags & authn_access_tags
-                if let Some(key_tags) = authn_access_tags {
-                    let key_set: std::collections::HashSet<&str> =
-                        key_tags.iter().map(|s| s.as_str()).collect();
-                    granted.retain(|t| key_set.contains(t.as_str()));
-                }
+                // authn_access_tags narrowing — the shared rule (see
+                // narrow_by_key): the effective grant is the principal's DB tags
+                // ∩ the key's tags. principal_decision applies the identical
+                // narrowing so listing and per-node gates stay uniform.
+                Self::narrow_by_key(&mut granted, authn_access_tags);
                 (Some(p.uuid.clone()), granted)
             }
         };
@@ -557,7 +580,7 @@ mod tests {
         let blob = serde_json::json!({"user": "other-uuid", "tags": ["secret"]});
         let meta = serde_json::json!({});
         let d = policy
-            .principal_decision(&admin, &session, ctx(&blob, &meta))
+            .principal_decision(&admin, &session, None, ctx(&blob, &meta))
             .await;
         assert_eq!(d.scopes, session);
     }
@@ -571,7 +594,7 @@ mod tests {
         let blob = serde_json::json!({"tags": ["public"]});
         let meta = serde_json::json!({});
         let d = policy
-            .principal_decision(&principal_from(&bob), &session, ctx(&blob, &meta))
+            .principal_decision(&principal_from(&bob), &session, None, ctx(&blob, &meta))
             .await;
         assert!(d.scopes.contains(Scope::ReadMetadata));
         assert!(d.scopes.contains(Scope::ReadData));
@@ -587,9 +610,96 @@ mod tests {
         let blob = serde_json::json!({"tags": ["secret"]});
         let meta = serde_json::json!({});
         let d = policy
-            .principal_decision(&principal_from(&bob), &session, ctx(&blob, &meta))
+            .principal_decision(&principal_from(&bob), &session, None, ctx(&blob, &meta))
             .await;
         assert!(!d.scopes.contains(Scope::ReadMetadata));
+    }
+
+    /// Regression for the access_tags DIRECT-ACCESS bypass: an API key's
+    /// `authn_access_tags` restriction must narrow the per-node decision to the
+    /// intersection — the same narrowing `list_filter` applies — so a key scoped
+    /// to `team-a` cannot reach a `team-b` node by direct path (it would 404),
+    /// not merely be hidden from listings. Untagged/public nodes stay reachable
+    /// under the narrow key, matching `list_filter`'s include_untagged + public.
+    #[tokio::test]
+    async fn principal_decision_honours_authn_access_tags_narrowing() {
+        let db = setup_auth_db().await;
+        // The principal is granted BOTH team-a and team-b in the DB.
+        let p = principal_with_tags(&db, &["team-a", "team-b"]).await;
+        let policy = TagBasedPolicy::new(Arc::new(db), ScopeSet::full());
+        let session = ScopeSet::for_role("user");
+        let meta = serde_json::json!({});
+        let key_team_a: &[String] = &["team-a".to_string()];
+
+        // team-b node + key restricted to [team-a]: DENIED. The key's restriction
+        // overrides the principal's broader DB grant.
+        let blob_b = serde_json::json!({"tags": ["team-b"]});
+        let d_denied = policy
+            .principal_decision(
+                &principal_from(&p),
+                &session,
+                Some(key_team_a),
+                ctx(&blob_b, &meta),
+            )
+            .await;
+        assert!(
+            !d_denied.scopes.contains(Scope::ReadMetadata),
+            "key scoped to team-a must NOT reach a team-b node by direct access"
+        );
+
+        // Same principal, NO key restriction: the team-b grant applies.
+        let d_unrestricted = policy
+            .principal_decision(&principal_from(&p), &session, None, ctx(&blob_b, &meta))
+            .await;
+        assert!(
+            d_unrestricted.scopes.contains(Scope::ReadMetadata),
+            "without an authn_access_tags restriction the team-b grant applies"
+        );
+
+        // team-a node + [team-a] key: still granted.
+        let blob_a = serde_json::json!({"tags": ["team-a"]});
+        let d_a = policy
+            .principal_decision(
+                &principal_from(&p),
+                &session,
+                Some(key_team_a),
+                ctx(&blob_a, &meta),
+            )
+            .await;
+        assert!(
+            d_a.scopes.contains(Scope::ReadMetadata),
+            "key scoped to team-a reaches a team-a node"
+        );
+
+        // Untagged and public nodes remain reachable under the narrow key —
+        // uniform with list_filter, which keeps include_untagged and the public
+        // tag regardless of authn_access_tags.
+        let blob_untagged = serde_json::json!({});
+        let d_untagged = policy
+            .principal_decision(
+                &principal_from(&p),
+                &session,
+                Some(key_team_a),
+                ctx(&blob_untagged, &meta),
+            )
+            .await;
+        assert!(
+            d_untagged.scopes.contains(Scope::ReadMetadata),
+            "untagged nodes stay readable under a narrow key (matches include_untagged)"
+        );
+        let blob_public = serde_json::json!({"tags": ["public"]});
+        let d_public = policy
+            .principal_decision(
+                &principal_from(&p),
+                &session,
+                Some(key_team_a),
+                ctx(&blob_public, &meta),
+            )
+            .await;
+        assert!(
+            d_public.scopes.contains(Scope::ReadMetadata),
+            "public nodes stay readable under a narrow key"
+        );
     }
 
     /// Store-backed tag intersection: a principal sees only nodes whose
@@ -609,7 +719,12 @@ mod tests {
 
         // Alice can see team-a nodes.
         let d_alice = policy
-            .principal_decision(&principal_from(&alice), &session, ctx(&blob_team_a, &meta))
+            .principal_decision(
+                &principal_from(&alice),
+                &session,
+                None,
+                ctx(&blob_team_a, &meta),
+            )
             .await;
         assert!(
             d_alice.scopes.contains(Scope::ReadMetadata),
@@ -618,7 +733,12 @@ mod tests {
 
         // Bob cannot see team-a nodes.
         let d_bob = policy
-            .principal_decision(&principal_from(&bob), &session, ctx(&blob_team_a, &meta))
+            .principal_decision(
+                &principal_from(&bob),
+                &session,
+                None,
+                ctx(&blob_team_a, &meta),
+            )
             .await;
         assert!(
             !d_bob.scopes.contains(Scope::ReadMetadata),

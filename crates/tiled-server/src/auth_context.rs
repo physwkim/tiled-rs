@@ -72,7 +72,12 @@ impl AuthContext {
         let decision = match self.principal.as_ref() {
             Some(p) => {
                 policy
-                    .principal_decision(p.as_ref(), &self.scopes, ctx)
+                    .principal_decision(
+                        p.as_ref(),
+                        &self.scopes,
+                        self.authn_access_tags.as_deref(),
+                        ctx,
+                    )
                     .await
             }
             None => policy.anonymous_decision(ctx).await,
