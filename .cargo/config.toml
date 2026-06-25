@@ -1,22 +1,37 @@
-# SAML signature validation (tiled-auth `saml` feature) links two C libraries that
-# each pull in their own libxml2: the `libxml` Rust crate (XML parsing + DOM + ID
-# registration) and Homebrew's xmlsec1 (signature verification). On macOS, Homebrew's
-# libxml2 is keg-only and newer than the system /usr/lib/libxml2, and `xmlsec1-config
-# --libs` additionally drags the macOS SDK's system libxml2 in via a bare `-lxml2`.
+# SAML signature validation (tiled-auth `saml` feature) links two C consumers of libxml2
+# into one binary: the `libxml` Rust crate (XML parse + DOM + XML `ID` registration) and
+# Homebrew's xmlsec1 (signature verification). Homebrew's libxml2 is keg-only, so xmlsec1
+# is linked as Homebrew dylibs ALREADY bound to brew's libxml2 (2.15.x), but the `libxml`
+# crate's bare `-lxml2` otherwise resolves to the macOS system /usr/lib/libxml2 (2.9.x).
 #
-# With TWO libxml2 instances loaded into one binary, SAML breaks: `collect_id_attributes`
-# registers the XML `ID` in one instance's lookup table, while xmlsec resolves every
-# same-document `URI="#id"` reference through `xmlXPtrEval("xpointer(id(...)))"` in the
-# OTHER instance — so the ID is never found and every signature is rejected with
-# "SAML Response and all assertions must be signed". (Proven: in pure C against a single
-# libxml2 2.15.3, xmlAddID + xmlXPtrEval(id()) resolves correctly.)
+# That split loads TWO libxml2 instances and breaks SAML: `collect_id_attributes`
+# registers the XML `ID` in the `libxml` crate's instance, while xmlsec resolves every
+# same-document `URI="#id"` reference through `xmlXPtrEval("xpointer(id(...)))"` in ITS
+# instance — the ID is never found and every signature is rejected with "SAML Response
+# and all assertions must be signed". (Proven two ways: in pure C against a single
+# libxml2 2.15.3, xmlAddID + xmlXPtrEval(id()) resolves correctly; and stripping the
+# override below flips the `libxml` crate back to system libxml2.2 and every signature
+# test fails again.)
 #
-# Putting Homebrew's libxml2 lib dir first on the linker search path makes every
-# `-lxml2` (from the `libxml` crate AND from xmlsec1-config's SDK path) resolve to the
-# single Homebrew libxml2, collapsing both consumers onto one instance. This is the
-# whole fix — samael's code and libxml2 2.15.x are both correct.
+# Putting Homebrew's libxml2 lib dir first on the linker search path makes the `libxml`
+# crate's `-lxml2` resolve to brew's libxml2, matching xmlsec — both SAML consumers then
+# share one instance and verification succeeds. This is the whole fix; samael's code and
+# libxml2 2.15.x are both correct. (System libxml2.2 may still load transitively via the
+# system libxslt xmlsec uses, but the macOS two-level namespace keeps it off the SAML
+# path — confirmed: the signed-response tests pass with both dylibs resident.)
 #
 # Safe everywhere else: non-SAML builds don't link libxml2 (samael is optional), and on
-# Linux there is one system libxml2 and this path simply does not exist (ignored).
-[target.'cfg(target_os = "macos")']
+# Linux there is one system libxml2 and these paths simply do not exist (ignored).
+#
+# Homebrew's libxml2 prefix differs by architecture — Apple Silicon under /opt/homebrew,
+# Intel under /usr/local — so each arch points at its own prefix. That keeps the -L dir
+# present on the active arch (a missing -L would draw a linker warning) while still
+# binding the `libxml` crate's `-lxml2` to brew. rustflags `-L` is prepended ahead of the
+# build-script search paths, so brew wins the search regardless of dependency build order
+# — a guarantee a per-crate build.rs cannot make, since xmlsec's build script runs first
+# as a dependency. A non-standard HOMEBREW_PREFIX is the only macOS layout left uncovered.
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))']
 rustflags = ["-L", "native=/opt/homebrew/opt/libxml2/lib"]
+
+[target.'cfg(all(target_os = "macos", target_arch = "x86_64"))']
+rustflags = ["-L", "native=/usr/local/opt/libxml2/lib"]
