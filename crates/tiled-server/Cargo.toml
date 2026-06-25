@@ -15,6 +15,7 @@ excel-adapter = ["tiled-adapters/excel-adapter"]
 image-serializer = ["tiled-serialization/image"]
 parquet-serializer = ["tiled-serialization/parquet"]
 web = ["dep:tiled-web"]
+saml = ["tiled-auth/saml"]
 
 [dependencies]
 tiled-core = { workspace = true }

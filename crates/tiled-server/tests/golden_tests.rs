@@ -81,6 +81,8 @@ fn build_app_for_root(
         authenticators: vec![],
         proxied_header_auth: None,
         external_oidc: None,
+        #[cfg(feature = "saml")]
+        saml_providers: vec![],
         forwarded_allow_ips: None,
         max_request_body_bytes: 10 * 1024 * 1024,
         response_bytesize_limit,
@@ -121,6 +123,8 @@ fn build_app_dynamic(trust_forwarded: bool) -> axum::Router {
         authenticators: vec![],
         proxied_header_auth: None,
         external_oidc: None,
+        #[cfg(feature = "saml")]
+        saml_providers: vec![],
         forwarded_allow_ips: None,
         max_request_body_bytes: 10 * 1024 * 1024,
         response_bytesize_limit: 300_000_000,
@@ -163,6 +167,8 @@ fn build_app_with_cors_origin(origin: &str) -> axum::Router {
         authenticators: vec![],
         proxied_header_auth: None,
         external_oidc: None,
+        #[cfg(feature = "saml")]
+        saml_providers: vec![],
         forwarded_allow_ips: None,
         max_request_body_bytes: 10 * 1024 * 1024,
         response_bytesize_limit: 300_000_000,
@@ -636,6 +642,8 @@ async fn test_empty_container() {
         authenticators: vec![],
         proxied_header_auth: None,
         external_oidc: None,
+        #[cfg(feature = "saml")]
+        saml_providers: vec![],
         forwarded_allow_ips: None,
         max_request_body_bytes: 10 * 1024 * 1024,
         response_bytesize_limit: 300_000_000,
@@ -764,6 +772,8 @@ fn build_app_with_api_key(key: &str) -> axum::Router {
         authenticators: vec![],
         proxied_header_auth: None,
         external_oidc: None,
+        #[cfg(feature = "saml")]
+        saml_providers: vec![],
         forwarded_allow_ips: None,
         max_request_body_bytes: 10 * 1024 * 1024,
         response_bytesize_limit: 300_000_000,
@@ -910,6 +920,8 @@ async fn test_metadata_handles_percent_encoded_slash_in_key() {
         authenticators: vec![],
         proxied_header_auth: None,
         external_oidc: None,
+        #[cfg(feature = "saml")]
+        saml_providers: vec![],
         forwarded_allow_ips: None,
         max_request_body_bytes: 10 * 1024 * 1024,
         response_bytesize_limit: 300_000_000,
@@ -997,6 +1009,8 @@ async fn array_full_returns_all_chunks_not_just_first() {
         authenticators: vec![],
         proxied_header_auth: None,
         external_oidc: None,
+        #[cfg(feature = "saml")]
+        saml_providers: vec![],
         forwarded_allow_ips: None,
         max_request_body_bytes: 10 * 1024 * 1024,
         response_bytesize_limit: 300_000_000,
@@ -1353,6 +1367,8 @@ fn build_table_app(csv_path: std::path::PathBuf, response_bytesize_limit: usize)
         authenticators: vec![],
         proxied_header_auth: None,
         external_oidc: None,
+        #[cfg(feature = "saml")]
+        saml_providers: vec![],
         forwarded_allow_ips: None,
         max_request_body_bytes: 10 * 1024 * 1024,
         response_bytesize_limit,
