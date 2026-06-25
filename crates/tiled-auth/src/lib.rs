@@ -24,11 +24,13 @@ pub mod external_oidc;
 pub mod jwt;
 pub mod migrate;
 pub mod principal;
+#[cfg(feature = "saml")]
+pub mod saml;
 pub mod scopes;
 pub mod session;
 
 pub use api_key::{ApiKeyCreate, ApiKeyRecord, KeyMaterial};
-pub use authenticator::{Authenticator, DummyAuthenticator, ProxiedHeaderAuthenticator};
+pub use authenticator::{Authenticator, DummyAuthenticator, ProxiedHeaderAuthenticator, Subject};
 pub use db::AuthDb;
 pub use error::{AuthError, Result};
 #[cfg(feature = "oidc")]
@@ -37,5 +39,7 @@ pub use external_oidc::{
 };
 pub use jwt::{AccessClaims, Issuer, RefreshClaims};
 pub use principal::{Identity, IdentityView, Principal, PrincipalDetail};
+#[cfg(feature = "saml")]
+pub use saml::{PendingSamlStore, SamlConfig, SamlProvider};
 pub use scopes::{Scope, ScopeSet};
 pub use session::{SessionRecord, SessionStore};
