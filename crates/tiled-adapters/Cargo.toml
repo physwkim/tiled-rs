@@ -11,6 +11,7 @@ arrow-ipc = []
 excel-adapter = ["dep:calamine"]
 sql-adapter = ["dep:sqlx"]
 hdf5 = ["dep:rust-hdf5"]
+netcdf-adapter = ["dep:rust-hdf5"]
 tiff = ["dep:tiff", "dep:image"]
 zarr = ["dep:zarrs", "dep:object_store"]
 
