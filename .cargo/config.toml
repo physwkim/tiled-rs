@@ -1,0 +1,22 @@
+# SAML signature validation (tiled-auth `saml` feature) links two C libraries that
+# each pull in their own libxml2: the `libxml` Rust crate (XML parsing + DOM + ID
+# registration) and Homebrew's xmlsec1 (signature verification). On macOS, Homebrew's
+# libxml2 is keg-only and newer than the system /usr/lib/libxml2, and `xmlsec1-config
+# --libs` additionally drags the macOS SDK's system libxml2 in via a bare `-lxml2`.
+#
+# With TWO libxml2 instances loaded into one binary, SAML breaks: `collect_id_attributes`
+# registers the XML `ID` in one instance's lookup table, while xmlsec resolves every
+# same-document `URI="#id"` reference through `xmlXPtrEval("xpointer(id(...)))"` in the
+# OTHER instance — so the ID is never found and every signature is rejected with
+# "SAML Response and all assertions must be signed". (Proven: in pure C against a single
+# libxml2 2.15.3, xmlAddID + xmlXPtrEval(id()) resolves correctly.)
+#
+# Putting Homebrew's libxml2 lib dir first on the linker search path makes every
+# `-lxml2` (from the `libxml` crate AND from xmlsec1-config's SDK path) resolve to the
+# single Homebrew libxml2, collapsing both consumers onto one instance. This is the
+# whole fix — samael's code and libxml2 2.15.x are both correct.
+#
+# Safe everywhere else: non-SAML builds don't link libxml2 (samael is optional), and on
+# Linux there is one system libxml2 and this path simply does not exist (ignored).
+[target.'cfg(target_os = "macos")']
+rustflags = ["-L", "native=/opt/homebrew/opt/libxml2/lib"]

@@ -449,34 +449,22 @@ mod tests {
         );
     }
 
-    // SKIP REASON: samael 0.0.21 cannot validate ANY XMLDSIG signature on xmlsec1 1.3.x +
-    // libxml2 2.15.x.  Root cause: XMLDSIG maps every barename fragment `URI="#id"` to
-    // `xpointer(id('id'))` per RFC 3986 §5.3.  xmlsec1's `collect_id_attributes` path
-    // (used by `reduce_xml_to_signed_with_allowed_algorithms`) calls `xmlAddID` to
-    // register the ID attribute before resolving it, but in libxml2 2.15.x `xmlAddID`
-    // silently succeeds without registering in the ID lookup table, so the subsequent
-    // `xmlXPtrEval("xpointer(id('...'))")` call returns NULL and reference resolution fails.
+    // Signature ACCEPTANCE on xmlsec1 1.3.x + libxml2 2.15.x.  This previously failed (and
+    // was #[ignore]d with an incorrect "xmlAddID regression" diagnosis) because the build
+    // linked TWO libxml2 instances — the `libxml` crate's and xmlsec1's.  XMLDSIG maps every
+    // barename fragment `URI="#id"` to `xpointer(id('id'))` (RFC 3986 §5.3); samael's
+    // `collect_id_attributes` registered the XML `ID` in one libxml2 instance while xmlsec
+    // resolved `xpointer(id('...'))` in the OTHER and never found it, so every signature was
+    // rejected as "SAML Response and all assertions must be signed".
     //
-    // This was confirmed by a probe against a MODERN-style response signed by the xmlsec1
-    // CLI itself (enveloped-signature + exc-c14n, no xpointer transform in the template):
-    //
-    //   xmlsec1 verify: OK   (CLI accepts its own signature)
-    //   samael verify:  FAILED — "SAML Response and all assertions must be signed"
-    //   xmlsec1 error:  xpointer(id('_assertion001')); xml error: 0: NULL
-    //
-    // The xpointer path is intrinsic to XMLDSIG barename-fragment references; it is NOT
-    // specific to the legacy test-vector format.  samael's own test
-    // `test_predigest_accepts_signed_assertion_response` shows the same failure.
-    //
-    // FIX: pin to xmlsec1 1.2.x / libxml2 2.13.x (Nix, pkgsrc, or `brew pin`) OR
-    // wait for samael to patch the ID-attribute registration path for libxml2 2.15.x.
-    // See `test_vectors/generate-modern-fixture.sh` for how to reproduce the proof.
-    //
-    // COVERED: that `validate_response` returns the correct attribute value when xmlsec1
-    //   accepts the signature (functional on xmlsec1 1.2.x).
-    // NOT COVERED: signature acceptance on this machine (xmlsec1 1.3.x + libxml2 2.15.x).
+    // Neither samael nor libxml2 2.15.x is at fault: in pure C against a SINGLE libxml2
+    // 2.15.3, xmlAddID + xmlXPtrEval(id()) resolves correctly.  The fix is at the build
+    // layer — `.cargo/config.toml` puts Homebrew's libxml2 first on the link search path so
+    // every `-lxml2` (the `libxml` crate's and xmlsec1-config's bare `-lxml2`) resolves to
+    // one libxml2 instance.  Both the legacy vector (this test) and the modern
+    // enveloped-signature fixture (validate_response_accepts_modern_signature) now verify.
+    // See `test_vectors/generate-modern-fixture.sh` for the modern fixture.
     #[test]
-    #[ignore = "samael 0.0.21 + xmlsec1 1.3.x + libxml2 2.15.x: xmlAddID regression breaks xpointer id() for ALL URI=\"#id\" references — modern-style and legacy both fail (see comment above)"]
     fn validate_response_accepts_valid_signature() {
         let sp = test_provider();
 
@@ -498,11 +486,11 @@ mod tests {
     }
 
     #[test]
-    // On xmlsec1 1.3.x + libxml2 2.15.x this test passes because `xpointer(id(...))` ID
-    // resolution fails before any digest comparison — the error is "SAML Response and all
-    // assertions must be signed" (no valid signature found), NOT a digest-mismatch error.
-    // On xmlsec1 1.2.x the assertion's digest mismatch would be detected instead.
-    // Both paths reject the tampered response; only the rejection *reason* differs.
+    // The tampered uid value changes the signed assertion's digest, so xmlsec rejects the
+    // response on digest mismatch — the signature no longer covers the modified content.
+    // With the single-libxml2 build (see validate_response_accepts_valid_signature) the
+    // `#id` reference resolves and the digest check actually runs, so this is a real
+    // cryptographic rejection, not a side effect of failed ID resolution.
     fn validate_response_rejects_tampered_assertion() {
         let sp = test_provider();
         sp.pending_requests
@@ -560,17 +548,13 @@ mod tests {
         );
     }
 
-    // Documenting test: probe the modern-style fixture (enveloped-signature + exc-c14n,
-    // URI="#_assertion001", signed by the xmlsec1 CLI with --id-attr:ID).  The xmlsec1 CLI
-    // verifies its own signature successfully.  samael fails because `collect_id_attributes`
-    // (via `xmlAddID` in libxml2 2.15.x) does not register the ID in the lookup table, so
-    // `xmlXPtrEval("xpointer(id('_assertion001'))")` returns NULL.
-    //
-    // This test DOES NOT use #[ignore] — it documents a confirmed runtime behavior.
-    // Expected error: "saml: response validation failed: SAML Response and all assertions
-    // must be signed" (the xmlsec1 xpointer failure surfaces as "no valid signature").
+    // Signature acceptance for a MODERN-style fixture: enveloped-signature + exc-c14n,
+    // URI="#_assertion001", no xpointer transform, signed by the xmlsec1 CLI with
+    // --id-attr:ID (see test_vectors/generate-modern-fixture.sh).  This is the signature
+    // shape modern IdPs (Okta, Azure AD, Shibboleth) emit.  It verifies on the
+    // single-libxml2 build for the same reason as validate_response_accepts_valid_signature.
     #[test]
-    fn validate_response_modern_fixture_xpointer_regression() {
+    fn validate_response_accepts_modern_signature() {
         let cert_pem = include_str!("../test_vectors/probe-idp.crt").to_string();
         let signed_xml = include_str!("../test_vectors/response_modern_signed.xml").to_string();
 
@@ -593,17 +577,15 @@ mod tests {
             .insert("TILED_TEST_REQUEST_001".to_string());
 
         let encoded = base64::engine::general_purpose::STANDARD.encode(signed_xml.as_bytes());
-        let err = sp
+        let subject = sp
             .validate_response(&encoded)
-            .expect_err("modern-style response must be rejected on xmlsec1 1.3.x + libxml2 2.15.x");
+            .expect("modern enveloped-signature response must be accepted");
 
-        // The rejection must be a validation failure, not a parse or config error.
-        // On xmlsec1 1.2.x this would be expected to succeed; update this test
-        // (remove the expect_err and assert the attribute value) when the environment
-        // is fixed.
-        assert!(
-            err.to_string().contains("validation failed"),
-            "expected validation-failure error, got: {err}"
+        assert_eq!(subject.provider, "probe-idp");
+        assert_eq!(
+            subject.sub, "testuser",
+            "uid attribute value must be 'testuser', got: {}",
+            subject.sub
         );
     }
 
