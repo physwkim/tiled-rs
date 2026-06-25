@@ -117,6 +117,9 @@ object_store = { version = "0.11", features = ["aws", "gcp", "azure"] }
 # CSV
 csv = "1"
 
+# Excel (pure-Rust xlsx/xls/ods reader — no system deps)
+calamine = "0.35"
+
 # Ordered maps
 indexmap = { version = "2", features = ["serde"] }
 

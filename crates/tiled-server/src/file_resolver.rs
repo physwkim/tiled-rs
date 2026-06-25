@@ -261,6 +261,25 @@ fn build_leaf_adapter(
                 return Err(CatalogError::Validation("hdf5 support not built in".into()));
             }
         }
+        "application/vnd.apache.arrow.file" => {
+            let adapter = tiled_adapters::ArrowIpcAdapter::from_path(path, metadata)
+                .map_err(|e| CatalogError::Validation(e.to_string()))?;
+            AnyAdapter::Table(Arc::new(adapter))
+        }
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => {
+            #[cfg(feature = "excel-adapter")]
+            {
+                let adapter = tiled_adapters::ExcelAdapter::from_path(path, metadata)
+                    .map_err(|e| CatalogError::Validation(e.to_string()))?;
+                AnyAdapter::Table(Arc::new(adapter))
+            }
+            #[cfg(not(feature = "excel-adapter"))]
+            {
+                return Err(CatalogError::Validation(
+                    "excel (.xlsx) support not built in".into(),
+                ));
+            }
+        }
         "text/csv" => {
             #[cfg(feature = "csv-adapter")]
             {
