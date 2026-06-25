@@ -54,6 +54,7 @@ async fn build_test_app() -> (axum::Router, tempfile::TempDir) {
         webhook_config: None,
         request_timeout_secs: 30,
         expose_raw_assets: true,
+        exact_count_limit: u64::MAX,
     };
     (tiled_server::build_app(state), dir)
 }
@@ -1485,4 +1486,82 @@ async fn revisions_list_then_delete_round_trip() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 
     let _ = empty_request(&app, Method::DELETE, "/api/v1/metadata/rev1").await;
+}
+
+/// exact_count_limit caps the `meta.count` returned by the search endpoint.
+/// With limit = 2 and 5 nodes registered, `meta.count` must be 2 not 5.
+/// Mirrors Python `Settings.exact_count_limit` (settings.py, default 100).
+#[tokio::test]
+async fn exact_count_limit_caps_meta_count() {
+    // Build a fresh app with a tight exact_count_limit.
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("sqlite://{}", dir.path().join("catalog.db").display());
+    let catalog = Catalog::connect(&uri).await.unwrap();
+    catalog.migrate().await.unwrap();
+
+    let resolver: Arc<dyn tiled_catalog::adapter::LeafResolver> = Arc::new(UnresolvedLeaf);
+    let root_tree: Arc<dyn ContainerAdapter> = Arc::new(tiled_catalog::CatalogAdapter::root(
+        catalog.clone(),
+        resolver,
+    ));
+    let registry = Arc::new(tiled_serialization::default_registry());
+    let state = tiled_server::AppState {
+        root_tree,
+        serialization_registry: registry,
+        query_names: tiled_core::queries::Query::all_query_names()
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        base_url: Some("http://localhost:8000".into()),
+        cors_policy: tiled_server::state::CorsOriginPolicy::Permissive,
+        trust_forwarded_headers: false,
+        api_key: None,
+        catalog: Some(catalog),
+        auth_db: None,
+        issuer: None,
+        authenticators: vec![],
+        proxied_header_auth: None,
+        external_oidc: None,
+        forwarded_allow_ips: None,
+        max_request_body_bytes: 10 * 1024 * 1024,
+        response_bytesize_limit: 300_000_000,
+        streaming_bus: tiled_server::streaming::StreamingBus::new(),
+        access_policy: None,
+        default_login_scopes: tiled_auth::ScopeSet::full(),
+        enable_web: true,
+        web_assets_dir: None,
+        spec_views: Vec::new(),
+        webhook_config: None,
+        request_timeout_secs: 30,
+        expose_raw_assets: true,
+        exact_count_limit: 2,
+    };
+    let app = tiled_server::build_app(state);
+
+    // Register 5 nodes — more than the limit of 2.
+    for key in ["a", "b", "c", "d", "e"] {
+        let body = serde_json::json!({
+            "key": key,
+            "structure_family": "container",
+            "metadata": {},
+            "specs": [],
+            "data_sources": [],
+        });
+        let (status, _) = json_request(&app, Method::POST, "/api/v1/register/", body).await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+
+    let (status, body) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/search/",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["meta"]["count"], 2,
+        "meta.count must be capped at exact_count_limit=2; got {}",
+        body["meta"]["count"]
+    );
 }

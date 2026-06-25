@@ -57,6 +57,13 @@ pub struct TiledConfig {
     /// this list.
     #[serde(default)]
     pub allow_origins: Vec<String>,
+    /// The largest number of matching nodes for which the search/list endpoint
+    /// returns an exact `COUNT(*)` total. When the true count exceeds this
+    /// value the reported `meta.count` is capped at this limit (the lower
+    /// bound). Mirrors Python `Settings.exact_count_limit` (`settings.py`,
+    /// default 100).
+    #[serde(default = "default_exact_count_limit")]
+    pub exact_count_limit: u64,
     /// Catch-all for config keys the Rust port does not yet model.
     /// Captured keys are warn-logged once at startup (see
     /// [`TiledConfig::warn_unknown_keys`]) so operators know their
@@ -82,6 +89,12 @@ pub fn default_expose_raw_assets() -> bool {
     true
 }
 
+/// Default for [`TiledConfig::exact_count_limit`] — 100, matching Python
+/// tiled (`Settings.exact_count_limit`, `settings.py`).
+pub fn default_exact_count_limit() -> u64 {
+    100
+}
+
 // `Default` is hand-written (not derived) so `response_bytesize_limit` agrees
 // with its serde default (300 MB) instead of `usize::default()` (0), which
 // would otherwise make every response "exceed" the limit.
@@ -97,6 +110,7 @@ impl Default for TiledConfig {
             request_timeout_secs: default_request_timeout_secs(),
             expose_raw_assets: default_expose_raw_assets(),
             allow_origins: Vec::new(),
+            exact_count_limit: default_exact_count_limit(),
             unknown: BTreeMap::new(),
         }
     }
@@ -786,22 +800,44 @@ mod tests {
     // `unknown` map instead of being silently dropped (config-parity guard).
     #[test]
     fn unknown_top_level_key_is_captured_not_dropped() {
-        let cfg: TiledConfig = serde_yaml::from_str("exact_count_limit: 100\ntrees: []").unwrap();
+        let cfg: TiledConfig = serde_yaml::from_str("some_future_key: 42\ntrees: []").unwrap();
         assert!(
-            cfg.unknown.contains_key("exact_count_limit"),
-            "unknown top-level key 'exact_count_limit' must land in the catch-all map; \
+            cfg.unknown.contains_key("some_future_key"),
+            "unknown top-level key 'some_future_key' must land in the catch-all map; \
              got unknown={:?}",
             cfg.unknown
         );
         assert_eq!(
-            cfg.unknown["exact_count_limit"],
-            serde_yaml::Value::Number(100.into()),
+            cfg.unknown["some_future_key"],
+            serde_yaml::Value::Number(42.into()),
             "captured value must match the YAML value"
         );
         // Known fields must NOT appear in unknown.
         assert!(
             !cfg.unknown.contains_key("trees"),
             "known key 'trees' must not appear in the catch-all"
+        );
+    }
+
+    // exact_count_limit is a modelled field — parses to u64 and must NOT appear
+    // in the unknown catch-all. Mirrors Python Settings.exact_count_limit
+    // (settings.py, default 100).
+    #[test]
+    fn exact_count_limit_parses_and_is_not_unknown() {
+        // Default: absent in YAML → 100.
+        let cfg: TiledConfig = serde_yaml::from_str("trees: []").unwrap();
+        assert_eq!(cfg.exact_count_limit, 100);
+        // Default::default() agrees.
+        assert_eq!(TiledConfig::default().exact_count_limit, 100);
+        // Explicit value is honoured.
+        let cfg: TiledConfig = serde_yaml::from_str("exact_count_limit: 500\ntrees: []").unwrap();
+        assert_eq!(cfg.exact_count_limit, 500);
+        // Modelled key must NOT appear in the catch-all.
+        assert!(
+            !cfg.unknown.contains_key("exact_count_limit"),
+            "exact_count_limit is modelled — must not appear in catch-all; \
+             got unknown={:?}",
+            cfg.unknown
         );
     }
 

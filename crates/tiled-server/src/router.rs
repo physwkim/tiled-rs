@@ -566,6 +566,7 @@ pub async fn search(
         limit,
         &queries,
         &sorting,
+        state.exact_count_limit,
     )
     .await?;
     // `select_metadata` only applies within `metadata in fields` (core.py:479-485):

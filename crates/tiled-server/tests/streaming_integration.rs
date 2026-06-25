@@ -57,6 +57,7 @@ async fn spawn_server() -> (String, tempfile::TempDir) {
         webhook_config: None,
         request_timeout_secs: 30,
         expose_raw_assets: true,
+        exact_count_limit: u64::MAX,
     };
     let app = tiled_server::build_app(state);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -246,6 +247,7 @@ async fn spawn_server_with_tag_policy() -> (String, Catalog, StreamingBus, tempf
         webhook_config: None,
         request_timeout_secs: 30,
         expose_raw_assets: true,
+        exact_count_limit: u64::MAX,
     };
     let app = tiled_server::build_app(state);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

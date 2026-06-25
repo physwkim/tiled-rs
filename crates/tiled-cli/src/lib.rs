@@ -799,6 +799,10 @@ pub async fn run(command: Command) -> Result<()> {
                     .as_ref()
                     .map(|c| c.expose_raw_assets)
                     .unwrap_or(true),
+                exact_count_limit: file_config
+                    .as_ref()
+                    .map(|c| c.exact_count_limit)
+                    .unwrap_or(config::default_exact_count_limit()),
             };
 
             let app = tiled_server::build_app(state);

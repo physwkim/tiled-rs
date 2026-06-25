@@ -80,6 +80,7 @@ async fn build_write_app() -> (axum::Router, tempfile::TempDir, tempfile::TempDi
         webhook_config: None,
         request_timeout_secs: 30,
         expose_raw_assets: true,
+        exact_count_limit: u64::MAX,
     };
     (tiled_server::build_app(state), writable_dir, db_dir)
 }

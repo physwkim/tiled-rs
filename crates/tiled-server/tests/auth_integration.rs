@@ -64,6 +64,7 @@ async fn build_test_app() -> (axum::Router, tempfile::TempDir, Catalog, AuthDb) 
         webhook_config: None,
         request_timeout_secs: 30,
         expose_raw_assets: true,
+        exact_count_limit: u64::MAX,
     };
     (tiled_server::build_app(state), dir, catalog, auth_db)
 }
@@ -868,6 +869,7 @@ async fn build_oidc_state(
         webhook_config: None,
         request_timeout_secs: 30,
         expose_raw_assets: true,
+        exact_count_limit: u64::MAX,
     };
     (state, auth_db, validator, dir)
 }
