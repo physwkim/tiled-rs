@@ -512,14 +512,36 @@ pub async fn run(command: Command) -> Result<()> {
                 api_key
             };
 
+            // Collect config-file catalog storage paths (config.py:64-65).
+            // CLI flags and config-file paths are unioned; CLI takes no
+            // precedence over config — both sets are honoured.
+            let config_cat = file_config.as_ref().and_then(|c| c.catalog.as_ref());
+            let config_writable_dirs: Vec<std::path::PathBuf> = config_cat
+                .map(|c| {
+                    c.writable_storage
+                        .iter()
+                        .map(std::path::PathBuf::from)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let config_readable_dirs: Vec<std::path::PathBuf> = config_cat
+                .map(|c| {
+                    c.readable_storage
+                        .iter()
+                        .map(std::path::PathBuf::from)
+                        .collect()
+                })
+                .unwrap_or_default();
+
             // Canonicalise the writable-storage roots to absolute paths,
             // creating them if missing, so `init_storage` can build valid
             // `file://` URIs and the read/delete/write containment checks
-            // compare against real paths. Empty without `--writable-storage`.
-            let mut writable_abs: Vec<std::path::PathBuf> =
-                Vec::with_capacity(writable_storage.len());
-            for dir in &writable_storage {
-                std::fs::create_dir_all(dir).map_err(|e| {
+            // compare against real paths. Sources: CLI `--writable-storage`
+            // and config `catalog.writable_storage`.
+            let all_writable_dirs = writable_storage.iter().cloned().chain(config_writable_dirs);
+            let mut writable_abs: Vec<std::path::PathBuf> = Vec::new();
+            for dir in all_writable_dirs {
+                std::fs::create_dir_all(&dir).map_err(|e| {
                     anyhow::anyhow!("create writable-storage dir {}: {e}", dir.display())
                 })?;
                 let abs = dir.canonicalize().map_err(|e| {
@@ -527,11 +549,13 @@ pub async fn run(command: Command) -> Result<()> {
                 })?;
                 writable_abs.push(abs);
             }
-            // Read + delete containment must also cover the writable-storage
-            // roots: a freshly-created managed file must be readable and
-            // (force-)deletable. writable ⊆ readable.
+            // Read + delete containment covers: CLI `--allowed-data-dir`,
+            // config `catalog.readable_storage`, and writable roots
+            // (writable ⊆ readable — a freshly-created managed file must be
+            // immediately readable and force-deletable).
             let read_dirs = {
                 let mut d = allowed_data_dirs.clone();
+                d.extend(config_readable_dirs);
                 d.extend(writable_abs.iter().cloned());
                 d
             };
@@ -637,15 +661,36 @@ pub async fn run(command: Command) -> Result<()> {
             }
 
             // Multi-user auth wiring.
-            let (auth_db_handle, issuer_handle, authenticators_built, proxied_auth) =
+            let (auth_db_handle, mut issuer_handle, authenticators_built, proxied_auth) =
                 build_auth_state(
                     auth_db_uri.as_deref(),
                     jwt_secret.as_deref(),
+                    file_config
+                        .as_ref()
+                        .and_then(|c| c.authentication.as_ref())
+                        .and_then(|a| a.secret_keys.as_deref()),
                     &users,
                     &auth_provider_name,
                     proxied_auth_header,
                 )
                 .await?;
+
+            // Apply config-file token TTLs to the Issuer when present
+            // (authentication.access_token_max_age / refresh_token_max_age,
+            // mirroring Python Authentication, config.py:150-151). Only
+            // meaningful in multi-user mode; single-user mode never uses JWTs.
+            if let Some(issuer) = issuer_handle.take() {
+                let auth_cfg = file_config.as_ref().and_then(|c| c.authentication.as_ref());
+                let new_access = auth_cfg
+                    .and_then(|a| a.access_token_max_age)
+                    .map(|s| chrono::Duration::seconds(s as i64))
+                    .unwrap_or(issuer.access_ttl);
+                let new_refresh = auth_cfg
+                    .and_then(|a| a.refresh_token_max_age)
+                    .map(|s| chrono::Duration::seconds(s as i64))
+                    .unwrap_or(issuer.refresh_ttl);
+                issuer_handle = Some(issuer.with_ttls(new_access, new_refresh));
+            }
 
             let trust_forwarded_headers = trust_proxy || proxied_auth_header;
 
@@ -995,9 +1040,16 @@ pub async fn run(command: Command) -> Result<()> {
 
 /// Wire up the multi-user auth pieces from the supplied flags. Returns
 /// the AppState fields the caller needs.
+///
+/// Secret precedence (highest to lowest):
+/// 1. `TILED_SECRET_KEYS` env (JSON array) — key-rotation list.
+/// 2. `config_secret_keys` — `authentication.secret_keys` from the YAML
+///    config file, same rotation semantics.
+/// 3. `jwt_secret` — the `--jwt-secret` / `TILED_JWT_SECRET` single key.
 async fn build_auth_state(
     auth_db_uri: Option<&str>,
     jwt_secret: Option<&str>,
+    config_secret_keys: Option<&[String]>,
     users: &[String],
     provider_name: &str,
     proxied_auth_header: bool,
@@ -1017,8 +1069,8 @@ async fn build_auth_state(
     })?;
     // JWT signing secret(s). Python tiled supports key rotation via a list of
     // secrets (`secret_keys` / `TILED_SECRET_KEYS`, a JSON list of strings): the
-    // first signs new tokens, all are tried when verifying. Honor that env when
-    // present; otherwise fall back to the single `--jwt-secret` / TILED_JWT_SECRET.
+    // first signs new tokens, all are tried when verifying.
+    // Precedence: env TILED_SECRET_KEYS > config authentication.secret_keys > --jwt-secret.
     let issuer = match std::env::var("TILED_SECRET_KEYS") {
         Ok(json) => {
             let keys: Vec<String> = serde_json::from_str(&json).map_err(|e| {
@@ -1028,15 +1080,24 @@ async fn build_auth_state(
             tiled_auth::Issuer::with_secrets(&refs)
                 .map_err(|e| anyhow::anyhow!("jwt secret: {e}"))?
         }
-        Err(_) => {
-            let secret_str = jwt_secret.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "--auth-db-uri requires --jwt-secret (or TILED_SECRET_KEYS for key rotation)"
-                )
-            })?;
-            tiled_auth::Issuer::new(secret_str.as_bytes())
-                .map_err(|e| anyhow::anyhow!("jwt secret: {e}"))?
-        }
+        Err(_) => match config_secret_keys.filter(|ks| !ks.is_empty()) {
+            Some(keys) => {
+                let refs: Vec<&[u8]> = keys.iter().map(|s| s.as_bytes()).collect();
+                tiled_auth::Issuer::with_secrets(&refs)
+                    .map_err(|e| anyhow::anyhow!("authentication.secret_keys: {e}"))?
+            }
+            None => {
+                let secret_str = jwt_secret.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "--auth-db-uri requires --jwt-secret, \
+                         'authentication.secret_keys' in config, \
+                         or TILED_SECRET_KEYS for key rotation"
+                    )
+                })?;
+                tiled_auth::Issuer::new(secret_str.as_bytes())
+                    .map_err(|e| anyhow::anyhow!("jwt secret: {e}"))?
+            }
+        },
     };
     let db = tiled_auth::AuthDb::connect(auth_uri)
         .await
