@@ -231,6 +231,20 @@ pub struct TreeArgs {
     pub handler_registry: std::collections::HashMap<String, String>,
 }
 
+/// One entry in `authentication.tiled_admins`. Mirrors Python's `TiledAdmin`
+/// model (`config.py`): the `(provider, id)` pair identifies the external
+/// identity that should be bootstrapped to the `"admin"` role at startup.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TiledAdmin {
+    /// The authentication provider name (e.g. `"ldap"`, `"oidc"`,
+    /// `"password"`). Matches the `provider` column of the `identities` table.
+    pub provider: String,
+    /// The subject identifier within that provider (the `sub` / external `id`
+    /// value stored in the `identities` table). Mirrors Python's `id` field on
+    /// `TiledAdmin`.
+    pub id: String,
+}
+
 /// Authentication configuration.
 #[derive(Debug, Deserialize)]
 pub struct AuthConfig {
@@ -261,8 +275,15 @@ pub struct AuthConfig {
     /// the compiled-in default (7 days) is used.
     #[serde(default)]
     pub refresh_token_max_age: Option<f64>,
+    /// Principals that must have the `"admin"` role at server startup.
+    /// Mirrors Python `Authentication.tiled_admins` (`config.py`). The server
+    /// bootstraps each `(provider, id)` pair idempotently: the identity is
+    /// created if absent, then the principal's role is set to `"admin"`.
+    /// Only takes effect in multi-user mode (`--auth-db-uri`).
+    #[serde(default)]
+    pub tiled_admins: Vec<TiledAdmin>,
     /// Catch-all for authentication config keys the Rust port does not yet
-    /// model (e.g. `providers`, `tiled_admins`, `session_max_age`).
+    /// model (e.g. `providers`, `session_max_age`).
     /// Warn-logged at startup.
     #[serde(flatten)]
     pub unknown: BTreeMap<String, serde_yaml::Value>,
@@ -809,6 +830,43 @@ mod tests {
         assert!(
             !auth.unknown.contains_key("single_user_api_key"),
             "known key 'single_user_api_key' must not appear in auth catch-all"
+        );
+    }
+
+    // authentication.tiled_admins parses into a typed Vec<TiledAdmin> and
+    // must NOT appear in the unknown catch-all (it is modelled and wired to
+    // the startup admin-bootstrap).
+    #[test]
+    fn auth_tiled_admins_parse_and_are_not_unknown() {
+        let cfg: TiledConfig = serde_yaml::from_str(
+            "trees: []\n\
+             authentication:\n\
+             \x20 tiled_admins:\n\
+             \x20   - provider: ldap\n\
+             \x20     id: alice\n\
+             \x20   - provider: oidc\n\
+             \x20     id: bob@example.com\n",
+        )
+        .unwrap();
+        let auth = cfg
+            .authentication
+            .as_ref()
+            .expect("authentication block present");
+        assert_eq!(
+            auth.tiled_admins.len(),
+            2,
+            "two tiled_admins entries must parse"
+        );
+        assert_eq!(auth.tiled_admins[0].provider, "ldap");
+        assert_eq!(auth.tiled_admins[0].id, "alice");
+        assert_eq!(auth.tiled_admins[1].provider, "oidc");
+        assert_eq!(auth.tiled_admins[1].id, "bob@example.com");
+        // tiled_admins is modelled — must NOT appear in the catch-all.
+        assert!(
+            !auth.unknown.contains_key("tiled_admins"),
+            "tiled_admins is modelled — must not appear in auth catch-all; \
+             got unknown={:?}",
+            auth.unknown
         );
     }
 

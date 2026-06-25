@@ -675,6 +675,33 @@ pub async fn run(command: Command) -> Result<()> {
                 )
                 .await?;
 
+            // Bootstrap tiled_admins: ensure each listed (provider, id) principal
+            // has role "admin". Mirrors Python app.py startup_event (app.py:702-712).
+            // Only runs when an auth DB is present (multi-user mode).
+            if let Some(ref auth_db) = auth_db_handle {
+                let admins = file_config
+                    .as_ref()
+                    .and_then(|c| c.authentication.as_ref())
+                    .map(|a| a.tiled_admins.as_slice())
+                    .unwrap_or(&[]);
+                for admin in admins {
+                    tracing::info!(
+                        provider = %admin.provider,
+                        id = %admin.id,
+                        "Ensuring principal has role 'admin'"
+                    );
+                    auth_db
+                        .make_admin_by_identity(&admin.provider, &admin.id)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "bootstrap admin for provider='{}' id='{}'",
+                                admin.provider, admin.id
+                            )
+                        })?;
+                }
+            }
+
             // Apply config-file token TTLs to the Issuer when present
             // (authentication.access_token_max_age / refresh_token_max_age,
             // mirroring Python Authentication, config.py:150-151). Only

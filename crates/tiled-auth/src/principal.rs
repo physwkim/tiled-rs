@@ -80,6 +80,18 @@ impl PrincipalDetail {
 }
 
 impl AuthDb {
+    /// Ensure the principal identified by `(provider, id)` has the `"admin"`
+    /// role, creating the identity if it does not yet exist. Idempotent:
+    /// calling it multiple times for the same identity is safe. Mirrors
+    /// Python's `make_admin_by_identity` in `authn_database/core.py`.
+    pub async fn make_admin_by_identity(&self, provider: &str, id: &str) -> Result<()> {
+        let (principal, _) = self.ensure_principal(provider, id).await?;
+        if principal.role != "admin" {
+            self.update_principal_role(principal.id, "admin").await?;
+        }
+        Ok(())
+    }
+
     /// Find or create a principal keyed by `(provider, sub)`. Used by every
     /// authenticator path: each successful login reaches here so we never
     /// create duplicate principals for the same external identity.

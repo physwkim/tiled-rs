@@ -345,3 +345,46 @@ async fn device_code_expired_approve_rejected() {
         "expected Conflict for expired code, got {err:?}"
     );
 }
+
+#[tokio::test]
+async fn make_admin_by_identity_creates_and_promotes() {
+    let (db, _dir) = fresh_db().await;
+
+    // First call: identity does not exist → creates principal + identity, sets admin.
+    db.make_admin_by_identity("ldap", "alice").await.unwrap();
+    let (principal, _) = db.ensure_principal("ldap", "alice").await.unwrap();
+    assert_eq!(
+        principal.role, "admin",
+        "make_admin_by_identity must set role to 'admin'"
+    );
+}
+
+#[tokio::test]
+async fn make_admin_by_identity_is_idempotent() {
+    let (db, _dir) = fresh_db().await;
+
+    db.make_admin_by_identity("oidc", "bob").await.unwrap();
+    // Second call must not error and must not demote.
+    db.make_admin_by_identity("oidc", "bob").await.unwrap();
+    let (principal, _) = db.ensure_principal("oidc", "bob").await.unwrap();
+    assert_eq!(principal.role, "admin");
+}
+
+#[tokio::test]
+async fn make_admin_by_identity_promotes_existing_user() {
+    let (db, _dir) = fresh_db().await;
+
+    // Create a user principal first (default role "user").
+    let (user_principal, _) = db.ensure_principal("password", "carol").await.unwrap();
+    assert_eq!(user_principal.role, "user", "default role must be 'user'");
+
+    // Now bootstrap as admin.
+    db.make_admin_by_identity("password", "carol")
+        .await
+        .unwrap();
+    let (promoted, _) = db.ensure_principal("password", "carol").await.unwrap();
+    assert_eq!(
+        promoted.role, "admin",
+        "existing user must be promoted to admin"
+    );
+}
