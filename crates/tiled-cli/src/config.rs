@@ -711,6 +711,31 @@ mod tests {
         );
     }
 
+    // authentication.access_token_max_age and refresh_token_max_age parse into
+    // AuthConfig and are NOT in the unknown catch-all (they are modelled and
+    // wired to Issuer::with_ttls in lib.rs).
+    #[test]
+    fn auth_token_ages_parse_and_are_not_unknown() {
+        let cfg: TiledConfig = serde_yaml::from_str(
+            "trees: []\nauthentication:\n  access_token_max_age: 900\n  refresh_token_max_age: 604800\n",
+        )
+        .unwrap();
+        let auth = cfg
+            .authentication
+            .as_ref()
+            .expect("authentication block present");
+        assert_eq!(auth.access_token_max_age, Some(900.0));
+        assert_eq!(auth.refresh_token_max_age, Some(604_800.0));
+        assert!(
+            !auth.unknown.contains_key("access_token_max_age"),
+            "access_token_max_age is modelled — must not appear in catch-all"
+        );
+        assert!(
+            !auth.unknown.contains_key("refresh_token_max_age"),
+            "refresh_token_max_age is modelled — must not appear in catch-all"
+        );
+    }
+
     // authentication.secret_keys parses into AuthConfig.secret_keys and does
     // NOT appear in the unknown catch-all (it is modelled and wired to Issuer).
     #[test]

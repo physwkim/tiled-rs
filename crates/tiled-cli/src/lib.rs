@@ -661,7 +661,7 @@ pub async fn run(command: Command) -> Result<()> {
             }
 
             // Multi-user auth wiring.
-            let (auth_db_handle, issuer_handle, authenticators_built, proxied_auth) =
+            let (auth_db_handle, mut issuer_handle, authenticators_built, proxied_auth) =
                 build_auth_state(
                     auth_db_uri.as_deref(),
                     jwt_secret.as_deref(),
@@ -674,6 +674,23 @@ pub async fn run(command: Command) -> Result<()> {
                     proxied_auth_header,
                 )
                 .await?;
+
+            // Apply config-file token TTLs to the Issuer when present
+            // (authentication.access_token_max_age / refresh_token_max_age,
+            // mirroring Python Authentication, config.py:150-151). Only
+            // meaningful in multi-user mode; single-user mode never uses JWTs.
+            if let Some(issuer) = issuer_handle.take() {
+                let auth_cfg = file_config.as_ref().and_then(|c| c.authentication.as_ref());
+                let new_access = auth_cfg
+                    .and_then(|a| a.access_token_max_age)
+                    .map(|s| chrono::Duration::seconds(s as i64))
+                    .unwrap_or(issuer.access_ttl);
+                let new_refresh = auth_cfg
+                    .and_then(|a| a.refresh_token_max_age)
+                    .map(|s| chrono::Duration::seconds(s as i64))
+                    .unwrap_or(issuer.refresh_ttl);
+                issuer_handle = Some(issuer.with_ttls(new_access, new_refresh));
+            }
 
             let trust_forwarded_headers = trust_proxy || proxied_auth_header;
 
