@@ -1,4 +1,5 @@
 pub mod array;
+pub mod awkward;
 pub mod container_json;
 pub mod html_container;
 pub mod json_seq;
@@ -30,6 +31,7 @@ pub fn default_registry() -> SerializationRegistry {
     table::register_table_serializers(&reg);
     sparse::register_sparse_serializers(&reg);
     ragged::register_ragged_serializers(&reg);
+    awkward::register_awkward_serializers(&reg);
     html_container::register_html_serializer(&reg);
     json_seq::register_json_seq_serializer(&reg);
     container_json::register_container_json_serializer(&reg);

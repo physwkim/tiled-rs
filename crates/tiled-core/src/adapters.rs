@@ -169,6 +169,10 @@ pub trait AwkwardAdapterRead: BaseAdapter {
         &'a self,
         form_keys: Option<&'a [String]>,
     ) -> BoxFuture<'a, Result<HashMap<String, bytes::Bytes>>>;
+
+    fn as_writable(&self) -> Option<&dyn AwkwardAdapterWrite> {
+        None
+    }
 }
 
 pub trait AwkwardAdapterWrite: AwkwardAdapterRead {
@@ -523,6 +527,15 @@ impl AnyAdapter {
     pub fn as_ragged_arc(&self) -> Option<Arc<dyn RaggedAdapterRead>> {
         match self {
             Self::Ragged(r) => Some(Arc::clone(r)),
+            _ => None,
+        }
+    }
+
+    /// Owned, `'static` clone of the awkward leaf. See [`AnyAdapter::as_array_arc`].
+    #[inline]
+    pub fn as_awkward_arc(&self) -> Option<Arc<dyn AwkwardAdapterRead>> {
+        match self {
+            Self::Awkward(a) => Some(Arc::clone(a)),
             _ => None,
         }
     }

@@ -63,16 +63,16 @@ pub fn links_for_node(family: StructureFamily, base_url: &str, path: &str) -> No
                 .extra
                 .insert("block".into(), format!("{base}/api/v1/ragged/block/{p}"));
         }
-        // Awkward is NOT servable end-to-end in this workspace: there is no
-        // concrete awkward adapter (only the `AwkwardAdapterRead` trait, with
-        // no extractor on `AnyAdapter`), no resolver builds one, and no
-        // serializer is registered for the Awkward family. Python's
-        // `links_for_awkward` (tiled/links.py:26-30) advertises `/awkward/full`
-        // and `/awkward/buffers`, but the Rust server registers no such routes —
-        // advertising them would hand a client a link that 404s when followed.
-        // Advertise only the metadata `self` link (set above) until the family
-        // is servable. (Parity gap tracked as server H1.)
-        StructureFamily::Awkward => {}
+        // Mirrors Python `links_for_awkward` (tiled/links.py:26-30): advertise
+        // `full` (GET /awkward/full) and `buffers` (POST /awkward/buffers).
+        // Both routes are wired in app.rs and handled in router.rs.
+        StructureFamily::Awkward => {
+            links.full = Some(format!("{base}/api/v1/awkward/full/{p}"));
+            links.extra.insert(
+                "buffers".into(),
+                format!("{base}/api/v1/awkward/buffers/{p}"),
+            );
+        }
     }
 
     links
@@ -218,10 +218,10 @@ mod tests {
     }
 
     #[test]
-    fn test_links_for_awkward_advertises_no_dead_read_links() {
-        // Awkward is not servable end-to-end (no concrete adapter, no registered
-        // serializer, no route), so the node must advertise only the metadata
-        // `self` link — never `/awkward/full` or `/awkward/buffers` (server H1).
+    fn test_links_for_awkward_advertises_full_and_buffers() {
+        // Awkward is servable end-to-end (AwkwardAdapter + /awkward/full +
+        // /awkward/buffers routes + application/zip serializer).  Mirrors Python
+        // `links_for_awkward` (tiled/links.py:26-30): `full` + `buffers`.
         let links = links_for_node(
             StructureFamily::Awkward,
             "http://localhost:8000",
@@ -231,10 +231,14 @@ mod tests {
             links.self_link.as_deref(),
             Some("http://localhost:8000/api/v1/metadata/my_awkward")
         );
-        assert!(links.full.is_none());
-        assert!(links.search.is_none());
-        assert!(!links.extra.contains_key("buffers"));
-        assert!(links.extra.is_empty());
+        assert_eq!(
+            links.full.as_deref(),
+            Some("http://localhost:8000/api/v1/awkward/full/my_awkward")
+        );
+        assert_eq!(
+            links.extra.get("buffers").map(|s| s.as_str()),
+            Some("http://localhost:8000/api/v1/awkward/buffers/my_awkward")
+        );
     }
 
     #[test]

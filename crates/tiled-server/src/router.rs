@@ -2575,6 +2575,310 @@ pub async fn ragged_full(
 }
 
 // ---------------------------------------------------------------------------
+// Awkward array read+write handlers
+// ---------------------------------------------------------------------------
+//
+// Three routes mirror Python's awkward family (router.py:1562-2310):
+//
+//   GET  /api/v1/awkward/full/{path}    — read ALL buffers, return ZIP
+//   PUT  /api/v1/awkward/full/{path}    — receive ZIP body, write buffers
+//   GET  /api/v1/awkward/buffers/{path} — read filtered buffers, return ZIP
+//   POST /api/v1/awkward/buffers/{path} — same, form keys in JSON body
+//
+// Wire format: a ZIP archive (uncompressed, ZIP_STORED) in which each entry
+// name is a buffer form key (e.g. "node0-data", "node0-offsets").  Matches
+// Python `to_zipped_buffers` / `from_zipped_buffers`
+// (tiled/serialization/awkward.py:14-36).
+
+/// Pack a buffer map into an uncompressed ZIP archive.
+///
+/// Each entry is named by its form key.  Matches Python's `to_zipped_buffers`
+/// which uses `zipfile.ZIP_STORED`.
+fn pack_buffers_to_zip(
+    buffers: &HashMap<String, bytes::Bytes>,
+) -> Result<bytes::Bytes, ServerError> {
+    use zip::write::SimpleFileOptions;
+
+    let cursor = Cursor::new(Vec::<u8>::new());
+    let mut zip = zip::ZipWriter::new(cursor);
+    let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    for (name, data) in buffers {
+        zip.start_file(name, opts)
+            .map_err(|e| ServerError::Internal(format!("awkward zip start_file: {e}")))?;
+        zip.write_all(data)
+            .map_err(|e| ServerError::Internal(format!("awkward zip write: {e}")))?;
+    }
+    let cursor = zip
+        .finish()
+        .map_err(|e| ServerError::Internal(format!("awkward zip finish: {e}")))?;
+    Ok(bytes::Bytes::from(cursor.into_inner()))
+}
+
+/// Unpack a ZIP archive into a buffer map.  Used by `put_awkward_full`.
+fn unpack_zip_to_buffers(data: &[u8]) -> Result<HashMap<String, bytes::Bytes>, ServerError> {
+    use std::io::Read as IoRead;
+
+    let cursor = Cursor::new(data);
+    let mut archive = zip::ZipArchive::new(cursor)
+        .map_err(|e| ServerError::Validation(format!("invalid ZIP body: {e}")))?;
+    let mut out = HashMap::new();
+    for i in 0..archive.len() {
+        let mut entry = archive
+            .by_index(i)
+            .map_err(|e| ServerError::Validation(format!("ZIP entry {i}: {e}")))?;
+        let name = entry.name().to_string();
+        let mut buf = Vec::new();
+        entry
+            .read_to_end(&mut buf)
+            .map_err(|e| ServerError::Validation(format!("ZIP read {name}: {e}")))?;
+        out.insert(name, bytes::Bytes::from(buf));
+    }
+    Ok(out)
+}
+
+/// Build the HTTP response for an awkward buffer read.
+///
+/// Packs `buffers` into a ZIP archive in `spawn_blocking`, negotiates the
+/// media type (only `application/zip` is registered), invokes the serializer
+/// (identity for ZIP), and returns the response.
+async fn build_awkward_response(
+    buffers: HashMap<String, bytes::Bytes>,
+    structure: &tiled_core::structures::AwkwardStructure,
+    format_param: Option<&str>,
+    headers: &HeaderMap,
+    state: &AppState,
+) -> Result<axum::response::Response, ServerError> {
+    let nbytes: usize = buffers.values().map(|b| b.len()).sum();
+    check_response_size(
+        nbytes,
+        state.response_bytesize_limit,
+        "Use form_key filtering (\"?form_key=...\") to request a subset of buffers.",
+    )?;
+
+    let family = tiled_core::structures::StructureFamily::Awkward;
+    let accept = headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let media_type = tiled_serialization::negotiate_media_type(
+        format_param,
+        accept,
+        family,
+        &state.serialization_registry,
+    )
+    .ok_or_else(|| {
+        unsupported_media_type(
+            family,
+            format_param.unwrap_or(accept),
+            &state.serialization_registry,
+        )
+    })?;
+
+    let ser_meta = serde_json::to_value(structure)
+        .map_err(|e| ServerError::Internal(format!("awkward structure encode: {e}")))?;
+
+    let zip_bytes = tokio::task::spawn_blocking(move || pack_buffers_to_zip(&buffers))
+        .await
+        .map_err(|e| ServerError::Internal(format!("blocking task failed: {e}")))??;
+
+    let serializer = state
+        .serialization_registry
+        .dispatch(family, &media_type)
+        .ok_or_else(|| {
+            unsupported_media_type(family, &media_type, &state.serialization_registry)
+        })?;
+
+    let body = tokio::task::spawn_blocking(move || serializer(&zip_bytes, &ser_meta))
+        .await
+        .map_err(|e| ServerError::Internal(format!("serialize task failed: {e}")))?
+        .map_err(map_serialize_error)?;
+
+    Ok(serve_with_range(headers, &media_type, body))
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/awkward/full/{*path}
+// ---------------------------------------------------------------------------
+
+/// Read the entire awkward array — all buffers — and return them as a ZIP.
+///
+/// Python parity: `awkward_full` (router.py:1704-1763):
+/// 1. read the array via `entry.read()`
+/// 2. convert to buffers with `awkward.to_buffers(array)`
+/// 3. serialize with `construct_data_response`
+///
+/// In Rust, `AwkwardAdapterRead::read` already returns the buffer map, so
+/// step 2 is implicit.
+pub async fn awkward_full(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    auth: crate::AuthContext,
+) -> Result<impl IntoResponse, ServerError> {
+    auth.require(tiled_auth::Scope::ReadData)?;
+    let segments = segments_from_uri(&uri, "/api/v1/awkward/full/");
+    let _ = resolve_entry(&state, auth.clone(), &segments, tiled_auth::Scope::ReadData).await?;
+
+    let format_str = params.get("format").cloned();
+    let adapter = core::walk_tree(state.root_tree.as_ref(), &segments).await?;
+
+    let awkward = adapter.as_awkward_arc().ok_or_else(|| {
+        ServerError::WrongType(format!("'{}' is not an awkward array", segments.join("/")))
+    })?;
+
+    let buffers = awkward.read().await.map_err(ServerError::from)?;
+    let structure = awkward.structure().clone();
+
+    build_awkward_response(buffers, &structure, format_str.as_deref(), &headers, &state).await
+}
+
+// ---------------------------------------------------------------------------
+// PUT /api/v1/awkward/full/{*path}
+// ---------------------------------------------------------------------------
+
+/// Write a buffer map (as a ZIP body) to an awkward array node.
+///
+/// Python parity: `put_awkward_full` (router.py:2272-2310).
+pub async fn put_awkward_full(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+    auth: crate::AuthContext,
+    body: bytes::Bytes,
+) -> Result<impl IntoResponse, ServerError> {
+    auth.require(tiled_auth::Scope::WriteData)?;
+    let segments = segments_from_uri(&uri, "/api/v1/awkward/full/");
+    let _ = resolve_entry(
+        &state,
+        auth.clone(),
+        &segments,
+        tiled_auth::Scope::WriteData,
+    )
+    .await?;
+
+    let adapter = core::walk_tree(state.root_tree.as_ref(), &segments).await?;
+    let awkward = adapter.as_awkward_arc().ok_or_else(|| {
+        ServerError::WrongType(format!("'{}' is not an awkward array", segments.join("/")))
+    })?;
+
+    let writable = awkward.as_writable().ok_or_else(|| {
+        ServerError::MethodNotAllowed(
+            "this awkward node is not writable; only internally-managed nodes accept writes".into(),
+        )
+    })?;
+
+    let buffers = tokio::task::spawn_blocking(move || unpack_zip_to_buffers(&body))
+        .await
+        .map_err(|e| ServerError::Internal(format!("blocking task failed: {e}")))??;
+
+    writable.write(buffers).await.map_err(ServerError::from)?;
+
+    let path = segments.join("/");
+    state.streaming_bus.publish(
+        &path,
+        crate::streaming::UpdateKind::DataAppended { partition: None },
+    );
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/v1/awkward/buffers/{*path}
+// ---------------------------------------------------------------------------
+
+/// Fetch a filtered subset of awkward buffers (GET variant).
+///
+/// `?form_key=A&form_key=B` selects which buffers to return.  Uses
+/// `Vec<(String, String)>` query extraction so repeated `?form_key=` params
+/// all survive (a `HashMap` collapses them).
+///
+/// Python parity: `get_awkward_buffers` (router.py:1562-1608).
+pub async fn awkward_buffers(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+    Query(params): Query<Vec<(String, String)>>,
+    headers: HeaderMap,
+    auth: crate::AuthContext,
+) -> Result<impl IntoResponse, ServerError> {
+    auth.require(tiled_auth::Scope::ReadData)?;
+    let segments = segments_from_uri(&uri, "/api/v1/awkward/buffers/");
+    let _ = resolve_entry(&state, auth.clone(), &segments, tiled_auth::Scope::ReadData).await?;
+
+    let form_keys: Vec<String> = params
+        .iter()
+        .filter(|(k, _)| k == "form_key")
+        .map(|(_, v)| v.clone())
+        .collect();
+    let format_str = params
+        .iter()
+        .find(|(k, _)| k == "format")
+        .map(|(_, v)| v.clone());
+
+    let adapter = core::walk_tree(state.root_tree.as_ref(), &segments).await?;
+    let awkward = adapter.as_awkward_arc().ok_or_else(|| {
+        ServerError::WrongType(format!("'{}' is not an awkward array", segments.join("/")))
+    })?;
+
+    let keys_opt: Option<Vec<String>> = if form_keys.is_empty() {
+        None
+    } else {
+        Some(form_keys)
+    };
+
+    let buffers = awkward
+        .read_buffers(keys_opt.as_deref())
+        .await
+        .map_err(ServerError::from)?;
+    let structure = awkward.structure().clone();
+
+    build_awkward_response(buffers, &structure, format_str.as_deref(), &headers, &state).await
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/v1/awkward/buffers/{*path}
+// ---------------------------------------------------------------------------
+
+/// Fetch a filtered subset of awkward buffers (POST variant).
+///
+/// Body: a JSON array of form keys (e.g. `["node0", "node1"]`).  POST is
+/// preferred by the Rust (and Python) client because a large key set can
+/// exceed URL length limits when expressed as repeated query params.
+///
+/// Python parity: `post_awkward_buffers` (router.py:1612-1658).
+pub async fn post_awkward_buffers(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    auth: crate::AuthContext,
+    Json(form_keys): Json<Vec<String>>,
+) -> Result<impl IntoResponse, ServerError> {
+    auth.require(tiled_auth::Scope::ReadData)?;
+    let segments = segments_from_uri(&uri, "/api/v1/awkward/buffers/");
+    let _ = resolve_entry(&state, auth.clone(), &segments, tiled_auth::Scope::ReadData).await?;
+
+    let format_str = params.get("format").cloned();
+
+    let adapter = core::walk_tree(state.root_tree.as_ref(), &segments).await?;
+    let awkward = adapter.as_awkward_arc().ok_or_else(|| {
+        ServerError::WrongType(format!("'{}' is not an awkward array", segments.join("/")))
+    })?;
+
+    let keys_opt: Option<Vec<String>> = if form_keys.is_empty() {
+        None
+    } else {
+        Some(form_keys)
+    };
+
+    let buffers = awkward
+        .read_buffers(keys_opt.as_deref())
+        .await
+        .map_err(ServerError::from)?;
+    let structure = awkward.structure().clone();
+
+    build_awkward_response(buffers, &structure, format_str.as_deref(), &headers, &state).await
+}
+
+// ---------------------------------------------------------------------------
 // GET /api/v1/table/partition/{*path}
 // ---------------------------------------------------------------------------
 
