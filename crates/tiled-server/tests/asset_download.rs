@@ -51,6 +51,8 @@ fn make_state(
         authenticators: vec![],
         proxied_header_auth: None,
         external_oidc: None,
+        #[cfg(feature = "saml")]
+        saml_providers: vec![],
         forwarded_allow_ips: None,
         max_request_body_bytes: 10 * 1024 * 1024,
         response_bytesize_limit: 300_000_000,

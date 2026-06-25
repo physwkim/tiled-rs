@@ -120,6 +120,21 @@ pub fn build_app(state: AppState) -> Router {
             post(auth_router::session_revoke_by_token),
         );
 
+    // SAML 2.0 SP-initiated SSO endpoints (feature-gated on `saml`).
+    // Each configured SamlProvider exposes:
+    //   GET  /api/v1/auth/saml/{name}/login  — redirect browser to IdP SSO URL
+    //   POST /api/v1/auth/saml/{name}/acs    — Assertion Consumer Service
+    #[cfg(feature = "saml")]
+    let public_auth = public_auth
+        .route(
+            "/api/v1/auth/saml/{provider}/login",
+            get(auth_router::saml_login),
+        )
+        .route(
+            "/api/v1/auth/saml/{provider}/acs",
+            post(auth_router::saml_acs),
+        );
+
     // Authenticated auth endpoints — must run inside the auth middleware
     // so AuthContext is populated.
     let private_auth = Router::new()

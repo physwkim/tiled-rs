@@ -52,6 +52,8 @@ async fn build_test_app() -> (axum::Router, tempfile::TempDir, Catalog, AuthDb) 
         authenticators: vec![Arc::new(dummy)],
         proxied_header_auth: None,
         external_oidc: None,
+        #[cfg(feature = "saml")]
+        saml_providers: vec![],
         forwarded_allow_ips: None,
         max_request_body_bytes: 10 * 1024 * 1024,
         response_bytesize_limit: 300_000_000,
@@ -863,6 +865,8 @@ async fn build_oidc_state(
         authenticators: vec![],
         proxied_header_auth: None,
         external_oidc: Some(validator.clone()),
+        #[cfg(feature = "saml")]
+        saml_providers: vec![],
         forwarded_allow_ips: None,
         max_request_body_bytes: 10 * 1024 * 1024,
         response_bytesize_limit: 300_000_000,
@@ -1870,8 +1874,9 @@ async fn build_code_flow_app(
     catalog.migrate().await.unwrap();
     let resolver: Arc<dyn tiled_catalog::adapter::LeafResolver> =
         Arc::new(tiled_catalog::adapter::UnresolvedLeaf);
-    let root_tree: Arc<dyn tiled_core::adapters::ContainerAdapter> =
-        Arc::new(tiled_catalog::CatalogAdapter::root(catalog.clone(), resolver));
+    let root_tree: Arc<dyn tiled_core::adapters::ContainerAdapter> = Arc::new(
+        tiled_catalog::CatalogAdapter::root(catalog.clone(), resolver),
+    );
     let registry = Arc::new(tiled_serialization::default_registry());
     let state = tiled_server::AppState {
         root_tree,
@@ -1887,6 +1892,8 @@ async fn build_code_flow_app(
         authenticators: vec![],
         proxied_header_auth: None,
         external_oidc: Some(validator.clone()),
+        #[cfg(feature = "saml")]
+        saml_providers: vec![],
         forwarded_allow_ips: None,
         max_request_body_bytes: 10 * 1024 * 1024,
         response_bytesize_limit: 300_000_000,

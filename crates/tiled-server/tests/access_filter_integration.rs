@@ -150,6 +150,8 @@ async fn search_respects_tag_based_access_policy() {
         authenticators: vec![Arc::new(dummy)],
         proxied_header_auth: None,
         external_oidc: None,
+        #[cfg(feature = "saml")]
+        saml_providers: vec![],
         forwarded_allow_ips: None,
         max_request_body_bytes: 10 * 1024 * 1024,
         response_bytesize_limit: 300_000_000,
@@ -272,6 +274,8 @@ async fn admin_search_sees_all_nodes() {
         authenticators: vec![Arc::new(dummy)],
         proxied_header_auth: None,
         external_oidc: None,
+        #[cfg(feature = "saml")]
+        saml_providers: vec![],
         forwarded_allow_ips: None,
         max_request_body_bytes: 10 * 1024 * 1024,
         response_bytesize_limit: 300_000_000,
@@ -398,6 +402,8 @@ async fn array_append_denied_by_tag_policy_returns_404() {
         authenticators: vec![Arc::new(dummy)],
         proxied_header_auth: None,
         external_oidc: None,
+        #[cfg(feature = "saml")]
+        saml_providers: vec![],
         forwarded_allow_ips: None,
         max_request_body_bytes: 10 * 1024 * 1024,
         response_bytesize_limit: 300_000_000,
@@ -491,6 +497,8 @@ async fn anonymous_search_shows_only_public_nodes() {
         authenticators: vec![],
         proxied_header_auth: None,
         external_oidc: None,
+        #[cfg(feature = "saml")]
+        saml_providers: vec![],
         forwarded_allow_ips: None,
         max_request_body_bytes: 10 * 1024 * 1024,
         response_bytesize_limit: 300_000_000,
@@ -588,6 +596,8 @@ async fn public_tagged_node_is_listable_and_readable_by_anonymous() {
         authenticators: vec![],
         proxied_header_auth: None,
         external_oidc: None,
+        #[cfg(feature = "saml")]
+        saml_providers: vec![],
         forwarded_allow_ips: None,
         max_request_body_bytes: 10 * 1024 * 1024,
         response_bytesize_limit: 300_000_000,
@@ -698,6 +708,8 @@ async fn anonymous_search_excludes_user_owned_nodes() {
         authenticators: vec![],
         proxied_header_auth: None,
         external_oidc: None,
+        #[cfg(feature = "saml")]
+        saml_providers: vec![],
         forwarded_allow_ips: None,
         max_request_body_bytes: 10 * 1024 * 1024,
         response_bytesize_limit: 300_000_000,
@@ -805,6 +817,8 @@ async fn cross_user_search_excludes_other_users_owned_nodes() {
         authenticators: vec![Arc::new(dummy)],
         proxied_header_auth: None,
         external_oidc: None,
+        #[cfg(feature = "saml")]
+        saml_providers: vec![],
         forwarded_allow_ips: None,
         max_request_body_bytes: 10 * 1024 * 1024,
         response_bytesize_limit: 300_000_000,
@@ -919,6 +933,8 @@ async fn metadata_read_excludes_other_users_owned_node() {
         authenticators: vec![Arc::new(dummy)],
         proxied_header_auth: None,
         external_oidc: None,
+        #[cfg(feature = "saml")]
+        saml_providers: vec![],
         forwarded_allow_ips: None,
         max_request_body_bytes: 10 * 1024 * 1024,
         response_bytesize_limit: 300_000_000,
