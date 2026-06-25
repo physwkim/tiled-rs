@@ -5,6 +5,8 @@ pub mod npy_adapter;
 pub mod ragged_adapter;
 pub mod sequence_adapter;
 
+#[cfg(feature = "arrow-ipc")]
+pub mod arrow_adapter;
 #[cfg(feature = "csv-adapter")]
 pub mod csv_adapter;
 #[cfg(feature = "hdf5")]
@@ -27,6 +29,8 @@ pub use ragged_adapter::RaggedAdapter;
 pub use sequence_adapter::{FrameOpener, NpyFrameOpener, SequenceAdapter};
 pub use tiled_core::adapters::{RaggedAdapterRead, RaggedData};
 
+#[cfg(feature = "arrow-ipc")]
+pub use arrow_adapter::ArrowIpcAdapter;
 #[cfg(feature = "csv-adapter")]
 pub use csv_adapter::{CsvAdapter, init_storage_csv};
 #[cfg(feature = "hdf5")]
