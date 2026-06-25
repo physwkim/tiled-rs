@@ -5,7 +5,7 @@ edition.workspace = true
 
 [features]
 default = ["oidc"]
-oidc = ["dep:reqwest"]
+oidc = ["dep:reqwest", "dep:sha2"]
 saml = []
 ldap = []
 
@@ -30,6 +30,7 @@ axum = { workspace = true }
 
 # Feature-gated
 reqwest = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

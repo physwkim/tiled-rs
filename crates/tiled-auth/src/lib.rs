@@ -32,7 +32,9 @@ pub use authenticator::{Authenticator, DummyAuthenticator, ProxiedHeaderAuthenti
 pub use db::AuthDb;
 pub use error::{AuthError, Result};
 #[cfg(feature = "oidc")]
-pub use external_oidc::{ExternalOidcValidator, OidcProvider, ValidatedToken};
+pub use external_oidc::{
+    ExternalOidcValidator, OidcProvider, PendingAuth, PendingAuthStore, ValidatedToken,
+};
 pub use jwt::{AccessClaims, Issuer, RefreshClaims};
 pub use principal::{Identity, IdentityView, Principal, PrincipalDetail};
 pub use scopes::{Scope, ScopeSet};
