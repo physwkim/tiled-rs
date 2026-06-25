@@ -9,6 +9,8 @@ pub mod sequence_adapter;
 pub mod arrow_adapter;
 #[cfg(feature = "csv-adapter")]
 pub mod csv_adapter;
+#[cfg(feature = "csv-adapter")]
+pub mod csv_array_adapter;
 #[cfg(feature = "excel-adapter")]
 pub mod excel_adapter;
 #[cfg(feature = "hdf5")]
@@ -35,6 +37,8 @@ pub use tiled_core::adapters::{RaggedAdapterRead, RaggedData};
 pub use arrow_adapter::ArrowIpcAdapter;
 #[cfg(feature = "csv-adapter")]
 pub use csv_adapter::{CsvAdapter, init_storage_csv};
+#[cfg(feature = "csv-adapter")]
+pub use csv_array_adapter::CsvArrayAdapter;
 #[cfg(feature = "excel-adapter")]
 pub use excel_adapter::ExcelAdapter;
 #[cfg(feature = "hdf5")]
