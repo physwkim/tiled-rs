@@ -292,7 +292,10 @@ pub(crate) fn default_media_type(family: StructureFamily) -> Option<String> {
         // to JSON list-of-lists (Python DEFAULT_MEDIA_TYPES[ragged]["*/*"] =
         // "application/json", core.py:323).
         StructureFamily::Ragged => Some(tiled_core::media_type::mime::JSON.to_string()),
-        _ => None,
+        // A no-preference request on an awkward node resolves to a ZIP archive of
+        // raw buffers (Python DEFAULT_MEDIA_TYPES[awkward]["*/*"] = "application/zip",
+        // core.py:327 — the only awkward format the Rust server implements).
+        StructureFamily::Awkward => Some("application/zip".to_string()),
     }
 }
 
