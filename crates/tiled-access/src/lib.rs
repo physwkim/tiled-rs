@@ -368,10 +368,9 @@ impl AccessPolicy for TagBasedPolicy {
         let mut include_public_tag = false;
 
         // Per-tag checks. Mirrors access_policies.py:133-156.
-        // Note: is_tag_defined and invalid_tag_names checks are omitted — no
-        // tag registry exists in the Rust auth DB (see module-level comment).
         for tag in &access_tags {
             // API key restriction applies to all tags, including for admins.
+            // Checked first, before is_tag_defined, matching Python order.
             if let Some(key_tags) = authn_access_tags
                 && !key_tags.iter().any(|k| k == tag)
             {
@@ -389,11 +388,27 @@ impl AccessPolicy for TagBasedPolicy {
                             .to_string(),
                     );
                 }
-            } else if !is_admin && !granted.contains(tag) {
-                return Err(format!(
-                    "Cannot apply tag to node: user='{}' is not an owner of tag={tag:?}",
-                    principal.uuid
-                ));
+            } else {
+                // is_tag_defined: ALL principals (including admin) must only
+                // assign tags that exist in the registry.
+                // Mirrors access_policies.py:145-146.
+                let defined = self
+                    .auth_db
+                    .is_tag_defined(tag)
+                    .await
+                    .map_err(|e| format!("failed to check tag registry: {e}"))?;
+                if !defined {
+                    return Err(format!(
+                        "Cannot apply tag to node: tag={tag:?} is not defined"
+                    ));
+                }
+                // Ownership check — admin bypasses. Mirrors access_policies.py:147-152.
+                if !is_admin && !granted.contains(tag) {
+                    return Err(format!(
+                        "Cannot apply tag to node: user='{}' is not an owner of tag={tag:?}",
+                        principal.uuid
+                    ));
+                }
             }
         }
 
@@ -513,11 +528,26 @@ impl AccessPolicy for TagBasedPolicy {
                             .to_string(),
                     );
                 }
-            } else if !is_admin && !granted.contains(tag) {
-                return Err(format!(
-                    "Cannot apply tag to node: user='{}' is not an owner of tag={tag:?}",
-                    principal.uuid
-                ));
+            } else {
+                // is_tag_defined: all principals (including admin) may only
+                // assign defined tags. Mirrors access_policies.py:248-249.
+                let defined = self
+                    .auth_db
+                    .is_tag_defined(tag)
+                    .await
+                    .map_err(|e| format!("failed to check tag registry: {e}"))?;
+                if !defined {
+                    return Err(format!(
+                        "Cannot apply tag to node: tag={tag:?} is not defined"
+                    ));
+                }
+                // Ownership check — admin bypasses. Mirrors access_policies.py:250-255.
+                if !is_admin && !granted.contains(tag) {
+                    return Err(format!(
+                        "Cannot apply tag to node: user='{}' is not an owner of tag={tag:?}",
+                        principal.uuid
+                    ));
+                }
             }
         }
 
@@ -558,11 +588,25 @@ impl AccessPolicy for TagBasedPolicy {
                             .to_string(),
                     );
                 }
-            } else if !is_admin && !granted.contains(tag) {
-                return Err(format!(
-                    "Cannot remove tag from node: user='{}' is not an owner of tag={tag:?}",
-                    principal.uuid
-                ));
+            } else {
+                // is_tag_defined for removal too. Mirrors access_policies.py:283-285.
+                let defined = self
+                    .auth_db
+                    .is_tag_defined(tag)
+                    .await
+                    .map_err(|e| format!("failed to check tag registry: {e}"))?;
+                if !defined {
+                    return Err(format!(
+                        "Cannot remove tag from node: tag={tag:?} is not defined"
+                    ));
+                }
+                // Ownership check — admin bypasses. Mirrors access_policies.py:286-291.
+                if !is_admin && !granted.contains(tag) {
+                    return Err(format!(
+                        "Cannot remove tag from node: user='{}' is not an owner of tag={tag:?}",
+                        principal.uuid
+                    ));
+                }
             }
         }
 
@@ -1057,6 +1101,9 @@ mod tests {
     #[tokio::test]
     async fn tag_based_policy_init_node_unowned_tag_rejected() {
         let db = setup_auth_db().await;
+        // Define both tags in the registry so the ownership check is reached.
+        db.define_tag("team-a").await.unwrap();
+        db.define_tag("team-b").await.unwrap();
         let alice = principal_with_tags(&db, &["team-a"]).await;
         let policy = TagBasedPolicy::new(Arc::new(db), ScopeSet::full());
         let session = ScopeSet::for_role("user");
@@ -1078,6 +1125,7 @@ mod tests {
     #[tokio::test]
     async fn tag_based_policy_init_node_owned_tag_accepted() {
         let db = setup_auth_db().await;
+        db.define_tag("team-a").await.unwrap();
         let alice = principal_with_tags(&db, &["team-a"]).await;
         let policy = TagBasedPolicy::new(Arc::new(db), ScopeSet::full());
         let session = ScopeSet::for_role("user");
@@ -1097,6 +1145,8 @@ mod tests {
     #[tokio::test]
     async fn tag_based_policy_init_node_admin_bypasses_ownership() {
         let db = setup_auth_db().await;
+        // Admin bypasses OWNERSHIP but not is_tag_defined — tag must exist.
+        db.define_tag("team-x").await.unwrap();
         let admin = admin_like("admin-uuid");
         let policy = TagBasedPolicy::new(Arc::new(db), ScopeSet::full());
         let session = ScopeSet::full(); // contains AdminApiKeys
@@ -1106,6 +1156,48 @@ mod tests {
             .await
             .expect("admin must bypass ownership check");
         assert_eq!(result, serde_json::json!({"tags": ["team-x"]}));
+    }
+
+    #[tokio::test]
+    async fn tag_based_policy_init_node_undefined_tag_rejected_for_non_admin() {
+        let db = setup_auth_db().await;
+        // "new-tag" is NOT in the registry.
+        let alice = principal_with_tags(&db, &["new-tag"]).await;
+        let policy = TagBasedPolicy::new(Arc::new(db), ScopeSet::full());
+        let session = ScopeSet::for_role("user");
+        let blob = serde_json::json!({"tags": ["new-tag"]});
+        let result = policy
+            .init_node(&principal_from(&alice), None, &session, Some(&blob))
+            .await;
+        assert!(
+            result.is_err(),
+            "undefined tag must be rejected for non-admin"
+        );
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("is not defined"),
+            "error must name registry failure, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tag_based_policy_init_node_undefined_tag_rejected_for_admin() {
+        let db = setup_auth_db().await;
+        // "ghost-tag" is NOT in the registry. Even admin cannot bypass this.
+        let admin = admin_like("admin-uuid");
+        let policy = TagBasedPolicy::new(Arc::new(db), ScopeSet::full());
+        let session = ScopeSet::full();
+        let blob = serde_json::json!({"tags": ["ghost-tag"]});
+        let result = policy.init_node(&admin, None, &session, Some(&blob)).await;
+        assert!(
+            result.is_err(),
+            "undefined tag must be rejected even for admin"
+        );
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("is not defined"),
+            "error must name registry failure, got: {msg}"
+        );
     }
 
     #[tokio::test]
@@ -1159,6 +1251,9 @@ mod tests {
     #[tokio::test]
     async fn tag_based_policy_modify_node_unauthorized_retag_rejected() {
         let db = setup_auth_db().await;
+        // Both tags must exist in registry so ownership check is reached.
+        db.define_tag("team-a").await.unwrap();
+        db.define_tag("team-b").await.unwrap();
         let alice = principal_with_tags(&db, &["team-a"]).await;
         let policy = TagBasedPolicy::new(Arc::new(db), ScopeSet::full());
         let session = ScopeSet::for_role("user");
@@ -1187,6 +1282,9 @@ mod tests {
     #[tokio::test]
     async fn tag_based_policy_modify_node_removing_unowned_tag_rejected() {
         let db = setup_auth_db().await;
+        // Both tags must exist in registry so ownership check is reached.
+        db.define_tag("team-a").await.unwrap();
+        db.define_tag("team-b").await.unwrap();
         // alice only owns team-a; node has team-a AND team-b
         let alice = principal_with_tags(&db, &["team-a"]).await;
         let policy = TagBasedPolicy::new(Arc::new(db), ScopeSet::full());
@@ -1214,6 +1312,8 @@ mod tests {
     #[tokio::test]
     async fn tag_based_policy_modify_node_owner_preserving_change_allowed() {
         let db = setup_auth_db().await;
+        db.define_tag("team-a").await.unwrap();
+        db.define_tag("team-b").await.unwrap();
         let alice = principal_with_tags(&db, &["team-a", "team-b"]).await;
         let policy = TagBasedPolicy::new(Arc::new(db), ScopeSet::full());
         let session = ScopeSet::for_role("user");
@@ -1232,7 +1332,10 @@ mod tests {
             )
             .await
             .expect("adding an owned tag must be allowed");
-        assert!(!modified, "proposed blob passed through unchanged by policy");
+        assert!(
+            !modified,
+            "proposed blob passed through unchanged by policy"
+        );
         let out_tags = result["tags"].as_array().unwrap();
         assert!(
             out_tags.iter().any(|v| v == "team-a"),
@@ -1247,6 +1350,9 @@ mod tests {
     #[tokio::test]
     async fn tag_based_policy_modify_node_admin_bypasses_ownership() {
         let db = setup_auth_db().await;
+        // Admin bypasses OWNERSHIP but not is_tag_defined — all tags must exist.
+        db.define_tag("team-a").await.unwrap();
+        db.define_tag("team-x").await.unwrap();
         let admin = admin_like("admin-uuid");
         let policy = TagBasedPolicy::new(Arc::new(db), ScopeSet::full());
         let session = ScopeSet::full();
