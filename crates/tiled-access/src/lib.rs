@@ -304,6 +304,119 @@ impl AccessPolicy for TagBasedPolicy {
         Decision { scopes }
     }
 
+    async fn init_node(
+        &self,
+        principal: &Principal,
+        authn_access_tags: Option<&[String]>,
+        session_scopes: &ScopeSet,
+        access_blob: Option<&serde_json::Value>,
+    ) -> Result<(bool, serde_json::Value), String> {
+        let is_admin = session_scopes.contains(Scope::AdminApiKeys);
+
+        let Some(blob) = access_blob else {
+            // No blob: default to user-owned node ({"user": uuid}).
+            // Mirrors access_policies.py:179-187.
+            if let Some(key_tags) = authn_access_tags {
+                return Err(format!(
+                    "Cannot init node as user-owned node.\n\
+                     Current API key does not permit action on user-owned nodes.\n\
+                     Please provide a tag allowed by this API key: {:?}",
+                    key_tags
+                ));
+            }
+            return Ok((true, serde_json::json!({"user": principal.uuid})));
+        };
+
+        // Validate blob shape: must be exactly {"tags": [...]}.
+        // Mirrors access_policies.py:121-125.
+        let blob_obj = blob
+            .as_object()
+            .filter(|m| m.len() == 1 && m.contains_key("tags"))
+            .ok_or_else(|| {
+                format!(
+                    "access_blob must be in the form {{\"tags\": [\"tag1\", \"tag2\", ...]}}\nReceived {blob}"
+                )
+            })?;
+
+        let tag_arr = blob_obj["tags"]
+            .as_array()
+            .ok_or_else(|| format!("access_blob.tags must be an array, received: {blob}"))?;
+
+        let access_tags: Vec<String> = tag_arr
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+
+        // Empty tag list is admin-only. Mirrors access_policies.py:126-130.
+        if access_tags.is_empty() && !is_admin {
+            return Err(
+                "Cannot apply empty tag list to node: only Tiled admins can apply an empty tag list."
+                    .to_string(),
+            );
+        }
+
+        // Load granted tags only for non-admin; admin bypasses ownership.
+        let granted: Vec<String> = if is_admin {
+            vec![]
+        } else {
+            self.auth_db
+                .get_principal_tags(&principal.uuid)
+                .await
+                .map_err(|e| format!("failed to load principal tags: {e}"))?
+        };
+
+        let mut include_public_tag = false;
+
+        // Per-tag checks. Mirrors access_policies.py:133-156.
+        // Note: is_tag_defined and invalid_tag_names checks are omitted — no
+        // tag registry exists in the Rust auth DB (see module-level comment).
+        for tag in &access_tags {
+            // API key restriction applies to all tags, including for admins.
+            if let Some(key_tags) = authn_access_tags
+                && !key_tags.iter().any(|k| k == tag)
+            {
+                return Err(format!(
+                    "Cannot apply tag to node: API key is restricted to access tags: {:?}.",
+                    key_tags
+                ));
+            }
+
+            if tag.to_lowercase() == PUBLIC_TAG {
+                include_public_tag = true;
+                if !is_admin {
+                    return Err(
+                        "Cannot apply 'public' tag to node: only Tiled admins can apply the 'public' tag."
+                            .to_string(),
+                    );
+                }
+            } else if !is_admin && !granted.contains(tag) {
+                return Err(format!(
+                    "Cannot apply tag to node: user='{}' is not an owner of tag={tag:?}",
+                    principal.uuid
+                ));
+            }
+        }
+
+        // Build the policy-normalized tag set (canonical lowercase "public").
+        // Mirrors access_policies.py:158-165.
+        let mut tags_from_policy: Vec<String> = access_tags
+            .iter()
+            .filter(|t| t.to_lowercase() != PUBLIC_TAG)
+            .cloned()
+            .collect();
+        if include_public_tag {
+            tags_from_policy.push(PUBLIC_TAG.to_string());
+        }
+
+        let input_set: std::collections::HashSet<&str> =
+            access_tags.iter().map(String::as_str).collect();
+        let output_set: std::collections::HashSet<&str> =
+            tags_from_policy.iter().map(String::as_str).collect();
+        let modified = input_set != output_set;
+
+        Ok((modified, serde_json::json!({"tags": tags_from_policy})))
+    }
+
     async fn list_filter(
         &self,
         principal: Option<&Principal>,
@@ -780,6 +893,108 @@ mod tests {
         assert!(
             !fb.tags.contains(&"team-a".to_string()),
             "bob filter has no team-a"
+        );
+    }
+
+    // ---- TagBasedPolicy::init_node ----
+
+    #[tokio::test]
+    async fn tag_based_policy_init_node_unowned_tag_rejected() {
+        let db = setup_auth_db().await;
+        let alice = principal_with_tags(&db, &["team-a"]).await;
+        let policy = TagBasedPolicy::new(Arc::new(db), ScopeSet::full());
+        let session = ScopeSet::for_role("user");
+        let blob = serde_json::json!({"tags": ["team-b"]});
+        let result = policy
+            .init_node(&principal_from(&alice), None, &session, Some(&blob))
+            .await;
+        assert!(
+            result.is_err(),
+            "non-admin assigning an unowned tag must be rejected"
+        );
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("is not an owner"),
+            "error must name ownership failure, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tag_based_policy_init_node_owned_tag_accepted() {
+        let db = setup_auth_db().await;
+        let alice = principal_with_tags(&db, &["team-a"]).await;
+        let policy = TagBasedPolicy::new(Arc::new(db), ScopeSet::full());
+        let session = ScopeSet::for_role("user");
+        let blob = serde_json::json!({"tags": ["team-a"]});
+        let (modified, result) = policy
+            .init_node(&principal_from(&alice), None, &session, Some(&blob))
+            .await
+            .expect("owned tag must be accepted");
+        assert!(!modified, "blob unchanged when input == output");
+        assert_eq!(
+            result,
+            serde_json::json!({"tags": ["team-a"]}),
+            "result must mirror the input"
+        );
+    }
+
+    #[tokio::test]
+    async fn tag_based_policy_init_node_admin_bypasses_ownership() {
+        let db = setup_auth_db().await;
+        let admin = admin_like("admin-uuid");
+        let policy = TagBasedPolicy::new(Arc::new(db), ScopeSet::full());
+        let session = ScopeSet::full(); // contains AdminApiKeys
+        let blob = serde_json::json!({"tags": ["team-x"]});
+        let (_, result) = policy
+            .init_node(&admin, None, &session, Some(&blob))
+            .await
+            .expect("admin must bypass ownership check");
+        assert_eq!(result, serde_json::json!({"tags": ["team-x"]}));
+    }
+
+    #[tokio::test]
+    async fn tag_based_policy_init_node_no_blob_defaults_to_user_owned() {
+        let db = setup_auth_db().await;
+        let alice = principal_with_tags(&db, &["team-a"]).await;
+        let policy = TagBasedPolicy::new(Arc::new(db), ScopeSet::full());
+        let session = ScopeSet::for_role("user");
+        let (modified, result) = policy
+            .init_node(&principal_from(&alice), None, &session, None)
+            .await
+            .expect("no-blob init must succeed");
+        assert!(modified, "blob was generated (modified=true)");
+        assert_eq!(
+            result,
+            serde_json::json!({"user": alice.uuid}),
+            "no-blob init must default to user-owned blob"
+        );
+    }
+
+    #[tokio::test]
+    async fn tag_based_policy_init_node_api_key_restriction_rejected() {
+        let db = setup_auth_db().await;
+        let alice = principal_with_tags(&db, &["team-a", "team-b"]).await;
+        let policy = TagBasedPolicy::new(Arc::new(db), ScopeSet::full());
+        let session = ScopeSet::for_role("user");
+        let blob = serde_json::json!({"tags": ["team-a"]});
+        // API key only allows team-b, so team-a is outside the key scope
+        let key_tags: Vec<String> = vec!["team-b".to_string()];
+        let result = policy
+            .init_node(
+                &principal_from(&alice),
+                Some(&key_tags),
+                &session,
+                Some(&blob),
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "tag outside API key restriction must be rejected"
+        );
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("API key is restricted"),
+            "error must mention key restriction, got: {msg}"
         );
     }
 
