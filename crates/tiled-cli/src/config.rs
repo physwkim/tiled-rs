@@ -2,7 +2,7 @@
 //!
 //! Supports YAML config files compatible with the databroker/Tiled config format.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -57,6 +57,12 @@ pub struct TiledConfig {
     /// this list.
     #[serde(default)]
     pub allow_origins: Vec<String>,
+    /// Catch-all for config keys the Rust port does not yet model.
+    /// Captured keys are warn-logged once at startup (see
+    /// [`TiledConfig::warn_unknown_keys`]) so operators know their
+    /// setting had no effect, instead of being silently dropped.
+    #[serde(flatten)]
+    pub unknown: BTreeMap<String, serde_yaml::Value>,
 }
 
 /// Default for [`TiledConfig::response_bytesize_limit`] — 300 MB, matching
@@ -91,6 +97,7 @@ impl Default for TiledConfig {
             request_timeout_secs: default_request_timeout_secs(),
             expose_raw_assets: default_expose_raw_assets(),
             allow_origins: Vec::new(),
+            unknown: BTreeMap::new(),
         }
     }
 }
@@ -234,21 +241,65 @@ pub struct AuthConfig {
     #[serde(default)]
     pub allow_anonymous_access: bool,
     pub single_user_api_key: Option<String>,
+    /// HMAC-SHA256 signing secrets for JWT tokens, supporting key rotation.
+    /// Mirrors Python `Authentication.secret_keys` (`config.py:147`).
+    /// The **first** secret signs new tokens; all are tried in order when
+    /// verifying (rotation: prepend the new secret, keep the old one until
+    /// its tokens expire). Env `TILED_SECRET_KEYS` (JSON array) takes
+    /// precedence over this field; `--jwt-secret` is the fallback.
+    #[serde(default)]
+    pub secret_keys: Option<Vec<String>>,
+    /// Access-token lifetime in seconds. Mirrors Python
+    /// `Authentication.access_token_max_age` (`config.py:150`, default 900 s).
+    /// Only takes effect in multi-user mode (`--auth-db-uri`). When absent
+    /// the compiled-in default (15 min) is used.
+    #[serde(default)]
+    pub access_token_max_age: Option<f64>,
+    /// Refresh-token lifetime in seconds. Mirrors Python
+    /// `Authentication.refresh_token_max_age` (`config.py:151`, default 7 d).
+    /// Only takes effect in multi-user mode (`--auth-db-uri`). When absent
+    /// the compiled-in default (7 days) is used.
+    #[serde(default)]
+    pub refresh_token_max_age: Option<f64>,
+    /// Catch-all for authentication config keys the Rust port does not yet
+    /// model (e.g. `providers`, `tiled_admins`, `session_max_age`).
+    /// Warn-logged at startup.
+    #[serde(flatten)]
+    pub unknown: BTreeMap<String, serde_yaml::Value>,
 }
 
 /// `catalog:` block — Python tiled's recommended config form
 /// (`config.py:60`, `CatalogConfig`). Specifies a single persistent catalog
 /// (SQLite/Postgres) by URI.
-///
-/// Only `uri` is consumed by the Rust server today; Python's additional
-/// fields (`writable_storage`, `readable_storage`, `init_if_not_exists`, …)
-/// are accepted-and-ignored — serde skips unknown keys — so a standard
-/// Python `catalog:` block parses without error.
 #[derive(Debug, Clone, Deserialize)]
 pub struct CatalogConfig {
     /// SQLite or Postgres URI for the persistent catalog
     /// (e.g. `sqlite:///path/to/catalog.db`).
     pub uri: String,
+    /// Directories the server may create internally-managed storage in.
+    /// Mirrors Python `CatalogConfig.writable_storage` (`config.py:64`).
+    /// CLI `--writable-storage` takes the union; these config-file paths
+    /// are also folded into the read allow-list (writable ⊆ readable).
+    #[serde(default)]
+    pub writable_storage: Vec<String>,
+    /// Directories the file-backed read resolver is allowed to serve files
+    /// from. Mirrors Python `CatalogConfig.readable_storage` (`config.py:65`).
+    /// CLI `--allowed-data-dir` takes the union.
+    #[serde(default)]
+    pub readable_storage: Vec<String>,
+    /// Whether to create the catalog DB when it does not exist.
+    /// Mirrors Python `CatalogConfig.init_if_not_exists` (`config.py:66`).
+    /// The Rust server always runs `migrate()` which creates the schema if
+    /// absent (equivalent to `true`); this field is parsed so a standard
+    /// Python config with `init_if_not_exists: false` does not trigger the
+    /// unknown-key warning, but the value has no effect.
+    #[serde(default)]
+    pub init_if_not_exists: bool,
+    /// Catch-all for catalog config keys the Rust port does not yet model
+    /// (e.g. `metadata`, `specs`, `adapters_by_mimetype`, `mount_node`,
+    /// `catalog_pool_size`, `storage_pool_size`, …). Warn-logged at startup.
+    #[serde(flatten)]
+    pub unknown: BTreeMap<String, serde_yaml::Value>,
 }
 
 fn default_path() -> String {
@@ -280,6 +331,7 @@ impl TiledConfig {
         config
             .reconcile_catalog_and_trees()
             .with_context(|| format!("in config {path}"))?;
+        config.warn_unknown_keys();
         Ok(config)
     }
 
@@ -393,6 +445,31 @@ impl TiledConfig {
             );
         }
         Ok(())
+    }
+
+    /// Emit a `tracing::warn!` for every config key at each level that the
+    /// Rust port does not model. Called once at startup after a successful
+    /// parse so operators learn which keys had no effect rather than having
+    /// them silently vanish.
+    pub fn warn_unknown_keys(&self) {
+        for key in self.unknown.keys() {
+            tracing::warn!("config key '{key}' is not modelled in tiled-rs and has no effect");
+        }
+        if let Some(auth) = &self.authentication {
+            for key in auth.unknown.keys() {
+                tracing::warn!(
+                    "config key 'authentication.{key}' is not modelled in tiled-rs \
+                     and has no effect"
+                );
+            }
+        }
+        if let Some(catalog) = &self.catalog {
+            for key in catalog.unknown.keys() {
+                tracing::warn!(
+                    "config key 'catalog.{key}' is not modelled in tiled-rs and has no effect"
+                );
+            }
+        }
     }
 
     /// Extract the MongoDB URI from the first tree that looks like a mongo adapter.
@@ -603,6 +680,82 @@ mod tests {
         assert!(
             format!("{err:#}").contains("duplicate configuration for 'response_bytesize_limit'"),
             "expected duplicate-key conflict; got: {err:#}"
+        );
+    }
+
+    // Structural: unknown top-level config keys must land in the catch-all
+    // `unknown` map instead of being silently dropped (config-parity guard).
+    #[test]
+    fn unknown_top_level_key_is_captured_not_dropped() {
+        let cfg: TiledConfig = serde_yaml::from_str("exact_count_limit: 100\ntrees: []").unwrap();
+        assert!(
+            cfg.unknown.contains_key("exact_count_limit"),
+            "unknown top-level key 'exact_count_limit' must land in the catch-all map; \
+             got unknown={:?}",
+            cfg.unknown
+        );
+        assert_eq!(
+            cfg.unknown["exact_count_limit"],
+            serde_yaml::Value::Number(100.into()),
+            "captured value must match the YAML value"
+        );
+        // Known fields must NOT appear in unknown.
+        assert!(
+            !cfg.unknown.contains_key("trees"),
+            "known key 'trees' must not appear in the catch-all"
+        );
+    }
+
+    // Unknown authentication sub-keys must land in AuthConfig.unknown.
+    #[test]
+    fn unknown_auth_key_is_captured_not_dropped() {
+        let cfg: TiledConfig = serde_yaml::from_str(
+            "trees: []\nauthentication:\n  session_max_age: 3600\n  providers: []\n",
+        )
+        .unwrap();
+        let auth = cfg
+            .authentication
+            .as_ref()
+            .expect("authentication block present");
+        assert!(
+            auth.unknown.contains_key("session_max_age"),
+            "unknown auth key 'session_max_age' must be captured; got {:?}",
+            auth.unknown
+        );
+        assert!(
+            auth.unknown.contains_key("providers"),
+            "unknown auth key 'providers' must be captured; got {:?}",
+            auth.unknown
+        );
+        // Known auth fields must NOT appear in unknown.
+        assert!(
+            !auth.unknown.contains_key("single_user_api_key"),
+            "known key 'single_user_api_key' must not appear in auth catch-all"
+        );
+    }
+
+    // Unknown catalog sub-keys must land in CatalogConfig.unknown.
+    #[test]
+    fn unknown_catalog_key_is_captured_not_dropped() {
+        let cfg: TiledConfig = serde_yaml::from_str(
+            "catalog:\n  uri: sqlite:///c.db\n  metadata: {foo: bar}\n  mount_node: /\n",
+        )
+        .unwrap();
+        let catalog = cfg.catalog.as_ref().expect("catalog block present");
+        assert!(
+            catalog.unknown.contains_key("metadata"),
+            "unknown catalog key 'metadata' must be captured; got {:?}",
+            catalog.unknown
+        );
+        assert!(
+            catalog.unknown.contains_key("mount_node"),
+            "unknown catalog key 'mount_node' must be captured; got {:?}",
+            catalog.unknown
+        );
+        // Known catalog fields must NOT appear in unknown.
+        assert!(
+            !catalog.unknown.contains_key("uri"),
+            "known key 'uri' must not appear in catalog catch-all"
         );
     }
 
