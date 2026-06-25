@@ -549,6 +549,7 @@ async fn handshake_auth(
             principal: None,
             scopes: tiled_auth::ScopeSet::full(),
             kind: AuthKind::Anonymous,
+            authn_access_tags: None,
         });
     }
     // Otherwise wait briefly for the client's first message — must be a

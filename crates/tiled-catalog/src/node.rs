@@ -617,16 +617,21 @@ impl Catalog {
         }
     }
 
-    /// Replace metadata + specs on a node. Pushes the previous (metadata,
-    /// specs, access_blob) onto the revisions table so undo is possible —
-    /// unless `drop_revision` is set, in which case the prior version is
-    /// discarded. Mirrors upstream tiled PR #972's `?drop_revision=true`
-    /// flag. Returns the updated node.
+    /// Replace metadata + specs (and optionally access_blob) on a node.
+    /// Pushes the previous (metadata, specs, access_blob) onto the revisions
+    /// table so undo is possible — unless `drop_revision` is set.
+    /// Mirrors upstream tiled PR #972's `?drop_revision=true` flag.
+    ///
+    /// `new_access_blob`: when `Some`, the stored `access_blob` is replaced
+    /// atomically with the metadata update — matching Python's combined
+    /// `replace_metadata(... access_blob=...)`. When `None`, the stored blob
+    /// is left unchanged.
     pub async fn update_metadata(
         &self,
         node_id: i64,
         metadata: Value,
         specs: Value,
+        new_access_blob: Option<Value>,
         drop_revision: bool,
     ) -> Result<Node> {
         validate_payload(&metadata, &specs)?;
@@ -658,19 +663,36 @@ impl Catalog {
                     .execute(pool)
                     .await?;
                 }
-                let row = sqlx::query(
-                    "UPDATE nodes
-                        SET metadata = ?, specs = ?,
-                            time_updated = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-                      WHERE id = ?
-                     RETURNING id, key, parent_id, ancestors, structure_family, metadata,
-                               specs, access_blob, time_created, time_updated",
-                )
-                .bind(serde_json::to_string(&metadata)?)
-                .bind(serde_json::to_string(&specs)?)
-                .bind(node_id)
-                .fetch_one(pool)
-                .await?;
+                let row = if let Some(blob) = new_access_blob {
+                    sqlx::query(
+                        "UPDATE nodes
+                            SET metadata = ?, specs = ?, access_blob = ?,
+                                time_updated = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                          WHERE id = ?
+                         RETURNING id, key, parent_id, ancestors, structure_family, metadata,
+                                   specs, access_blob, time_created, time_updated",
+                    )
+                    .bind(serde_json::to_string(&metadata)?)
+                    .bind(serde_json::to_string(&specs)?)
+                    .bind(serde_json::to_string(&blob)?)
+                    .bind(node_id)
+                    .fetch_one(pool)
+                    .await?
+                } else {
+                    sqlx::query(
+                        "UPDATE nodes
+                            SET metadata = ?, specs = ?,
+                                time_updated = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                          WHERE id = ?
+                         RETURNING id, key, parent_id, ancestors, structure_family, metadata,
+                                   specs, access_blob, time_created, time_updated",
+                    )
+                    .bind(serde_json::to_string(&metadata)?)
+                    .bind(serde_json::to_string(&specs)?)
+                    .bind(node_id)
+                    .fetch_one(pool)
+                    .await?
+                };
                 node_from_sqlite_row(&row)
             }
             DbPool::Postgres(pool) => {
@@ -705,18 +727,35 @@ impl Catalog {
                     .execute(pool)
                     .await?;
                 }
-                let row = sqlx::query(
-                    "UPDATE nodes
-                        SET metadata = $1::jsonb, specs = $2::jsonb, time_updated = now()
-                      WHERE id = $3
-                     RETURNING id, key, parent_id, ancestors, structure_family, metadata,
-                               specs, access_blob, time_created, time_updated",
-                )
-                .bind(serde_json::to_string(&metadata)?)
-                .bind(serde_json::to_string(&specs)?)
-                .bind(node_id)
-                .fetch_one(pool)
-                .await?;
+                let row = if let Some(blob) = new_access_blob {
+                    sqlx::query(
+                        "UPDATE nodes
+                            SET metadata = $1::jsonb, specs = $2::jsonb,
+                                access_blob = $3::jsonb, time_updated = now()
+                          WHERE id = $4
+                         RETURNING id, key, parent_id, ancestors, structure_family, metadata,
+                                   specs, access_blob, time_created, time_updated",
+                    )
+                    .bind(serde_json::to_string(&metadata)?)
+                    .bind(serde_json::to_string(&specs)?)
+                    .bind(serde_json::to_string(&blob)?)
+                    .bind(node_id)
+                    .fetch_one(pool)
+                    .await?
+                } else {
+                    sqlx::query(
+                        "UPDATE nodes
+                            SET metadata = $1::jsonb, specs = $2::jsonb, time_updated = now()
+                          WHERE id = $3
+                         RETURNING id, key, parent_id, ancestors, structure_family, metadata,
+                                   specs, access_blob, time_created, time_updated",
+                    )
+                    .bind(serde_json::to_string(&metadata)?)
+                    .bind(serde_json::to_string(&specs)?)
+                    .bind(node_id)
+                    .fetch_one(pool)
+                    .await?
+                };
                 node_from_postgres_row(&row)
             }
         }

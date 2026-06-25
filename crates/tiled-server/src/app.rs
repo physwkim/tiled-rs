@@ -473,6 +473,7 @@ pub async fn validate_bearer(state: &AppState, token: &str) -> Result<AuthContex
             principal: Some(Arc::new(principal)),
             scopes: claims.scopes.intersect(&session.scopes),
             kind: AuthKind::Session,
+            authn_access_tags: None,
         });
     }
     if let Some(validator) = state.external_oidc.as_ref() {
@@ -499,6 +500,7 @@ pub async fn validate_bearer(state: &AppState, token: &str) -> Result<AuthContex
             principal: Some(Arc::new(principal.clone())),
             scopes,
             kind: AuthKind::Session,
+            authn_access_tags: None,
         });
     }
     Err("no JWT issuer or external OIDC configured".into())
@@ -517,10 +519,16 @@ pub async fn validate_apikey(state: &AppState, key: &str) -> Result<AuthContext,
             .map_err(|_| "principal lookup failed".to_string())?
             .ok_or_else(|| "principal vanished".to_string())?;
         let scopes = resolve_api_key_scopes(&record.scopes, &principal, state);
+        let authn_access_tags = if record.access_tags.is_empty() {
+            None
+        } else {
+            Some(record.access_tags)
+        };
         return Ok(AuthContext {
             principal: Some(Arc::new(principal)),
             scopes,
             kind: AuthKind::ApiKey,
+            authn_access_tags,
         });
     }
     if let Some(expected) = state.api_key.as_ref() {
@@ -533,6 +541,7 @@ pub async fn validate_apikey(state: &AppState, key: &str) -> Result<AuthContext,
                 principal: None,
                 scopes: ScopeSet::full(),
                 kind: AuthKind::SingleUserKey,
+                authn_access_tags: None,
             });
         }
     }
@@ -568,10 +577,16 @@ async fn resolve_auth_inner(
                 _ => return Err(unauthorized("principal vanished")),
             };
             let scopes = resolve_api_key_scopes(&record.scopes, &principal, state);
+            let authn_access_tags = if record.access_tags.is_empty() {
+                None
+            } else {
+                Some(record.access_tags)
+            };
             return Ok(AuthContext {
                 principal: Some(principal),
                 scopes,
                 kind: AuthKind::ApiKey,
+                authn_access_tags,
             });
         }
         if let Some(expected) = state.api_key.as_ref() {
@@ -584,6 +599,7 @@ async fn resolve_auth_inner(
                     principal: None,
                     scopes: ScopeSet::full(),
                     kind: AuthKind::SingleUserKey,
+                    authn_access_tags: None,
                 });
             }
         }
@@ -608,6 +624,7 @@ async fn resolve_auth_inner(
             principal: Some(Arc::new(principal.clone())),
             scopes: mint_session_scopes(&principal, state),
             kind: AuthKind::Proxied,
+            authn_access_tags: None,
         });
     }
 
@@ -622,6 +639,7 @@ async fn resolve_auth_inner(
             principal: None,
             scopes: ScopeSet::full(),
             kind: AuthKind::Anonymous,
+            authn_access_tags: None,
         });
     }
     Err(unauthorized("authentication required"))

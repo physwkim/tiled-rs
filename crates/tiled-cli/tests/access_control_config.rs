@@ -132,6 +132,7 @@ async fn tag_based_config_narrows_forbidden_node() {
         .as_ref()
         .expect("access_control section present")
         .build()
+        .await
         .expect("policy builds from config");
 
     let resolver: Arc<dyn tiled_catalog::adapter::LeafResolver> =
@@ -199,8 +200,8 @@ async fn tag_based_config_narrows_forbidden_node() {
 }
 
 /// Unknown policy name → clear error.
-#[test]
-fn unknown_policy_name_is_rejected() {
+#[tokio::test]
+async fn unknown_policy_name_is_rejected() {
     let yaml = "access_control:\n  access_policy: bogus\n";
     let config: TiledConfig = serde_yaml::from_str(yaml).unwrap();
     let err = config
@@ -208,6 +209,7 @@ fn unknown_policy_name_is_rejected() {
         .as_ref()
         .unwrap()
         .build()
+        .await
         .err()
         .expect("unknown policy must error");
     let msg = err.to_string();
@@ -219,8 +221,8 @@ fn unknown_policy_name_is_rejected() {
 }
 
 /// `tag_based` without the required `grants` arg → clear error.
-#[test]
-fn tag_based_missing_grants_is_rejected() {
+#[tokio::test]
+async fn tag_based_missing_grants_is_rejected() {
     let yaml = "access_control:\n  access_policy: tag_based\n  args:\n    default_scopes: [read:metadata]\n";
     let config: TiledConfig = serde_yaml::from_str(yaml).unwrap();
     let err = config
@@ -228,6 +230,7 @@ fn tag_based_missing_grants_is_rejected() {
         .as_ref()
         .unwrap()
         .build()
+        .await
         .err()
         .expect("missing grants must error");
     let msg = err.to_string();
@@ -235,8 +238,8 @@ fn tag_based_missing_grants_is_rejected() {
 }
 
 /// `passthrough` (and `none`) build successfully and ignore args.
-#[test]
-fn passthrough_and_none_build_successfully() {
+#[tokio::test]
+async fn passthrough_and_none_build_successfully() {
     for name in ["passthrough", "none"] {
         let yaml = format!("access_control:\n  access_policy: {name}\n");
         let config: TiledConfig = serde_yaml::from_str(&yaml).unwrap();
@@ -245,6 +248,7 @@ fn passthrough_and_none_build_successfully() {
             .as_ref()
             .unwrap()
             .build()
+            .await
             .unwrap_or_else(|e| panic!("{name} must build: {e}"));
     }
 }

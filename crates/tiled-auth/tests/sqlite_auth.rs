@@ -89,6 +89,7 @@ async fn migrate_and_principal_lifecycle() {
             "0001_initial".to_string(),
             "0002_add_principal_role".to_string(),
             "0003_add_session_refresh_count".to_string(),
+            "0004_add_access_tags".to_string(),
         ]
     );
 

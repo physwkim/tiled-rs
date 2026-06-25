@@ -703,7 +703,7 @@ pub async fn run(command: Command) -> Result<()> {
                 .as_ref()
                 .and_then(|c| c.access_control.as_ref())
             {
-                Some(ac) => Some(ac.build()?),
+                Some(ac) => Some(ac.build().await?),
                 None if auth_db_handle.is_some() => Some(Arc::new(tiled_access::PassthroughPolicy)),
                 None => None,
             };
