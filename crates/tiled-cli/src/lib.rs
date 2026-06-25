@@ -568,9 +568,14 @@ pub async fn run(command: Command) -> Result<()> {
                     None => None,
                     Some(uri) => {
                         tracing::info!("Opening catalog: {}", redact_mongo_uri(uri));
-                        let cat = tiled_catalog::Catalog::connect(uri)
-                            .await
-                            .map_err(|e| anyhow::anyhow!("catalog connect: {e}"))?;
+                        let cat = match config_cat.and_then(|c| c.catalog_pool_size) {
+                            Some(n) => tiled_catalog::Catalog::connect_with_pool_size(uri, n)
+                                .await
+                                .map_err(|e| anyhow::anyhow!("catalog connect: {e}"))?,
+                            None => tiled_catalog::Catalog::connect(uri)
+                                .await
+                                .map_err(|e| anyhow::anyhow!("catalog connect: {e}"))?,
+                        };
                         // Contain managed-asset physical deletion to the same
                         // directories the read-side resolver allows. A client can
                         // register an internally-managed data source with an
@@ -675,6 +680,33 @@ pub async fn run(command: Command) -> Result<()> {
                 )
                 .await?;
 
+            // Bootstrap tiled_admins: ensure each listed (provider, id) principal
+            // has role "admin". Mirrors Python app.py startup_event (app.py:702-712).
+            // Only runs when an auth DB is present (multi-user mode).
+            if let Some(ref auth_db) = auth_db_handle {
+                let admins = file_config
+                    .as_ref()
+                    .and_then(|c| c.authentication.as_ref())
+                    .map(|a| a.tiled_admins.as_slice())
+                    .unwrap_or(&[]);
+                for admin in admins {
+                    tracing::info!(
+                        provider = %admin.provider,
+                        id = %admin.id,
+                        "Ensuring principal has role 'admin'"
+                    );
+                    auth_db
+                        .make_admin_by_identity(&admin.provider, &admin.id)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "bootstrap admin for provider='{}' id='{}'",
+                                admin.provider, admin.id
+                            )
+                        })?;
+                }
+            }
+
             // Apply config-file token TTLs to the Issuer when present
             // (authentication.access_token_max_age / refresh_token_max_age,
             // mirroring Python Authentication, config.py:150-151). Only
@@ -772,6 +804,10 @@ pub async fn run(command: Command) -> Result<()> {
                     .as_ref()
                     .map(|c| c.expose_raw_assets)
                     .unwrap_or(true),
+                exact_count_limit: file_config
+                    .as_ref()
+                    .map(|c| c.exact_count_limit)
+                    .unwrap_or(config::default_exact_count_limit()),
             };
 
             let app = tiled_server::build_app(state);

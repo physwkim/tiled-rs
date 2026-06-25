@@ -131,7 +131,21 @@ impl Catalog {
     ///
     /// `uri` schemes: `sqlite://...`, `sqlite:` (in-memory),
     /// `postgres://...`, `postgresql://...`.
+    ///
+    /// Uses built-in pool defaults (8 connections for SQLite, 16 for Postgres).
+    /// Call [`Catalog::connect_with_pool_size`] to override.
     pub async fn connect(uri: &str) -> Result<Self> {
+        Self::connect_inner(uri, None).await
+    }
+
+    /// Like [`Catalog::connect`] but sets `PoolOptions::max_connections` to
+    /// `max_connections`. Mirrors `CatalogConfig.catalog_pool_size` from the
+    /// Python tiled config (`config.py`, default 5).
+    pub async fn connect_with_pool_size(uri: &str, max_connections: u32) -> Result<Self> {
+        Self::connect_inner(uri, Some(max_connections)).await
+    }
+
+    async fn connect_inner(uri: &str, max_connections: Option<u32>) -> Result<Self> {
         let pool = if uri.starts_with("sqlite:") {
             // `create_if_missing(true)` so a fresh `tiled serve catalog
             // --temp <path>` works without a separate `init` step.
@@ -144,7 +158,7 @@ impl Catalog {
                 // Lower the chatty per-statement INFO logs sqlx emits.
                 .log_statements(tracing::log::LevelFilter::Debug);
             let pool = SqlitePoolOptions::new()
-                .max_connections(8)
+                .max_connections(max_connections.unwrap_or(8))
                 .connect_with(opts)
                 .await?;
             DbPool::Sqlite(pool)
@@ -153,7 +167,7 @@ impl Catalog {
                 .map_err(CatalogError::from)?
                 .log_statements(tracing::log::LevelFilter::Debug);
             let pool = PgPoolOptions::new()
-                .max_connections(16)
+                .max_connections(max_connections.unwrap_or(16))
                 .connect_with(opts)
                 .await?;
             DbPool::Postgres(pool)

@@ -116,6 +116,11 @@ pub struct AppState {
     /// (settings.py:57); when `false` both endpoints return 403 even for
     /// otherwise-valid requests.
     pub expose_raw_assets: bool,
+    /// Cap on the exact `COUNT(*)` total reported in `meta.count` for search /
+    /// list responses. When the true count exceeds this value, `meta.count` is
+    /// set to this limit (a lower-bound estimate). Mirrors Python
+    /// `Settings.exact_count_limit` (`settings.py`, default 100).
+    pub exact_count_limit: u64,
 }
 
 /// One `spec_views` entry. Wire-compatible with tiled-web's

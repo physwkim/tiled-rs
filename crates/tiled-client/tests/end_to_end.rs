@@ -100,6 +100,7 @@ async fn spawn_server(api_key: Option<String>) -> String {
         webhook_config: None,
         request_timeout_secs: 30,
         expose_raw_assets: true,
+        exact_count_limit: u64::MAX,
     };
 
     let app = tiled_server::build_app(state);
@@ -387,6 +388,7 @@ async fn spawn_write_server() -> (String, tempfile::TempDir, tempfile::TempDir) 
         webhook_config: None,
         request_timeout_secs: 30,
         expose_raw_assets: true,
+        exact_count_limit: u64::MAX,
     };
 
     let app = tiled_server::build_app(state);

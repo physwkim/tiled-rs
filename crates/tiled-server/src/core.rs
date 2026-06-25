@@ -174,11 +174,16 @@ pub async fn construct_entries_response(
     limit: usize,
     queries: &[tiled_core::queries::Query],
     sorting: &[(String, SortDirection)],
+    exact_count_limit: u64,
 ) -> Result<Response<Vec<Resource>>, ServerError> {
     let page = container
         .search_page(queries, sorting, cursor, offset, limit)
         .await?;
-    let (entries, total, next_cursor) = (page.entries, page.total, page.next_cursor);
+    let (entries, next_cursor) = (page.entries, page.next_cursor);
+    // Cap the reported total at `exact_count_limit`. When the true count
+    // exceeds this value the client receives the limit as a lower-bound
+    // estimate, mirroring Python `Settings.exact_count_limit` (settings.py).
+    let total = page.total.min(exact_count_limit as usize);
     let path_trimmed = path.trim_matches('/');
 
     let mut resources: Vec<Resource> = Vec::with_capacity(entries.len());

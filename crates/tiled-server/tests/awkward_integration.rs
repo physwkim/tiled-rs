@@ -84,6 +84,7 @@ fn build_awkward_app() -> axum::Router {
         webhook_config: None,
         request_timeout_secs: 30,
         expose_raw_assets: true,
+        exact_count_limit: u64::MAX,
     };
     tiled_server::build_app(state)
 }

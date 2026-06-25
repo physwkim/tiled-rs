@@ -175,6 +175,7 @@ async fn tag_based_config_narrows_forbidden_node() {
         webhook_config: None,
         request_timeout_secs: 30,
         expose_raw_assets: true,
+        exact_count_limit: u64::MAX,
     };
     let app = tiled_server::build_app(state);
 

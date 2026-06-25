@@ -63,6 +63,7 @@ fn make_state(
         webhook_config: None,
         request_timeout_secs: 30,
         expose_raw_assets,
+        exact_count_limit: u64::MAX,
     }
 }
 
