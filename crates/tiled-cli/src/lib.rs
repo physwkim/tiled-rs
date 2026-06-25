@@ -568,9 +568,14 @@ pub async fn run(command: Command) -> Result<()> {
                     None => None,
                     Some(uri) => {
                         tracing::info!("Opening catalog: {}", redact_mongo_uri(uri));
-                        let cat = tiled_catalog::Catalog::connect(uri)
-                            .await
-                            .map_err(|e| anyhow::anyhow!("catalog connect: {e}"))?;
+                        let cat = match config_cat.and_then(|c| c.catalog_pool_size) {
+                            Some(n) => tiled_catalog::Catalog::connect_with_pool_size(uri, n)
+                                .await
+                                .map_err(|e| anyhow::anyhow!("catalog connect: {e}"))?,
+                            None => tiled_catalog::Catalog::connect(uri)
+                                .await
+                                .map_err(|e| anyhow::anyhow!("catalog connect: {e}"))?,
+                        };
                         // Contain managed-asset physical deletion to the same
                         // directories the read-side resolver allows. A client can
                         // register an internally-managed data source with an

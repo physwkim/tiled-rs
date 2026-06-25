@@ -5,6 +5,7 @@ use tiled_core::queries::{Eq, FullText, In, Like, NotEq, NotIn, Query, SpecsQuer
 use tiled_core::schemas::SortDirection;
 
 use tiled_catalog::data_source::{AssetSpec, DataSourceSpec};
+use tiled_catalog::db::DbPool;
 use tiled_catalog::{Catalog, RegisterRequest};
 
 #[tokio::test]
@@ -1185,5 +1186,30 @@ async fn full_text_search_uses_fts5_token_match() {
         hits(&cat, parent.id, "copper").await,
         vec!["b"],
         "delete trigger must drop a from the copper results"
+    );
+}
+
+/// `connect_with_pool_size(n)` threads `n` through to `PoolOptions::max_connections`.
+/// With max_connections=1, holding one connection makes `try_acquire()` return None
+/// because the single slot is occupied.
+#[tokio::test]
+async fn connect_with_pool_size_limits_connections() {
+    // In-memory SQLite — no tempdir needed.
+    let cat = tiled_catalog::Catalog::connect_with_pool_size("sqlite:", 1)
+        .await
+        .unwrap();
+    cat.migrate().await.unwrap();
+
+    // Acquire the one allowed connection.
+    let DbPool::Sqlite(pool) = cat.pool() else {
+        panic!("expected SQLite pool in SQLite test");
+    };
+    let _conn1 = pool.acquire().await.unwrap();
+
+    // With conn1 held and max_connections=1, a second try_acquire must return None.
+    // This is the load-bearing assertion: it proves max_connections reached the builder.
+    assert!(
+        pool.try_acquire().is_none(),
+        "pool size 1: try_acquire must return None while one connection is held"
     );
 }

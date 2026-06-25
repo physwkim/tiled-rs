@@ -330,9 +330,34 @@ pub struct CatalogConfig {
     /// unknown-key warning, but the value has no effect.
     #[serde(default)]
     pub init_if_not_exists: bool,
+    /// Maximum number of connections in the sqlx pool for the catalog DB.
+    /// Mirrors Python `CatalogConfig.catalog_pool_size` (`config.py`, default
+    /// 5). Absent → the pool's compiled-in default (8 for SQLite, 16 for
+    /// Postgres). Passed to `PoolOptions::max_connections` at pool creation.
+    #[serde(default)]
+    pub catalog_pool_size: Option<u32>,
+    /// Maximum connections for the storage adapter pool. Mirrors Python
+    /// `CatalogConfig.storage_pool_size` (`config.py`, default 5). Parsed to
+    /// remove the unknown-key warning; the Rust server has no separate storage
+    /// SQL pool (file adapters open/close per request), so this value is
+    /// accepted but has no effect.
+    #[serde(default)]
+    pub storage_pool_size: Option<u32>,
+    /// SQLAlchemy-style overflow allowance for the catalog pool. Mirrors Python
+    /// `CatalogConfig.catalog_max_overflow` (`config.py`, default 10). Parsed
+    /// to remove the unknown-key warning; sqlx pools have no overflow concept
+    /// (`max_connections` is the hard total), so this value is accepted but has
+    /// no effect.
+    #[serde(default)]
+    pub catalog_max_overflow: Option<u32>,
+    /// SQLAlchemy-style overflow for the storage pool. Mirrors Python
+    /// `CatalogConfig.storage_max_overflow` (`config.py`, default 10). Parsed
+    /// to remove the unknown-key warning; no effect in Rust.
+    #[serde(default)]
+    pub storage_max_overflow: Option<u32>,
     /// Catch-all for catalog config keys the Rust port does not yet model
-    /// (e.g. `metadata`, `specs`, `adapters_by_mimetype`, `mount_node`,
-    /// `catalog_pool_size`, `storage_pool_size`, …). Warn-logged at startup.
+    /// (e.g. `metadata`, `specs`, `adapters_by_mimetype`, `mount_node`).
+    /// Warn-logged at startup.
     #[serde(flatten)]
     pub unknown: BTreeMap<String, serde_yaml::Value>,
 }
@@ -929,6 +954,43 @@ mod tests {
             !catalog.unknown.contains_key("uri"),
             "known key 'uri' must not appear in catalog catch-all"
         );
+    }
+
+    // catalog.catalog_pool_size parses and does not appear in catalog.unknown.
+    #[test]
+    fn catalog_pool_size_parses_and_is_not_unknown() {
+        // Absent → None (caller falls back to built-in defaults).
+        let cfg: TiledConfig = serde_yaml::from_str("catalog:\n  uri: \"sqlite:\"").unwrap();
+        let cat = cfg.catalog.as_ref().unwrap();
+        assert_eq!(cat.catalog_pool_size, None);
+        assert_eq!(cat.storage_pool_size, None);
+        assert_eq!(cat.catalog_max_overflow, None);
+        assert_eq!(cat.storage_max_overflow, None);
+
+        // Explicit values are honoured.
+        let cfg: TiledConfig = serde_yaml::from_str(
+            "catalog:\n  uri: \"sqlite:\"\n  catalog_pool_size: 3\n  storage_pool_size: 4\n  catalog_max_overflow: 8\n  storage_max_overflow: 9\n",
+        )
+        .unwrap();
+        let cat = cfg.catalog.as_ref().unwrap();
+        assert_eq!(cat.catalog_pool_size, Some(3));
+        assert_eq!(cat.storage_pool_size, Some(4));
+        assert_eq!(cat.catalog_max_overflow, Some(8));
+        assert_eq!(cat.storage_max_overflow, Some(9));
+
+        // All four are modelled — must NOT appear in the catch-all.
+        for key in [
+            "catalog_pool_size",
+            "storage_pool_size",
+            "catalog_max_overflow",
+            "storage_max_overflow",
+        ] {
+            assert!(
+                !cat.unknown.contains_key(key),
+                "'{key}' is modelled — must not appear in catalog catch-all; got {:?}",
+                cat.unknown
+            );
+        }
     }
 
     // cli-M6: TILED_RESPONSE_BYTESIZE_LIMIT overlays the file value
