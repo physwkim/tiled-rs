@@ -121,6 +121,13 @@ pub struct OidcProvider {
     pub authorization_endpoint: Option<String>,
     /// IdP's token endpoint URL. Required for code flow.
     pub token_endpoint: Option<String>,
+    /// IdP's RP-initiated-logout (end-session) endpoint from OIDC discovery
+    /// (`end_session_endpoint`). Advertised to clients as
+    /// `authentication.links.logout` so they can end the upstream IdP session
+    /// (OIDC RP-Initiated Logout 1.0). `None` → clients use tiled's own logout
+    /// route. Mirrors Python `OIDCAuthenticator.end_session_endpoint`
+    /// (authenticators.py:203).
+    pub end_session_endpoint: Option<String>,
     /// After a successful code-flow callback, redirect the browser here
     /// with `access_token` and `refresh_token` as query params.
     /// `None` → return the tokens as JSON (API-client mode).
@@ -155,6 +162,12 @@ pub struct OidcDiscovery {
     /// Populates [`OidcProvider::token_endpoint`].
     #[serde(default)]
     pub token_endpoint: Option<String>,
+    /// OPTIONAL. The provider's RP-initiated-logout endpoint (OIDC
+    /// RP-Initiated Logout 1.0). Populates
+    /// [`OidcProvider::end_session_endpoint`]; advertised as
+    /// `authentication.links.logout`.
+    #[serde(default)]
+    pub end_session_endpoint: Option<String>,
 }
 
 /// Fetch and parse an OIDC Discovery document from `well_known_uri`.
@@ -1125,6 +1138,7 @@ mod tests {
             "issuer": "https://idp.test/",
             "authorization_endpoint": "https://idp.test/authorize",
             "token_endpoint": "https://idp.test/token",
+            "end_session_endpoint": "https://idp.test/logout",
             "jwks_uri": "https://idp.test/keys",
             "userinfo_endpoint": "https://idp.test/userinfo",
             "response_types_supported": ["code"],
@@ -1138,17 +1152,22 @@ mod tests {
             Some("https://idp.test/authorize")
         );
         assert_eq!(d.token_endpoint.as_deref(), Some("https://idp.test/token"));
+        assert_eq!(
+            d.end_session_endpoint.as_deref(),
+            Some("https://idp.test/logout")
+        );
     }
 
     #[test]
     fn parse_oidc_discovery_optional_endpoints_default_none() {
-        // A bearer-only provider may omit authorization/token endpoints.
+        // A bearer-only provider may omit authorization/token/end-session.
         let body = br#"{"issuer":"https://idp.test/","jwks_uri":"https://idp.test/keys"}"#;
         let d = parse_oidc_discovery(body).expect("issuer + jwks_uri suffice");
         assert_eq!(d.issuer, "https://idp.test/");
         assert_eq!(d.jwks_uri, "https://idp.test/keys");
         assert!(d.authorization_endpoint.is_none());
         assert!(d.token_endpoint.is_none());
+        assert!(d.end_session_endpoint.is_none());
     }
 
     #[test]
@@ -1333,6 +1352,7 @@ mod tests {
             client_secret: None,
             authorization_endpoint: None,
             token_endpoint: None,
+            end_session_endpoint: None,
             redirect_on_success: None,
             redirect_on_failure: None,
         }
@@ -1352,6 +1372,7 @@ mod tests {
             client_secret: None,
             authorization_endpoint: Some("https://code-idp.test/authorize".into()),
             token_endpoint: Some("https://code-idp.test/token".into()),
+            end_session_endpoint: None,
             redirect_on_success: None,
             redirect_on_failure: None,
         }

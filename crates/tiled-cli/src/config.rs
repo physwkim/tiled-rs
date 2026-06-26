@@ -388,6 +388,9 @@ pub struct OidcProviderArgs {
     pub authorization_endpoint: Option<String>,
     /// Explicit token endpoint. Overrides discovery.
     pub token_endpoint: Option<String>,
+    /// Explicit RP-initiated-logout (end-session) endpoint. Overrides
+    /// discovery's `end_session_endpoint`.
+    pub end_session_endpoint: Option<String>,
     /// JWT claim used as the principal subject. Defaults to `sub`.
     pub subject_claim: Option<String>,
     /// On a successful code-flow callback, redirect the browser here.
@@ -520,6 +523,11 @@ impl OidcProviderArgs {
             .token_endpoint
             .clone()
             .or_else(|| discovery.as_ref().and_then(|d| d.token_endpoint.clone()));
+        let end_session_endpoint = self.end_session_endpoint.clone().or_else(|| {
+            discovery
+                .as_ref()
+                .and_then(|d| d.end_session_endpoint.clone())
+        });
 
         let mut scopes_map = HashMap::new();
         if let Some(map) = &self.scopes_map {
@@ -556,6 +564,7 @@ impl OidcProviderArgs {
             client_secret: self.client_secret.clone(),
             authorization_endpoint,
             token_endpoint,
+            end_session_endpoint,
             redirect_on_success: self.redirect_on_success.clone(),
             redirect_on_failure: self.redirect_on_failure.clone(),
         })
@@ -972,6 +981,7 @@ mod tests {
             jwks_uri: "https://idp.test/keys".into(),
             authorization_endpoint: Some("https://idp.test/authorize".into()),
             token_endpoint: Some("https://idp.test/token".into()),
+            end_session_endpoint: Some("https://idp.test/logout".into()),
         }
     }
 
@@ -1053,6 +1063,10 @@ mod tests {
             Some("https://idp.test/authorize")
         );
         assert_eq!(p.token_endpoint.as_deref(), Some("https://idp.test/token"));
+        assert_eq!(
+            p.end_session_endpoint.as_deref(),
+            Some("https://idp.test/logout")
+        );
         assert_eq!(p.client_id.as_deref(), Some("tiled-server"));
         // Empty algorithms → derive from JWKS at validation time.
         assert!(p.algorithms.is_empty());
@@ -1069,6 +1083,21 @@ mod tests {
         let p = args.assemble("p", Some(discovery_doc())).unwrap();
         assert_eq!(p.issuer, "https://override.test/");
         assert_eq!(p.jwks_url, "https://override.test/keys");
+    }
+
+    #[test]
+    fn assemble_explicit_end_session_endpoint_overrides_discovery() {
+        let args = OidcProviderArgs {
+            audience: Some("tiled".into()),
+            end_session_endpoint: Some("https://override.test/logout".into()),
+            ..Default::default()
+        };
+        let p = args.assemble("p", Some(discovery_doc())).unwrap();
+        // Explicit arg wins over discovery's `end_session_endpoint`.
+        assert_eq!(
+            p.end_session_endpoint.as_deref(),
+            Some("https://override.test/logout")
+        );
     }
 
     #[test]

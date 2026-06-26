@@ -206,6 +206,41 @@ pub async fn about(State(state): State<AppState>, BaseUrl(base_url): BaseUrl) ->
     // NOT requiring auth even though every request needs the key.
     let auth_required = !state.no_auth_configured();
 
+    // authentication.links — Python router.py:262-278 builds this dict whenever
+    // any login path exists (`if provider_specs:`). It is the client's contract:
+    // tiled-client `context.rs` reads `whoami`, `refresh_session`,
+    // `revoke_session`, and `logout` from it. The only OIDC-specific entry is
+    // `logout`: when an external OIDC provider advertises an
+    // `end_session_endpoint` (OIDC RP-Initiated Logout 1.0), it is surfaced so
+    // the client can end the upstream IdP session (id_token_hint); otherwise
+    // `logout` points at tiled's own session-revoking route.
+    //
+    // Built when an internal authenticator OR an external OIDC provider is
+    // configured, mirroring Python's `if provider_specs:` (provider_specs
+    // includes OIDC providers there).
+    //
+    // Deliberate divergence from Python: `refresh_session` always points at
+    // tiled's own `/auth/refresh`, never the IdP token endpoint (Python uses the
+    // IdP token endpoint for `ProxiedOIDCAuthenticator`). tiled-rs mints its own
+    // session tokens for OIDC flows too and the client refreshes them
+    // server-side, so the IdP token endpoint would be the wrong target here.
+    let oidc_logout = state.external_oidc.as_ref().and_then(|v| {
+        v.providers()
+            .iter()
+            .find_map(|p| p.end_session_endpoint.clone())
+    });
+    let has_login = !providers.is_empty() || state.external_oidc.is_some();
+    let auth_links = has_login.then(|| {
+        let logout = oidc_logout.unwrap_or_else(|| format!("{base_url}/api/v1/auth/logout"));
+        serde_json::json!({
+            "whoami": format!("{base_url}/api/v1/auth/whoami"),
+            "apikey": format!("{base_url}/api/v1/auth/apikey"),
+            "refresh_session": format!("{base_url}/api/v1/auth/refresh"),
+            "revoke_session": format!("{base_url}/api/v1/auth/session/revoke/{{session_id}}"),
+            "logout": logout,
+        })
+    });
+
     let about = About {
         api_version: 0,
         library_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -215,7 +250,7 @@ pub async fn about(State(state): State<AppState>, BaseUrl(base_url): BaseUrl) ->
         authentication: AboutAuthentication {
             required: auth_required,
             providers,
-            links: None,
+            links: auth_links,
         },
         links: HashMap::from([
             ("self".into(), format!("{base_url}/api/v1/")),

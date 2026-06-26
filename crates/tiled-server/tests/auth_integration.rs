@@ -828,6 +828,7 @@ async fn build_oidc_state(
             client_secret: None,
             authorization_endpoint: None,
             token_endpoint: None,
+            end_session_endpoint: None,
             redirect_on_success: None,
             redirect_on_failure: None,
         }])
@@ -1876,6 +1877,7 @@ async fn build_code_flow_app_with_mapping(
             client_secret: None,
             authorization_endpoint: Some("https://mock-idp.test/authorize".into()),
             token_endpoint: Some(token_endpoint.to_string()),
+            end_session_endpoint: Some("https://mock-idp.test/logout".into()),
             redirect_on_success: None,
             redirect_on_failure: None,
         }])
@@ -2012,6 +2014,74 @@ async fn oidc_authorize_302_with_pkce_params() {
     assert!(
         params.contains_key("nonce"),
         "nonce parameter must be present"
+    );
+}
+
+/// G5: the About endpoint advertises the IdP's `end_session_endpoint` as
+/// `authentication.links.logout` (OIDC RP-Initiated Logout 1.0), and exposes
+/// the rest of the links block the client depends on (whoami / refresh /
+/// revoke). `refresh_session` points at tiled's own refresh route, not the IdP.
+#[tokio::test]
+async fn about_advertises_oidc_end_session_endpoint_as_logout() {
+    let (app, _validator, _dir) = build_code_flow_app("https://mock-idp.test/token").await;
+
+    let (status, body) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/",
+        &[("host", "localhost:8000")],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let links = &body["authentication"]["links"];
+    assert_eq!(
+        links["logout"].as_str(),
+        Some("https://mock-idp.test/logout"),
+        "logout must be the IdP's end_session_endpoint"
+    );
+    assert_eq!(
+        links["refresh_session"].as_str(),
+        Some("http://localhost:8000/api/v1/auth/refresh"),
+        "refresh_session must be tiled's own refresh route, not the IdP token endpoint"
+    );
+    assert_eq!(
+        links["whoami"].as_str(),
+        Some("http://localhost:8000/api/v1/auth/whoami")
+    );
+    assert_eq!(
+        links["apikey"].as_str(),
+        Some("http://localhost:8000/api/v1/auth/apikey")
+    );
+    assert_eq!(
+        links["revoke_session"].as_str(),
+        Some("http://localhost:8000/api/v1/auth/session/revoke/{session_id}")
+    );
+}
+
+/// G5: without an external OIDC provider, `authentication.links.logout` falls
+/// back to tiled's own logout route (the links block is still built because an
+/// internal authenticator is configured).
+#[tokio::test]
+async fn about_logout_falls_back_to_local_route_without_oidc() {
+    let (app, _dir, _cat, _auth_db) = build_test_app().await;
+
+    let (status, body) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/",
+        &[("host", "localhost:8000")],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let links = &body["authentication"]["links"];
+    assert_eq!(
+        links["logout"].as_str(),
+        Some("http://localhost:8000/api/v1/auth/logout"),
+        "logout must fall back to tiled's own route when no OIDC provider is configured"
     );
 }
 
