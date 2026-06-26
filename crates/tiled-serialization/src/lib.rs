@@ -14,6 +14,8 @@ pub mod csv_table;
 pub mod excel_table;
 #[cfg(feature = "hdf5")]
 pub mod hdf5_array;
+#[cfg(feature = "hdf5")]
+pub mod hdf5_table;
 #[cfg(feature = "image")]
 pub mod image_array;
 #[cfg(feature = "parquet")]
@@ -45,5 +47,7 @@ pub fn default_registry() -> SerializationRegistry {
     excel_table::register_excel_serializer(&reg);
     #[cfg(feature = "hdf5")]
     hdf5_array::register_hdf5_serializer(&reg);
+    #[cfg(feature = "hdf5")]
+    hdf5_table::register_hdf5_table_serializer(&reg);
     reg
 }
