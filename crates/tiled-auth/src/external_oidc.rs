@@ -43,6 +43,25 @@ use tokio::sync::RwLock;
 use crate::error::{AuthError, Result};
 use crate::scopes::{Scope, ScopeSet};
 
+/// How a provider derives the principal subject (and username) from a verified
+/// token. Mirrors the split between Python's `OIDCAuthenticator` and
+/// `EntraAuthenticator` (`authenticators.py`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IdentityMapping {
+    /// The subject is the provider's `subject_claim` value verbatim (plain
+    /// OIDC). No username is derived.
+    #[default]
+    Standard,
+    /// Microsoft Entra ID: the subject is a stable
+    /// `uuid5(NAMESPACE_URL, "{iss}|{sub}")` (the raw Entra `sub` is opaque and
+    /// per-application, so it is not a safe cross-tenant identity), and a
+    /// human-readable username is derived from the token claims (nameID /
+    /// preferred_username / upn / email). The returned `claims` are enriched
+    /// with `entra_sub` / `entra_username` / `user`, mirroring
+    /// `EntraAuthenticator.decode_token`.
+    Entra,
+}
+
 /// One configured upstream IdP.
 #[derive(Debug, Clone)]
 pub struct OidcProvider {
@@ -57,8 +76,15 @@ pub struct OidcProvider {
     /// rejects an empty list (OIDC Core §3.1.3.7 #3 / RFC 8725 §3.1).
     pub audiences: Vec<String>,
     /// Override the JWT claim used as the principal subject. Defaults
-    /// to `sub`; some IdPs prefer `oid` (Entra) or `email`.
+    /// to `sub`; some IdPs prefer `oid` (Entra) or `email`. Ignored when
+    /// `identity_mapping` is [`IdentityMapping::Entra`] (which always derives
+    /// the subject from the `sub` claim via uuid5).
     pub subject_claim: String,
+    /// How the principal subject (and username) is derived from a verified
+    /// token. [`IdentityMapping::Standard`] uses `subject_claim` verbatim;
+    /// [`IdentityMapping::Entra`] derives a stable uuid5 subject plus a
+    /// human-readable username. Defaults to `Standard`.
+    pub identity_mapping: IdentityMapping,
     /// Allowed signing algorithms. When non-empty, tokens whose `alg`
     /// header is not in this list are rejected before signature
     /// verification. When empty, the algorithm is derived from the
@@ -395,24 +421,7 @@ impl ExternalOidcValidator {
         let claims = decode::<serde_json::Value>(token, &key, &validation)
             .map_err(AuthError::from)?
             .claims;
-        let sub = claims
-            .get(&provider.subject_claim)
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                AuthError::Unauthorized(format!("token missing claim '{}'", provider.subject_claim))
-            })?
-            .to_string();
-        let scopes = if provider.scopes_map.is_empty() {
-            None
-        } else {
-            Some(translate_scp(&provider.scopes_map, &claims))
-        };
-        Ok(ValidatedToken {
-            provider: provider.name.clone(),
-            sub,
-            claims,
-            scopes,
-        })
+        finalize_token(provider, claims)
     }
 
     // ---------------------------------------------------------------------------
@@ -611,29 +620,7 @@ impl ExternalOidcValidator {
             ));
         }
 
-        let sub = claims
-            .get(&provider.subject_claim)
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                AuthError::Unauthorized(format!(
-                    "id_token missing claim '{}'",
-                    provider.subject_claim
-                ))
-            })?
-            .to_string();
-
-        let scopes = if provider.scopes_map.is_empty() {
-            None
-        } else {
-            Some(translate_scp(&provider.scopes_map, &claims))
-        };
-
-        Ok(ValidatedToken {
-            provider: provider.name.clone(),
-            sub,
-            claims,
-            scopes,
-        })
+        finalize_token(provider, claims)
     }
 
     // ---------------------------------------------------------------------------
@@ -709,6 +696,120 @@ pub struct ValidatedToken {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Build the [`ValidatedToken`] from verified `claims`. The single owner of
+/// identity derivation, shared by the bearer ([`ExternalOidcValidator::validate`])
+/// and code-flow ([`ExternalOidcValidator::validate_id_token`]) paths so the
+/// provider's [`IdentityMapping`] applies uniformly to both — no path can
+/// derive the subject differently.
+fn finalize_token(
+    provider: &OidcProvider,
+    mut claims: serde_json::Value,
+) -> Result<ValidatedToken> {
+    // Compute scopes from the original `scp` claim before any Entra enrichment
+    // mutates `claims` (enrichment never touches `scp`, but keep it explicit).
+    let scopes = if provider.scopes_map.is_empty() {
+        None
+    } else {
+        Some(translate_scp(&provider.scopes_map, &claims))
+    };
+    let sub = match provider.identity_mapping {
+        IdentityMapping::Standard => claims
+            .get(&provider.subject_claim)
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                AuthError::Unauthorized(format!("token missing claim '{}'", provider.subject_claim))
+            })?
+            .to_string(),
+        IdentityMapping::Entra => derive_entra_identity(&mut claims)?,
+    };
+    Ok(ValidatedToken {
+        provider: provider.name.clone(),
+        sub,
+        claims,
+        scopes,
+    })
+}
+
+/// Entra identity derivation. Mirrors `EntraAuthenticator.decode_token`
+/// (`authenticators.py:354-402`): replace the opaque per-tenant `sub` with a
+/// stable `uuid5(NAMESPACE_URL, "{iss}|{sub}")` (`.hex` form — 32 lowercase hex
+/// digits, no dashes), and derive a human-readable username, enriching `claims`
+/// with `entra_sub` / `entra_username` / `user` the same way upstream does.
+/// Returns the derived (uuid5) subject.
+fn derive_entra_identity(claims: &mut serde_json::Value) -> Result<String> {
+    let original_sub = claims
+        .get("sub")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| AuthError::Unauthorized("Entra token missing 'sub' claim".into()))?
+        .to_string();
+    let issuer = claims
+        .get("iss")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let uuid_sub = uuid::Uuid::new_v5(
+        &uuid::Uuid::NAMESPACE_URL,
+        format!("{issuer}|{original_sub}").as_bytes(),
+    )
+    .simple()
+    .to_string();
+
+    // Human-readable username: nameID → preferred_username → upn → email,
+    // normalized; fall back to the original opaque sub when none is present.
+    let entra_username = entra_username_claim(claims);
+    let user = match entra_username.as_deref() {
+        Some(raw) => normalize_entra_username(raw),
+        None => {
+            tracing::warn!(
+                sub = %original_sub,
+                "EntraAuthenticator: no human-readable username claim found \
+                 (checked nameID, preferred_username, upn, email); falling back to Entra sub"
+            );
+            original_sub.clone()
+        }
+    };
+
+    if let Some(obj) = claims.as_object_mut() {
+        obj.insert("sub".into(), serde_json::Value::String(uuid_sub.clone()));
+        obj.insert("entra_sub".into(), serde_json::Value::String(original_sub));
+        if let Some(eu) = entra_username {
+            obj.insert("entra_username".into(), serde_json::Value::String(eu));
+        }
+        obj.insert("user".into(), serde_json::Value::String(user));
+    }
+    Ok(uuid_sub)
+}
+
+/// First non-empty Entra username claim, in Python's priority order
+/// (`authenticators.py:375-380`): nameID → preferred_username → upn → email.
+/// Empty strings are skipped (they are falsy in Python's `or` chain).
+fn entra_username_claim(claims: &serde_json::Value) -> Option<String> {
+    ["nameID", "preferred_username", "upn", "email"]
+        .iter()
+        .find_map(|k| {
+            claims
+                .get(*k)
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+        })
+        .map(str::to_string)
+}
+
+/// Normalize a raw username claim the way Python does
+/// (`authenticators.py:382-387`): strip surrounding whitespace, then reduce
+/// `DOMAIN\user` → `user` (after the last backslash) or `user@domain` → `user`
+/// (before the first `@`). Backslash takes precedence over `@`.
+fn normalize_entra_username(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if let Some(idx) = trimmed.rfind('\\') {
+        trimmed[idx + 1..].to_string()
+    } else if let Some(idx) = trimmed.find('@') {
+        trimmed[..idx].to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
 
 /// Translate a token's `scp` claim into tiled scopes via a provider's
 /// `scopes_map`. Mirrors `EntraAuthenticator.decode_token`
@@ -887,6 +988,110 @@ mod tests {
         );
     }
 
+    // --- Entra identity mapping (G2) ---
+
+    #[test]
+    fn entra_username_claim_priority_and_empty_skipped() {
+        let c = serde_json::json!({"preferred_username":"pref","upn":"upnval","email":"e@x"});
+        assert_eq!(entra_username_claim(&c).as_deref(), Some("pref"));
+        let c2 = serde_json::json!({"upn":"upnval","email":"e@x"});
+        assert_eq!(entra_username_claim(&c2).as_deref(), Some("upnval"));
+        let c3 = serde_json::json!({"email":"e@x.com"});
+        assert_eq!(entra_username_claim(&c3).as_deref(), Some("e@x.com"));
+        // nameID has the highest priority.
+        let c4 = serde_json::json!({"nameID":"nm","preferred_username":"pref"});
+        assert_eq!(entra_username_claim(&c4).as_deref(), Some("nm"));
+        // Empty strings are falsy → skipped in favour of the next claim.
+        let c5 = serde_json::json!({"preferred_username":"","upn":"realupn"});
+        assert_eq!(entra_username_claim(&c5).as_deref(), Some("realupn"));
+        // No username claim at all.
+        let c6 = serde_json::json!({"sub":"x"});
+        assert!(entra_username_claim(&c6).is_none());
+    }
+
+    #[test]
+    fn normalize_entra_username_strips_domain_and_whitespace() {
+        assert_eq!(normalize_entra_username("user@domain.com"), "user");
+        assert_eq!(normalize_entra_username("CONTOSO\\bob"), "bob");
+        assert_eq!(normalize_entra_username("  spaced  "), "spaced");
+        // Backslash takes precedence over '@'.
+        assert_eq!(normalize_entra_username("dom\\u@x.com"), "u@x.com");
+        // A plain username is unchanged.
+        assert_eq!(normalize_entra_username("dallan"), "dallan");
+    }
+
+    #[test]
+    fn finalize_token_entra_derives_uuid5_sub_and_username() {
+        let mut provider = test_provider();
+        provider.identity_mapping = IdentityMapping::Entra;
+        let claims = serde_json::json!({
+            "sub": "opaque-entra-oid-123",
+            "iss": "https://login.microsoftonline.com/TENANT/v2.0",
+            "preferred_username": "Alice@contoso.com",
+        });
+        let vt = finalize_token(&provider, claims).unwrap();
+        let expected = uuid::Uuid::new_v5(
+            &uuid::Uuid::NAMESPACE_URL,
+            b"https://login.microsoftonline.com/TENANT/v2.0|opaque-entra-oid-123",
+        )
+        .simple()
+        .to_string();
+        assert_eq!(vt.sub, expected, "sub must be the uuid5(iss|sub) hex");
+        assert_eq!(vt.sub.len(), 32, "uuid5 .hex form is 32 chars, no dashes");
+        assert_ne!(vt.sub, "opaque-entra-oid-123");
+        // claims enriched exactly like Python decode_token.
+        assert_eq!(vt.claims["sub"].as_str(), Some(expected.as_str()));
+        assert_eq!(
+            vt.claims["entra_sub"].as_str(),
+            Some("opaque-entra-oid-123")
+        );
+        assert_eq!(
+            vt.claims["entra_username"].as_str(),
+            Some("Alice@contoso.com")
+        );
+        assert_eq!(vt.claims["user"].as_str(), Some("Alice"));
+    }
+
+    #[test]
+    fn finalize_token_entra_falls_back_to_sub_without_username_claim() {
+        let mut provider = test_provider();
+        provider.identity_mapping = IdentityMapping::Entra;
+        let claims = serde_json::json!({"sub": "oid-9", "iss": "https://i.test/"});
+        let vt = finalize_token(&provider, claims).unwrap();
+        assert_eq!(
+            vt.claims["user"].as_str(),
+            Some("oid-9"),
+            "username falls back to the Entra sub when no human-readable claim exists"
+        );
+        assert_eq!(vt.claims["entra_sub"].as_str(), Some("oid-9"));
+        assert!(
+            vt.claims.get("entra_username").is_none(),
+            "no entra_username is stored when no claim was found"
+        );
+    }
+
+    #[test]
+    fn finalize_token_entra_requires_sub_claim() {
+        let mut provider = test_provider();
+        provider.identity_mapping = IdentityMapping::Entra;
+        let claims = serde_json::json!({"iss": "https://i.test/", "preferred_username": "x"});
+        assert!(
+            finalize_token(&provider, claims).is_err(),
+            "Entra mapping needs the 'sub' claim to derive the uuid5 subject"
+        );
+    }
+
+    #[test]
+    fn finalize_token_standard_uses_subject_claim_verbatim() {
+        let provider = test_provider(); // Standard, subject_claim = "sub"
+        let claims = serde_json::json!({"sub": "raw-subject", "iss": "https://issuer.test/"});
+        let vt = finalize_token(&provider, claims).unwrap();
+        assert_eq!(vt.sub, "raw-subject");
+        // Standard mode must not enrich claims with Entra fields.
+        assert!(vt.claims.get("user").is_none());
+        assert!(vt.claims.get("entra_sub").is_none());
+    }
+
     fn test_provider() -> OidcProvider {
         OidcProvider {
             name: "test".into(),
@@ -894,6 +1099,7 @@ mod tests {
             issuer: "https://issuer.test/".into(),
             audiences: vec!["tiled".into()],
             subject_claim: "sub".into(),
+            identity_mapping: IdentityMapping::Standard,
             algorithms: vec![Algorithm::HS256],
             scopes_map: HashMap::new(),
             client_id: None,
@@ -912,6 +1118,7 @@ mod tests {
             issuer: "https://code-idp.test/".into(),
             audiences: vec!["tiled-code-client".into()],
             subject_claim: "sub".into(),
+            identity_mapping: IdentityMapping::Standard,
             algorithms: vec![Algorithm::HS256],
             scopes_map: HashMap::new(),
             client_id: Some("tiled-code-client".into()),

@@ -10,7 +10,8 @@ use serde::Deserialize;
 
 use tiled_access::{AccessPolicy, PassthroughPolicy, TagBasedPolicy};
 use tiled_auth::{
-    ExternalOidcValidator, OidcDiscovery, OidcProvider, Scope, ScopeSet, discover_oidc,
+    ExternalOidcValidator, IdentityMapping, OidcDiscovery, OidcProvider, Scope, ScopeSet,
+    discover_oidc,
 };
 
 /// Top-level configuration.
@@ -442,9 +443,21 @@ fn is_oidc_authenticator(authenticator: &str) -> bool {
     ) || matches!(authenticator, "oidc" | "entra" | "proxied_oidc")
 }
 
+/// True when `authenticator` is the Entra-specific authenticator (a Python
+/// import path ending in `EntraAuthenticator`, or the short selector `entra`).
+/// Selects [`IdentityMapping::Entra`] — uuid5 subject + username derivation.
+fn is_entra_authenticator(authenticator: &str) -> bool {
+    let class = authenticator
+        .rsplit([':', '.'])
+        .next()
+        .unwrap_or(authenticator);
+    class == "EntraAuthenticator" || authenticator == "entra"
+}
+
 impl AuthProviderConfig {
     /// Run discovery (if `well_known_uri` is set) then assemble the
-    /// [`OidcProvider`].
+    /// [`OidcProvider`], selecting the Entra identity mapping for an
+    /// Entra-family authenticator.
     async fn build_oidc_provider(&self) -> anyhow::Result<OidcProvider> {
         let discovery = match &self.args.well_known_uri {
             Some(uri) => Some(discover_oidc(uri).await.with_context(|| {
@@ -455,7 +468,11 @@ impl AuthProviderConfig {
             })?),
             None => None,
         };
-        self.args.assemble(&self.provider, discovery)
+        let mut provider = self.args.assemble(&self.provider, discovery)?;
+        if is_entra_authenticator(&self.authenticator) {
+            provider.identity_mapping = IdentityMapping::Entra;
+        }
+        Ok(provider)
     }
 }
 
@@ -529,6 +546,9 @@ impl OidcProviderArgs {
                 .subject_claim
                 .clone()
                 .unwrap_or_else(|| "sub".to_string()),
+            // Default identity mapping; `build_oidc_provider` flips this to
+            // `Entra` for an Entra-family authenticator.
+            identity_mapping: IdentityMapping::Standard,
             // Empty → derive the algorithm from the matched JWK (RS256/ES256).
             algorithms: Vec::new(),
             scopes_map,
@@ -1202,6 +1222,55 @@ mod tests {
         assert!(url.contains("code_challenge_method=S256"), "url={url}");
         assert!(url.contains("state="), "url={url}");
         assert!(url.contains("nonce="), "url={url}");
+    }
+
+    #[test]
+    fn is_entra_authenticator_matches_entra_only() {
+        assert!(is_entra_authenticator(
+            "tiled.authenticators:EntraAuthenticator"
+        ));
+        assert!(is_entra_authenticator("entra"));
+        // The plain / proxied OIDC authenticators are NOT Entra.
+        assert!(!is_entra_authenticator(
+            "tiled.authenticators:OIDCAuthenticator"
+        ));
+        assert!(!is_entra_authenticator(
+            "tiled.authenticators:ProxiedOIDCAuthenticator"
+        ));
+        assert!(!is_entra_authenticator("oidc"));
+        assert!(!is_entra_authenticator("proxied_oidc"));
+    }
+
+    #[tokio::test]
+    async fn entra_authenticator_selects_entra_identity_mapping() {
+        let entra = AuthProviderConfig {
+            provider: "corp-entra".into(),
+            authenticator: "tiled.authenticators:EntraAuthenticator".into(),
+            args: OidcProviderArgs {
+                audience: Some("api://tiled".into()),
+                issuer: Some("https://login.microsoftonline.com/tid/v2.0".into()),
+                jwks_uri: Some("https://login.microsoftonline.com/tid/keys".into()),
+                ..Default::default()
+            },
+        };
+        let provider = entra.build_oidc_provider().await.unwrap();
+        assert_eq!(provider.identity_mapping, IdentityMapping::Entra);
+
+        // A plain OIDC authenticator stays Standard.
+        let plain = AuthProviderConfig {
+            provider: "kc".into(),
+            authenticator: "oidc".into(),
+            args: OidcProviderArgs {
+                audience: Some("tiled".into()),
+                issuer: Some("https://idp.test/".into()),
+                jwks_uri: Some("https://idp.test/keys".into()),
+                ..Default::default()
+            },
+        };
+        assert_eq!(
+            plain.build_oidc_provider().await.unwrap().identity_mapping,
+            IdentityMapping::Standard
+        );
     }
 
     #[test]
