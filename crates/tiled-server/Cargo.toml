@@ -14,6 +14,10 @@ zarr-adapter = ["tiled-adapters/zarr"]
 excel-adapter = ["tiled-adapters/excel-adapter"]
 image-serializer = ["tiled-serialization/image"]
 parquet-serializer = ["tiled-serialization/parquet"]
+# HDF5 export serializers (array/table/sparse leaves + the container deep-export
+# built inline in container_full). Opt-in like hdf5-adapter: pulls in the system
+# libhdf5 via tiled-serialization, so it is NOT in `default`.
+hdf5-serializer = ["tiled-serialization/hdf5"]
 web = ["dep:tiled-web"]
 saml = ["tiled-auth/saml"]
 

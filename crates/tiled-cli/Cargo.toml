@@ -13,6 +13,10 @@ web = ["tiled-server/web", "dep:tiled-web"]
 # `authentication.providers` entry that names LDAP/PAM is skipped with a warning.
 ldap = ["tiled-auth/ldap"]
 pam = ["tiled-auth/pam"]
+# Compile in the HDF5 export serializers (array/table/sparse + container
+# deep-export). Forwards to tiled-server's `hdf5-serializer`, which pulls in the
+# system libhdf5 via tiled-serialization; off by default like ldap/pam.
+hdf5-serializer = ["tiled-server/hdf5-serializer"]
 
 [dependencies]
 tiled-web = { workspace = true, optional = true }
