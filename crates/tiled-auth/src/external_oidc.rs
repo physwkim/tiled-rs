@@ -125,6 +125,18 @@ pub struct OidcProvider {
     pub authorization_endpoint: Option<String>,
     /// IdP's token endpoint URL. Required for code flow.
     pub token_endpoint: Option<String>,
+    /// Extra OAuth2 scopes appended to the `openid offline_access` baseline in
+    /// every authorization-code token POST (both the browser and device flows).
+    /// This is the Entra resource-scope mechanism (e.g.
+    /// `["api://<client-id>/access_as_user"]`): Entra only issues an
+    /// `access_token` whose `aud` matches the requested resource scope, so any
+    /// scope a downstream OBO exchange uses as its `assertion` audience MUST be
+    /// requested here — requesting it only on the authorize redirect is not
+    /// sufficient (Entra does not carry redirect scopes into the token POST).
+    /// Empty for a plain OIDC provider. Mirrors Python
+    /// `EntraAuthenticator.extra_scopes` (authenticators.py:326,460) consumed by
+    /// `exchange_code` (authenticators.py:522-532).
+    pub extra_scopes: Vec<String>,
     /// IdP's RP-initiated-logout (end-session) endpoint from OIDC discovery
     /// (`end_session_endpoint`). Advertised to clients as
     /// `authentication.links.logout` so they can end the upstream IdP session
@@ -501,7 +513,9 @@ impl ExternalOidcValidator {
             form.push(("client_secret", secret.as_str()));
         }
 
-        let body = self.post_token_request(token_endpoint, &form).await?;
+        let body = self
+            .post_token_request(token_endpoint, &form, &provider.extra_scopes)
+            .await?;
 
         let id_token = body["id_token"].as_str().ok_or_else(|| {
             AuthError::Validation("token response is missing the 'id_token' field".into())
@@ -525,22 +539,26 @@ impl ExternalOidcValidator {
     /// ([`Self::exchange_device_code`]) — the per-flow forms differ only in the
     /// PKCE `code_verifier` (browser-only).
     ///
-    /// This single owner of every authorization-code exchange explicitly adds
-    /// the `openid offline_access` scope to the token POST so the IdP returns a
-    /// `refresh_token` unconditionally — required for the G3 OBO refresh, which
-    /// renews the upstream tokens silently. Setting it here (not at each caller)
-    /// keeps the rule uniform and makes it impossible for a code-exchange path
-    /// to omit it. Safe even when the authorize URL already requested
-    /// `offline_access` (the IdP ignores the duplicate). Mirrors Python
-    /// `exchange_code` (`authenticators.py:530`), which sets the same scope in
-    /// the token POST data for both the browser and device flows.
+    /// This single owner of every authorization-code exchange explicitly sets
+    /// the token-POST `scope` to `openid offline_access` plus the provider's
+    /// [`OidcProvider::extra_scopes`]. `offline_access` makes the IdP return a
+    /// `refresh_token` unconditionally (required for the G3 OBO refresh, which
+    /// renews the upstream tokens silently); the extra scopes are the Entra
+    /// resource scopes a downstream OBO exchange needs in the `access_token`
+    /// `aud`. Setting it here (not at each caller) keeps the rule uniform and
+    /// makes it impossible for a code-exchange path to omit it. Safe even when
+    /// the authorize URL already requested these scopes (the IdP ignores
+    /// duplicates). Mirrors Python `exchange_code` (`authenticators.py:530`),
+    /// which builds the same `" ".join(sorted(scopes))` for both flows.
     async fn post_token_request(
         &self,
         token_endpoint: &str,
         form: &[(&str, &str)],
+        extra_scopes: &[String],
     ) -> Result<serde_json::Value> {
+        let scope = build_token_scope(extra_scopes);
         let mut form = form.to_vec();
-        form.push(("scope", "openid offline_access"));
+        form.push(("scope", &scope));
         let resp = self
             .http
             .post(token_endpoint)
@@ -648,7 +666,9 @@ impl ExternalOidcValidator {
             form.push(("client_secret", secret.as_str()));
         }
 
-        let body = self.post_token_request(token_endpoint, &form).await?;
+        let body = self
+            .post_token_request(token_endpoint, &form, &provider.extra_scopes)
+            .await?;
 
         let id_token = body["id_token"].as_str().ok_or_else(|| {
             AuthError::Validation("token response is missing the 'id_token' field".into())
@@ -923,6 +943,23 @@ fn normalize_entra_username(raw: &str) -> String {
     } else {
         trimmed.to_string()
     }
+}
+
+/// Build the `scope` value for an authorization-code token POST: the
+/// `openid offline_access` baseline unioned with `extra_scopes`, then sorted and
+/// space-joined. Mirrors Python `exchange_code`'s
+/// `" ".join(sorted({"openid", "offline_access"} | extra_scopes))`
+/// (authenticators.py:530-542) — a [`BTreeSet`] gives the same sorted, de-
+/// duplicated set (a duplicate `openid`/`offline_access` in `extra_scopes`
+/// collapses, exactly as Python's set does).
+fn build_token_scope(extra_scopes: &[String]) -> String {
+    let mut scopes: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    scopes.insert("openid");
+    scopes.insert("offline_access");
+    for s in extra_scopes {
+        scopes.insert(s.as_str());
+    }
+    scopes.into_iter().collect::<Vec<_>>().join(" ")
 }
 
 /// Build the OBO session state from a code-flow token-endpoint response.
@@ -1282,6 +1319,35 @@ mod tests {
         );
     }
 
+    // --- G3 token-POST scope (offline_access + Entra extra_scopes) ---
+
+    #[test]
+    fn build_token_scope_baseline_is_sorted_openid_offline_access() {
+        // No extra scopes → exactly Python's sorted({"openid","offline_access"}).
+        assert_eq!(build_token_scope(&[]), "offline_access openid");
+    }
+
+    #[test]
+    fn build_token_scope_unions_and_sorts_extra_scopes() {
+        let extra = vec![
+            "api://tiled-api/access_as_user".to_string(),
+            "User.Read".to_string(),
+        ];
+        // Sorted union of the baseline + extras (BTreeSet order).
+        assert_eq!(
+            build_token_scope(&extra),
+            "User.Read api://tiled-api/access_as_user offline_access openid"
+        );
+    }
+
+    #[test]
+    fn build_token_scope_dedups_baseline_collisions() {
+        // A duplicate baseline scope in extra_scopes collapses (set semantics),
+        // matching Python's `{"openid","offline_access"} | extra_scopes`.
+        let extra = vec!["openid".to_string(), "offline_access".to_string()];
+        assert_eq!(build_token_scope(&extra), "offline_access openid");
+    }
+
     #[test]
     fn build_session_state_standard_is_empty_object() {
         let provider = test_provider(); // Standard mapping
@@ -1311,6 +1377,7 @@ mod tests {
             client_secret: None,
             authorization_endpoint: None,
             token_endpoint: None,
+            extra_scopes: Vec::new(),
             end_session_endpoint: None,
             redirect_on_success: None,
             redirect_on_failure: None,
@@ -1331,6 +1398,7 @@ mod tests {
             client_secret: None,
             authorization_endpoint: Some("https://code-idp.test/authorize".into()),
             token_endpoint: Some("https://code-idp.test/token".into()),
+            extra_scopes: Vec::new(),
             end_session_endpoint: None,
             redirect_on_success: None,
             redirect_on_failure: None,

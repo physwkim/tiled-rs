@@ -828,6 +828,7 @@ async fn build_oidc_state(
             client_secret: None,
             authorization_endpoint: None,
             token_endpoint: None,
+            extra_scopes: Vec::new(),
             end_session_endpoint: None,
             redirect_on_success: None,
             redirect_on_failure: None,
@@ -1881,6 +1882,7 @@ async fn build_code_flow_app_with_mapping(
             client_secret: None,
             authorization_endpoint: Some("https://mock-idp.test/authorize".into()),
             token_endpoint: Some(token_endpoint.to_string()),
+            extra_scopes: Vec::new(),
             end_session_endpoint: Some("https://mock-idp.test/logout".into()),
             redirect_on_success: None,
             redirect_on_failure: None,
@@ -2282,11 +2284,13 @@ async fn oidc_callback_with_mock_idp_mints_session() {
                     "mock IdP: code_verifier must be sent"
                 );
                 // G3: the token POST must request offline_access so the IdP
-                // returns a refresh_token for the downstream OBO refresh.
+                // returns a refresh_token for the downstream OBO refresh. The
+                // scope is the sorted set (Python `" ".join(sorted(...))`); with
+                // no extra_scopes that is "offline_access openid".
                 assert_eq!(
                     form.get("scope").map(String::as_str),
-                    Some("openid offline_access"),
-                    "mock IdP: token POST must request 'openid offline_access'"
+                    Some("offline_access openid"),
+                    "mock IdP: token POST must request 'offline_access openid'"
                 );
                 axum::Json(serde_json::json!({
                     "id_token": token,
@@ -2352,6 +2356,98 @@ async fn oidc_callback_with_mock_idp_mints_session() {
         body.pointer("/identity/id").and_then(|v| v.as_str()),
         Some("bob"),
         "identity.id must be the sub from the id_token"
+    );
+}
+
+/// G3: a provider configured with `extra_scopes` (the Entra resource-scope
+/// mechanism) appends them — sorted into the `openid offline_access` baseline —
+/// to the token POST. Exercises the full chain provider.extra_scopes →
+/// exchange_code_flow → post_token_request → wire, calling the validator
+/// directly (no HTTP app needed).
+#[tokio::test]
+async fn exchange_code_flow_appends_provider_extra_scopes() {
+    use axum::Router;
+    use axum::body::Bytes;
+    use axum::routing::post;
+    use jsonwebtoken::Algorithm;
+    use std::collections::HashMap;
+    use tiled_auth::{ExternalOidcValidator, OidcFlowState, OidcProvider};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let token_endpoint = format!("http://127.0.0.1:{port}/token");
+
+    let known_nonce = "extra-scope-nonce";
+    let id_token = mint_code_flow_id_token("carol", known_nonce);
+    let id_token_clone = id_token.clone();
+    let mock_app = Router::new().route(
+        "/token",
+        post(move |body: Bytes| {
+            let token = id_token_clone.clone();
+            async move {
+                let form: HashMap<String, String> =
+                    form_urlencoded::parse(body.as_ref()).into_owned().collect();
+                // baseline ∪ extra_scopes, sorted (BTreeSet / Python sorted()).
+                assert_eq!(
+                    form.get("scope").map(String::as_str),
+                    Some("api://tiled-api/access_as_user offline_access openid"),
+                    "token POST scope must be the sorted union of baseline + extra_scopes"
+                );
+                axum::Json(serde_json::json!({
+                    "id_token": token,
+                    "access_token": "a",
+                    "refresh_token": "r",
+                    "token_type": "Bearer",
+                }))
+            }
+        }),
+    );
+    tokio::spawn(async move {
+        axum::serve(listener, mock_app).await.unwrap();
+    });
+
+    let validator = Arc::new(
+        ExternalOidcValidator::new(vec![OidcProvider {
+            name: "entra-idp".into(),
+            jwks_url: "https://mock-idp.test/jwks".into(),
+            issuer: "https://mock-idp.test/".into(),
+            audiences: vec!["tiled-code-client".into()],
+            subject_claim: "sub".into(),
+            identity_mapping: tiled_auth::IdentityMapping::Standard,
+            algorithms: vec![Algorithm::HS256],
+            scopes_map: HashMap::new(),
+            client_id: Some("tiled-code-client".into()),
+            client_secret: None,
+            authorization_endpoint: Some("https://mock-idp.test/authorize".into()),
+            token_endpoint: Some(token_endpoint.clone()),
+            extra_scopes: vec!["api://tiled-api/access_as_user".into()],
+            end_session_endpoint: None,
+            redirect_on_success: None,
+            redirect_on_failure: None,
+        }])
+        .unwrap(),
+    );
+    validator
+        .inject_key_for_test(
+            "entra-idp",
+            "test-kid",
+            jsonwebtoken::DecodingKey::from_secret(b"mock-idp-secret!!"),
+            Algorithm::HS256,
+        )
+        .await;
+
+    let flow = OidcFlowState {
+        provider: "entra-idp".into(),
+        code_verifier: "verifier".into(),
+        nonce: known_nonce.into(),
+    };
+    let session = validator
+        .exchange_code_flow(&flow, "auth-code", "https://app/cb")
+        .await
+        .expect("code exchange must succeed");
+    assert_eq!(
+        session.token.sub, "carol",
+        "the id_token must still validate (sanity that the exchange completed)"
     );
 }
 
@@ -2621,11 +2717,12 @@ async fn spawn_mock_device_token_endpoint(id_token: String, extra: serde_json::V
                     "device flow must NOT send a PKCE code_verifier"
                 );
                 // G3: the device-flow token POST must also request
-                // offline_access (same shared exchange path as the browser flow).
+                // offline_access (same shared exchange path as the browser
+                // flow); sorted set → "offline_access openid".
                 assert_eq!(
                     form.get("scope").map(String::as_str),
-                    Some("openid offline_access"),
-                    "mock IdP: device-flow token POST must request 'openid offline_access'"
+                    Some("offline_access openid"),
+                    "mock IdP: device-flow token POST must request 'offline_access openid'"
                 );
                 let mut resp = serde_json::json!({ "id_token": token, "token_type": "Bearer" });
                 if let Some(obj) = extra.as_object() {

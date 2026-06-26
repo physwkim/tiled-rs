@@ -401,6 +401,13 @@ pub struct OidcProviderArgs {
     /// tiled scope strings (e.g. `[read:metadata, read:data]`).
     #[serde(default)]
     pub scopes_map: Option<HashMap<String, Vec<String>>>,
+    /// Extra OAuth2 scopes appended to the `openid offline_access` baseline in
+    /// every authorization-code token POST (the Entra resource-scope mechanism,
+    /// e.g. `["api://<client-id>/access_as_user"]`). Empty for a plain OIDC
+    /// provider. Maps to [`OidcProvider::extra_scopes`]; mirrors Python
+    /// `EntraAuthenticator(extra_scopes=...)`.
+    #[serde(default)]
+    pub extra_scopes: Vec<String>,
 }
 
 impl AuthConfig {
@@ -564,6 +571,7 @@ impl OidcProviderArgs {
             client_secret: self.client_secret.clone(),
             authorization_endpoint,
             token_endpoint,
+            extra_scopes: self.extra_scopes.clone(),
             end_session_endpoint,
             redirect_on_success: self.redirect_on_success.clone(),
             redirect_on_failure: self.redirect_on_failure.clone(),
@@ -1083,6 +1091,32 @@ mod tests {
         let p = args.assemble("p", Some(discovery_doc())).unwrap();
         assert_eq!(p.issuer, "https://override.test/");
         assert_eq!(p.jwks_url, "https://override.test/keys");
+    }
+
+    #[test]
+    fn assemble_carries_extra_scopes() {
+        // Entra resource scopes configured under `extra_scopes` reach
+        // `OidcProvider::extra_scopes` verbatim (the token POST sorts/dedups
+        // them; assemble just plumbs them through). A provider without the key
+        // gets an empty list.
+        let args = OidcProviderArgs {
+            audience: Some("tiled".into()),
+            client_id: Some("tiled-server".into()),
+            extra_scopes: vec!["api://tiled-api/access_as_user".into()],
+            ..Default::default()
+        };
+        let p = args.assemble("entra", Some(discovery_doc())).unwrap();
+        assert_eq!(p.extra_scopes, vec!["api://tiled-api/access_as_user"]);
+
+        let plain = OidcProviderArgs {
+            audience: Some("tiled".into()),
+            ..Default::default()
+        };
+        let pp = plain.assemble("plain", Some(discovery_doc())).unwrap();
+        assert!(
+            pp.extra_scopes.is_empty(),
+            "a provider without extra_scopes config gets an empty list"
+        );
     }
 
     #[test]
