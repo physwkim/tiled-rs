@@ -2281,6 +2281,13 @@ async fn oidc_callback_with_mock_idp_mints_session() {
                     form.contains_key("code_verifier"),
                     "mock IdP: code_verifier must be sent"
                 );
+                // G3: the token POST must request offline_access so the IdP
+                // returns a refresh_token for the downstream OBO refresh.
+                assert_eq!(
+                    form.get("scope").map(String::as_str),
+                    Some("openid offline_access"),
+                    "mock IdP: token POST must request 'openid offline_access'"
+                );
                 axum::Json(serde_json::json!({
                     "id_token": token,
                     "access_token": "mock-access-token",
@@ -2612,6 +2619,13 @@ async fn spawn_mock_device_token_endpoint(id_token: String, extra: serde_json::V
                 assert!(
                     !form.contains_key("code_verifier"),
                     "device flow must NOT send a PKCE code_verifier"
+                );
+                // G3: the device-flow token POST must also request
+                // offline_access (same shared exchange path as the browser flow).
+                assert_eq!(
+                    form.get("scope").map(String::as_str),
+                    Some("openid offline_access"),
+                    "mock IdP: device-flow token POST must request 'openid offline_access'"
                 );
                 let mut resp = serde_json::json!({ "id_token": token, "token_type": "Bearer" });
                 if let Some(obj) = extra.as_object() {

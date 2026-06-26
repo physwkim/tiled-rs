@@ -522,17 +522,29 @@ impl ExternalOidcValidator {
     /// POST a form to a provider's `token_endpoint`, parse the JSON body, and
     /// surface a non-2xx response as `Unauthorized`. Shared by the PKCE browser
     /// flow ([`Self::exchange_code_flow`]) and the IdP-brokered device flow
-    /// ([`Self::exchange_device_code`]) — the only difference between them is
-    /// the form fields each builds.
+    /// ([`Self::exchange_device_code`]) — the per-flow forms differ only in the
+    /// PKCE `code_verifier` (browser-only).
+    ///
+    /// This single owner of every authorization-code exchange explicitly adds
+    /// the `openid offline_access` scope to the token POST so the IdP returns a
+    /// `refresh_token` unconditionally — required for the G3 OBO refresh, which
+    /// renews the upstream tokens silently. Setting it here (not at each caller)
+    /// keeps the rule uniform and makes it impossible for a code-exchange path
+    /// to omit it. Safe even when the authorize URL already requested
+    /// `offline_access` (the IdP ignores the duplicate). Mirrors Python
+    /// `exchange_code` (`authenticators.py:530`), which sets the same scope in
+    /// the token POST data for both the browser and device flows.
     async fn post_token_request(
         &self,
         token_endpoint: &str,
         form: &[(&str, &str)],
     ) -> Result<serde_json::Value> {
+        let mut form = form.to_vec();
+        form.push(("scope", "openid offline_access"));
         let resp = self
             .http
             .post(token_endpoint)
-            .form(form)
+            .form(&form)
             .send()
             .await
             .map_err(|e| AuthError::Validation(format!("token endpoint request failed: {e}")))?;
