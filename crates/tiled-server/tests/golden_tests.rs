@@ -1244,6 +1244,41 @@ async fn container_full_hdf5_non_scalar_metadata_fails() {
     );
 }
 
+/// Standalone `(table, application/x-hdf5)` export, end-to-end: a 200 + HDF5
+/// magic proves `build_table_response` threads the table node's metadata
+/// (`{"kind": "demo"}`, scalar) to the serializer, which writes it as HDF5 file
+/// attributes (Python `file.attrs.update`). The serializer's file-attr mapping
+/// is unit-tested; here we exercise the router → serializer plumbing.
+#[cfg(feature = "hdf5-serializer")]
+#[tokio::test]
+async fn table_full_hdf5_export_with_metadata() {
+    use std::io::Write;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.csv");
+    let mut f = std::fs::File::create(&path).unwrap();
+    writeln!(f, "x,y").unwrap();
+    writeln!(f, "1,10").unwrap();
+    writeln!(f, "2,20").unwrap();
+    f.flush().unwrap();
+
+    let app = build_table_app(path, 300_000_000);
+    let (status, headers, body) =
+        get_with_headers(&app, "/api/v1/table/full/some_table?format=h5", &[]).await;
+    assert_eq!(status, 200, "table hdf5 export must succeed");
+    let ct = headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        ct.starts_with("application/x-hdf5"),
+        "table hdf5 content-type must be application/x-hdf5; got {ct}"
+    );
+    assert!(
+        body.len() > 8 && &body[..8] == b"\x89HDF\r\n\x1a\n",
+        "body must be a valid HDF5 file (magic signature)"
+    );
+}
+
 /// Serialization M4b: `application/json` for a container returns the recursive
 /// `{contents, metadata}` tree (Python `serialize_json`, container.py:91-115),
 /// resolvable via BOTH `Accept: application/json` and `?format=json`. The

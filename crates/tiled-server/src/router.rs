@@ -916,8 +916,12 @@ async fn build_array_response(
 // Shared by `table_partition` and `table_full`: encode an already-read
 // `ArrowTable` to Arrow IPC and route it through the serialization registry so
 // format negotiation applies (e.g. csv/parquet re-encode the IPC bytes).
+// `metadata` is the table node's user metadata, handed to the serializer; only
+// the HDF5 serializer reads it (→ file attrs, Python `file.attrs.update`), every
+// other table serializer ignores its meta argument.
 async fn build_table_response(
     table: tiled_core::dtype::ArrowTable,
+    metadata: serde_json::Value,
     format_param: Option<&str>,
     headers: &HeaderMap,
     state: &AppState,
@@ -988,11 +992,10 @@ async fn build_table_response(
         .ok_or_else(|| {
             unsupported_media_type(family, &media_type, &state.serialization_registry)
         })?;
-    let body =
-        tokio::task::spawn_blocking(move || serializer(&ipc_bytes, &serde_json::Value::Null))
-            .await
-            .map_err(|e| ServerError::Internal(format!("serialize task failed: {e}")))?
-            .map_err(map_serialize_error)?;
+    let body = tokio::task::spawn_blocking(move || serializer(&ipc_bytes, &metadata))
+        .await
+        .map_err(|e| ServerError::Internal(format!("serialize task failed: {e}")))?
+        .map_err(map_serialize_error)?;
 
     Ok(serve_with_range(headers, &media_type, body))
 }
@@ -3336,7 +3339,8 @@ async fn table_partition_core(
         .await
         .map_err(ServerError::from)?;
 
-    build_table_response(table, format_param.as_deref(), headers, state).await
+    let metadata = table_adapter.metadata().clone();
+    build_table_response(table, metadata, format_param.as_deref(), headers, state).await
 }
 
 // ---------------------------------------------------------------------------
@@ -3393,7 +3397,8 @@ pub async fn table_full(
         .await
         .map_err(ServerError::from)?;
 
-    build_table_response(table, format_param.as_deref(), &headers, &state).await
+    let metadata = table_adapter.metadata().clone();
+    build_table_response(table, metadata, format_param.as_deref(), &headers, &state).await
 }
 
 // ---------------------------------------------------------------------------

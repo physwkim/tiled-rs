@@ -8,11 +8,16 @@
 //! the column — the HDF5-idiomatic shape, and the same rule the array-leaf and
 //! sparse exporters use, so a container HDF5 export is uniform across families.
 //!
-//! Input is the Arrow IPC table the server hands every table serializer; output
-//! is a self-contained `.h5` file. Like [`crate::hdf5_array`], `rust-hdf5` only
-//! writes through a file path, so we round-trip through a temp file, and table
-//! `metadata` is not written as HDF5 attributes (matching the array exporter;
-//! JSON→HDF5 attribute mapping is intentionally out of scope).
+//! Input is the Arrow IPC table the server hands every table serializer; the
+//! `meta` argument is the table node's user metadata, written as HDF5 file (root
+//! group) attributes — Python `serialize_hdf5`'s `file.attrs.update(metadata)`.
+//! (Python also copies it onto each per-column dataset; with one dataset per
+//! column the file is the single natural carrier, and the columns stay
+//! attribute-free.) Only scalar JSON values map; a non-scalar value fails the
+//! export, the same fail-fast as Python's `except TypeError: raise
+//! SerializationError` (see [`crate::hdf5_common::write_file_attrs`]). Output is a
+//! self-contained `.h5` file; like [`crate::hdf5_array`], `rust-hdf5` only writes
+//! through a file path, so we round-trip through a temp file.
 //!
 //! Limitation: `rust-hdf5` 0.2.20 implements `H5Type` only for numeric/boolean
 //! scalars — it has no string *dataset* support (its `VarLenUnicode` works only
@@ -41,7 +46,7 @@ pub fn register_hdf5_table_serializer(reg: &SerializationRegistry) {
 }
 
 fn hdf5_table_serializer() -> SerializerFn {
-    Box::new(|data, _meta| -> Result<Bytes, SerializeError> {
+    Box::new(|data, meta| -> Result<Bytes, SerializeError> {
         // Decode the Arrow IPC table into a single RecordBatch (the server hands
         // one IPC stream; concat multi-batch streams into one frame so each
         // column becomes a single contiguous dataset).
@@ -67,7 +72,7 @@ fn hdf5_table_serializer() -> SerializerFn {
             .map_err(|e| format!("temp file: {e}"))?;
         let path = tmp.into_temp_path();
 
-        write_table(&path, &batch).map_err(|e| format!("hdf5 write: {e}"))?;
+        write_table(&path, &batch, meta).map_err(|e| format!("hdf5 write: {e}"))?;
 
         let mut buf = Vec::new();
         std::fs::File::open(&path)
@@ -80,12 +85,18 @@ fn hdf5_table_serializer() -> SerializerFn {
 
 type DynError = Box<dyn std::error::Error + Send + Sync>;
 
-fn write_table(path: &std::path::Path, batch: &RecordBatch) -> Result<(), DynError> {
+fn write_table(
+    path: &std::path::Path,
+    batch: &RecordBatch,
+    meta: &serde_json::Value,
+) -> Result<(), DynError> {
     let file = rust_hdf5::H5File::create(path)?;
     let group = file.root_group();
     for (i, field) in batch.schema().fields().iter().enumerate() {
         crate::hdf5_common::write_table_column(&group, field.name(), batch.column(i).as_ref())?;
     }
+    // Table node metadata → file (root group) attrs (Python `file.attrs.update`).
+    crate::hdf5_common::write_file_attrs(&file, meta)?;
     Ok(())
 }
 
@@ -227,6 +238,53 @@ mod tests {
         assert!(
             err.contains("label") && err.contains("Utf8"),
             "error must name the unsupported column and type: {err}"
+        );
+    }
+
+    /// The table node's metadata is written as HDF5 file (root group) attributes
+    /// — Python `file.attrs.update(metadata)` — across the four scalar kinds.
+    /// rust-hdf5 reads only dataset attr *values*, so file attrs are checked by
+    /// name (the builder unit test covers per-kind values).
+    #[test]
+    fn table_hdf5_writes_metadata_as_file_attrs() {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2]))]).unwrap();
+        let meta = serde_json::json!({
+            "sample": "NaCl", "temperature": 300, "scale": 1.5, "ok": true,
+        });
+        let ser = registry()
+            .dispatch(StructureFamily::Table, mime::HDF5)
+            .unwrap();
+        let h5 = ser(&ipc_bytes(&batch), &meta).expect("serialize");
+        let tmp = tempfile::Builder::new().suffix(".h5").tempfile().unwrap();
+        std::fs::write(tmp.path(), &h5).unwrap();
+        let file = rust_hdf5::H5File::open(tmp.path()).unwrap();
+        let attrs = file.attr_names().unwrap();
+        for key in ["sample", "temperature", "scale", "ok"] {
+            assert!(
+                attrs.contains(&key.to_string()),
+                "file attr '{key}' must be present; got {attrs:?}"
+            );
+        }
+    }
+
+    /// Python parity: a non-scalar metadata value fails the export, mirroring
+    /// h5py's `TypeError → SerializationError` (rust-hdf5 writes no array attrs).
+    #[test]
+    fn table_hdf5_non_scalar_metadata_fails() {
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1]))]).unwrap();
+        let ser = registry()
+            .dispatch(StructureFamily::Table, mime::HDF5)
+            .unwrap();
+        let err = ser(&ipc_bytes(&batch), &serde_json::json!({"tags": [1, 2, 3]}))
+            .expect_err("non-scalar metadata must fail the export")
+            .to_string();
+        assert!(
+            err.contains("tags") && err.contains("non-scalar"),
+            "error must name the offending key and reason: {err}"
         );
     }
 }
