@@ -15,6 +15,8 @@ pub mod excel_table;
 #[cfg(feature = "hdf5")]
 pub mod hdf5_array;
 #[cfg(feature = "hdf5")]
+mod hdf5_common;
+#[cfg(feature = "hdf5")]
 pub mod hdf5_table;
 #[cfg(feature = "image")]
 pub mod image_array;

@@ -60,8 +60,21 @@ fn hdf5_serializer() -> SerializerFn {
             let path = tmp.into_temp_path();
             let path_str = path.to_path_buf();
 
-            write_dataset(&path_str, data, itemsize, kind, &shape, big_endian)
-                .map_err(|e| format!("hdf5 write: {e}"))?;
+            let file =
+                rust_hdf5::H5File::create(&path_str).map_err(|e| format!("hdf5 create: {e}"))?;
+            crate::hdf5_common::write_array_dataset(
+                &file.root_group(),
+                "data",
+                data,
+                kind.chars().next().unwrap_or('f'),
+                itemsize,
+                big_endian,
+                &shape,
+            )
+            .map_err(|e| format!("hdf5 write: {e}"))?;
+            // Close the file so all buffered bytes hit the path before we read
+            // them back.
+            drop(file);
 
             let mut buf = Vec::new();
             std::fs::File::open(&path_str)
@@ -71,77 +84,6 @@ fn hdf5_serializer() -> SerializerFn {
             Ok(Bytes::from(buf))
         },
     )
-}
-
-fn write_dataset(
-    path: &std::path::Path,
-    data: &[u8],
-    itemsize: usize,
-    kind: &str,
-    shape: &[usize],
-    big_endian: bool,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let file = rust_hdf5::H5File::create(path)?;
-    match (kind, itemsize) {
-        ("f", 8) => write_typed::<f64>(&file, data, shape, 8, big_endian)?,
-        ("f", 4) => write_typed::<f32>(&file, data, shape, 4, big_endian)?,
-        ("i", 8) => write_typed::<i64>(&file, data, shape, 8, big_endian)?,
-        ("i", 4) => write_typed::<i32>(&file, data, shape, 4, big_endian)?,
-        ("i", 2) => write_typed::<i16>(&file, data, shape, 2, big_endian)?,
-        ("i", 1) => write_typed::<i8>(&file, data, shape, 1, big_endian)?,
-        ("u", 8) => write_typed::<u64>(&file, data, shape, 8, big_endian)?,
-        ("u", 4) => write_typed::<u32>(&file, data, shape, 4, big_endian)?,
-        ("u", 2) => write_typed::<u16>(&file, data, shape, 2, big_endian)?,
-        ("u", 1) => write_typed::<u8>(&file, data, shape, 1, big_endian)?,
-        other => {
-            return Err(format!("unsupported dtype kind/itemsize: {other:?} {itemsize}").into());
-        }
-    }
-    Ok(())
-}
-
-fn write_typed<T>(
-    file: &rust_hdf5::H5File,
-    data: &[u8],
-    shape: &[usize],
-    itemsize: usize,
-    big_endian: bool,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
-where
-    T: rust_hdf5::types::H5Type + Copy,
-{
-    if !data.len().is_multiple_of(itemsize) {
-        return Err(format!(
-            "byte buffer length {} not aligned to itemsize {itemsize}",
-            data.len()
-        )
-        .into());
-    }
-    let n = data.len() / itemsize;
-    // Reinterpret the byte slice as &[T]. Caller has already validated itemsize
-    // matches T. The host is little-endian (x86/arm); a big-endian source buffer
-    // is byte-swapped per element to native LE first, so the value stored in
-    // `T` is correct and the native HDF5 datatype matches it. Cast goes through
-    // a Vec to satisfy alignment.
-    let mut typed: Vec<T> = Vec::with_capacity(n);
-    let chunk = itemsize;
-    let mut buf = vec![0u8; chunk];
-    for i in 0..n {
-        buf.copy_from_slice(&data[i * chunk..(i + 1) * chunk]);
-        if big_endian {
-            buf.reverse();
-        }
-        // SAFETY: we write `itemsize` bytes (now in native byte order) that
-        // match T's layout.
-        unsafe {
-            let mut value = std::mem::MaybeUninit::<T>::uninit();
-            std::ptr::copy_nonoverlapping(buf.as_ptr(), value.as_mut_ptr() as *mut u8, chunk);
-            typed.push(value.assume_init());
-        }
-    }
-    let dataset = file.new_dataset::<T>().shape(shape).create("data")?;
-    dataset.write_raw(&typed)?;
-    Ok(())
 }
 
 #[cfg(test)]

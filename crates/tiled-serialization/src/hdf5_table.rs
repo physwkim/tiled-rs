@@ -25,11 +25,6 @@
 
 use std::io::Read;
 
-use arrow::array::{
-    Array, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
-    UInt8Array, UInt16Array, UInt32Array, UInt64Array,
-};
-use arrow::datatypes::DataType;
 use arrow::ipc::reader::FileReader;
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
@@ -87,97 +82,9 @@ type DynError = Box<dyn std::error::Error + Send + Sync>;
 
 fn write_table(path: &std::path::Path, batch: &RecordBatch) -> Result<(), DynError> {
     let file = rust_hdf5::H5File::create(path)?;
+    let group = file.root_group();
     for (i, field) in batch.schema().fields().iter().enumerate() {
-        write_column(&file, field.name(), batch.column(i).as_ref())?;
-    }
-    Ok(())
-}
-
-/// Write one Arrow column as a 1-D HDF5 dataset named `name`.
-///
-/// HDF5 has no native null: float nulls become NaN (matching the JSON
-/// serializer's NaN↔null rule and h5py's float behavior), and integer/boolean
-/// nulls carry their underlying buffer value (pandas promotes nullable integer
-/// columns to float, so a genuinely null-bearing integer column does not reach
-/// the integer arms). String/temporal columns are unsupported — see the module
-/// docs (rust-hdf5 has no string dataset type).
-fn write_column(file: &rust_hdf5::H5File, name: &str, array: &dyn Array) -> Result<(), DynError> {
-    let n = array.len();
-
-    // Integer/unsigned: copy the underlying values buffer verbatim.
-    macro_rules! write_copy {
-        ($arr_ty:ty, $native:ty) => {{
-            let a = array
-                .as_any()
-                .downcast_ref::<$arr_ty>()
-                .ok_or_else(|| -> DynError {
-                    format!("downcast to {} failed", stringify!($arr_ty)).into()
-                })?;
-            let values: Vec<$native> = a.values().to_vec();
-            file.new_dataset::<$native>()
-                .shape([n])
-                .create(name)?
-                .write_raw(&values)?;
-        }};
-    }
-
-    // Float: map each slot, turning Arrow nulls into NaN.
-    macro_rules! write_float {
-        ($arr_ty:ty, $native:ty) => {{
-            let a = array
-                .as_any()
-                .downcast_ref::<$arr_ty>()
-                .ok_or_else(|| -> DynError {
-                    format!("downcast to {} failed", stringify!($arr_ty)).into()
-                })?;
-            let values: Vec<$native> = (0..n)
-                .map(|i| {
-                    if a.is_null(i) {
-                        <$native>::NAN
-                    } else {
-                        a.value(i)
-                    }
-                })
-                .collect();
-            file.new_dataset::<$native>()
-                .shape([n])
-                .create(name)?
-                .write_raw(&values)?;
-        }};
-    }
-
-    match array.data_type() {
-        DataType::Int8 => write_copy!(Int8Array, i8),
-        DataType::Int16 => write_copy!(Int16Array, i16),
-        DataType::Int32 => write_copy!(Int32Array, i32),
-        DataType::Int64 => write_copy!(Int64Array, i64),
-        DataType::UInt8 => write_copy!(UInt8Array, u8),
-        DataType::UInt16 => write_copy!(UInt16Array, u16),
-        DataType::UInt32 => write_copy!(UInt32Array, u32),
-        DataType::UInt64 => write_copy!(UInt64Array, u64),
-        DataType::Float32 => write_float!(Float32Array, f32),
-        DataType::Float64 => write_float!(Float64Array, f64),
-        DataType::Boolean => {
-            let a = array
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .ok_or_else(|| -> DynError { "downcast to BooleanArray failed".into() })?;
-            // No native bool dataset path; store as u8 (0/1), null → 0.
-            let values: Vec<u8> = (0..n)
-                .map(|i| u8::from(!a.is_null(i) && a.value(i)))
-                .collect();
-            file.new_dataset::<u8>()
-                .shape([n])
-                .create(name)?
-                .write_raw(&values)?;
-        }
-        other => {
-            return Err(format!(
-                "hdf5 table serializer does not support column '{name}' of type {other:?} \
-                 (rust-hdf5 has no string/temporal dataset support)"
-            )
-            .into());
-        }
+        crate::hdf5_common::write_table_column(&group, field.name(), batch.column(i).as_ref())?;
     }
     Ok(())
 }
