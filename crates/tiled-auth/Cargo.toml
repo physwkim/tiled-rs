@@ -8,6 +8,7 @@ default = ["oidc"]
 oidc = ["dep:reqwest", "dep:sha2"]
 saml = ["dep:samael"]
 ldap = []
+pam = ["dep:libc"]
 
 [dependencies]
 tiled-core = { workspace = true }
@@ -32,7 +33,13 @@ axum = { workspace = true }
 reqwest = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
 samael = { version = "0.0.21", features = ["xmlsec"], optional = true }
+# PAM is bound via a minimal portable FFI surface (pam_start/pam_authenticate/
+# pam_end + a conversation callback) over the system `libpam`, so it builds on
+# both Linux-PAM and macOS/BSD OpenPAM. `libc` supplies the C allocator that
+# PAM frees the conversation response array with.
+libc = { version = "0.2", optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+serde_yaml = { workspace = true }

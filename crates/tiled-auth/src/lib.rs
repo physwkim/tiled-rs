@@ -28,6 +28,10 @@ pub mod migrate;
 /// unconditionally (a harmless empty table when the feature is off).
 #[cfg(feature = "oidc")]
 pub mod oidc_flow;
+/// PAM (Pluggable Authentication Modules) username/password authenticator.
+/// Gated on `pam`, which links the system `libpam`.
+#[cfg(feature = "pam")]
+pub mod pam;
 /// IdP-brokered OAuth2 device-code flow (pending-session store). Gated on
 /// `oidc` because it is meaningful only with an external OIDC provider; the
 /// `0007_add_pending_sessions` migration runs unconditionally (a harmless
@@ -52,6 +56,8 @@ pub use external_oidc::{
 pub use jwt::{AccessClaims, Issuer, RefreshClaims};
 #[cfg(feature = "oidc")]
 pub use oidc_flow::OidcFlowState;
+#[cfg(feature = "pam")]
+pub use pam::{PamAuthenticator, PamConfig};
 #[cfg(feature = "oidc")]
 pub use pending_session::{PendingSessionInit, PendingSessionRecord, PendingSessionStatus};
 pub use principal::{Identity, IdentityView, Principal, PrincipalDetail};
