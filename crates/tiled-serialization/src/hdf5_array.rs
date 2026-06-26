@@ -3,8 +3,14 @@
 //! `rust-hdf5`'s API only writes through a file path, so we round-trip
 //! through a temp file: serialize → write → read bytes → return. The
 //! resulting blob is a self-contained .h5 file with one dataset at
-//! `/data` storing the array. Metadata `attrs` is attached as HDF5
-//! attributes on the dataset.
+//! `/data` storing the array.
+//!
+//! Python registers no `(array, application/x-hdf5)` serializer — only the
+//! table and container families have one (`serialize_hdf5`) — so this is a
+//! Rust-only export. The `meta` it receives is the array *structure*
+//! (kind/itemsize/shape/byteorder), not the node's user metadata, so no
+//! dataset attributes are written here; node-metadata→attrs lives in the
+//! container deep-export (which can reach `adapter.metadata()`).
 
 #![cfg(feature = "hdf5")]
 
@@ -70,6 +76,9 @@ fn hdf5_serializer() -> SerializerFn {
                 itemsize,
                 big_endian,
                 &shape,
+                // `meta` here is the array structure, not user metadata; no
+                // node-metadata attrs for the Rust-only array export.
+                &serde_json::Value::Null,
             )
             .map_err(|e| format!("hdf5 write: {e}"))?;
             // Close the file so all buffered bytes hit the path before we read

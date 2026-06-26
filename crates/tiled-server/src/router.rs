@@ -1928,12 +1928,16 @@ pub async fn container_full(
             .and_then(|s| s.parse::<usize>().ok())
             .map(|d| d.min(DEPTH_LIMIT));
         let mut entries: Vec<ZipEntry> = Vec::new();
+        // The zip export carries metadata in the JSON tree, not per-entry, so the
+        // collected group metadata is discarded here.
+        let mut group_metas: Vec<(String, serde_json::Value)> = Vec::new();
         collect_zip_entries(
             container,
             "",
             &path,
             access_filter.as_ref(),
             &mut entries,
+            &mut group_metas,
             0,
             max_depth,
         )
@@ -1955,7 +1959,7 @@ pub async fn container_full(
             SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
         let mut writer: ZipBuf = zip::ZipWriter::new(Cursor::new(Vec::<u8>::new()));
         let mut cumulative_bytes: usize = 0;
-        for ZipEntry { name, leaf } in entries {
+        for ZipEntry { name, leaf, .. } in entries {
             match leaf {
                 ZipLeaf::Array(arc) => {
                     let slice = tiled_core::ndslice::NDSlice::empty();
@@ -2150,6 +2154,13 @@ struct ZipEntry {
     /// Full in-zip filename including extension (`.bin` / `.arrow` / `.json`).
     name: String,
     leaf: ZipLeaf,
+    /// The leaf node's own metadata. Read only by the HDF5 export
+    /// (`container_full_hdf5`), where it becomes dataset/group attributes; the zip
+    /// export carries metadata in the JSON tree instead and ignores it. Hence it
+    /// is genuinely unread when the `hdf5-serializer` feature is off — a
+    /// feature-conditional field, not dead code. `Null` for crumbs.
+    #[cfg_attr(not(feature = "hdf5-serializer"), allow(dead_code))]
+    metadata: serde_json::Value,
 }
 
 /// The owned-buffer ZipWriter that ping-pongs through `spawn_blocking` in
@@ -2172,12 +2183,16 @@ enum CollectedH5Leaf {
         itemsize: usize,
         big_endian: bool,
         shape: Vec<usize>,
+        /// The array node's metadata → dataset attributes.
+        metadata: serde_json::Value,
     },
     Table {
         /// Group path for the table (its key); each column becomes a dataset
         /// beneath it.
         group_path: String,
         batch: arrow::record_batch::RecordBatch,
+        /// The table node's metadata → group attributes.
+        metadata: serde_json::Value,
     },
 }
 
@@ -2213,13 +2228,20 @@ async fn container_full_hdf5(
         .and_then(|s| s.parse::<usize>().ok())
         .map(|d| d.min(DEPTH_LIMIT));
 
+    // The export root's metadata becomes the HDF5 file (root group) attributes —
+    // Python `file.attrs.update(metadata)`.
+    let root_metadata = container.metadata().clone();
+
     let mut entries: Vec<ZipEntry> = Vec::new();
+    // (group_path, metadata) for each intermediate container → group attributes.
+    let mut group_metas: Vec<(String, serde_json::Value)> = Vec::new();
     collect_zip_entries(
         container,
         "",
         path,
         access_filter,
         &mut entries,
+        &mut group_metas,
         0,
         max_depth,
     )
@@ -2230,7 +2252,12 @@ async fn container_full_hdf5(
     // tree is held decoded before the single-file build).
     let mut collected: Vec<CollectedH5Leaf> = Vec::new();
     let mut cumulative_bytes: usize = 0;
-    for ZipEntry { name, leaf } in entries {
+    for ZipEntry {
+        name,
+        leaf,
+        metadata,
+    } in entries
+    {
         match leaf {
             ZipLeaf::Array(arc) => {
                 let slice = tiled_core::ndslice::NDSlice::empty();
@@ -2255,6 +2282,7 @@ async fn container_full_hdf5(
                     big_endian: nd.dtype.endianness.to_numpy_char() == '>',
                     shape: nd.shape.clone(),
                     data: nd.data,
+                    metadata,
                 });
             }
             ZipLeaf::Table(arc) => {
@@ -2282,7 +2310,11 @@ async fn container_full_hdf5(
                         .map_err(|e| ServerError::Internal(format!("arrow concat: {e}")))?
                 };
                 let group_path = name.strip_suffix(".arrow").unwrap_or(&name).to_string();
-                collected.push(CollectedH5Leaf::Table { group_path, batch });
+                collected.push(CollectedH5Leaf::Table {
+                    group_path,
+                    batch,
+                    metadata,
+                });
             }
             ZipLeaf::Crumb(_) => continue,
         }
@@ -2292,6 +2324,14 @@ async fn container_full_hdf5(
     let h5 = tokio::task::spawn_blocking(move || -> Result<bytes::Bytes, ServerError> {
         let mut builder =
             Hdf5TreeBuilder::new().map_err(|e| ServerError::Internal(format!("hdf5 init: {e}")))?;
+        // Root attrs, then register every group's attrs BEFORE the leaves so the
+        // attributes land the moment each group is created by `ensure_group`.
+        builder
+            .set_root_attrs(&root_metadata)
+            .map_err(|e| ServerError::Internal(format!("hdf5 root attrs: {e}")))?;
+        for (group_path, meta) in group_metas {
+            builder.register_group_attrs(group_path, meta);
+        }
         for leaf in collected {
             match leaf {
                 CollectedH5Leaf::Array {
@@ -2302,6 +2342,7 @@ async fn container_full_hdf5(
                     itemsize,
                     big_endian,
                     shape,
+                    metadata,
                 } => {
                     builder
                         .add_array(
@@ -2312,12 +2353,17 @@ async fn container_full_hdf5(
                             itemsize,
                             big_endian,
                             &shape,
+                            &metadata,
                         )
                         .map_err(|e| ServerError::Internal(format!("hdf5 array '{name}': {e}")))?;
                 }
-                CollectedH5Leaf::Table { group_path, batch } => {
+                CollectedH5Leaf::Table {
+                    group_path,
+                    batch,
+                    metadata,
+                } => {
                     builder
-                        .add_table_columns(&group_path, &batch)
+                        .add_table_columns(&group_path, &batch, &metadata)
                         .map_err(|e| {
                             ServerError::Internal(format!("hdf5 table '{group_path}': {e}"))
                         })?;
@@ -2348,12 +2394,17 @@ const DEPTH_LIMIT: usize = 5;
 /// the caller is not permitted to see.
 /// `current_depth` is the depth of `container` relative to the export root
 /// (0 = root). `max_depth` caps the walk; `None` means unlimited.
+#[allow(clippy::too_many_arguments)]
 fn collect_zip_entries<'a>(
     container: &'a dyn ContainerAdapter,
     prefix: &'a str,
     base_path: &'a str,
     access_filter: Option<&'a tiled_core::queries::AccessBlobFilter>,
     out: &'a mut Vec<ZipEntry>,
+    // Intermediate-container metadata collected as `(group_path, metadata)` for
+    // the HDF5 export's group attributes. The zip export passes a throwaway Vec
+    // and ignores it.
+    group_metas: &'a mut Vec<(String, serde_json::Value)>,
     current_depth: usize,
     max_depth: Option<usize>,
 ) -> tiled_core::adapters::BoxFuture<'a, Result<(), ServerError>> {
@@ -2377,15 +2428,20 @@ fn collect_zip_entries<'a>(
             } else {
                 format!("{prefix}/{key}")
             };
+            // The child's own metadata, captured before `as_*` so it is available
+            // for the HDF5 export regardless of which family branch is taken.
+            let child_meta = child.metadata().clone();
             if let Some(arc) = child.as_array_arc() {
                 out.push(ZipEntry {
                     name: format!("{entry_name}.bin"),
                     leaf: ZipLeaf::Array(arc),
+                    metadata: child_meta,
                 });
             } else if let Some(arc) = child.as_table_arc() {
                 out.push(ZipEntry {
                     name: format!("{entry_name}.arrow"),
                     leaf: ZipLeaf::Table(arc),
+                    metadata: child_meta,
                 });
             } else if let Some(child_c) = child.as_container() {
                 if max_depth.is_some_and(|d| current_depth >= d) {
@@ -2401,14 +2457,19 @@ fn collect_zip_entries<'a>(
                     out.push(ZipEntry {
                         name: format!("{entry_name}.json"),
                         leaf: ZipLeaf::Crumb(crumb_bytes),
+                        metadata: serde_json::Value::Null,
                     });
                 } else {
+                    // Record this container's metadata for its HDF5 group attrs,
+                    // then recurse into it.
+                    group_metas.push((entry_name.clone(), child_meta));
                     collect_zip_entries(
                         child_c,
                         &entry_name,
                         base_path,
                         access_filter,
                         out,
+                        group_metas,
                         current_depth + 1,
                         max_depth,
                     )
@@ -2427,6 +2488,7 @@ fn collect_zip_entries<'a>(
                 out.push(ZipEntry {
                     name: format!("{entry_name}.json"),
                     leaf: ZipLeaf::Crumb(crumb_bytes),
+                    metadata: serde_json::Value::Null,
                 });
             }
         }

@@ -15,14 +15,155 @@ use arrow::array::{
     UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow::datatypes::DataType;
-use rust_hdf5::H5Group;
+use rust_hdf5::types::{HBool, VarLenUnicode};
+use rust_hdf5::{H5Dataset, H5File, H5Group};
+use serde_json::Value;
 
 pub(crate) type DynError = Box<dyn std::error::Error + Send + Sync>;
+
+/// A target that can carry HDF5 scalar attributes: a file (root attrs), a group
+/// (node attrs), or a dataset (leaf attrs). It unifies the two distinct
+/// rust-hdf5 attribute APIs — `set_attr_string`/`set_attr_numeric` on
+/// files/groups, the `new_attr` builder on datasets — so [`write_scalar_attrs`]
+/// serves all three with one mapping.
+trait AttrTarget {
+    fn put_str(&self, name: &str, value: &str) -> Result<(), DynError>;
+    fn put_bool(&self, name: &str, value: bool) -> Result<(), DynError>;
+    fn put_i64(&self, name: &str, value: i64) -> Result<(), DynError>;
+    fn put_f64(&self, name: &str, value: f64) -> Result<(), DynError>;
+}
+
+impl AttrTarget for H5File {
+    fn put_str(&self, name: &str, value: &str) -> Result<(), DynError> {
+        self.set_attr_string(name, value)?;
+        Ok(())
+    }
+    fn put_bool(&self, name: &str, value: bool) -> Result<(), DynError> {
+        self.set_attr_numeric(name, &HBool::from(value))?;
+        Ok(())
+    }
+    fn put_i64(&self, name: &str, value: i64) -> Result<(), DynError> {
+        self.set_attr_numeric(name, &value)?;
+        Ok(())
+    }
+    fn put_f64(&self, name: &str, value: f64) -> Result<(), DynError> {
+        self.set_attr_numeric(name, &value)?;
+        Ok(())
+    }
+}
+
+impl AttrTarget for H5Group {
+    fn put_str(&self, name: &str, value: &str) -> Result<(), DynError> {
+        self.set_attr_string(name, value)?;
+        Ok(())
+    }
+    fn put_bool(&self, name: &str, value: bool) -> Result<(), DynError> {
+        self.set_attr_numeric(name, &HBool::from(value))?;
+        Ok(())
+    }
+    fn put_i64(&self, name: &str, value: i64) -> Result<(), DynError> {
+        self.set_attr_numeric(name, &value)?;
+        Ok(())
+    }
+    fn put_f64(&self, name: &str, value: f64) -> Result<(), DynError> {
+        self.set_attr_numeric(name, &value)?;
+        Ok(())
+    }
+}
+
+impl AttrTarget for H5Dataset {
+    fn put_str(&self, name: &str, value: &str) -> Result<(), DynError> {
+        self.new_attr::<VarLenUnicode>()
+            .shape(())
+            .create(name)?
+            .write_string(value)?;
+        Ok(())
+    }
+    fn put_bool(&self, name: &str, value: bool) -> Result<(), DynError> {
+        self.new_attr::<HBool>()
+            .shape(())
+            .create(name)?
+            .write_numeric(&HBool::from(value))?;
+        Ok(())
+    }
+    fn put_i64(&self, name: &str, value: i64) -> Result<(), DynError> {
+        self.new_attr::<i64>()
+            .shape(())
+            .create(name)?
+            .write_numeric(&value)?;
+        Ok(())
+    }
+    fn put_f64(&self, name: &str, value: f64) -> Result<(), DynError> {
+        self.new_attr::<f64>()
+            .shape(())
+            .create(name)?
+            .write_numeric(&value)?;
+        Ok(())
+    }
+}
+
+/// Write a JSON metadata object as HDF5 scalar attributes on `target`.
+///
+/// Mirrors Python `serialize_hdf5`'s `file/group.attrs.update(metadata)` and
+/// `dataset.attrs.create(k, v)`. Python raises `SerializationError` for any value
+/// h5py cannot store as an attribute; rust-hdf5 0.2.20 writes only *scalar*
+/// attributes (no array attrs — its `AttrBuilder::shape` only supports scalars),
+/// so the four scalar JSON kinds (string/bool/integer/float) map to attributes
+/// and every other value — array, nested object, null — is a hard error that
+/// fails the whole export. That is the same fail-fast contract as Python's
+/// `except TypeError: raise SerializationError`, surfaced here as an `Err`.
+/// (A non-object `meta`, e.g. `Null`, writes nothing — there are no attrs to set.)
+fn write_scalar_attrs<T: AttrTarget>(target: &T, meta: &Value) -> Result<(), DynError> {
+    let Some(obj) = meta.as_object() else {
+        return Ok(());
+    };
+    for (key, value) in obj {
+        match value {
+            Value::String(s) => target.put_str(key, s)?,
+            Value::Bool(b) => target.put_bool(key, *b)?,
+            Value::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    target.put_i64(key, i)?;
+                } else if let Some(f) = n.as_f64() {
+                    target.put_f64(key, f)?;
+                } else {
+                    return Err(format!(
+                        "metadata attribute '{key}': numeric value is not representable \
+                         as i64 or f64"
+                    )
+                    .into());
+                }
+            }
+            Value::Array(_) | Value::Object(_) | Value::Null => {
+                return Err(format!(
+                    "metadata attribute '{key}' has a non-scalar value (array/object/null) \
+                     that HDF5 cannot store as an attribute; export fails (Python's h5py \
+                     raises the same as SerializationError)"
+                )
+                .into());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Write a metadata object as attributes on a file (HDF5 root attrs).
+pub(crate) fn write_file_attrs(file: &H5File, meta: &Value) -> Result<(), DynError> {
+    write_scalar_attrs(file, meta)
+}
+
+/// Write a metadata object as attributes on a group (node attrs).
+pub(crate) fn write_group_attrs(group: &H5Group, meta: &Value) -> Result<(), DynError> {
+    write_scalar_attrs(group, meta)
+}
 
 /// Write a raw numeric byte buffer as a dataset `name` (shape `shape`) under
 /// `group`. `kind`/`itemsize` are the numpy dtype kind char (`f`/`i`/`u`) and
 /// element size; `big_endian` byte-swaps each element to native before storing
-/// (matching the CSV/array serializers' `>`-buffer handling).
+/// (matching the CSV/array serializers' `>`-buffer handling). `attrs` is the
+/// array node's metadata, written as dataset attributes (Python
+/// `dataset.attrs.create`); pass `&Value::Null` for a leaf with no metadata.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn write_array_dataset(
     group: &H5Group,
     name: &str,
@@ -31,18 +172,19 @@ pub(crate) fn write_array_dataset(
     itemsize: usize,
     big_endian: bool,
     shape: &[usize],
+    attrs: &Value,
 ) -> Result<(), DynError> {
     match (kind, itemsize) {
-        ('f', 8) => write_typed_into::<f64>(group, name, data, shape, 8, big_endian),
-        ('f', 4) => write_typed_into::<f32>(group, name, data, shape, 4, big_endian),
-        ('i', 8) => write_typed_into::<i64>(group, name, data, shape, 8, big_endian),
-        ('i', 4) => write_typed_into::<i32>(group, name, data, shape, 4, big_endian),
-        ('i', 2) => write_typed_into::<i16>(group, name, data, shape, 2, big_endian),
-        ('i', 1) => write_typed_into::<i8>(group, name, data, shape, 1, big_endian),
-        ('u', 8) => write_typed_into::<u64>(group, name, data, shape, 8, big_endian),
-        ('u', 4) => write_typed_into::<u32>(group, name, data, shape, 4, big_endian),
-        ('u', 2) => write_typed_into::<u16>(group, name, data, shape, 2, big_endian),
-        ('u', 1) => write_typed_into::<u8>(group, name, data, shape, 1, big_endian),
+        ('f', 8) => write_typed_into::<f64>(group, name, data, shape, 8, big_endian, attrs),
+        ('f', 4) => write_typed_into::<f32>(group, name, data, shape, 4, big_endian, attrs),
+        ('i', 8) => write_typed_into::<i64>(group, name, data, shape, 8, big_endian, attrs),
+        ('i', 4) => write_typed_into::<i32>(group, name, data, shape, 4, big_endian, attrs),
+        ('i', 2) => write_typed_into::<i16>(group, name, data, shape, 2, big_endian, attrs),
+        ('i', 1) => write_typed_into::<i8>(group, name, data, shape, 1, big_endian, attrs),
+        ('u', 8) => write_typed_into::<u64>(group, name, data, shape, 8, big_endian, attrs),
+        ('u', 4) => write_typed_into::<u32>(group, name, data, shape, 4, big_endian, attrs),
+        ('u', 2) => write_typed_into::<u16>(group, name, data, shape, 2, big_endian, attrs),
+        ('u', 1) => write_typed_into::<u8>(group, name, data, shape, 1, big_endian, attrs),
         other => Err(format!("unsupported dtype kind/itemsize: {other:?}").into()),
     }
 }
@@ -54,6 +196,7 @@ fn write_typed_into<T>(
     shape: &[usize],
     itemsize: usize,
     big_endian: bool,
+    attrs: &Value,
 ) -> Result<(), DynError>
 where
     T: rust_hdf5::types::H5Type + Copy,
@@ -89,6 +232,7 @@ where
     }
     let dataset = group.new_dataset::<T>().shape(shape).create(name)?;
     dataset.write_raw(&typed)?;
+    write_scalar_attrs(&dataset, attrs)?;
     Ok(())
 }
 

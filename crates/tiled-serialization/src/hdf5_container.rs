@@ -15,12 +15,19 @@
 //! registers the `(Container, application/x-hdf5)` media type so the format is
 //! advertised by the About endpoint and resolvable via content negotiation.
 //!
-//! Parity gap (UNFIXED, deliberate): Python also copies each node's `metadata()`
-//! into HDF5 group/dataset `attrs`. tiled-rs does not write metadata as HDF5
-//! attributes here — same scope decision as the array/table exporters (a faithful
-//! JSON→HDF5 attribute mapping is its own task). Only the group/dataset tree is
-//! built. Sparse/awkward leaves are skipped (Python's `walk` also has no defined
-//! dataset shape for them).
+//! Node metadata is written as HDF5 attributes, matching Python: the root
+//! container's metadata → file (root group) attrs, each intermediate container's
+//! metadata → group attrs, each array's metadata → dataset attrs, and a table
+//! node's metadata → its group's attrs. Only *scalar* JSON values map (string,
+//! integer, float, bool) — rust-hdf5 0.2.20 writes no array attributes — so a
+//! non-scalar metadata value (nested object, array, null) fails the whole export,
+//! the same fail-fast contract as Python's `except TypeError: raise
+//! SerializationError`. See [`crate::hdf5_common::write_file_attrs`].
+//!
+//! Remaining parity gaps (UNFIXED, library-bound): sparse/awkward leaves are
+//! skipped — Python's `walk` has no defined dataset shape for them either — and
+//! string/temporal columns are unsupported because rust-hdf5 0.2.20 has no string
+//! *dataset* type (h5py does), so those columns hard-error.
 
 #![cfg(feature = "hdf5")]
 
@@ -28,6 +35,7 @@ use std::io::Read;
 
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
+use serde_json::Value;
 
 use tiled_core::media_type::mime;
 use tiled_core::structures::StructureFamily;
@@ -49,6 +57,11 @@ pub struct Hdf5TreeBuilder {
     /// in read mode), so we cannot probe-then-create; we track what we made and
     /// `create_group` only the first time a path is seen.
     created: std::collections::HashSet<String>,
+    /// Metadata to write as group attributes, keyed by full group path ("a/b").
+    /// Applied the moment a group is first created in [`ensure_group`], so the
+    /// attrs land whichever leaf forces the group into existence. Registered up
+    /// front via [`register_group_attrs`](Self::register_group_attrs).
+    group_attrs: std::collections::HashMap<String, Value>,
 }
 
 impl Hdf5TreeBuilder {
@@ -63,12 +76,31 @@ impl Hdf5TreeBuilder {
             file,
             tmp,
             created: std::collections::HashSet::new(),
+            group_attrs: std::collections::HashMap::new(),
         })
     }
 
+    /// Record the root container's metadata as file (root group) attributes —
+    /// Python `file.attrs.update(metadata)`. Call once before adding leaves.
+    pub fn set_root_attrs(&mut self, meta: &Value) -> Result<(), Hdf5BuildError> {
+        crate::hdf5_common::write_file_attrs(&self.file, meta)
+    }
+
+    /// Register an intermediate container's metadata to be written as group
+    /// attributes when that group is created. Must be called before the leaves
+    /// that create the group are added (the whole point is to apply attrs at
+    /// create time, since a reopened write-mode group handle cannot be trusted).
+    pub fn register_group_attrs(&mut self, group_path: String, meta: Value) {
+        if group_path.is_empty() {
+            return;
+        }
+        self.group_attrs.insert(group_path, meta);
+    }
+
     /// Resolve `group_path` ("a/b/c") to its `H5Group`, creating each level the
-    /// first time it is seen and reopening a handle thereafter. Empty path → the
-    /// file root.
+    /// first time it is seen and reopening a handle thereafter. On first creation
+    /// of a level, any registered group attributes for that path are written.
+    /// Empty path → the file root.
     fn ensure_group(&mut self, group_path: &str) -> Result<rust_hdf5::H5Group, Hdf5BuildError> {
         let mut cur = self.file.root_group();
         let mut acc = String::new();
@@ -85,13 +117,18 @@ impl Hdf5TreeBuilder {
                 cur.group(comp)?
             } else {
                 self.created.insert(acc.clone());
-                cur.create_group(comp)?
+                let group = cur.create_group(comp)?;
+                if let Some(meta) = self.group_attrs.get(&acc) {
+                    crate::hdf5_common::write_group_attrs(&group, meta)?;
+                }
+                group
             };
         }
         Ok(cur)
     }
 
-    /// Write a raw numeric array as dataset `name` under `group_path`.
+    /// Write a raw numeric array as dataset `name` under `group_path`, with the
+    /// array node's `metadata` as dataset attributes.
     #[allow(clippy::too_many_arguments)]
     pub fn add_array(
         &mut self,
@@ -102,21 +139,27 @@ impl Hdf5TreeBuilder {
         itemsize: usize,
         big_endian: bool,
         shape: &[usize],
+        metadata: &Value,
     ) -> Result<(), Hdf5BuildError> {
         let group = self.ensure_group(group_path)?;
         crate::hdf5_common::write_array_dataset(
-            &group, name, data, kind, itemsize, big_endian, shape,
+            &group, name, data, kind, itemsize, big_endian, shape, metadata,
         )
     }
 
     /// Write each column of `batch` as its own 1-D dataset under `group_path`
-    /// (the column-per-dataset rule, named after the column).
+    /// (the column-per-dataset rule, named after the column). The table node's
+    /// `metadata` is written as attributes on the table's group — Python copies
+    /// it onto each per-column dataset, but with one group per table the group is
+    /// the single natural carrier (and the columns stay attribute-free).
     pub fn add_table_columns(
         &mut self,
         group_path: &str,
         batch: &RecordBatch,
+        metadata: &Value,
     ) -> Result<(), Hdf5BuildError> {
         let group = self.ensure_group(group_path)?;
+        crate::hdf5_common::write_group_attrs(&group, metadata)?;
         for (i, field) in batch.schema().fields().iter().enumerate() {
             crate::hdf5_common::write_table_column(&group, field.name(), batch.column(i).as_ref())?;
         }
@@ -183,7 +226,7 @@ mod tests {
             .flat_map(|v| v.to_le_bytes())
             .collect();
         builder
-            .add_array("", "top", &top, 'f', 8, false, &[3])
+            .add_array("", "top", &top, 'f', 8, false, &[3], &Value::Null)
             .unwrap();
 
         // array `grp/inner` under a group
@@ -192,7 +235,7 @@ mod tests {
             .flat_map(|v| v.to_le_bytes())
             .collect();
         builder
-            .add_array("grp", "inner", &inner, 'f', 8, false, &[2])
+            .add_array("grp", "inner", &inner, 'f', 8, false, &[2], &Value::Null)
             .unwrap();
 
         // table at group `grp/tbl` → one dataset per column
@@ -208,7 +251,9 @@ mod tests {
             ],
         )
         .unwrap();
-        builder.add_table_columns("grp/tbl", &batch).unwrap();
+        builder
+            .add_table_columns("grp/tbl", &batch, &Value::Null)
+            .unwrap();
 
         let bytes = builder.finish().unwrap();
         assert_eq!(&bytes[..8], b"\x89HDF\r\n\x1a\n", "HDF5 magic signature");
@@ -244,5 +289,103 @@ mod tests {
             .read_slice::<f64>(&[0], &[3])
             .unwrap();
         assert_eq!(y.to_vec(), vec![0.5, 1.5, 2.5]);
+    }
+
+    /// Node metadata lands as HDF5 attributes: root metadata on the file, an
+    /// intermediate container's metadata on its group, and an array's metadata on
+    /// its dataset, with the four scalar JSON kinds mapping to scalar attributes.
+    /// Group/file attrs are checked by name (rust-hdf5 reads only dataset attr
+    /// *values*); dataset attrs are checked by value across string/int/float/bool.
+    #[test]
+    fn builder_writes_metadata_as_attrs() {
+        let mut builder = Hdf5TreeBuilder::new().unwrap();
+        builder
+            .set_root_attrs(&serde_json::json!({"experiment": "alpha", "run": 42}))
+            .unwrap();
+        builder.register_group_attrs("grp".to_string(), serde_json::json!({"kind": "detector"}));
+
+        let img: Vec<u8> = [1.0f64, 2.0].iter().flat_map(|v| v.to_le_bytes()).collect();
+        builder
+            .add_array(
+                "grp",
+                "img",
+                &img,
+                'f',
+                8,
+                false,
+                &[2],
+                &serde_json::json!({
+                    "units": "counts", "gain": 2.5, "channels": 7, "ok": true,
+                }),
+            )
+            .unwrap();
+
+        let bytes = builder.finish().unwrap();
+        let tmp = tempfile::Builder::new().suffix(".h5").tempfile().unwrap();
+        std::fs::write(tmp.path(), &bytes).unwrap();
+        let file = rust_hdf5::H5File::open(tmp.path()).unwrap();
+
+        // Root attrs on the file.
+        let root_attrs = file.attr_names().unwrap();
+        assert!(root_attrs.contains(&"experiment".to_string()));
+        assert!(root_attrs.contains(&"run".to_string()));
+
+        // Group attrs on the intermediate container's group.
+        let grp_attrs = file
+            .root_group()
+            .group("grp")
+            .unwrap()
+            .attr_names()
+            .unwrap();
+        assert!(grp_attrs.contains(&"kind".to_string()));
+
+        // Dataset attrs on the array leaf — values, one per scalar kind.
+        let ds = file.dataset("grp/img").unwrap();
+        assert_eq!(ds.attr("units").unwrap().read_string().unwrap(), "counts");
+        assert_eq!(ds.attr("gain").unwrap().read_numeric::<f64>().unwrap(), 2.5);
+        assert_eq!(
+            ds.attr("channels").unwrap().read_numeric::<i64>().unwrap(),
+            7
+        );
+        assert_eq!(
+            ds.attr("ok")
+                .unwrap()
+                .read_numeric::<rust_hdf5::types::HBool>()
+                .unwrap()
+                .0,
+            1
+        );
+    }
+
+    /// Python parity: a non-scalar metadata value (nested object / array / null)
+    /// fails the whole export, mirroring h5py's `TypeError → SerializationError`.
+    /// rust-hdf5 writes only scalar attributes, so there is no array-attr fallback.
+    #[test]
+    fn builder_rejects_non_scalar_metadata() {
+        let mut builder = Hdf5TreeBuilder::new().unwrap();
+        let err = builder
+            .set_root_attrs(&serde_json::json!({"tags": [1, 2, 3]}))
+            .expect_err("a non-scalar (array) metadata value must fail the export");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("tags") && msg.contains("non-scalar"),
+            "error must name the offending key and reason: {msg}"
+        );
+
+        // Nested object is equally rejected, on a dataset's metadata.
+        let data: Vec<u8> = 1.0f64.to_le_bytes().to_vec();
+        let err = builder
+            .add_array(
+                "",
+                "d",
+                &data,
+                'f',
+                8,
+                false,
+                &[1],
+                &serde_json::json!({"calibration": {"slope": 1.0}}),
+            )
+            .expect_err("a nested-object metadata value must fail the export");
+        assert!(err.to_string().contains("calibration"));
     }
 }

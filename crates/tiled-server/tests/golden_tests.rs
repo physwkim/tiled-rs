@@ -1167,11 +1167,15 @@ async fn container_full_explicit_unsupported_accept_returns_406() {
 /// Serialization M4 (HDF5 deep-export): GET /container/full/?format=h5 walks the
 /// subtree and emits one self-contained HDF5 file — each numeric array a
 /// dataset, nested containers groups (Python `container.serialize_hdf5`). Only
-/// built with the `hdf5-serializer` feature (system libhdf5). Dataset values and
-/// the group/column layout are covered by the tiled-serialization builder unit
-/// tests; here we assert the router walks → reads → builds → returns a valid
-/// `.h5` with the right content-type (a 200 + magic also proves the nested
-/// `subgroup/nested_arr` leaf was read and written, else the build would 500).
+/// built with the `hdf5-serializer` feature (system libhdf5). Dataset values, the
+/// group/column layout, and the metadata→attrs mapping are covered by the
+/// tiled-serialization builder unit tests; here we assert the router walks →
+/// reads → builds → returns a valid `.h5` with the right content-type (a 200 +
+/// magic also proves the nested `subgroup/nested_arr` leaf was read and written,
+/// else the build would 500). The fixture sets *scalar* metadata on the root
+/// (`description`), `some_array` (`element`), and `subgroup` (`nested`) nodes, so
+/// a 200 also proves the metadata→attrs plumbing succeeded — a non-scalar value
+/// would 500 (see `container_full_hdf5_non_scalar_metadata_fails`).
 #[cfg(feature = "hdf5-serializer")]
 #[tokio::test]
 async fn container_full_hdf5_export_emits_valid_hdf5() {
@@ -1211,6 +1215,32 @@ async fn container_full_hdf5_via_accept_header() {
     assert!(
         body.len() > 8 && &body[..8] == b"\x89HDF\r\n\x1a\n",
         "body must be a valid HDF5 file (magic signature)"
+    );
+}
+
+/// Python parity, end-to-end: node metadata that cannot map to HDF5 scalar
+/// attributes (here a nested object on the root) fails the export with a 5xx —
+/// mirroring Python `serialize_hdf5`'s `except TypeError: raise
+/// SerializationError`, not a silent metadata drop. rust-hdf5 writes only scalar
+/// attributes, so there is no array-attr fallback.
+#[cfg(feature = "hdf5-serializer")]
+#[tokio::test]
+async fn container_full_hdf5_non_scalar_metadata_fails() {
+    let mut mapping = IndexMap::new();
+    let data: Vec<f64> = vec![1.0, 2.0];
+    let arr = ArrayAdapter::from_f64_1d(&data, serde_json::json!({}));
+    mapping.insert("a".to_string(), AnyAdapter::Array(Arc::new(arr)));
+    let root = MapAdapter::new(
+        mapping,
+        serde_json::json!({"calibration": {"slope": 1.0}}),
+        vec![],
+    );
+    let app = build_app_for_root(Arc::new(root), 300_000_000);
+    let (status, _headers, _body) =
+        get_with_headers(&app, "/api/v1/container/full/?format=h5", &[]).await;
+    assert!(
+        status.is_server_error(),
+        "a non-scalar metadata value must fail the hdf5 export; got {status}"
     );
 }
 
