@@ -93,6 +93,7 @@ async fn migrate_and_principal_lifecycle() {
             "0005_tag_registry".to_string(),
             "0006_add_session_state".to_string(),
             "0007_add_pending_sessions".to_string(),
+            "0008_add_oidc_flow_states".to_string(),
         ]
     );
 
@@ -389,6 +390,103 @@ async fn pending_session_invalid_hex_device_code_is_unauthorized() {
         db.poll_pending_session(&other).await,
         Err(tiled_auth::AuthError::NotFound(_))
     ));
+}
+
+// === OIDC authorization-code (PKCE browser) flow state — DB-backed (G6) ===
+
+// Round-trip + single use: create persists the verifier/nonce/provider; take
+// recovers them exactly once and atomically deletes the row, so a replayed
+// callback (second take) finds nothing.
+#[tokio::test]
+async fn oidc_flow_create_take_single_use() {
+    let (db, _dir) = fresh_db().await;
+    db.create_oidc_flow_state(
+        "state-xyz",
+        "mock-idp",
+        "the-code-verifier",
+        "the-nonce",
+        Duration::minutes(10),
+    )
+    .await
+    .unwrap();
+
+    let flow = db
+        .take_oidc_flow_state("state-xyz")
+        .await
+        .unwrap()
+        .expect("valid state must be recoverable");
+    assert_eq!(flow.provider, "mock-idp");
+    assert_eq!(flow.code_verifier, "the-code-verifier");
+    assert_eq!(flow.nonce, "the-nonce");
+
+    // Single use: the second take (a replay) finds the row already consumed.
+    assert!(
+        db.take_oidc_flow_state("state-xyz")
+            .await
+            .unwrap()
+            .is_none(),
+        "a consumed flow state must not be reusable"
+    );
+}
+
+// An unknown state yields None, never an error.
+#[tokio::test]
+async fn oidc_flow_take_unknown_state_is_none() {
+    let (db, _dir) = fresh_db().await;
+    assert!(
+        db.take_oidc_flow_state("no-such-state")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+// Boundary: expiration_time < now. An expired state yields None AND is consumed
+// by the take (delete-regardless), so it cannot be replayed once it lapses.
+#[tokio::test]
+async fn oidc_flow_expired_take_is_none() {
+    let (db, _dir) = fresh_db().await;
+    db.create_oidc_flow_state(
+        "stale-state",
+        "mock-idp",
+        "v",
+        "n",
+        Duration::seconds(-1), // already expired
+    )
+    .await
+    .unwrap();
+    assert!(
+        db.take_oidc_flow_state("stale-state")
+            .await
+            .unwrap()
+            .is_none(),
+        "expired state must not be honored"
+    );
+    // The row was removed by that take; a follow-up is still None.
+    assert!(
+        db.take_oidc_flow_state("stale-state")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+// Distinct states are independent: consuming one leaves the other intact.
+#[tokio::test]
+async fn oidc_flow_states_are_keyed_independently() {
+    let (db, _dir) = fresh_db().await;
+    db.create_oidc_flow_state("state-a", "idp", "va", "na", Duration::minutes(10))
+        .await
+        .unwrap();
+    db.create_oidc_flow_state("state-b", "idp", "vb", "nb", Duration::minutes(10))
+        .await
+        .unwrap();
+
+    let a = db.take_oidc_flow_state("state-a").await.unwrap().unwrap();
+    assert_eq!(a.code_verifier, "va");
+    // Consuming state-a must not touch state-b.
+    let b = db.take_oidc_flow_state("state-b").await.unwrap().unwrap();
+    assert_eq!(b.code_verifier, "vb");
 }
 
 /// Python parity: `create_default_roles` in authn_database/core.py defines

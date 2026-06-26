@@ -828,11 +828,16 @@ pub async fn get_principal(
 // OIDC authorization-code flow (#1178)
 // ---------------------------------------------------------------------------
 
+/// Minutes a server-side PKCE flow state stays valid between `/authorize` and
+/// `/callback` (matches the former in-memory store's 10-minute expiry).
+const OIDC_FLOW_TTL_MINUTES: i64 = 10;
+
 /// `GET /api/v1/auth/provider/{provider}/authorize`
 ///
 /// Redirect the browser to the IdP's authorization endpoint with PKCE S256,
-/// nonce, and state. Pending state is stored server-side for consumption by
-/// the `/callback` route. Mirrors Python `authorize_redirect_route`
+/// nonce, and state. The server-side PKCE state is persisted in the auth DB
+/// (single owner; survives across processes — G6) for consumption by the
+/// `/callback` route. Mirrors Python `authorize_redirect_route`
 /// (authentication.py:954-976).
 pub async fn oidc_authorize(
     State(state): State<AppState>,
@@ -850,10 +855,22 @@ pub async fn oidc_authorize(
         base.trim_end_matches('/'),
         provider
     );
-    let authorize_url = validator
+    let redirect = validator
         .build_authorize_url(&provider, &redirect_uri)
         .map_err(map_auth_err)?;
-    Ok(Redirect::to(&authorize_url))
+    // Persist the PKCE state so the callback — which may land on a different
+    // process behind a load balancer — can recover and consume it (G6).
+    let (db, _issuer) = require_auth_db(&state)?;
+    db.create_oidc_flow_state(
+        &redirect.state,
+        &provider,
+        &redirect.code_verifier,
+        &redirect.nonce,
+        Duration::minutes(OIDC_FLOW_TTL_MINUTES),
+    )
+    .await
+    .map_err(map_auth_err)?;
+    Ok(Redirect::to(&redirect.url))
 }
 
 /// Query parameters received on the callback URL.
@@ -909,8 +926,22 @@ pub async fn oidc_callback(
         provider
     );
 
+    // Recover and consume the server-side PKCE state (single use; expiry
+    // enforced in the DB — G6). Unknown / expired / replayed `state` → 401.
+    let flow = db
+        .take_oidc_flow_state(state_param)
+        .await
+        .map_err(map_auth_err)?
+        .ok_or_else(|| {
+            ServerError::Unauthorized(
+                "unknown or expired authorization state — the state parameter was tampered \
+                 with, the authorize window elapsed, or the callback was replayed"
+                    .into(),
+            )
+        })?;
+
     let code_flow = validator
-        .exchange_code_flow(state_param, code, &redirect_uri)
+        .exchange_code_flow(&flow, code, &redirect_uri)
         .await
         .map_err(map_auth_err)?;
     let validated = code_flow.token;

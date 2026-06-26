@@ -1241,7 +1241,8 @@ mod tests {
             .expect("an OIDC provider must yield a validator");
         let url = validator
             .build_authorize_url("keycloak", "https://app.test/cb")
-            .expect("provider must be wired for the code flow");
+            .expect("provider must be wired for the code flow")
+            .url;
         assert!(
             url.starts_with("https://idp.test/authorize?"),
             "authorize URL must target the configured endpoint: {url}"

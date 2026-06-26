@@ -23,6 +23,11 @@ pub mod error;
 pub mod external_oidc;
 pub mod jwt;
 pub mod migrate;
+/// OIDC authorization-code (PKCE browser) flow — DB-backed pending-state store
+/// (G6). Gated on `oidc`; the `0008_add_oidc_flow_states` migration runs
+/// unconditionally (a harmless empty table when the feature is off).
+#[cfg(feature = "oidc")]
+pub mod oidc_flow;
 /// IdP-brokered OAuth2 device-code flow (pending-session store). Gated on
 /// `oidc` because it is meaningful only with an external OIDC provider; the
 /// `0007_add_pending_sessions` migration runs unconditionally (a harmless
@@ -41,10 +46,12 @@ pub use db::AuthDb;
 pub use error::{AuthError, Result};
 #[cfg(feature = "oidc")]
 pub use external_oidc::{
-    CodeFlowSession, ExternalOidcValidator, IdentityMapping, OidcDiscovery, OidcProvider,
-    PendingAuth, PendingAuthStore, ValidatedToken, discover_oidc,
+    AuthorizeRedirect, CodeFlowSession, ExternalOidcValidator, IdentityMapping, OidcDiscovery,
+    OidcProvider, ValidatedToken, discover_oidc,
 };
 pub use jwt::{AccessClaims, Issuer, RefreshClaims};
+#[cfg(feature = "oidc")]
+pub use oidc_flow::OidcFlowState;
 #[cfg(feature = "oidc")]
 pub use pending_session::{PendingSessionInit, PendingSessionRecord, PendingSessionStatus};
 pub use principal::{Identity, IdentityView, Principal, PrincipalDetail};

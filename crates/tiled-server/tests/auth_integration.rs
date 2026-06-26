@@ -1838,19 +1838,23 @@ async fn build_code_flow_app(
 ) -> (
     axum::Router,
     Arc<tiled_auth::ExternalOidcValidator>,
+    tiled_auth::AuthDb,
     tempfile::TempDir,
 ) {
     build_code_flow_app_with_mapping(token_endpoint, tiled_auth::IdentityMapping::Standard).await
 }
 
 /// Like [`build_code_flow_app`] but with a configurable identity mapping, so a
-/// test can exercise the Entra OBO path (G3).
+/// test can exercise the Entra OBO path (G3). Returns the [`AuthDb`] handle so
+/// a test can seed an OIDC flow state directly (the PKCE store is DB-backed —
+/// G6).
 async fn build_code_flow_app_with_mapping(
     token_endpoint: &str,
     identity_mapping: tiled_auth::IdentityMapping,
 ) -> (
     axum::Router,
     Arc<tiled_auth::ExternalOidcValidator>,
+    tiled_auth::AuthDb,
     tempfile::TempDir,
 ) {
     use jsonwebtoken::Algorithm;
@@ -1911,7 +1915,7 @@ async fn build_code_flow_app_with_mapping(
         trust_forwarded_headers: false,
         api_key: None,
         catalog: Some(catalog.clone()),
-        auth_db: Some(auth_db),
+        auth_db: Some(auth_db.clone()),
         issuer: Some(issuer),
         authenticators: vec![],
         proxied_header_auth: None,
@@ -1933,7 +1937,7 @@ async fn build_code_flow_app_with_mapping(
         exact_count_limit: u64::MAX,
     };
     let app = tiled_server::build_app(state);
-    (app, validator, dir)
+    (app, validator, auth_db, dir)
 }
 
 /// Mint an HS256 id_token for code-flow tests with the mock-idp key.
@@ -1964,7 +1968,8 @@ fn mint_code_flow_id_token(sub: &str, nonce: &str) -> String {
 /// code_challenge + state in the Location header.
 #[tokio::test]
 async fn oidc_authorize_302_with_pkce_params() {
-    let (app, _validator, _dir) = build_code_flow_app("https://mock-idp.test/token").await;
+    let (app, _validator, _auth_db, _dir) =
+        build_code_flow_app("https://mock-idp.test/token").await;
 
     let req = Request::builder()
         .method(Method::GET)
@@ -2023,7 +2028,8 @@ async fn oidc_authorize_302_with_pkce_params() {
 /// revoke). `refresh_session` points at tiled's own refresh route, not the IdP.
 #[tokio::test]
 async fn about_advertises_oidc_end_session_endpoint_as_logout() {
-    let (app, _validator, _dir) = build_code_flow_app("https://mock-idp.test/token").await;
+    let (app, _validator, _auth_db, _dir) =
+        build_code_flow_app("https://mock-idp.test/token").await;
 
     let (status, body) = json_request(
         &app,
@@ -2088,7 +2094,8 @@ async fn about_logout_falls_back_to_local_route_without_oidc() {
 /// GET /authorize for an unknown provider → Validation error (not 302).
 #[tokio::test]
 async fn oidc_authorize_unknown_provider_returns_error() {
-    let (app, _validator, _dir) = build_code_flow_app("https://mock-idp.test/token").await;
+    let (app, _validator, _auth_db, _dir) =
+        build_code_flow_app("https://mock-idp.test/token").await;
 
     let req = Request::builder()
         .method(Method::GET)
@@ -2107,7 +2114,8 @@ async fn oidc_authorize_unknown_provider_returns_error() {
 /// GET /callback with an unknown state → 401.
 #[tokio::test]
 async fn oidc_callback_unknown_state_rejected() {
-    let (app, _validator, _dir) = build_code_flow_app("https://mock-idp.test/token").await;
+    let (app, _validator, _auth_db, _dir) =
+        build_code_flow_app("https://mock-idp.test/token").await;
 
     let req = Request::builder()
         .method(Method::GET)
@@ -2126,19 +2134,19 @@ async fn oidc_callback_unknown_state_rejected() {
 /// GET /callback with expired state → 401.
 #[tokio::test]
 async fn oidc_callback_expired_state_rejected() {
-    use chrono::{Duration, Utc};
-    let (app, validator, _dir) = build_code_flow_app("https://mock-idp.test/token").await;
+    use chrono::Duration;
+    let (app, _validator, db, _dir) = build_code_flow_app("https://mock-idp.test/token").await;
 
-    // Inject an already-expired pending auth.
-    validator.inject_pending_auth_for_test(
-        "expired-state".into(),
-        tiled_auth::PendingAuth {
-            provider: "mock-idp".into(),
-            code_verifier: "some-verifier".into(),
-            nonce: "some-nonce".into(),
-            expires_at: Utc::now() - Duration::seconds(1),
-        },
-    );
+    // Seed an already-expired flow state (negative TTL → expiration in the past).
+    db.create_oidc_flow_state(
+        "expired-state",
+        "mock-idp",
+        "some-verifier",
+        "some-nonce",
+        Duration::seconds(-1),
+    )
+    .await
+    .unwrap();
 
     let req = Request::builder()
         .method(Method::GET)
@@ -2164,7 +2172,7 @@ async fn oidc_callback_with_mock_idp_mints_session() {
     use axum::Router;
     use axum::body::Bytes;
     use axum::routing::post;
-    use chrono::{Duration, Utc};
+    use chrono::Duration;
     use std::collections::HashMap;
 
     // Spin up a local mock token endpoint.
@@ -2206,18 +2214,18 @@ async fn oidc_callback_with_mock_idp_mints_session() {
         axum::serve(listener, mock_app).await.unwrap();
     });
 
-    let (app, validator, _dir) = build_code_flow_app(&token_endpoint).await;
+    let (app, _validator, db, _dir) = build_code_flow_app(&token_endpoint).await;
 
-    // Pre-inject the known pending auth with our known state + nonce.
-    validator.inject_pending_auth_for_test(
-        known_state.into(),
-        tiled_auth::PendingAuth {
-            provider: "mock-idp".into(),
-            code_verifier: "known-verifier".into(),
-            nonce: known_nonce.into(),
-            expires_at: Utc::now() + Duration::minutes(10),
-        },
-    );
+    // Pre-seed the known flow state (DB-backed) with our known state + nonce.
+    db.create_oidc_flow_state(
+        known_state,
+        "mock-idp",
+        "known-verifier",
+        known_nonce,
+        Duration::minutes(10),
+    )
+    .await
+    .unwrap();
 
     let callback_uri =
         format!("/api/v1/auth/provider/mock-idp/callback?code=mock-code&state={known_state}");
@@ -2269,7 +2277,7 @@ async fn oidc_callback_entra_embeds_obo_tokens_and_survives_refresh() {
     use axum::Router;
     use axum::body::Bytes;
     use axum::routing::post;
-    use chrono::{Duration, Utc};
+    use chrono::Duration;
     use tower::ServiceExt as _; // app.clone().oneshot twice
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2300,17 +2308,17 @@ async fn oidc_callback_entra_embeds_obo_tokens_and_survives_refresh() {
         axum::serve(listener, mock_app).await.unwrap();
     });
 
-    let (app, validator, _dir) =
+    let (app, _validator, db, _dir) =
         build_code_flow_app_with_mapping(&token_endpoint, tiled_auth::IdentityMapping::Entra).await;
-    validator.inject_pending_auth_for_test(
-        known_state.into(),
-        tiled_auth::PendingAuth {
-            provider: "mock-idp".into(),
-            code_verifier: "verifier".into(),
-            nonce: known_nonce.into(),
-            expires_at: Utc::now() + Duration::minutes(10),
-        },
-    );
+    db.create_oidc_flow_state(
+        known_state,
+        "mock-idp",
+        "verifier",
+        known_nonce,
+        Duration::minutes(10),
+    )
+    .await
+    .unwrap();
 
     // --- initial login via callback ---
     let callback_uri =
@@ -2418,7 +2426,7 @@ async fn oidc_callback_state_not_replayable() {
     use axum::Router;
     use axum::body::Bytes;
     use axum::routing::post;
-    use chrono::{Duration, Utc};
+    use chrono::Duration;
     use tower::ServiceExt as _; // second oneshot
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2447,22 +2455,23 @@ async fn oidc_callback_state_not_replayable() {
         axum::serve(listener, mock_app).await.unwrap();
     });
 
-    let (app, validator, _dir) = build_code_flow_app(&token_endpoint).await;
+    let (app, _validator, db, _dir) = build_code_flow_app(&token_endpoint).await;
 
-    validator.inject_pending_auth_for_test(
-        known_state.into(),
-        tiled_auth::PendingAuth {
-            provider: "mock-idp".into(),
-            code_verifier: "verifier".into(),
-            nonce: known_nonce.into(),
-            expires_at: Utc::now() + Duration::minutes(10),
-        },
-    );
+    db.create_oidc_flow_state(
+        known_state,
+        "mock-idp",
+        "verifier",
+        known_nonce,
+        Duration::minutes(10),
+    )
+    .await
+    .unwrap();
 
     let callback_uri =
         format!("/api/v1/auth/provider/mock-idp/callback?code=c&state={known_state}");
 
-    // First request should succeed.
+    // First request should succeed (consumes the single-use flow state); the
+    // second must be rejected as a replay (the row is already deleted).
     let resp1 = app
         .clone()
         .oneshot(
@@ -2547,7 +2556,8 @@ async fn spawn_mock_device_token_endpoint(id_token: String, extra: serde_json::V
 /// user_code, interval, expires_in.
 #[tokio::test]
 async fn oidc_device_authorize_returns_broker_response() {
-    let (app, _validator, _dir) = build_code_flow_app("https://mock-idp.test/token").await;
+    let (app, _validator, _auth_db, _dir) =
+        build_code_flow_app("https://mock-idp.test/token").await;
 
     let req = Request::builder()
         .method(Method::POST)
@@ -2608,7 +2618,7 @@ async fn oidc_device_authorize_returns_broker_response() {
 async fn oidc_device_flow_pending_then_fulfilled() {
     let id_token = mint_code_flow_id_token("device-bob", "ignored-nonce");
     let token_endpoint = spawn_mock_device_token_endpoint(id_token, serde_json::json!({})).await;
-    let (app, _validator, _dir) = build_code_flow_app(&token_endpoint).await;
+    let (app, _validator, _auth_db, _dir) = build_code_flow_app(&token_endpoint).await;
 
     // 1. authorize
     let resp = app
@@ -2715,7 +2725,7 @@ async fn oidc_device_flow_entra_embeds_obo() {
         }),
     )
     .await;
-    let (app, _validator, _dir) =
+    let (app, _validator, _auth_db, _dir) =
         build_code_flow_app_with_mapping(&token_endpoint, tiled_auth::IdentityMapping::Entra).await;
 
     // authorize → user_code/device_code

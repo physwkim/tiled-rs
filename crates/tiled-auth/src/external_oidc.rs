@@ -17,17 +17,20 @@
 //! `OidcProvider` may carry code-flow config (`client_id`,
 //! `authorization_endpoint`, `token_endpoint`). When those fields are
 //! set, `ExternalOidcValidator::build_authorize_url` builds a
-//! browser-redirect URL with PKCE S256 + nonce (OIDC Core §3.1.2.1).
-//! After the IdP redirects back with `?code=…&state=…`,
-//! `exchange_code_flow` exchanges the code at `token_endpoint`, validates
-//! the returned `id_token` (same JWKS machinery + nonce check per OIDC
-//! Core §3.1.3.7 #11), and returns the principal identity.
+//! browser-redirect URL with PKCE S256 + nonce (OIDC Core §3.1.2.1) and
+//! returns an [`AuthorizeRedirect`] carrying the verifier/nonce/state the
+//! caller persists. After the IdP redirects back with `?code=…&state=…`,
+//! `exchange_code_flow` (given the recovered [`crate::OidcFlowState`])
+//! exchanges the code at `token_endpoint`, validates the returned `id_token`
+//! (same JWKS machinery + nonce check per OIDC Core §3.1.3.7 #11), and returns
+//! the principal identity.
 //!
-//! **Single-process limitation**: `PendingAuthStore` is an in-memory
-//! `Mutex<HashMap>`. The `/authorize` and `/callback` requests MUST land
-//! on the same process. A horizontally-scaled deployment needs a shared
-//! external store (e.g. Redis) to avoid "unknown state" errors on the
-//! callback.
+//! **Pending-state ownership (G6)**: the PKCE state between `/authorize` and
+//! `/callback` lives in the auth DB ([`crate::AuthDb::create_oidc_flow_state`]
+//! / [`crate::AuthDb::take_oidc_flow_state`]), NOT in this validator. That makes
+//! the flow survive restarts and multi-process / load-balanced deployments
+//! where the two requests land on different processes. This validator is
+//! stateless w.r.t. the flow — it only builds URLs and exchanges codes.
 
 #![cfg(feature = "oidc")]
 
@@ -41,6 +44,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 
 use crate::error::{AuthError, Result};
+use crate::oidc_flow::OidcFlowState;
 use crate::scopes::{Scope, ScopeSet};
 
 /// How a provider derives the principal subject (and username) from a verified
@@ -228,66 +232,31 @@ struct CachedKeys {
 }
 
 // ---------------------------------------------------------------------------
-// Pending authorization-code state store
+// Authorization-code redirect
 // ---------------------------------------------------------------------------
 
-/// Server-side state kept between the `/authorize` redirect (generated)
-/// and the `/callback` completion (consumed). Expires after 10 minutes.
+/// Result of [`ExternalOidcValidator::build_authorize_url`]: the redirect URL
+/// to send the browser to, plus the server-side PKCE state the caller MUST
+/// persist (via [`crate::AuthDb::create_oidc_flow_state`], keyed by `state`) so
+/// the `/callback` can recover it. Persistence is the DB's job — the single
+/// owner of pending-flow state (G6) — not this validator's.
 ///
-/// The `state` key is a 16-byte cryptographically random token, so
-/// guessing it is infeasible — this also provides CSRF protection per
-/// OAuth 2.0 §10.12 / RFC 6819 §4.4.1.8.
-pub struct PendingAuth {
-    /// Name of the OIDC provider that initiated the flow.
-    pub provider: String,
-    /// PKCE code verifier (43 base64url chars, RFC 7636 §4.1).
-    /// Sent to the token endpoint so the IdP can verify the S256
-    /// `code_challenge` from the authorization request.
+/// The `state` is a cryptographically random token, so guessing it is
+/// infeasible; it doubles as CSRF protection per OAuth 2.0 §10.12 /
+/// RFC 6819 §4.4.1.8.
+#[derive(Debug, Clone)]
+pub struct AuthorizeRedirect {
+    /// Full IdP authorization URL (becomes the `Location:` on the 302).
+    pub url: String,
+    /// Random OAuth2 `state` — CSRF token and the DB lookup key. Only its hash
+    /// is persisted; the raw value is echoed back by the browser on callback.
+    pub state: String,
+    /// PKCE code verifier (43 base64url chars, RFC 7636 §4.1) to persist; sent
+    /// to the token endpoint so the IdP can verify the S256 `code_challenge`.
     pub code_verifier: String,
-    /// OIDC nonce embedded in the authorization URL and expected in the
-    /// returned `id_token` (OIDC Core §3.1.3.7 #11).
+    /// OIDC nonce to persist; checked against the returned `id_token`
+    /// (OIDC Core §3.1.3.7 #11).
     pub nonce: String,
-    /// Absolute expiry. Entries past this are rejected and lazily purged.
-    pub expires_at: DateTime<Utc>,
-}
-
-/// In-memory pending-auth state store.
-///
-/// **Single-process limitation**: does not survive restarts or survive
-/// load-balanced deployments where the `/callback` may land on a
-/// different process than `/authorize`. Wire a Redis / DB-backed store
-/// for multi-process deployments.
-pub struct PendingAuthStore {
-    inner: std::sync::Mutex<HashMap<String, PendingAuth>>,
-}
-
-impl PendingAuthStore {
-    fn new() -> Self {
-        Self {
-            inner: std::sync::Mutex::new(HashMap::new()),
-        }
-    }
-
-    pub fn insert(&self, state: String, pending: PendingAuth) {
-        let mut map = self.inner.lock().expect("pending auth store poisoned");
-        map.insert(state, pending);
-    }
-
-    /// Remove and return the pending auth for `state`. Returns `None` when
-    /// the state is unknown or has expired. Lazily purges other stale
-    /// entries on every call.
-    pub fn take(&self, state: &str) -> Option<PendingAuth> {
-        let mut map = self.inner.lock().expect("pending auth store poisoned");
-        // Always consume — prevents replay even for expired entries.
-        let entry = map.remove(state)?;
-        // Lazily purge other stale entries while we hold the lock.
-        let now = Utc::now();
-        map.retain(|_, v| v.expires_at > now);
-        if entry.expires_at <= now {
-            return None;
-        }
-        Some(entry)
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -302,10 +271,6 @@ pub struct ExternalOidcValidator {
     cache: Arc<RwLock<HashMap<String, CachedKeys>>>,
     cache_ttl: Duration,
     http: reqwest::Client,
-    /// In-memory store for pending authorization-code states. Shared
-    /// across clones via `Arc` so the `/authorize` handler and the
-    /// `/callback` handler see the same store.
-    pub flow_store: Arc<PendingAuthStore>,
 }
 
 impl std::fmt::Debug for ExternalOidcValidator {
@@ -337,7 +302,6 @@ impl ExternalOidcValidator {
             cache: Arc::new(RwLock::new(HashMap::new())),
             cache_ttl: Duration::hours(1),
             http: reqwest::Client::new(),
-            flow_store: Arc::new(PendingAuthStore::new()),
         })
     }
 
@@ -370,14 +334,6 @@ impl ExternalOidcValidator {
             .write()
             .await
             .insert(provider_name.to_string(), cached);
-    }
-
-    /// Pre-insert a known `PendingAuth` entry. For tests only — allows
-    /// the test to inject a known state + nonce so the mock token endpoint
-    /// can embed the correct nonce in the id_token.
-    #[doc(hidden)]
-    pub fn inject_pending_auth_for_test(&self, state: String, pending: PendingAuth) {
-        self.flow_store.insert(state, pending);
     }
 
     /// Return the configured providers. Used by server routes that need
@@ -444,12 +400,16 @@ impl ExternalOidcValidator {
     /// Build the authorization redirect URL for a code-flow provider.
     ///
     /// Generates a PKCE code verifier + S256 challenge, a random OAuth2
-    /// `state` parameter, and a random OIDC `nonce`. The pending state is
-    /// stored in `flow_store` with a 10-minute expiry; `exchange_code_flow`
-    /// retrieves and consumes it on the callback.
-    ///
-    /// Returns the full redirect URL (to be sent as `Location: …` in a 302).
-    pub fn build_authorize_url(&self, provider_name: &str, redirect_uri: &str) -> Result<String> {
+    /// `state` parameter, and a random OIDC `nonce`. Returns an
+    /// [`AuthorizeRedirect`] carrying the URL (to send as `Location: …` in a
+    /// 302) plus the verifier/nonce/state; the caller persists that state via
+    /// [`crate::AuthDb::create_oidc_flow_state`] so `exchange_code_flow` can
+    /// recover it on the callback. This method does no persistence itself.
+    pub fn build_authorize_url(
+        &self,
+        provider_name: &str,
+        redirect_uri: &str,
+    ) -> Result<AuthorizeRedirect> {
         let provider = self
             .providers
             .iter()
@@ -473,16 +433,6 @@ impl ExternalOidcValidator {
         let nonce = gen_nonce();
         let state = gen_state();
 
-        self.flow_store.insert(
-            state.clone(),
-            PendingAuth {
-                provider: provider_name.to_string(),
-                code_verifier,
-                nonce: nonce.clone(),
-                expires_at: Utc::now() + Duration::minutes(10),
-            },
-        );
-
         let mut url = reqwest::Url::parse(auth_endpoint).map_err(|e| {
             AuthError::Validation(format!("bad authorization_endpoint '{auth_endpoint}': {e}"))
         })?;
@@ -497,39 +447,36 @@ impl ExternalOidcValidator {
             .append_pair("nonce", &nonce)
             .append_pair("prompt", "login");
 
-        Ok(url.to_string())
+        Ok(AuthorizeRedirect {
+            url: url.to_string(),
+            state,
+            code_verifier,
+            nonce,
+        })
     }
 
     /// Exchange an authorization code for tokens, validate the `id_token`,
     /// and return the principal identity.
     ///
-    /// Consumes the pending state keyed by `state_param`. Returns an error
-    /// when `state_param` is unknown, expired, or has already been used —
-    /// the entry is removed from the store even on failure so replayed
-    /// callbacks cannot succeed on retry.
+    /// `flow` is the server-side PKCE state the caller recovered (and consumed)
+    /// from [`crate::AuthDb::take_oidc_flow_state`] for this callback's `state`
+    /// — that store enforces single-use and expiry, so by the time we are here
+    /// the state is valid and already removed. This method holds no flow state
+    /// itself.
     pub async fn exchange_code_flow(
         &self,
-        state_param: &str,
+        flow: &OidcFlowState,
         code: &str,
         redirect_uri: &str,
     ) -> Result<CodeFlowSession> {
-        // Consume (and validate) the pending state.
-        let pending = self.flow_store.take(state_param).ok_or_else(|| {
-            AuthError::Unauthorized(
-                "unknown or expired authorization state — the state parameter was tampered \
-                 with, the 10-minute authorize window elapsed, or the callback was replayed"
-                    .into(),
-            )
-        })?;
-
         let provider = self
             .providers
             .iter()
-            .find(|p| p.name == pending.provider)
+            .find(|p| p.name == flow.provider)
             .ok_or_else(|| {
                 AuthError::Validation(format!(
                     "OIDC provider '{}' disappeared from config",
-                    pending.provider
+                    flow.provider
                 ))
             })?;
 
@@ -548,7 +495,7 @@ impl ExternalOidcValidator {
             ("client_id", client_id),
             ("redirect_uri", redirect_uri),
             ("code", code),
-            ("code_verifier", &pending.code_verifier),
+            ("code_verifier", &flow.code_verifier),
         ];
         if let Some(ref secret) = secret_clone {
             form.push(("client_secret", secret.as_str()));
@@ -561,7 +508,7 @@ impl ExternalOidcValidator {
         })?;
 
         let token = self
-            .validate_id_token(provider, id_token, Some(&pending.nonce))
+            .validate_id_token(provider, id_token, Some(&flow.nonce))
             .await?;
         // Capture the upstream IdP tokens for OBO (Entra only; `{}` otherwise),
         // mirroring EntraAuthenticator.authenticate (authenticators.py:497-502).
@@ -1426,64 +1373,21 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Pending auth store
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn pending_auth_store_round_trip() {
-        let store = PendingAuthStore::new();
-        store.insert(
-            "state-abc".into(),
-            PendingAuth {
-                provider: "idp".into(),
-                code_verifier: "verifier".into(),
-                nonce: "nonce123".into(),
-                expires_at: Utc::now() + Duration::minutes(10),
-            },
-        );
-        let got = store.take("state-abc").expect("entry should be present");
-        assert_eq!(got.provider, "idp");
-        assert_eq!(got.nonce, "nonce123");
-        // Second take must return None (consumed).
-        assert!(store.take("state-abc").is_none());
-    }
-
-    #[test]
-    fn pending_auth_store_unknown_state() {
-        let store = PendingAuthStore::new();
-        assert!(store.take("no-such-state").is_none());
-    }
-
-    #[test]
-    fn pending_auth_store_expired_entry() {
-        let store = PendingAuthStore::new();
-        store.insert(
-            "expired-state".into(),
-            PendingAuth {
-                provider: "idp".into(),
-                code_verifier: "v".into(),
-                nonce: "n".into(),
-                // Already expired.
-                expires_at: Utc::now() - Duration::seconds(1),
-            },
-        );
-        assert!(
-            store.take("expired-state").is_none(),
-            "expired entry must be rejected"
-        );
-    }
-
-    // -----------------------------------------------------------------------
     // build_authorize_url
+    //
+    // The pending-state STORE is now DB-backed ([`crate::AuthDb`]); its
+    // lifecycle (insert / single-use consume / expiry) is covered by the
+    // `oidc_flow_*` tests in tiled-auth/tests/sqlite_auth.rs. Here we only test
+    // the pure URL builder and the state it hands back for the caller to persist.
     // -----------------------------------------------------------------------
 
     #[test]
     fn build_authorize_url_structure() {
         let validator = ExternalOidcValidator::new(vec![code_flow_provider()]).unwrap();
-        let url_str = validator
+        let redirect = validator
             .build_authorize_url("code-idp", "https://tiled.example.com/callback")
             .unwrap();
-        let url = reqwest::Url::parse(&url_str).expect("returned URL must be valid");
+        let url = reqwest::Url::parse(&redirect.url).expect("returned URL must be valid");
 
         assert_eq!(url.scheme(), "https");
         assert_eq!(url.host_str(), Some("code-idp.test"));
@@ -1528,25 +1432,28 @@ mod tests {
     }
 
     #[test]
-    fn build_authorize_url_stores_pending_state() {
+    fn build_authorize_url_returns_state_to_persist() {
         let validator = ExternalOidcValidator::new(vec![code_flow_provider()]).unwrap();
-        let url_str = validator
+        let redirect = validator
             .build_authorize_url("code-idp", "https://tiled.example.com/callback")
             .unwrap();
-        let url = reqwest::Url::parse(&url_str).unwrap();
+        // The verifier/nonce/state the caller must persist are returned, not
+        // stored internally; the `state` returned must equal the one in the URL.
+        assert!(!redirect.code_verifier.is_empty());
+        assert!(!redirect.nonce.is_empty());
+        assert!(!redirect.state.is_empty());
+        let url = reqwest::Url::parse(&redirect.url).unwrap();
         let params: HashMap<_, _> = url.query_pairs().collect();
-        let state = params
-            .get("state")
-            .expect("state must be in URL")
-            .to_string();
-        // The pending entry must be in the store under that state key.
-        let pending = validator
-            .flow_store
-            .take(&state)
-            .expect("pending auth must be stored");
-        assert_eq!(pending.provider, "code-idp");
-        assert!(!pending.code_verifier.is_empty());
-        assert!(!pending.nonce.is_empty());
+        assert_eq!(
+            params.get("state").map(|s| s.as_ref()),
+            Some(redirect.state.as_str()),
+            "returned state must match the URL's state param"
+        );
+        assert_eq!(
+            params.get("nonce").map(|s| s.as_ref()),
+            Some(redirect.nonce.as_str()),
+            "returned nonce must match the URL's nonce param"
+        );
     }
 
     #[test]

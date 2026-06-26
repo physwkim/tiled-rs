@@ -34,6 +34,10 @@ const SQLITE_MIGRATIONS: &[(&str, &str)] = &[
         "0007_add_pending_sessions",
         include_str!("../migrations/sqlite/0007_add_pending_sessions.sql"),
     ),
+    (
+        "0008_add_oidc_flow_states",
+        include_str!("../migrations/sqlite/0008_add_oidc_flow_states.sql"),
+    ),
 ];
 
 const POSTGRES_MIGRATIONS: &[(&str, &str)] = &[
@@ -64,6 +68,10 @@ const POSTGRES_MIGRATIONS: &[(&str, &str)] = &[
     (
         "0007_add_pending_sessions",
         include_str!("../migrations/postgres/0007_add_pending_sessions.sql"),
+    ),
+    (
+        "0008_add_oidc_flow_states",
+        include_str!("../migrations/postgres/0008_add_oidc_flow_states.sql"),
     ),
 ];
 
