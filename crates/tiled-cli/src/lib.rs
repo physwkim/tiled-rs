@@ -666,7 +666,7 @@ pub async fn run(command: Command) -> Result<()> {
             }
 
             // Multi-user auth wiring.
-            let (auth_db_handle, mut issuer_handle, authenticators_built, proxied_auth) =
+            let (auth_db_handle, mut issuer_handle, mut authenticators_built, proxied_auth) =
                 build_auth_state(
                     auth_db_uri.as_deref(),
                     jwt_secret.as_deref(),
@@ -679,6 +679,24 @@ pub async fn run(command: Command) -> Result<()> {
                     proxied_auth_header,
                 )
                 .await?;
+
+            // Append config-declared internal (username/password) authenticators
+            // — LDAP/PAM from `authentication.providers`. They are served at
+            // `/auth/{provider}/login` and advertised by About as mode=internal,
+            // exactly like the `--user` dummy authenticator. Building them needs
+            // an auth DB to persist sessions (same contract as `--user`), so a
+            // config that declares them without one fails fast.
+            if let Some(auth_cfg) = file_config.as_ref().and_then(|c| c.authentication.as_ref()) {
+                let extra = auth_cfg.build_internal_authenticators()?;
+                if !extra.is_empty() && auth_db_handle.is_none() {
+                    anyhow::bail!(
+                        "authentication.providers configures LDAP/PAM authenticator(s) but no auth \
+                         database is set; provide --auth-db-uri and --jwt-secret (or \
+                         authentication.secret_keys) so the server can persist sessions"
+                    );
+                }
+                authenticators_built.extend(extra);
+            }
 
             // Bootstrap tiled_admins: ensure each listed (provider, id) principal
             // has role "admin". Mirrors Python app.py startup_event (app.py:702-712).

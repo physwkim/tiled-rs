@@ -8,6 +8,11 @@ default = ["web"]
 # Forwards to tiled-server's `web` feature so the same `#[cfg(feature = "web")]`
 # gate works on AppState field initialisations in this crate.
 web = ["tiled-server/web", "dep:tiled-web"]
+# Compile in the LDAP / PAM username-password authenticators (off by default,
+# like SAML). Each forwards to the matching tiled-auth feature; when off, an
+# `authentication.providers` entry that names LDAP/PAM is skipped with a warning.
+ldap = ["tiled-auth/ldap"]
+pam = ["tiled-auth/pam"]
 
 [dependencies]
 tiled-web = { workspace = true, optional = true }

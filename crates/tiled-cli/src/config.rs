@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use anyhow::Context;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use tiled_access::{AccessPolicy, PassthroughPolicy, TagBasedPolicy};
 use tiled_auth::{
@@ -358,15 +358,20 @@ pub struct AuthProviderConfig {
     pub provider: String,
     /// Authenticator selector (import path or short name). See the type docs.
     pub authenticator: String,
-    /// Authenticator arguments. Only the OIDC family is read.
+    /// Authenticator arguments — a raw YAML value, polymorphic by the
+    /// `authenticator` selector (exactly as Python passes a generic `args`
+    /// dict to the named authenticator's constructor). Each builder
+    /// deserializes it into its own typed config: [`OidcProviderArgs`] for the
+    /// OIDC family, `tiled_auth::LdapConfig` for LDAP, `tiled_auth::PamConfig`
+    /// for PAM. An absent `args:` is `Null`, treated as an empty mapping.
     #[serde(default)]
-    pub args: OidcProviderArgs,
+    pub args: serde_yaml::Value,
 }
 
 /// `args` for an OIDC-family provider. Mirrors the constructor kwargs of
 /// Python's `OIDCAuthenticator` (`authenticators.py`): one `well_known_uri`
 /// drives endpoint discovery, or the endpoints are given explicitly.
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct OidcProviderArgs {
     /// Required `aud` claim every token must carry. Maps to the
     /// (single-element) `OidcProvider::audiences`.
@@ -420,12 +425,10 @@ impl AuthConfig {
     pub async fn build_oidc_validator(&self) -> anyhow::Result<Option<Arc<ExternalOidcValidator>>> {
         let mut providers = Vec::new();
         for entry in &self.providers {
+            // Non-OIDC authenticators (LDAP/PAM/...) are handled by
+            // build_internal_authenticators, which also warns about any
+            // authenticator that is not modeled; skip them silently here.
             if !is_oidc_authenticator(&entry.authenticator) {
-                tracing::warn!(
-                    provider = %entry.provider,
-                    authenticator = %entry.authenticator,
-                    "authentication.providers: non-OIDC authenticator is not yet wired; skipping"
-                );
                 continue;
             }
             providers.push(entry.build_oidc_provider().await?);
@@ -436,6 +439,38 @@ impl AuthConfig {
         let validator = ExternalOidcValidator::new(providers)
             .context("authentication.providers: building external OIDC validator")?;
         Ok(Some(Arc::new(validator)))
+    }
+
+    /// Build the internal (username/password) authenticators declared in
+    /// `providers` — currently LDAP and PAM. These are added to
+    /// `AppState.authenticators` and served at `/auth/{provider}/login`, and
+    /// advertised by the About endpoint as `mode: internal`. OIDC-family
+    /// providers are handled by [`AuthConfig::build_oidc_validator`]; any other
+    /// authenticator is skipped with a warning.
+    ///
+    /// LDAP/PAM are compiled in only under the matching build feature; when the
+    /// feature is off, a provider that names them is skipped with a warning
+    /// (mirroring SAML's opt-in build).
+    pub fn build_internal_authenticators(
+        &self,
+    ) -> anyhow::Result<Vec<Arc<dyn tiled_auth::Authenticator>>> {
+        let mut out: Vec<Arc<dyn tiled_auth::Authenticator>> = Vec::new();
+        for entry in &self.providers {
+            if is_oidc_authenticator(&entry.authenticator) {
+                continue; // handled by build_oidc_validator
+            } else if is_ldap_authenticator(&entry.authenticator) {
+                out.extend(build_ldap_authenticator(entry)?);
+            } else if is_pam_authenticator(&entry.authenticator) {
+                out.extend(build_pam_authenticator(entry)?);
+            } else {
+                tracing::warn!(
+                    provider = %entry.provider,
+                    authenticator = %entry.authenticator,
+                    "authentication.providers: authenticator is not modeled; skipping"
+                );
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -464,12 +499,86 @@ fn is_entra_authenticator(authenticator: &str) -> bool {
     class == "EntraAuthenticator" || authenticator == "entra"
 }
 
+/// True when `authenticator` names the LDAP authenticator — a Python import
+/// path ending in `LDAPAuthenticator`, or the short selector `ldap`.
+fn is_ldap_authenticator(authenticator: &str) -> bool {
+    let class = authenticator
+        .rsplit([':', '.'])
+        .next()
+        .unwrap_or(authenticator);
+    class == "LDAPAuthenticator" || authenticator == "ldap"
+}
+
+/// True when `authenticator` names the PAM authenticator — a Python import path
+/// ending in `PAMAuthenticator`, or the short selector `pam`.
+fn is_pam_authenticator(authenticator: &str) -> bool {
+    let class = authenticator
+        .rsplit([':', '.'])
+        .next()
+        .unwrap_or(authenticator);
+    class == "PAMAuthenticator" || authenticator == "pam"
+}
+
+/// Build an LDAP authenticator from a provider entry. Compiled only under the
+/// `ldap` feature; otherwise the provider is skipped with a warning.
+#[cfg(feature = "ldap")]
+fn build_ldap_authenticator(
+    entry: &AuthProviderConfig,
+) -> anyhow::Result<Option<Arc<dyn tiled_auth::Authenticator>>> {
+    let config: tiled_auth::LdapConfig = deserialize_provider_args(&entry.args)
+        .with_context(|| format!("authentication.providers '{}': LDAP args", entry.provider))?;
+    let auth =
+        tiled_auth::LdapAuthenticator::from_config(&entry.provider, config).with_context(|| {
+            format!(
+                "authentication.providers '{}': building LDAP authenticator",
+                entry.provider
+            )
+        })?;
+    Ok(Some(Arc::new(auth)))
+}
+
+#[cfg(not(feature = "ldap"))]
+fn build_ldap_authenticator(
+    entry: &AuthProviderConfig,
+) -> anyhow::Result<Option<Arc<dyn tiled_auth::Authenticator>>> {
+    tracing::warn!(
+        provider = %entry.provider,
+        "authentication.providers: LDAP authenticator requires the 'ldap' build feature; skipping"
+    );
+    Ok(None)
+}
+
+/// Build a PAM authenticator from a provider entry. Compiled only under the
+/// `pam` feature; otherwise the provider is skipped with a warning.
+#[cfg(feature = "pam")]
+fn build_pam_authenticator(
+    entry: &AuthProviderConfig,
+) -> anyhow::Result<Option<Arc<dyn tiled_auth::Authenticator>>> {
+    let config: tiled_auth::PamConfig = deserialize_provider_args(&entry.args)
+        .with_context(|| format!("authentication.providers '{}': PAM args", entry.provider))?;
+    let auth = tiled_auth::PamAuthenticator::from_config(&entry.provider, config);
+    Ok(Some(Arc::new(auth)))
+}
+
+#[cfg(not(feature = "pam"))]
+fn build_pam_authenticator(
+    entry: &AuthProviderConfig,
+) -> anyhow::Result<Option<Arc<dyn tiled_auth::Authenticator>>> {
+    tracing::warn!(
+        provider = %entry.provider,
+        "authentication.providers: PAM authenticator requires the 'pam' build feature; skipping"
+    );
+    Ok(None)
+}
+
 impl AuthProviderConfig {
     /// Run discovery (if `well_known_uri` is set) then assemble the
     /// [`OidcProvider`], selecting the Entra identity mapping for an
     /// Entra-family authenticator.
     async fn build_oidc_provider(&self) -> anyhow::Result<OidcProvider> {
-        let discovery = match &self.args.well_known_uri {
+        let args: OidcProviderArgs = deserialize_provider_args(&self.args)
+            .with_context(|| format!("authentication.providers '{}': OIDC args", self.provider))?;
+        let discovery = match &args.well_known_uri {
             Some(uri) => Some(discover_oidc(uri).await.with_context(|| {
                 format!(
                     "authentication.providers '{}': OIDC discovery from '{uri}'",
@@ -478,12 +587,28 @@ impl AuthProviderConfig {
             })?),
             None => None,
         };
-        let mut provider = self.args.assemble(&self.provider, discovery)?;
+        let mut provider = args.assemble(&self.provider, discovery)?;
         if is_entra_authenticator(&self.authenticator) {
             provider.identity_mapping = IdentityMapping::Entra;
         }
         Ok(provider)
     }
+}
+
+/// Deserialize a provider's `args` (a raw YAML value, polymorphic by the
+/// `authenticator` selector) into the typed config `T`. An absent `args:`
+/// (`Null`) is treated as an empty mapping so authenticators whose fields are
+/// all optional get their defaults; authenticators with a required field (e.g.
+/// LDAP `server_address`) still surface a "missing field" error.
+fn deserialize_provider_args<T: serde::de::DeserializeOwned>(
+    args: &serde_yaml::Value,
+) -> anyhow::Result<T> {
+    let value = if args.is_null() {
+        serde_yaml::Value::Mapping(serde_yaml::Mapping::new())
+    } else {
+        args.clone()
+    };
+    serde_yaml::from_value(value).map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 impl OidcProviderArgs {
@@ -1020,10 +1145,12 @@ mod tests {
         let p = &auth.providers[0];
         assert_eq!(p.provider, "keycloak");
         assert_eq!(p.authenticator, "tiled.authenticators:OIDCAuthenticator");
-        assert_eq!(p.args.audience.as_deref(), Some("tiled"));
-        assert_eq!(p.args.client_id.as_deref(), Some("tiled-server"));
+        // args is now a raw YAML value, deserialized per-authenticator.
+        let oidc_args: OidcProviderArgs = deserialize_provider_args(&p.args).unwrap();
+        assert_eq!(oidc_args.audience.as_deref(), Some("tiled"));
+        assert_eq!(oidc_args.client_id.as_deref(), Some("tiled-server"));
         assert_eq!(
-            p.args.well_known_uri.as_deref(),
+            oidc_args.well_known_uri.as_deref(),
             Some("https://idp.example/.well-known/openid-configuration")
         );
         assert!(is_oidc_authenticator(&p.authenticator));
@@ -1051,6 +1178,163 @@ mod tests {
             "tiled.authenticators:LDAPAuthenticator"
         ));
         assert!(!is_oidc_authenticator("ldap"));
+    }
+
+    #[test]
+    fn is_ldap_authenticator_matches_class_and_selector() {
+        assert!(is_ldap_authenticator(
+            "tiled.authenticators:LDAPAuthenticator"
+        ));
+        assert!(is_ldap_authenticator("ldap"));
+        assert!(!is_ldap_authenticator(
+            "tiled.authenticators:PAMAuthenticator"
+        ));
+        assert!(!is_ldap_authenticator("oidc"));
+        assert!(!is_ldap_authenticator("pam"));
+    }
+
+    #[test]
+    fn is_pam_authenticator_matches_class_and_selector() {
+        assert!(is_pam_authenticator(
+            "tiled.authenticators:PAMAuthenticator"
+        ));
+        assert!(is_pam_authenticator("pam"));
+        assert!(!is_pam_authenticator(
+            "tiled.authenticators:LDAPAuthenticator"
+        ));
+        assert!(!is_pam_authenticator("oidc"));
+        assert!(!is_pam_authenticator("ldap"));
+    }
+
+    #[test]
+    fn build_internal_authenticators_skips_oidc_and_unknown() {
+        // OIDC-family providers are handled elsewhere; an unmodeled
+        // authenticator is skipped with a warning. Neither contributes an
+        // internal authenticator. Holds regardless of build features.
+        let cfg: TiledConfig = serde_yaml::from_str(
+            r#"
+trees: []
+authentication:
+  providers:
+    - provider: kc
+      authenticator: oidc
+      args:
+        audience: tiled
+        issuer: https://idp.test/
+        jwks_uri: https://idp.test/keys
+    - provider: mystery
+      authenticator: tiled.authenticators:MysteryAuthenticator
+      args: {}
+"#,
+        )
+        .unwrap();
+        let auth = cfg.authentication.unwrap();
+        let built = auth.build_internal_authenticators().unwrap();
+        assert!(
+            built.is_empty(),
+            "OIDC and unknown authenticators contribute no internal authenticator"
+        );
+    }
+
+    #[cfg(feature = "ldap")]
+    #[test]
+    fn build_internal_authenticators_builds_ldap_from_config() {
+        let cfg: TiledConfig = serde_yaml::from_str(
+            r#"
+trees: []
+authentication:
+  providers:
+    - provider: corp-ldap
+      authenticator: tiled.authenticators:LDAPAuthenticator
+      args:
+        server_address: ldap.example.com
+"#,
+        )
+        .unwrap();
+        let auth = cfg.authentication.unwrap();
+        let built = auth.build_internal_authenticators().unwrap();
+        assert_eq!(built.len(), 1);
+        assert_eq!(built[0].name(), "corp-ldap");
+    }
+
+    #[cfg(feature = "ldap")]
+    #[test]
+    fn ldap_provider_without_server_address_errors() {
+        // server_address is required; an absent `args:` (Null → empty mapping)
+        // must surface a "missing field" error, not silently build.
+        let cfg: TiledConfig = serde_yaml::from_str(
+            r#"
+trees: []
+authentication:
+  providers:
+    - provider: corp-ldap
+      authenticator: ldap
+"#,
+        )
+        .unwrap();
+        let auth = cfg.authentication.unwrap();
+        // The Ok type (Vec<Arc<dyn Authenticator>>) is not Debug, so unwrap_err
+        // is unavailable; take the error via .err() instead. The missing-field
+        // detail is in the source chain, so format with the alternate ({:#})
+        // formatter to include it alongside the outer context.
+        let err = format!(
+            "{:#}",
+            auth.build_internal_authenticators()
+                .err()
+                .expect("missing server_address must error")
+        );
+        assert!(
+            err.contains("server_address"),
+            "error must name the missing server_address field: {err}"
+        );
+    }
+
+    #[cfg(feature = "pam")]
+    #[test]
+    fn build_internal_authenticators_builds_pam_from_config() {
+        // PAM has no required args; an absent `args:` uses defaults (service
+        // "login"), exercising the Null → empty-mapping → defaults path.
+        let cfg: TiledConfig = serde_yaml::from_str(
+            r#"
+trees: []
+authentication:
+  providers:
+    - provider: unix
+      authenticator: tiled.authenticators:PAMAuthenticator
+"#,
+        )
+        .unwrap();
+        let auth = cfg.authentication.unwrap();
+        let built = auth.build_internal_authenticators().unwrap();
+        assert_eq!(built.len(), 1);
+        assert_eq!(built[0].name(), "unix");
+    }
+
+    #[cfg(not(any(feature = "ldap", feature = "pam")))]
+    #[test]
+    fn non_oidc_authenticators_skipped_without_build_features() {
+        // With neither feature compiled in, LDAP/PAM providers are skipped with
+        // a warning rather than failing the build or the parse.
+        let cfg: TiledConfig = serde_yaml::from_str(
+            r#"
+trees: []
+authentication:
+  providers:
+    - provider: corp-ldap
+      authenticator: ldap
+      args:
+        server_address: ldap.example.com
+    - provider: unix
+      authenticator: pam
+"#,
+        )
+        .unwrap();
+        let auth = cfg.authentication.unwrap();
+        let built = auth.build_internal_authenticators().unwrap();
+        assert!(
+            built.is_empty(),
+            "LDAP/PAM providers are skipped when their build features are off"
+        );
     }
 
     #[test]
@@ -1310,12 +1594,13 @@ mod tests {
         let entra = AuthProviderConfig {
             provider: "corp-entra".into(),
             authenticator: "tiled.authenticators:EntraAuthenticator".into(),
-            args: OidcProviderArgs {
+            args: serde_yaml::to_value(OidcProviderArgs {
                 audience: Some("api://tiled".into()),
                 issuer: Some("https://login.microsoftonline.com/tid/v2.0".into()),
                 jwks_uri: Some("https://login.microsoftonline.com/tid/keys".into()),
                 ..Default::default()
-            },
+            })
+            .unwrap(),
         };
         let provider = entra.build_oidc_provider().await.unwrap();
         assert_eq!(provider.identity_mapping, IdentityMapping::Entra);
@@ -1324,12 +1609,13 @@ mod tests {
         let plain = AuthProviderConfig {
             provider: "kc".into(),
             authenticator: "oidc".into(),
-            args: OidcProviderArgs {
+            args: serde_yaml::to_value(OidcProviderArgs {
                 audience: Some("tiled".into()),
                 issuer: Some("https://idp.test/".into()),
                 jwks_uri: Some("https://idp.test/keys".into()),
                 ..Default::default()
-            },
+            })
+            .unwrap(),
         };
         assert_eq!(
             plain.build_oidc_provider().await.unwrap().identity_mapping,
