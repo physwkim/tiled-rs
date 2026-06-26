@@ -94,13 +94,25 @@ pub fn build_app(state: AppState) -> Router {
     // the IdP redirect target (no prior credential).
     let public_auth = Router::new()
         .route("/api/v1/auth/{provider}/login", post(auth_router::login))
+        // GET = PKCE browser flow (redirect to IdP); POST = IdP-brokered device
+        // flow init. Same path, distinct methods — mirrors Python tiled.
         .route(
             "/api/v1/auth/provider/{provider}/authorize",
-            get(auth_router::oidc_authorize),
+            get(auth_router::oidc_authorize).post(auth_router::oidc_device_authorize),
         )
         .route(
             "/api/v1/auth/provider/{provider}/callback",
             get(auth_router::oidc_callback),
+        )
+        // IdP-brokered device flow: GET serves the user-code HTML form (the IdP
+        // redirect target), POST processes it; the CLI polls /token.
+        .route(
+            "/api/v1/auth/provider/{provider}/device_code",
+            get(auth_router::oidc_device_code_form).post(auth_router::oidc_device_code_submit),
+        )
+        .route(
+            "/api/v1/auth/provider/{provider}/token",
+            post(auth_router::oidc_device_token),
         )
         .route("/api/v1/auth/refresh", post(auth_router::refresh))
         .route(

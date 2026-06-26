@@ -115,6 +115,38 @@ impl AuthDb {
         }
     }
 
+    /// Look up a session by its integer primary key. Used by the IdP device
+    /// flow's token route, which stores the bound session's `id` (not its
+    /// UUID) in `pending_sessions.session_id` (FK to `sessions.id`).
+    pub async fn lookup_session_by_id(&self, id: i64) -> Result<SessionRecord> {
+        match self.pool() {
+            AuthPool::Sqlite(pool) => {
+                let row = sqlx::query(
+                    "SELECT id, principal_id, uuid, time_last_used, expiration_time,
+                            revoked, scopes, time_created, state
+                       FROM sessions WHERE id = ?",
+                )
+                .bind(id)
+                .fetch_optional(pool)
+                .await?
+                .ok_or_else(|| AuthError::NotFound(format!("session id {id}")))?;
+                session_from_sqlite(&row)
+            }
+            AuthPool::Postgres(pool) => {
+                let row = sqlx::query(
+                    "SELECT id, principal_id, uuid, time_last_used, expiration_time,
+                            revoked, scopes, time_created, state
+                       FROM sessions WHERE id = $1",
+                )
+                .bind(id)
+                .fetch_optional(pool)
+                .await?
+                .ok_or_else(|| AuthError::NotFound(format!("session id {id}")))?;
+                session_from_postgres(&row)
+            }
+        }
+    }
+
     /// Mark every session belonging to `principal_id` revoked — used when
     /// the user clicks "logout everywhere".
     pub async fn revoke_all_sessions(&self, principal_id: i64) -> Result<()> {

@@ -92,6 +92,7 @@ async fn migrate_and_principal_lifecycle() {
             "0004_add_access_tags".to_string(),
             "0005_tag_registry".to_string(),
             "0006_add_session_state".to_string(),
+            "0007_add_pending_sessions".to_string(),
         ]
     );
 
@@ -254,6 +255,140 @@ async fn dummy_authenticator_password_check() {
     let s = auth.authenticate("alice", "open-sesame").await.unwrap();
     assert_eq!(s.sub, "alice");
     auth.authenticate("alice", "wrong").await.unwrap_err();
+}
+
+// ---------------------------------------------------------------------------
+// G4 — IdP-brokered device flow: pending_sessions store
+// ---------------------------------------------------------------------------
+
+use tiled_auth::PendingSessionStatus;
+
+// Full lifecycle: create → poll(pending) → lookup-by-user_code → bind →
+// poll(fulfilled, single use). The device_code returned to the client polls
+// successfully even though only its SHA-256 hash is persisted.
+#[tokio::test]
+async fn pending_session_full_lifecycle() {
+    let (db, _dir) = fresh_db().await;
+
+    let init = db
+        .create_pending_session(Duration::minutes(15))
+        .await
+        .unwrap();
+    assert_eq!(init.device_code.len(), 64, "32 bytes → 64 hex chars");
+    assert_eq!(init.user_code.len(), 8, "4 bytes → 8 hex chars");
+    assert_eq!(init.user_code, init.user_code.to_uppercase());
+
+    // Before binding, the CLI poll sees authorization_pending.
+    assert!(matches!(
+        db.poll_pending_session(&init.device_code).await.unwrap(),
+        PendingSessionStatus::AuthorizationPending
+    ));
+
+    // The submit route looks up the row by the (un-normalized) user_code.
+    let rec = db
+        .lookup_valid_pending_session_by_user_code(&init.user_code)
+        .await
+        .unwrap();
+    assert!(rec.session_id.is_none(), "unbound until login completes");
+    assert!(!rec.hashed_device_code.is_empty());
+
+    // Bind a real session, then the poll yields it exactly once.
+    let (p, _) = db.ensure_principal("entra", "oid-1").await.unwrap();
+    let session = db
+        .create_session(
+            p.id,
+            ScopeSet::from_iter([Scope::ReadMetadata]),
+            Utc::now() + Duration::hours(1),
+            serde_json::json!({"entra_access_token": "at"}),
+        )
+        .await
+        .unwrap();
+    db.bind_pending_session(&rec.hashed_device_code, session.id)
+        .await
+        .unwrap();
+
+    match db.poll_pending_session(&init.device_code).await.unwrap() {
+        PendingSessionStatus::Fulfilled(sid) => assert_eq!(sid, session.id),
+        other => panic!("expected Fulfilled, got {other:?}"),
+    }
+
+    // Single use: the row is gone after a fulfilled poll.
+    assert!(matches!(
+        db.poll_pending_session(&init.device_code).await,
+        Err(tiled_auth::AuthError::NotFound(_))
+    ));
+}
+
+// The user_code lookup normalizes input: the displayed dashed `XXXX-XXXX`
+// form, in lowercase, still matches the canonical stored value.
+#[tokio::test]
+async fn pending_session_user_code_lookup_is_normalized() {
+    let (db, _dir) = fresh_db().await;
+    let init = db
+        .create_pending_session(Duration::minutes(15))
+        .await
+        .unwrap();
+    let dashed_lower = format!(
+        "{}-{}",
+        &init.user_code[..4].to_lowercase(),
+        &init.user_code[4..].to_lowercase()
+    );
+    let rec = db
+        .lookup_valid_pending_session_by_user_code(&dashed_lower)
+        .await
+        .unwrap();
+    assert_eq!(rec.user_code, init.user_code);
+
+    // A code that doesn't exist → NotFound.
+    assert!(matches!(
+        db.lookup_valid_pending_session_by_user_code("ZZZZZZZZ")
+            .await,
+        Err(tiled_auth::AuthError::NotFound(_))
+    ));
+}
+
+// An expired pending session is invisible to both lookups (boundary:
+// expiration_time < now).
+#[tokio::test]
+async fn pending_session_expired_is_not_found() {
+    let (db, _dir) = fresh_db().await;
+    // ttl in the past → already expired.
+    let init = db
+        .create_pending_session(Duration::minutes(-1))
+        .await
+        .unwrap();
+    assert!(matches!(
+        db.lookup_valid_pending_session_by_user_code(&init.user_code)
+            .await,
+        Err(tiled_auth::AuthError::NotFound(_))
+    ));
+    assert!(matches!(
+        db.poll_pending_session(&init.device_code).await,
+        Err(tiled_auth::AuthError::NotFound(_))
+    ));
+}
+
+// A malformed (non-hex) device_code is rejected distinctly (Python: 401
+// "Invalid device code"), separate from the NotFound used for unknown codes.
+#[tokio::test]
+async fn pending_session_invalid_hex_device_code_is_unauthorized() {
+    let (db, _dir) = fresh_db().await;
+    for bad in ["not-hex!!", "abc", "0g"] {
+        assert!(
+            matches!(
+                db.poll_pending_session(bad).await,
+                Err(tiled_auth::AuthError::Unauthorized(_))
+            ),
+            "{bad:?} must be Unauthorized, not NotFound"
+        );
+    }
+    // Valid hex but never issued → NotFound (the stored value is a hash, so an
+    // arbitrary same-length hex does not match any row).
+    let other = "00".repeat(32);
+    assert!(matches!(
+        db.poll_pending_session(&other).await,
+        Err(tiled_auth::AuthError::NotFound(_))
+    ));
 }
 
 /// Python parity: `create_default_roles` in authn_database/core.py defines

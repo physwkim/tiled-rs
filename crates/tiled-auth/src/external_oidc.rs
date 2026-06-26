@@ -541,10 +541,38 @@ impl ExternalOidcValidator {
             form.push(("client_secret", secret.as_str()));
         }
 
+        let body = self.post_token_request(token_endpoint, &form).await?;
+
+        let id_token = body["id_token"].as_str().ok_or_else(|| {
+            AuthError::Validation("token response is missing the 'id_token' field".into())
+        })?;
+
+        let token = self
+            .validate_id_token(provider, id_token, Some(&pending.nonce))
+            .await?;
+        // Capture the upstream IdP tokens for OBO (Entra only; `{}` otherwise),
+        // mirroring EntraAuthenticator.authenticate (authenticators.py:497-502).
+        let session_state = build_session_state(provider, &body);
+        Ok(CodeFlowSession {
+            token,
+            session_state,
+        })
+    }
+
+    /// POST a form to a provider's `token_endpoint`, parse the JSON body, and
+    /// surface a non-2xx response as `Unauthorized`. Shared by the PKCE browser
+    /// flow ([`Self::exchange_code_flow`]) and the IdP-brokered device flow
+    /// ([`Self::exchange_device_code`]) — the only difference between them is
+    /// the form fields each builds.
+    async fn post_token_request(
+        &self,
+        token_endpoint: &str,
+        form: &[(&str, &str)],
+    ) -> Result<serde_json::Value> {
         let resp = self
             .http
             .post(token_endpoint)
-            .form(&form)
+            .form(form)
             .send()
             .await
             .map_err(|e| AuthError::Validation(format!("token endpoint request failed: {e}")))?;
@@ -562,16 +590,101 @@ impl ExternalOidcValidator {
                 "token endpoint returned {status}: {err_msg} — {err_desc}"
             )));
         }
+        Ok(body)
+    }
+
+    /// Build the IdP authorization URL for the **device** flow. Unlike
+    /// [`Self::build_authorize_url`] (PKCE browser flow) this carries no PKCE
+    /// challenge, no nonce, and no server-side pending state — the device flow
+    /// tracks its own state in the `pending_sessions` table, and the redirect
+    /// lands on the `/device_code` route where the user enters their user_code.
+    /// Mirrors Python `device_code_authorize_route` (authentication.py:991).
+    pub fn build_device_authorize_url(
+        &self,
+        provider_name: &str,
+        redirect_uri: &str,
+    ) -> Result<String> {
+        let provider = self
+            .providers
+            .iter()
+            .find(|p| p.name == provider_name)
+            .ok_or_else(|| {
+                AuthError::Validation(format!("unknown OIDC provider '{provider_name}'"))
+            })?;
+        let client_id = provider.client_id.as_deref().ok_or_else(|| {
+            AuthError::Validation(format!(
+                "provider '{provider_name}' is not configured for the device flow \
+                 (client_id is required)"
+            ))
+        })?;
+        let auth_endpoint = provider.authorization_endpoint.as_deref().ok_or_else(|| {
+            AuthError::Validation(format!(
+                "provider '{provider_name}': authorization_endpoint is not configured"
+            ))
+        })?;
+
+        let mut url = reqwest::Url::parse(auth_endpoint).map_err(|e| {
+            AuthError::Validation(format!("bad authorization_endpoint '{auth_endpoint}': {e}"))
+        })?;
+        url.query_pairs_mut()
+            .append_pair("client_id", client_id)
+            .append_pair("response_type", "code")
+            .append_pair("scope", "openid")
+            .append_pair("redirect_uri", redirect_uri);
+        Ok(url.to_string())
+    }
+
+    /// Exchange an authorization code obtained via the IdP-brokered **device**
+    /// flow for tokens, validate the id_token (no nonce — see
+    /// [`Self::validate_id_token`]), and return the principal identity plus OBO
+    /// session state. Mirrors Python `OIDCAuthenticator.authenticate`
+    /// (authenticators.py:222) as used by the device-code submit route.
+    ///
+    /// `redirect_uri` MUST equal the one sent in
+    /// [`Self::build_device_authorize_url`] (the `/device_code` route URL); the
+    /// token endpoint validates that they match.
+    pub async fn exchange_device_code(
+        &self,
+        provider_name: &str,
+        code: &str,
+        redirect_uri: &str,
+    ) -> Result<CodeFlowSession> {
+        let provider = self
+            .providers
+            .iter()
+            .find(|p| p.name == provider_name)
+            .ok_or_else(|| {
+                AuthError::Validation(format!("unknown OIDC provider '{provider_name}'"))
+            })?;
+        let client_id = provider.client_id.as_deref().ok_or_else(|| {
+            AuthError::Validation("client_id not configured for device flow".into())
+        })?;
+        let token_endpoint = provider.token_endpoint.as_deref().ok_or_else(|| {
+            AuthError::Validation("token_endpoint not configured for device flow".into())
+        })?;
+
+        // No PKCE verifier (the device authorize URL carries no challenge);
+        // add client_secret only in confidential-client mode.
+        let secret_clone = provider.client_secret.clone().filter(|s| !s.is_empty());
+        let mut form: Vec<(&str, &str)> = vec![
+            ("grant_type", "authorization_code"),
+            ("client_id", client_id),
+            ("redirect_uri", redirect_uri),
+            ("code", code),
+        ];
+        if let Some(ref secret) = secret_clone {
+            form.push(("client_secret", secret.as_str()));
+        }
+
+        let body = self.post_token_request(token_endpoint, &form).await?;
 
         let id_token = body["id_token"].as_str().ok_or_else(|| {
             AuthError::Validation("token response is missing the 'id_token' field".into())
         })?;
 
-        let token = self
-            .validate_id_token(provider, id_token, &pending.nonce)
-            .await?;
+        let token = self.validate_id_token(provider, id_token, None).await?;
         // Capture the upstream IdP tokens for OBO (Entra only; `{}` otherwise),
-        // mirroring EntraAuthenticator.authenticate (authenticators.py:497-502).
+        // identical to the browser flow.
         let session_state = build_session_state(provider, &body);
         Ok(CodeFlowSession {
             token,
@@ -582,14 +695,17 @@ impl ExternalOidcValidator {
     /// Validate an id_token returned from the token endpoint.
     ///
     /// Applies the same iss / aud / exp / nbf / alg checks as bearer
-    /// validation, plus a `nonce` claim check (OIDC Core §3.1.3.7 #11).
-    /// The `kid` header field is required; IdPs that omit it are not
-    /// supported.
+    /// validation. When `expected_nonce` is `Some`, also enforces the `nonce`
+    /// claim (OIDC Core §3.1.3.7 #11) — the PKCE browser flow passes the nonce
+    /// it sent in the authorize request. The IdP-brokered device flow has no
+    /// nonce round-trip (Python's device flow omits it too), so it passes
+    /// `None` and the nonce check is skipped. The `kid` header field is
+    /// required; IdPs that omit it are not supported.
     async fn validate_id_token(
         &self,
         provider: &OidcProvider,
         id_token: &str,
-        expected_nonce: &str,
+        expected_nonce: Option<&str>,
     ) -> Result<ValidatedToken> {
         let header = decode_header(id_token).map_err(AuthError::from)?;
         let kid = header.kid.ok_or_else(|| {
@@ -612,20 +728,23 @@ impl ExternalOidcValidator {
             .map_err(AuthError::from)?
             .claims;
 
-        // OIDC Core §3.1.3.7 #11: the nonce MUST be present and MUST equal
-        // the value sent in the authorization request.
-        let nonce_claim = claims
-            .get("nonce")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                AuthError::Unauthorized("id_token is missing the 'nonce' claim".into())
-            })?;
-        if nonce_claim != expected_nonce {
-            return Err(AuthError::Unauthorized(
-                "id_token nonce does not match the nonce sent in the authorization \
-                 request — possible replay or CSRF attempt"
-                    .into(),
-            ));
+        // OIDC Core §3.1.3.7 #11: when a nonce was sent (PKCE browser flow),
+        // it MUST be present and MUST equal the value sent in the authorization
+        // request. The device flow sends no nonce and passes `None` here.
+        if let Some(expected_nonce) = expected_nonce {
+            let nonce_claim = claims
+                .get("nonce")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    AuthError::Unauthorized("id_token is missing the 'nonce' claim".into())
+                })?;
+            if nonce_claim != expected_nonce {
+                return Err(AuthError::Unauthorized(
+                    "id_token nonce does not match the nonce sent in the authorization \
+                     request — possible replay or CSRF attempt"
+                        .into(),
+                ));
+            }
         }
 
         finalize_token(provider, claims)

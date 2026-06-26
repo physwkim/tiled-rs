@@ -2421,3 +2421,308 @@ async fn oidc_callback_state_not_replayable() {
         .unwrap();
     assert_eq!(resp2.status(), StatusCode::UNAUTHORIZED);
 }
+
+// ---------------------------------------------------------------------------
+// G4 — IdP-brokered device-code flow (end-to-end through the HTTP app)
+// ---------------------------------------------------------------------------
+
+/// Spawn a mock IdP token endpoint for the DEVICE flow. Returns `id_token`
+/// plus any `extra` top-level fields (e.g. access_token/refresh_token), and
+/// asserts the request carries NO PKCE `code_verifier` (the device flow is
+/// non-PKCE). Returns the endpoint URL.
+async fn spawn_mock_device_token_endpoint(id_token: String, extra: serde_json::Value) -> String {
+    use axum::Router;
+    use axum::body::Bytes;
+    use axum::routing::post;
+    use std::collections::HashMap;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let token_endpoint = format!("http://127.0.0.1:{port}/token");
+    let mock_app = Router::new().route(
+        "/token",
+        post(move |body: Bytes| {
+            let token = id_token.clone();
+            let extra = extra.clone();
+            async move {
+                let form: HashMap<String, String> =
+                    form_urlencoded::parse(body.as_ref()).into_owned().collect();
+                assert_eq!(
+                    form.get("grant_type").map(String::as_str),
+                    Some("authorization_code")
+                );
+                assert!(
+                    !form.contains_key("code_verifier"),
+                    "device flow must NOT send a PKCE code_verifier"
+                );
+                let mut resp = serde_json::json!({ "id_token": token, "token_type": "Bearer" });
+                if let Some(obj) = extra.as_object() {
+                    for (k, v) in obj {
+                        resp[k] = v.clone();
+                    }
+                }
+                axum::Json(resp)
+            }
+        }),
+    );
+    tokio::spawn(async move {
+        axum::serve(listener, mock_app).await.unwrap();
+    });
+    token_endpoint
+}
+
+/// POST /provider/{p}/authorize returns the broker response the CLI's
+/// device_code_grant (broker mode) depends on: an IdP `authorization_uri`
+/// (no PKCE/nonce/state) + a `verification_uri` to poll, plus device_code,
+/// user_code, interval, expires_in.
+#[tokio::test]
+async fn oidc_device_authorize_returns_broker_response() {
+    let (app, _validator, _dir) = build_code_flow_app("https://mock-idp.test/token").await;
+
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/api/v1/auth/provider/mock-idp/authorize")
+        .header("host", "localhost:8000")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+    assert_eq!(
+        body["verification_uri"].as_str(),
+        Some("http://localhost:8000/api/v1/auth/provider/mock-idp/token")
+    );
+    assert_eq!(body["interval"].as_i64(), Some(5));
+    assert_eq!(body["expires_in"].as_i64(), Some(900));
+    assert_eq!(
+        body["device_code"].as_str().map(|s| s.len()),
+        Some(64),
+        "device_code is 32 bytes hex"
+    );
+    let user_code = body["user_code"].as_str().unwrap();
+    assert!(user_code.contains('-'), "user_code shown in dashed form");
+
+    // authorization_uri = IdP authorize endpoint with the device redirect.
+    let auth_url = reqwest::Url::parse(body["authorization_uri"].as_str().unwrap()).unwrap();
+    assert_eq!(auth_url.host_str(), Some("mock-idp.test"));
+    assert_eq!(auth_url.path(), "/authorize");
+    let params: std::collections::HashMap<_, _> = auth_url.query_pairs().collect();
+    assert_eq!(
+        params.get("response_type").map(|s| s.as_ref()),
+        Some("code")
+    );
+    assert_eq!(params.get("scope").map(|s| s.as_ref()), Some("openid"));
+    assert_eq!(
+        params.get("client_id").map(|s| s.as_ref()),
+        Some("tiled-code-client")
+    );
+    assert_eq!(
+        params.get("redirect_uri").map(|s| s.as_ref()),
+        Some("http://localhost:8000/api/v1/auth/provider/mock-idp/device_code")
+    );
+    // Device flow carries NO PKCE/nonce/state in the authorize URL.
+    assert!(!params.contains_key("code_challenge"));
+    assert!(!params.contains_key("nonce"));
+    assert!(!params.contains_key("state"));
+}
+
+/// Full device flow: authorize → poll(authorization_pending) → user-code
+/// submit (exchanges the IdP code, binds a session) → poll(tokens) →
+/// poll(404, single use).
+#[tokio::test]
+async fn oidc_device_flow_pending_then_fulfilled() {
+    let id_token = mint_code_flow_id_token("device-bob", "ignored-nonce");
+    let token_endpoint = spawn_mock_device_token_endpoint(id_token, serde_json::json!({})).await;
+    let (app, _validator, _dir) = build_code_flow_app(&token_endpoint).await;
+
+    // 1. authorize
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/auth/provider/mock-idp/authorize")
+                .header("host", "localhost:8000")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let device_code = body["device_code"].as_str().unwrap().to_string();
+    let user_code = body["user_code"].as_str().unwrap().to_string();
+
+    // 2. poll before the browser login → 400 authorization_pending
+    let poll = |app: axum::Router, dc: String| async move {
+        app.oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/auth/provider/mock-idp/token")
+                .header("host", "localhost:8000")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "device_code": dc,
+                        "grant_type": "urn:ietf:params:oauth:grant-type:device_code"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+    };
+
+    let pending = poll(app.clone(), device_code.clone()).await;
+    assert_eq!(pending.status(), StatusCode::BAD_REQUEST);
+    let pbytes = axum::body::to_bytes(pending.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let pbody: serde_json::Value = serde_json::from_slice(&pbytes).unwrap();
+    assert_eq!(
+        pbody.pointer("/detail/error").and_then(|v| v.as_str()),
+        Some("authorization_pending"),
+        "client polls until this exact shape"
+    );
+
+    // 3. user submits the code in the browser (the IdP code rides the form).
+    let submit = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/auth/provider/mock-idp/device_code")
+                .header("host", "localhost:8000")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(format!(
+                    "code=idp-auth-code&user_code={user_code}"
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(submit.status(), StatusCode::OK);
+    let sbytes = axum::body::to_bytes(submit.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let shtml = String::from_utf8(sbytes.to_vec()).unwrap();
+    assert!(shtml.contains("Success"), "submit returns the success page");
+
+    // 4. poll after login → 200 with tokens
+    let granted = poll(app.clone(), device_code.clone()).await;
+    assert_eq!(granted.status(), StatusCode::OK);
+    let gbytes = axum::body::to_bytes(granted.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let gbody: serde_json::Value = serde_json::from_slice(&gbytes).unwrap();
+    assert!(gbody["access_token"].is_string());
+    assert!(gbody["refresh_token"].is_string());
+    assert_eq!(gbody["token_type"].as_str(), Some("Bearer"));
+
+    // 5. single use: the pending row is consumed → 404
+    let again = poll(app.clone(), device_code.clone()).await;
+    assert_eq!(again.status(), StatusCode::NOT_FOUND);
+}
+
+/// G3+G4: an Entra device login embeds the upstream OBO tokens in the access
+/// token the CLI receives from the /token poll.
+#[tokio::test]
+async fn oidc_device_flow_entra_embeds_obo() {
+    let id_token = mint_code_flow_id_token("entra-device-oid", "ignored-nonce");
+    let token_endpoint = spawn_mock_device_token_endpoint(
+        id_token,
+        serde_json::json!({
+            "access_token": "entra-upstream-access",
+            "refresh_token": "entra-upstream-refresh",
+        }),
+    )
+    .await;
+    let (app, _validator, _dir) =
+        build_code_flow_app_with_mapping(&token_endpoint, tiled_auth::IdentityMapping::Entra).await;
+
+    // authorize → user_code/device_code
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/auth/provider/mock-idp/authorize")
+                .header("host", "localhost:8000")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let device_code = body["device_code"].as_str().unwrap().to_string();
+    let user_code = body["user_code"].as_str().unwrap().to_string();
+
+    // submit (browser-side OIDC login)
+    let submit = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/auth/provider/mock-idp/device_code")
+                .header("host", "localhost:8000")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(format!(
+                    "code=idp-auth-code&user_code={user_code}"
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(submit.status(), StatusCode::OK);
+
+    // poll → tokens; decode the access token and assert the OBO state.
+    let granted = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/auth/provider/mock-idp/token")
+                .header("host", "localhost:8000")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "device_code": device_code }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(granted.status(), StatusCode::OK);
+    let gbytes = axum::body::to_bytes(granted.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let gbody: serde_json::Value = serde_json::from_slice(&gbytes).unwrap();
+    let access = gbody["access_token"].as_str().unwrap();
+
+    let issuer = tiled_auth::Issuer::new(b"code-flow-test-secret-32bytes!!!").unwrap();
+    let claims = issuer.verify_access(access).unwrap();
+    assert_eq!(
+        claims
+            .state
+            .pointer("/entra_access_token")
+            .and_then(|v| v.as_str()),
+        Some("entra-upstream-access"),
+        "device-flow access token must carry the upstream Entra access token"
+    );
+    assert_eq!(
+        claims
+            .state
+            .pointer("/entra_refresh_token")
+            .and_then(|v| v.as_str()),
+        Some("entra-upstream-refresh"),
+    );
+}

@@ -23,6 +23,12 @@ pub mod error;
 pub mod external_oidc;
 pub mod jwt;
 pub mod migrate;
+/// IdP-brokered OAuth2 device-code flow (pending-session store). Gated on
+/// `oidc` because it is meaningful only with an external OIDC provider; the
+/// `0007_add_pending_sessions` migration runs unconditionally (a harmless
+/// empty table when the feature is off).
+#[cfg(feature = "oidc")]
+pub mod pending_session;
 pub mod principal;
 #[cfg(feature = "saml")]
 pub mod saml;
@@ -39,6 +45,8 @@ pub use external_oidc::{
     PendingAuth, PendingAuthStore, ValidatedToken, discover_oidc,
 };
 pub use jwt::{AccessClaims, Issuer, RefreshClaims};
+#[cfg(feature = "oidc")]
+pub use pending_session::{PendingSessionInit, PendingSessionRecord, PendingSessionStatus};
 pub use principal::{Identity, IdentityView, Principal, PrincipalDetail};
 #[cfg(feature = "saml")]
 pub use saml::{PendingSamlStore, SamlConfig, SamlProvider};

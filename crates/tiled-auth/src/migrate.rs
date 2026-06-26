@@ -30,6 +30,10 @@ const SQLITE_MIGRATIONS: &[(&str, &str)] = &[
         "0006_add_session_state",
         include_str!("../migrations/sqlite/0006_add_session_state.sql"),
     ),
+    (
+        "0007_add_pending_sessions",
+        include_str!("../migrations/sqlite/0007_add_pending_sessions.sql"),
+    ),
 ];
 
 const POSTGRES_MIGRATIONS: &[(&str, &str)] = &[
@@ -56,6 +60,10 @@ const POSTGRES_MIGRATIONS: &[(&str, &str)] = &[
     (
         "0006_add_session_state",
         include_str!("../migrations/postgres/0006_add_session_state.sql"),
+    ),
+    (
+        "0007_add_pending_sessions",
+        include_str!("../migrations/postgres/0007_add_pending_sessions.sql"),
     ),
 ];
 

@@ -10,9 +10,9 @@ use std::sync::Arc;
 
 use axum::{
     Json,
-    extract::{Path, Query, State},
+    extract::{Form, Path, Query, State},
     http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Redirect},
+    response::{Html, IntoResponse, Redirect, Response},
 };
 use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
@@ -980,6 +980,315 @@ pub async fn oidc_callback(
     }
 
     Ok(Json(tokens).into_response())
+}
+
+// ---------------------------------------------------------------------------
+// IdP-brokered device-code flow (external OIDC)
+//
+// A device login brokered through an EXTERNAL OIDC provider: the CLI polls
+// tiled while the user completes the IdP's authorization-code flow in a
+// browser. DISTINCT from the native `device_*` routes above, which approve a
+// device code against a LOCAL tiled principal. Mirrors Python tiled's
+// per-provider device routes (authentication.py:980-1133). The pending state
+// lives in the `pending_sessions` table (tiled_auth::pending_session).
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+pub struct OidcDeviceAuthorizeResponse {
+    /// URL the user opens in a browser (the IdP's authorization endpoint).
+    pub authorization_uri: String,
+    /// URL the CLI polls for tokens (this server's `/token` route).
+    pub verification_uri: String,
+    pub interval: i64,
+    pub device_code: String,
+    pub expires_in: i64,
+    pub user_code: String,
+}
+
+/// `POST /api/v1/auth/provider/{provider}/authorize`
+///
+/// Start an IdP-brokered device login: mint a pending session and return the
+/// IdP `authorization_uri` (for the user's browser) plus the `verification_uri`
+/// (for the CLI to poll). Mirrors Python `device_code_authorize_route`
+/// (authentication.py:980).
+pub async fn oidc_device_authorize(
+    State(state): State<AppState>,
+    Path(provider): Path<String>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, ServerError> {
+    let validator = state.external_oidc.as_ref().ok_or_else(|| {
+        ServerError::Validation(
+            "OIDC device flow requested but no external_oidc is configured".into(),
+        )
+    })?;
+    let (db, _issuer) = require_auth_db(&state)?;
+    let base = state.resolve_base_url(&headers);
+    let base = base.trim_end_matches('/');
+    // The redirect_uri the IdP sends the user back to (where they enter their
+    // user_code). It MUST match the redirect_uri used at code exchange time.
+    let device_code_uri = format!("{base}/api/v1/auth/provider/{provider}/device_code");
+    let verification_uri = format!("{base}/api/v1/auth/provider/{provider}/token");
+
+    // Validate provider config (and build the URL) BEFORE creating the pending
+    // row, so a misconfigured provider never leaves an orphan pending session.
+    let authorization_uri = validator
+        .build_device_authorize_url(&provider, &device_code_uri)
+        .map_err(map_auth_err)?;
+
+    let init = db
+        .create_pending_session(Duration::minutes(15))
+        .await
+        .map_err(map_auth_err)?;
+
+    Ok(Json(OidcDeviceAuthorizeResponse {
+        authorization_uri,
+        verification_uri,
+        interval: 5,
+        device_code: init.device_code,
+        expires_in: 15 * 60,
+        // Display the canonical code in its dashed `XXXX-XXXX` form; the submit
+        // route normalizes case/dashes back out.
+        user_code: tiled_auth::device_code::format_user_code(&init.user_code),
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct OidcDeviceCodeFormQuery {
+    /// The IdP authorization code, received on the redirect from the IdP.
+    pub code: String,
+}
+
+/// `GET /api/v1/auth/provider/{provider}/device_code?code=...`
+///
+/// Serve the HTML form where the user enters their `user_code` after the IdP
+/// redirects them here. Mirrors Python `device_code_user_code_form_route`
+/// (authentication.py:1012).
+pub async fn oidc_device_code_form(
+    State(state): State<AppState>,
+    Path(provider): Path<String>,
+    Query(q): Query<OidcDeviceCodeFormQuery>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let base = state.resolve_base_url(&headers);
+    let action = format!(
+        "{}/api/v1/auth/provider/{}/device_code",
+        base.trim_end_matches('/'),
+        provider
+    );
+    Html(device_code_form_html(&action, &q.code, None))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct OidcDeviceCodeSubmit {
+    /// IdP authorization code (carried by the form's hidden field).
+    pub code: String,
+    /// The user-entered code (any case, dashes optional).
+    pub user_code: String,
+}
+
+/// `POST /api/v1/auth/provider/{provider}/device_code`
+///
+/// Process the user-code form: look up the pending session, exchange the IdP
+/// code for an identity, create a tiled session, and bind it to the pending
+/// session so the CLI's next `/token` poll succeeds. Mirrors Python
+/// `device_code_user_code_submit_route` (authentication.py:1031).
+pub async fn oidc_device_code_submit(
+    State(state): State<AppState>,
+    Path(provider): Path<String>,
+    headers: HeaderMap,
+    Form(body): Form<OidcDeviceCodeSubmit>,
+) -> Result<Response, ServerError> {
+    let validator = state.external_oidc.as_ref().ok_or_else(|| {
+        ServerError::Validation("OIDC device flow used but no external_oidc is configured".into())
+    })?;
+    let (db, issuer) = require_auth_db(&state)?;
+    let base = state.resolve_base_url(&headers);
+    let base = base.trim_end_matches('/');
+    let action = format!("{base}/api/v1/auth/provider/{provider}/device_code");
+    // The redirect_uri presented at code exchange MUST match the one sent in
+    // the authorize step (the /device_code route URL).
+    let redirect_uri = action.clone();
+
+    // Invalid or expired user_code → re-render the form with an error (401),
+    // exactly as Python does.
+    let pending = match db
+        .lookup_valid_pending_session_by_user_code(&body.user_code)
+        .await
+    {
+        Ok(p) => p,
+        Err(_) => {
+            let html = device_code_form_html(
+                &action,
+                &body.code,
+                Some(
+                    "Invalid user code. It may have been mistyped, or the pending \
+                     request may have expired.",
+                ),
+            );
+            return Ok((StatusCode::UNAUTHORIZED, Html(html)).into_response());
+        }
+    };
+
+    // Exchange the IdP authorization code (no PKCE/nonce — device flow). A
+    // failure here means the user_code was right but the IdP rejected the code.
+    let code_flow = match validator
+        .exchange_device_code(&provider, &body.code, &redirect_uri)
+        .await
+    {
+        Ok(cf) => cf,
+        Err(_) => {
+            let html = device_code_failure_html(
+                "User code was correct but authentication with third party failed. \
+                 Ask administrator to see logs for details.",
+            );
+            return Ok((StatusCode::UNAUTHORIZED, Html(html)).into_response());
+        }
+    };
+    let validated = code_flow.token;
+
+    let (principal, identity) = db
+        .ensure_principal(&validated.provider, &validated.sub)
+        .await
+        .map_err(map_auth_err)?;
+    db.touch_identity_login(identity.id).await.ok();
+
+    let role_scopes = tiled_auth::ScopeSet::for_role(&principal.role);
+    let scopes = role_scopes.intersect(&state.default_login_scopes);
+
+    // Persist the OBO session state (Entra tokens or `{}`) so it rides every
+    // access token minted for this session, identical to the browser flow.
+    let session = db
+        .create_session(
+            principal.id,
+            scopes,
+            Utc::now() + issuer.refresh_ttl,
+            code_flow.session_state,
+        )
+        .await
+        .map_err(map_auth_err)?;
+
+    db.bind_pending_session(&pending.hashed_device_code, session.id)
+        .await
+        .map_err(map_auth_err)?;
+
+    Ok(Html(device_code_success_html(5)).into_response())
+}
+
+/// `POST /api/v1/auth/provider/{provider}/token`
+///
+/// The CLI polls this with its `device_code`. Returns `400 {"detail":
+/// {"error": "authorization_pending"}}` until the browser-side login completes,
+/// then mints and returns the session's tokens (single use — the pending row is
+/// deleted). Mirrors Python `device_code_token_route` (authentication.py:1097).
+pub async fn oidc_device_token(
+    State(state): State<AppState>,
+    Path(_provider): Path<String>,
+    Json(body): Json<DeviceTokenRequest>,
+) -> Result<Response, ServerError> {
+    let (db, issuer) = require_auth_db(&state)?;
+    match db.poll_pending_session(&body.device_code).await {
+        Ok(tiled_auth::PendingSessionStatus::AuthorizationPending) => Ok((
+            StatusCode::BAD_REQUEST,
+            // The client polls until `/detail/error == authorization_pending`;
+            // this shape mirrors FastAPI's HTTPException(400, {"error": ...}).
+            Json(serde_json::json!({"detail": {"error": "authorization_pending"}})),
+        )
+            .into_response()),
+        Ok(tiled_auth::PendingSessionStatus::Fulfilled(session_id)) => {
+            let session = db
+                .lookup_session_by_id(session_id)
+                .await
+                .map_err(map_auth_err)?;
+            let principal = db
+                .get_principal(session.principal_id)
+                .await
+                .map_err(map_auth_err)?
+                .ok_or_else(|| {
+                    ServerError::Internal("pending session references a missing principal".into())
+                })?;
+            let access = issuer
+                .issue_access(
+                    &principal.uuid,
+                    &session.uuid,
+                    session.scopes.clone(),
+                    session.state.clone(),
+                )
+                .map_err(map_auth_err)?;
+            let refresh = issuer
+                .issue_refresh(&principal.uuid, &session.uuid)
+                .map_err(map_auth_err)?;
+            Ok(Json(TokensResponse {
+                access_token: access,
+                refresh_token: refresh,
+                token_type: "Bearer",
+                expires_in: issuer.access_ttl.num_seconds(),
+                identity: None,
+            })
+            .into_response())
+        }
+        // Malformed (non-hex) device_code.
+        Err(tiled_auth::AuthError::Unauthorized(msg)) => Err(ServerError::Unauthorized(msg)),
+        // Absent or expired pending session.
+        Err(_) => Err(ServerError::NotFound(
+            "No such device_code. The pending request may have expired.".into(),
+        )),
+    }
+}
+
+/// Minimal HTML-attribute / text escape for values interpolated into the
+/// device-code pages (the IdP `code` and error messages).
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#x27;")
+}
+
+/// User-code entry form. Mirrors `device_code_form.html`: the IdP `code` rides
+/// in a hidden field (the real source the submit route reads), and an optional
+/// error message is shown above the form.
+fn device_code_form_html(action: &str, code: &str, message: Option<&str>) -> String {
+    let msg_block = match message {
+        Some(m) => format!(
+            "<p style=\"color:#b00;font-weight:bold\">{}</p>",
+            html_escape(m)
+        ),
+        None => String::new(),
+    };
+    format!(
+        "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+         <title>Authorize Tiled Session</title></head><body>\
+         <h1>Authorize Tiled Session</h1>{msg_block}\
+         <form action=\"{action}\" method=\"post\">\
+         <label for=\"user_code\">Enter code</label> \
+         <input type=\"text\" id=\"user_code\" name=\"user_code\" />\
+         <input type=\"hidden\" id=\"code\" name=\"code\" value=\"{code}\" />\
+         <input type=\"submit\" value=\"Enter\" /></form></body></html>",
+        action = html_escape(action),
+        code = html_escape(code),
+    )
+}
+
+/// Shown after a successful user-code submission. Mirrors
+/// `device_code_success.html`.
+fn device_code_success_html(interval: i64) -> String {
+    format!(
+        "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+         <title>Success</title></head><body><h1>Success</h1>\
+         <p>Return to your Tiled application. Within {interval} seconds it should \
+         be successfully logged in.</p></body></html>"
+    )
+}
+
+/// Shown when the user_code was valid but the IdP exchange failed. Mirrors
+/// `device_code_failure.html`.
+fn device_code_failure_html(message: &str) -> String {
+    format!(
+        "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+         <title>Failed</title></head><body><h1>Failed</h1><p>{}</p></body></html>",
+        html_escape(message)
+    )
 }
 
 // ---------------------------------------------------------------------------
