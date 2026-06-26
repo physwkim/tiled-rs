@@ -175,15 +175,10 @@ pub async fn about(State(state): State<AppState>, BaseUrl(base_url): BaseUrl) ->
     let formats = state.serialization_registry.all_formats();
     let aliases = state.serialization_registry.all_aliases();
 
-    // Surface configured authenticators so the SPA can render the right
-    // login form. We only advertise internal (username/password) authenticators
-    // here — `state.external_oidc` is a *bearer validator*, not an OAuth code-
-    // flow initiator: it accepts tokens issued elsewhere but doesn't drive a
-    // browser redirect login. Emitting it as a `mode=external` provider would
-    // be a lie until upstream tiled #1178's `/authorize` endpoint is ported
-    // (tracked in workspace task; needs OidcProvider to gain client_id/secret/
-    // authorize_endpoint/token_endpoint).
-    let providers: Vec<serde_json::Value> = state
+    // Surface configured authenticators so the SPA / CLI can render the right
+    // login form. Internal (username/password) authenticators are advertised as
+    // `mode=internal` with a `/token`-style auth_endpoint.
+    let mut providers: Vec<serde_json::Value> = state
         .authenticators
         .iter()
         .map(|a| {
@@ -196,6 +191,40 @@ pub async fn about(State(state): State<AppState>, BaseUrl(base_url): BaseUrl) ->
             })
         })
         .collect();
+
+    // External OIDC providers wired for an interactive login — i.e. that have
+    // BOTH `client_id` and `authorization_endpoint` (the same gate
+    // `build_authorize_url` / `build_device_authorize_url` enforce). A
+    // bearer-only validator (it only accepts tokens minted elsewhere, with no
+    // authorize endpoint) cannot drive a login, so it is intentionally NOT
+    // advertised: emitting it as a login provider would be a lie and the
+    // client's device grant would POST to an endpoint that 422s.
+    //
+    // Shape mirrors Python's `OIDCAuthenticator` / `ExternalAuthenticator` spec
+    // (router.py:245-253): `mode=external` with `links.auth_endpoint` = tiled's
+    // own `/authorize` route. tiled-rs brokers the device flow through that
+    // route plus its own `/token`, so — unlike Python's IdP-direct
+    // `ProxiedOIDCAuthenticator` — neither `client_id` nor `token_endpoint` is
+    // surfaced: advertising `client_id` would switch the tiled-client refresh
+    // into the form-encoded OAuth mode this server's JSON-only `/auth/refresh`
+    // does not accept, and `token_endpoint` would flip the client's device
+    // grant into the IdP-direct OAuth2 variant this server does not serve. The
+    // RP-Initiated Logout link (G5) still works without `client_id` via
+    // `id_token_hint`.
+    if let Some(validator) = state.external_oidc.as_ref() {
+        for p in validator.providers() {
+            if p.client_id.is_some() && p.authorization_endpoint.is_some() {
+                providers.push(serde_json::json!({
+                    "provider": p.name.clone(),
+                    "mode": "external",
+                    "links": {
+                        "auth_endpoint":
+                            format!("{base_url}/api/v1/auth/provider/{}/authorize", p.name),
+                    },
+                }));
+            }
+        }
+    }
     // Python: `authentication.required = not settings.allow_anonymous_access`
     // (router.py:301) — purely the anonymous-access policy, NOT whether login
     // providers exist. Rust's `no_auth_configured()` (no api_key AND no

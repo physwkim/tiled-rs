@@ -2091,6 +2091,85 @@ async fn about_logout_falls_back_to_local_route_without_oidc() {
     );
 }
 
+/// A login-capable external OIDC provider (has `client_id` +
+/// `authorization_endpoint`) is advertised in `authentication.providers` as a
+/// `mode=external` entry whose `auth_endpoint` is tiled's own `/authorize`
+/// route. Deliberate divergence from Python's IdP-direct
+/// `ProxiedOIDCAuthenticator`: tiled-rs brokers the device flow itself, so the
+/// entry surfaces NEITHER `client_id` NOR `token_endpoint` (either would
+/// mis-drive the tiled-client refresh / device grant).
+#[tokio::test]
+async fn about_advertises_login_capable_oidc_provider() {
+    let (app, _validator, _auth_db, _dir) =
+        build_code_flow_app("https://mock-idp.test/token").await;
+
+    let (status, body) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/",
+        &[("host", "localhost:8000")],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let providers = body["authentication"]["providers"].as_array().unwrap();
+    assert_eq!(
+        providers.len(),
+        1,
+        "exactly the one login-capable OIDC provider must be advertised: {providers:?}"
+    );
+    let p = &providers[0];
+    assert_eq!(p["provider"].as_str(), Some("mock-idp"));
+    assert_eq!(p["mode"].as_str(), Some("external"));
+    assert_eq!(
+        p["links"]["auth_endpoint"].as_str(),
+        Some("http://localhost:8000/api/v1/auth/provider/mock-idp/authorize"),
+        "auth_endpoint must be tiled's own brokered /authorize route"
+    );
+    assert!(
+        p["links"].get("client_id").is_none(),
+        "client_id must NOT be advertised (would switch client refresh to form-encoded OAuth)"
+    );
+    assert!(
+        p["links"].get("token_endpoint").is_none(),
+        "token_endpoint must NOT be advertised (would flip the device grant to IdP-direct OAuth2)"
+    );
+}
+
+/// A bearer-only external OIDC validator (no `client_id` /
+/// `authorization_endpoint` — it only accepts tokens minted elsewhere) cannot
+/// drive a login, so it is NOT advertised in `authentication.providers`. The
+/// links block is still present (an external OIDC validator is configured).
+#[tokio::test]
+async fn about_omits_bearer_only_oidc_provider() {
+    let (app, _auth_db, _validator, _dir) = build_oidc_app().await;
+
+    let (status, body) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/",
+        &[("host", "localhost:8000")],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    assert_eq!(
+        body["authentication"]["providers"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0,
+        "a bearer-only validator must not be advertised as a login provider"
+    );
+    // The links block is still built (external OIDC validator is configured).
+    assert!(
+        body["authentication"]["links"]["whoami"].is_string(),
+        "links block must still be present for a bearer-validator deployment"
+    );
+}
+
 /// GET /authorize for an unknown provider → Validation error (not 302).
 #[tokio::test]
 async fn oidc_authorize_unknown_provider_returns_error() {
