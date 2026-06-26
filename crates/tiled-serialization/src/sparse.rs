@@ -70,6 +70,18 @@ pub fn register_sparse_serializers(reg: &SerializationRegistry) {
                 crate::csv_table::csv_table_serializer(false),
             );
         }
+
+        // Real XLSX spreadsheet (NOT the legacy `application/vnd.ms-excel` xls,
+        // which maps to CSV above to match the array/table families). Mirrors
+        // Python sparse.py:45-51, which registers XLSX_MIME_TYPE to
+        // `serialize_excel(to_dataframe(sparse_arr), ...)`. The server already
+        // hands us the COO Arrow IPC table (columns dim0..dimN, data), so the
+        // table spreadsheet serializer applies unchanged.
+        reg.register(
+            StructureFamily::Sparse,
+            crate::excel_table::XLSX_MIME,
+            crate::excel_table::excel_serializer(),
+        );
     }
 
     #[cfg(feature = "parquet")]
@@ -230,6 +242,36 @@ mod tests {
         assert!(
             reg.dispatch(StructureFamily::Sparse, mime::CSV).is_some(),
             "Sparse must have a text/csv serializer"
+        );
+    }
+
+    /// (Sparse, XLSX) must resolve to the real spreadsheet serializer — NOT the
+    /// CSV serializer the legacy `application/vnd.ms-excel` xls maps to —
+    /// mirroring Python sparse.py:45-51 (XLSX_MIME_TYPE → serialize_excel over
+    /// the COO DataFrame). Output is an XLSX (a zip, magic `PK`), not CSV text.
+    #[cfg(feature = "csv")]
+    #[test]
+    fn sparse_xlsx_registered_and_emits_spreadsheet() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("dim0", DataType::Int64, false),
+            Field::new("data", DataType::Float64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(Float64Array::from(vec![10.0, 20.0])),
+            ],
+        )
+        .unwrap();
+        let serializer = sparse_registry()
+            .dispatch(StructureFamily::Sparse, crate::excel_table::XLSX_MIME)
+            .expect("sparse XLSX must be registered (Python sparse.py:45-51)");
+        let out = serializer(&ipc_bytes(&batch), &Value::Null).unwrap();
+        assert_eq!(
+            &out[..2],
+            b"PK",
+            "XLSX output must be a zip (PK magic), not CSV text"
         );
     }
 

@@ -25,7 +25,7 @@ pub fn register_excel_serializer(reg: &SerializationRegistry) {
     reg.register_alias(".xlsx", XLSX_MIME);
 }
 
-fn excel_serializer() -> SerializerFn {
+pub(crate) fn excel_serializer() -> SerializerFn {
     Box::new(
         |data, _meta| -> Result<Bytes, crate::registry::SerializeError> {
             // Read Arrow IPC and stream rows directly into the worksheet
