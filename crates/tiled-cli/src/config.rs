@@ -9,7 +9,9 @@ use anyhow::Context;
 use serde::Deserialize;
 
 use tiled_access::{AccessPolicy, PassthroughPolicy, TagBasedPolicy};
-use tiled_auth::ScopeSet;
+use tiled_auth::{
+    ExternalOidcValidator, OidcDiscovery, OidcProvider, Scope, ScopeSet, discover_oidc,
+};
 
 /// Top-level configuration.
 #[derive(Debug, Deserialize)]
@@ -312,11 +314,232 @@ pub struct AuthConfig {
     /// Only takes effect in multi-user mode (`--auth-db-uri`).
     #[serde(default)]
     pub tiled_admins: Vec<TiledAdmin>,
+    /// External authentication providers — the OIDC family of Python's
+    /// `authentication.providers` (`config.py`). Each OIDC-family entry is
+    /// validated and wired into the external-OIDC validator at startup
+    /// (bearer + authorization-code flow); non-OIDC authenticators
+    /// (SAML/LDAP/PAM) in the same list are skipped with a warning until they
+    /// are modeled. See [`AuthProviderConfig`].
+    #[serde(default)]
+    pub providers: Vec<AuthProviderConfig>,
     /// Catch-all for authentication config keys the Rust port does not yet
-    /// model (e.g. `providers`, `session_max_age`).
+    /// model (e.g. `session_max_age`).
     /// Warn-logged at startup.
     #[serde(flatten)]
     pub unknown: BTreeMap<String, serde_yaml::Value>,
+}
+
+/// One entry in `authentication.providers`. Mirrors the OIDC-family entries of
+/// Python's `authentication.providers`: a `provider` name, an `authenticator`
+/// selector, and an `args` map.
+///
+/// Python uses an import path (`tiled.authenticators:OIDCAuthenticator`); the
+/// Rust port cannot import arbitrary code, so `authenticator` is matched by its
+/// class name — the OIDC family (`OIDCAuthenticator`, `ProxiedOIDCAuthenticator`,
+/// `EntraAuthenticator`) or the short selectors `oidc`/`entra`/`proxied_oidc`.
+/// Any other authenticator is skipped with a warning (not yet modeled).
+///
+/// ```yaml
+/// authentication:
+///   providers:
+///     - provider: keycloak
+///       authenticator: tiled.authenticators:OIDCAuthenticator
+///       args:
+///         audience: tiled
+///         client_id: tiled-server
+///         client_secret: s3cret
+///         well_known_uri: https://idp.example/.well-known/openid-configuration
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct AuthProviderConfig {
+    /// Provider name — becomes the principal `provider` and the
+    /// `/api/v1/auth/provider/{provider}/...` route segment.
+    pub provider: String,
+    /// Authenticator selector (import path or short name). See the type docs.
+    pub authenticator: String,
+    /// Authenticator arguments. Only the OIDC family is read.
+    #[serde(default)]
+    pub args: OidcProviderArgs,
+}
+
+/// `args` for an OIDC-family provider. Mirrors the constructor kwargs of
+/// Python's `OIDCAuthenticator` (`authenticators.py`): one `well_known_uri`
+/// drives endpoint discovery, or the endpoints are given explicitly.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct OidcProviderArgs {
+    /// Required `aud` claim every token must carry. Maps to the
+    /// (single-element) `OidcProvider::audiences`.
+    pub audience: Option<String>,
+    /// OAuth2 `client_id` (required for the authorization-code flow).
+    pub client_id: Option<String>,
+    /// OAuth2 `client_secret`. Omit / empty → PKCE-only public client.
+    pub client_secret: Option<String>,
+    /// OIDC Discovery document URL. When set, `issuer`, `jwks_uri`,
+    /// `authorization_endpoint`, and `token_endpoint` are fetched from it.
+    pub well_known_uri: Option<String>,
+    /// Explicit issuer. Overrides discovery; required when `well_known_uri`
+    /// is absent.
+    pub issuer: Option<String>,
+    /// Explicit JWKS URL. Overrides discovery; required when `well_known_uri`
+    /// is absent.
+    pub jwks_uri: Option<String>,
+    /// Explicit authorization endpoint. Overrides discovery.
+    pub authorization_endpoint: Option<String>,
+    /// Explicit token endpoint. Overrides discovery.
+    pub token_endpoint: Option<String>,
+    /// JWT claim used as the principal subject. Defaults to `sub`.
+    pub subject_claim: Option<String>,
+    /// On a successful code-flow callback, redirect the browser here.
+    pub redirect_on_success: Option<String>,
+    /// On a code-flow failure, redirect the browser here.
+    pub redirect_on_failure: Option<String>,
+    /// Entra-style upstream-scope → tiled-scope map. Each value is a list of
+    /// tiled scope strings (e.g. `[read:metadata, read:data]`).
+    #[serde(default)]
+    pub scopes_map: Option<HashMap<String, Vec<String>>>,
+}
+
+impl AuthConfig {
+    /// Build the external-OIDC validator from `providers` entries in the OIDC
+    /// family. Returns `None` when no such providers are configured.
+    ///
+    /// Performs `.well-known/openid-configuration` discovery for any provider
+    /// that sets `well_known_uri`; a discovery or config error aborts startup
+    /// (fail-fast) rather than silently leaving OIDC disabled.
+    pub async fn build_oidc_validator(&self) -> anyhow::Result<Option<Arc<ExternalOidcValidator>>> {
+        let mut providers = Vec::new();
+        for entry in &self.providers {
+            if !is_oidc_authenticator(&entry.authenticator) {
+                tracing::warn!(
+                    provider = %entry.provider,
+                    authenticator = %entry.authenticator,
+                    "authentication.providers: non-OIDC authenticator is not yet wired; skipping"
+                );
+                continue;
+            }
+            providers.push(entry.build_oidc_provider().await?);
+        }
+        if providers.is_empty() {
+            return Ok(None);
+        }
+        let validator = ExternalOidcValidator::new(providers)
+            .context("authentication.providers: building external OIDC validator")?;
+        Ok(Some(Arc::new(validator)))
+    }
+}
+
+/// True when `authenticator` names an OIDC-family authenticator — either a
+/// Python import path ending in `OIDCAuthenticator`/`ProxiedOIDCAuthenticator`/
+/// `EntraAuthenticator`, or a short selector (`oidc`/`entra`/`proxied_oidc`).
+fn is_oidc_authenticator(authenticator: &str) -> bool {
+    let class = authenticator
+        .rsplit([':', '.'])
+        .next()
+        .unwrap_or(authenticator);
+    matches!(
+        class,
+        "OIDCAuthenticator" | "ProxiedOIDCAuthenticator" | "EntraAuthenticator"
+    ) || matches!(authenticator, "oidc" | "entra" | "proxied_oidc")
+}
+
+impl AuthProviderConfig {
+    /// Run discovery (if `well_known_uri` is set) then assemble the
+    /// [`OidcProvider`].
+    async fn build_oidc_provider(&self) -> anyhow::Result<OidcProvider> {
+        let discovery = match &self.args.well_known_uri {
+            Some(uri) => Some(discover_oidc(uri).await.with_context(|| {
+                format!(
+                    "authentication.providers '{}': OIDC discovery from '{uri}'",
+                    self.provider
+                )
+            })?),
+            None => None,
+        };
+        self.args.assemble(&self.provider, discovery)
+    }
+}
+
+impl OidcProviderArgs {
+    /// Assemble an [`OidcProvider`] from the args and an optional discovery
+    /// result. Pure (no network) so the override/validation logic is unit-
+    /// testable. Explicit args win over discovered values; a missing required
+    /// endpoint (with no discovery to supply it) is a hard error.
+    fn assemble(
+        &self,
+        name: &str,
+        discovery: Option<OidcDiscovery>,
+    ) -> anyhow::Result<OidcProvider> {
+        let audience = self.audience.clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "authentication.providers '{name}': 'audience' is required (token 'aud' validation)"
+            )
+        })?;
+        let issuer = self
+            .issuer
+            .clone()
+            .or_else(|| discovery.as_ref().map(|d| d.issuer.clone()))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "authentication.providers '{name}': 'issuer' missing — set 'well_known_uri' \
+                     for discovery or provide 'issuer' explicitly"
+                )
+            })?;
+        let jwks_url = self
+            .jwks_uri
+            .clone()
+            .or_else(|| discovery.as_ref().map(|d| d.jwks_uri.clone()))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "authentication.providers '{name}': 'jwks_uri' missing — set 'well_known_uri' \
+                     for discovery or provide 'jwks_uri' explicitly"
+                )
+            })?;
+        let authorization_endpoint = self.authorization_endpoint.clone().or_else(|| {
+            discovery
+                .as_ref()
+                .and_then(|d| d.authorization_endpoint.clone())
+        });
+        let token_endpoint = self
+            .token_endpoint
+            .clone()
+            .or_else(|| discovery.as_ref().and_then(|d| d.token_endpoint.clone()));
+
+        let mut scopes_map = HashMap::new();
+        if let Some(map) = &self.scopes_map {
+            for (upstream, tiled_scopes) in map {
+                let mut parsed = Vec::with_capacity(tiled_scopes.len());
+                for s in tiled_scopes {
+                    let scope = Scope::parse(s).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "authentication.providers '{name}': unknown tiled scope '{s}' in scopes_map"
+                        )
+                    })?;
+                    parsed.push(scope);
+                }
+                scopes_map.insert(upstream.clone(), parsed);
+            }
+        }
+
+        Ok(OidcProvider {
+            name: name.to_string(),
+            jwks_url,
+            issuer,
+            audiences: vec![audience],
+            subject_claim: self
+                .subject_claim
+                .clone()
+                .unwrap_or_else(|| "sub".to_string()),
+            // Empty → derive the algorithm from the matched JWK (RS256/ES256).
+            algorithms: Vec::new(),
+            scopes_map,
+            client_id: self.client_id.clone(),
+            client_secret: self.client_secret.clone(),
+            authorization_endpoint,
+            token_endpoint,
+            redirect_on_success: self.redirect_on_success.clone(),
+            redirect_on_failure: self.redirect_on_failure.clone(),
+        })
+    }
 }
 
 /// `catalog:` block — Python tiled's recommended config form
@@ -721,6 +944,266 @@ mod tests {
         );
     }
 
+    // --- authentication.providers (OIDC) ---
+
+    fn discovery_doc() -> OidcDiscovery {
+        OidcDiscovery {
+            issuer: "https://idp.test/".into(),
+            jwks_uri: "https://idp.test/keys".into(),
+            authorization_endpoint: Some("https://idp.test/authorize".into()),
+            token_endpoint: Some("https://idp.test/token".into()),
+        }
+    }
+
+    #[test]
+    fn oidc_provider_parses_into_typed_field_not_unknown() {
+        let cfg: TiledConfig = serde_yaml::from_str(
+            "trees: []\n\
+             authentication:\n\
+             \x20 providers:\n\
+             \x20   - provider: keycloak\n\
+             \x20     authenticator: tiled.authenticators:OIDCAuthenticator\n\
+             \x20     args:\n\
+             \x20       audience: tiled\n\
+             \x20       client_id: tiled-server\n\
+             \x20       well_known_uri: https://idp.example/.well-known/openid-configuration\n",
+        )
+        .unwrap();
+        let auth = cfg
+            .authentication
+            .as_ref()
+            .expect("authentication block present");
+        assert!(
+            !auth.unknown.contains_key("providers"),
+            "modeled key 'providers' must not appear in catch-all; got {:?}",
+            auth.unknown
+        );
+        assert_eq!(auth.providers.len(), 1);
+        let p = &auth.providers[0];
+        assert_eq!(p.provider, "keycloak");
+        assert_eq!(p.authenticator, "tiled.authenticators:OIDCAuthenticator");
+        assert_eq!(p.args.audience.as_deref(), Some("tiled"));
+        assert_eq!(p.args.client_id.as_deref(), Some("tiled-server"));
+        assert_eq!(
+            p.args.well_known_uri.as_deref(),
+            Some("https://idp.example/.well-known/openid-configuration")
+        );
+        assert!(is_oidc_authenticator(&p.authenticator));
+    }
+
+    #[test]
+    fn is_oidc_authenticator_matches_family_only() {
+        assert!(is_oidc_authenticator(
+            "tiled.authenticators:OIDCAuthenticator"
+        ));
+        assert!(is_oidc_authenticator(
+            "tiled.authenticators:ProxiedOIDCAuthenticator"
+        ));
+        assert!(is_oidc_authenticator(
+            "tiled.authenticators:EntraAuthenticator"
+        ));
+        assert!(is_oidc_authenticator("oidc"));
+        assert!(is_oidc_authenticator("entra"));
+        assert!(is_oidc_authenticator("proxied_oidc"));
+        // Non-OIDC authenticators must not match.
+        assert!(!is_oidc_authenticator(
+            "tiled.authenticators:SAMLAuthenticator"
+        ));
+        assert!(!is_oidc_authenticator(
+            "tiled.authenticators:LDAPAuthenticator"
+        ));
+        assert!(!is_oidc_authenticator("ldap"));
+    }
+
+    #[test]
+    fn assemble_fills_endpoints_from_discovery() {
+        let args = OidcProviderArgs {
+            audience: Some("tiled".into()),
+            client_id: Some("tiled-server".into()),
+            ..Default::default()
+        };
+        let p = args.assemble("keycloak", Some(discovery_doc())).unwrap();
+        assert_eq!(p.name, "keycloak");
+        assert_eq!(p.issuer, "https://idp.test/");
+        assert_eq!(p.jwks_url, "https://idp.test/keys");
+        assert_eq!(p.audiences, vec!["tiled".to_string()]);
+        assert_eq!(p.subject_claim, "sub");
+        assert_eq!(
+            p.authorization_endpoint.as_deref(),
+            Some("https://idp.test/authorize")
+        );
+        assert_eq!(p.token_endpoint.as_deref(), Some("https://idp.test/token"));
+        assert_eq!(p.client_id.as_deref(), Some("tiled-server"));
+        // Empty algorithms → derive from JWKS at validation time.
+        assert!(p.algorithms.is_empty());
+    }
+
+    #[test]
+    fn assemble_explicit_endpoints_override_discovery() {
+        let args = OidcProviderArgs {
+            audience: Some("tiled".into()),
+            issuer: Some("https://override.test/".into()),
+            jwks_uri: Some("https://override.test/keys".into()),
+            ..Default::default()
+        };
+        let p = args.assemble("p", Some(discovery_doc())).unwrap();
+        assert_eq!(p.issuer, "https://override.test/");
+        assert_eq!(p.jwks_url, "https://override.test/keys");
+    }
+
+    #[test]
+    fn assemble_without_discovery_uses_explicit_endpoints() {
+        let args = OidcProviderArgs {
+            audience: Some("tiled".into()),
+            issuer: Some("https://idp.test/".into()),
+            jwks_uri: Some("https://idp.test/keys".into()),
+            subject_claim: Some("oid".into()),
+            ..Default::default()
+        };
+        let p = args.assemble("p", None).unwrap();
+        assert_eq!(p.issuer, "https://idp.test/");
+        assert_eq!(p.jwks_url, "https://idp.test/keys");
+        assert_eq!(p.subject_claim, "oid");
+    }
+
+    #[test]
+    fn assemble_requires_audience() {
+        let args = OidcProviderArgs {
+            issuer: Some("https://idp.test/".into()),
+            jwks_uri: Some("https://idp.test/keys".into()),
+            ..Default::default()
+        };
+        let err = args.assemble("p", None).unwrap_err().to_string();
+        assert!(
+            err.contains("audience"),
+            "error must name the missing audience: {err}"
+        );
+    }
+
+    #[test]
+    fn assemble_requires_endpoints_without_discovery() {
+        let args = OidcProviderArgs {
+            audience: Some("tiled".into()),
+            ..Default::default()
+        };
+        let err = args.assemble("p", None).unwrap_err().to_string();
+        assert!(
+            err.contains("issuer"),
+            "error must name the missing issuer: {err}"
+        );
+    }
+
+    #[test]
+    fn assemble_parses_scopes_map_and_rejects_unknown_scope() {
+        let mut ok_map = HashMap::new();
+        ok_map.insert(
+            "Tiled.Read".to_string(),
+            vec!["read:metadata".to_string(), "read:data".to_string()],
+        );
+        let args = OidcProviderArgs {
+            audience: Some("tiled".into()),
+            issuer: Some("https://idp.test/".into()),
+            jwks_uri: Some("https://idp.test/keys".into()),
+            scopes_map: Some(ok_map),
+            ..Default::default()
+        };
+        let p = args.assemble("entra", None).unwrap();
+        let mapped: Vec<&str> = p
+            .scopes_map
+            .get("Tiled.Read")
+            .expect("mapped upstream scope present")
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        assert_eq!(mapped, vec!["read:metadata", "read:data"]);
+
+        let mut bad_map = HashMap::new();
+        bad_map.insert("X".to_string(), vec!["not:a:scope".to_string()]);
+        let bad = OidcProviderArgs {
+            audience: Some("tiled".into()),
+            issuer: Some("https://idp.test/".into()),
+            jwks_uri: Some("https://idp.test/keys".into()),
+            scopes_map: Some(bad_map),
+            ..Default::default()
+        };
+        let err = bad.assemble("entra", None).unwrap_err().to_string();
+        assert!(
+            err.contains("scopes_map"),
+            "error must name scopes_map: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_oidc_validator_none_when_no_providers() {
+        let cfg: TiledConfig =
+            serde_yaml::from_str("trees: []\nauthentication:\n  single_user_api_key: secret\n")
+                .unwrap();
+        let auth = cfg.authentication.unwrap();
+        assert!(auth.build_oidc_validator().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn build_oidc_validator_skips_non_oidc_providers() {
+        // A SAML entry in the list is skipped (not yet modeled) without any
+        // network call, so no validator is built.
+        let cfg: TiledConfig = serde_yaml::from_str(
+            "trees: []\n\
+             authentication:\n\
+             \x20 providers:\n\
+             \x20   - provider: corp-saml\n\
+             \x20     authenticator: tiled.authenticators:SAMLAuthenticator\n\
+             \x20     args: {}\n",
+        )
+        .unwrap();
+        let auth = cfg.authentication.unwrap();
+        let validator = auth.build_oidc_validator().await.unwrap();
+        assert!(
+            validator.is_none(),
+            "a non-OIDC provider must be skipped, yielding no validator"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_oidc_validator_builds_code_flow_provider_from_config() {
+        // Positive end-to-end path: a YAML OIDC provider with explicit endpoints
+        // (no well_known_uri → no network) builds a validator whose provider is
+        // wired for the authorization-code flow, proving config alone produces a
+        // working external_oidc.
+        let cfg: TiledConfig = serde_yaml::from_str(
+            "trees: []\n\
+             authentication:\n\
+             \x20 providers:\n\
+             \x20   - provider: keycloak\n\
+             \x20     authenticator: oidc\n\
+             \x20     args:\n\
+             \x20       audience: tiled\n\
+             \x20       client_id: tiled-server\n\
+             \x20       issuer: https://idp.test/\n\
+             \x20       jwks_uri: https://idp.test/keys\n\
+             \x20       authorization_endpoint: https://idp.test/authorize\n\
+             \x20       token_endpoint: https://idp.test/token\n",
+        )
+        .unwrap();
+        let auth = cfg.authentication.unwrap();
+        let validator = auth
+            .build_oidc_validator()
+            .await
+            .unwrap()
+            .expect("an OIDC provider must yield a validator");
+        let url = validator
+            .build_authorize_url("keycloak", "https://app.test/cb")
+            .expect("provider must be wired for the code flow");
+        assert!(
+            url.starts_with("https://idp.test/authorize?"),
+            "authorize URL must target the configured endpoint: {url}"
+        );
+        assert!(url.contains("response_type=code"), "url={url}");
+        assert!(url.contains("client_id=tiled-server"), "url={url}");
+        assert!(url.contains("code_challenge_method=S256"), "url={url}");
+        assert!(url.contains("state="), "url={url}");
+        assert!(url.contains("nonce="), "url={url}");
+    }
+
     #[test]
     fn allow_origins_concatenates_across_config_directory() {
         // allow_origins is a mergeable list (Python config.py:484), so a
@@ -882,7 +1365,8 @@ mod tests {
         );
     }
 
-    // Unknown authentication sub-keys must land in AuthConfig.unknown.
+    // Unknown authentication sub-keys must land in AuthConfig.unknown, while
+    // modeled keys (`providers`) must NOT.
     #[test]
     fn unknown_auth_key_is_captured_not_dropped() {
         let cfg: TiledConfig = serde_yaml::from_str(
@@ -898,9 +1382,15 @@ mod tests {
             "unknown auth key 'session_max_age' must be captured; got {:?}",
             auth.unknown
         );
+        // `providers` is now modeled — it must parse into the typed field and
+        // must NOT fall into the catch-all.
         assert!(
-            auth.unknown.contains_key("providers"),
-            "unknown auth key 'providers' must be captured; got {:?}",
+            auth.providers.is_empty(),
+            "empty providers list must parse into the typed field"
+        );
+        assert!(
+            !auth.unknown.contains_key("providers"),
+            "modeled key 'providers' must not appear in auth catch-all; got {:?}",
             auth.unknown
         );
         // Known auth fields must NOT appear in unknown.

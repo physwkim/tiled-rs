@@ -749,6 +749,16 @@ pub async fn run(command: Command) -> Result<()> {
                 None
             };
 
+            // Build the external-OIDC validator from `authentication.providers`
+            // (OIDC family). `.well-known/openid-configuration` discovery runs
+            // here for any provider with a `well_known_uri`; a config or
+            // discovery error fails startup rather than silently disabling OIDC.
+            let external_oidc_value =
+                match file_config.as_ref().and_then(|c| c.authentication.as_ref()) {
+                    Some(auth) => auth.build_oidc_validator().await?,
+                    None => None,
+                };
+
             let state = tiled_server::AppState {
                 root_tree,
                 serialization_registry: registry,
@@ -765,7 +775,7 @@ pub async fn run(command: Command) -> Result<()> {
                 issuer: issuer_handle,
                 authenticators: authenticators_built,
                 proxied_header_auth: proxied_auth,
-                external_oidc: None,
+                external_oidc: external_oidc_value,
                 forwarded_allow_ips: None,
                 max_request_body_bytes: 10 * 1024 * 1024,
                 response_bytesize_limit: file_config

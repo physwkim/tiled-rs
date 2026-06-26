@@ -105,6 +105,63 @@ pub struct OidcProvider {
     pub redirect_on_failure: Option<String>,
 }
 
+/// Endpoints discovered from an OpenID Connect Discovery document
+/// (`<issuer>/.well-known/openid-configuration`, OIDC Discovery 1.0 §3/§4).
+///
+/// Lets an operator configure a single `well_known_uri` instead of spelling
+/// out `issuer`, `jwks_url`, `authorization_endpoint`, and `token_endpoint`
+/// by hand — mirrors Python tiled's `OIDCAuthenticator(well_known_uri=…)`,
+/// which derives the same endpoints from this document. Only the fields the
+/// validator needs are captured; every other member is ignored.
+#[derive(Debug, Clone, Deserialize)]
+pub struct OidcDiscovery {
+    /// REQUIRED. The provider's issuer identifier; must equal the `iss` claim
+    /// of tokens it signs (becomes [`OidcProvider::issuer`]).
+    pub issuer: String,
+    /// REQUIRED. URL of the provider's JWKS — its signing keys
+    /// (becomes [`OidcProvider::jwks_url`]).
+    pub jwks_uri: String,
+    /// REQUIRED for the authorization-code flow; some bearer-only providers
+    /// omit it. Populates [`OidcProvider::authorization_endpoint`].
+    #[serde(default)]
+    pub authorization_endpoint: Option<String>,
+    /// REQUIRED unless the provider only supports the implicit flow.
+    /// Populates [`OidcProvider::token_endpoint`].
+    #[serde(default)]
+    pub token_endpoint: Option<String>,
+}
+
+/// Fetch and parse an OIDC Discovery document from `well_known_uri`.
+///
+/// `well_known_uri` must be the full discovery URL — typically
+/// `<issuer>/.well-known/openid-configuration` — matching Python tiled's
+/// `OIDCAuthenticator(well_known_uri=…)` (it is requested verbatim, not
+/// derived from an issuer base). The returned endpoints build an
+/// [`OidcProvider`] so operators configure one URL instead of four.
+pub async fn discover_oidc(well_known_uri: &str) -> Result<OidcDiscovery> {
+    let http = reqwest::Client::new();
+    let resp = http.get(well_known_uri).send().await.map_err(|e| {
+        AuthError::Validation(format!("OIDC discovery fetch '{well_known_uri}': {e}"))
+    })?;
+    let status = resp.status();
+    if !status.is_success() {
+        return Err(AuthError::Validation(format!(
+            "OIDC discovery '{well_known_uri}' returned HTTP {status}"
+        )));
+    }
+    let body = resp.bytes().await.map_err(|e| {
+        AuthError::Validation(format!("OIDC discovery '{well_known_uri}' read body: {e}"))
+    })?;
+    parse_oidc_discovery(&body)
+        .map_err(|e| AuthError::Validation(format!("OIDC discovery '{well_known_uri}': {e}")))
+}
+
+/// Parse a discovery-document body. Split out from [`discover_oidc`] so the
+/// JSON shape is unit-testable without a network fetch.
+fn parse_oidc_discovery(body: &[u8]) -> std::result::Result<OidcDiscovery, serde_json::Error> {
+    serde_json::from_slice(body)
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct JwksDocument {
     keys: Vec<Jwk>,
@@ -785,6 +842,50 @@ fn gen_state() -> String {
 mod tests {
     use super::*;
     use jsonwebtoken::{EncodingKey, Header, encode};
+
+    #[test]
+    fn parse_oidc_discovery_extracts_endpoints_and_ignores_extra() {
+        // A representative `.well-known/openid-configuration` body with the
+        // four fields we read plus extra members an IdP advertises.
+        let body = br#"{
+            "issuer": "https://idp.test/",
+            "authorization_endpoint": "https://idp.test/authorize",
+            "token_endpoint": "https://idp.test/token",
+            "jwks_uri": "https://idp.test/keys",
+            "userinfo_endpoint": "https://idp.test/userinfo",
+            "response_types_supported": ["code"],
+            "id_token_signing_alg_values_supported": ["RS256"]
+        }"#;
+        let d = parse_oidc_discovery(body).expect("well-formed discovery doc must parse");
+        assert_eq!(d.issuer, "https://idp.test/");
+        assert_eq!(d.jwks_uri, "https://idp.test/keys");
+        assert_eq!(
+            d.authorization_endpoint.as_deref(),
+            Some("https://idp.test/authorize")
+        );
+        assert_eq!(d.token_endpoint.as_deref(), Some("https://idp.test/token"));
+    }
+
+    #[test]
+    fn parse_oidc_discovery_optional_endpoints_default_none() {
+        // A bearer-only provider may omit authorization/token endpoints.
+        let body = br#"{"issuer":"https://idp.test/","jwks_uri":"https://idp.test/keys"}"#;
+        let d = parse_oidc_discovery(body).expect("issuer + jwks_uri suffice");
+        assert_eq!(d.issuer, "https://idp.test/");
+        assert_eq!(d.jwks_uri, "https://idp.test/keys");
+        assert!(d.authorization_endpoint.is_none());
+        assert!(d.token_endpoint.is_none());
+    }
+
+    #[test]
+    fn parse_oidc_discovery_rejects_missing_jwks_uri() {
+        // `jwks_uri` is required — without it the validator has no keys.
+        let body = br#"{"issuer":"https://idp.test/"}"#;
+        assert!(
+            parse_oidc_discovery(body).is_err(),
+            "a discovery doc without jwks_uri must be rejected"
+        );
+    }
 
     fn test_provider() -> OidcProvider {
         OidcProvider {
