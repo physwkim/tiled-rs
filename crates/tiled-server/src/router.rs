@@ -2049,6 +2049,22 @@ pub async fn container_full(
         ));
     }
 
+    // Deep-export to a single HDF5 file — Python container.serialize_hdf5
+    // (serialization/container.py:46). Like the zip branch this needs the
+    // adapter tree (not just bytes), so the walk + per-leaf read happen here:
+    // each numeric array → a dataset, each table column → its own 1-D dataset,
+    // intermediate containers → groups.
+    #[cfg(feature = "hdf5-serializer")]
+    if media_type == tiled_core::media_type::mime::HDF5 {
+        let h5 =
+            container_full_hdf5(&state, &segments, &path, access_filter.as_ref(), &params).await?;
+        return Ok(serve_with_range(
+            &headers,
+            tiled_core::media_type::mime::HDF5,
+            h5,
+        ));
+    }
+
     // Non-zip: resolve the container on the executor (async walk/keys/search/get).
     let walked_nonzip;
     let container: &dyn ContainerAdapter = if segments.is_empty() {
@@ -2139,6 +2155,184 @@ struct ZipEntry {
 /// The owned-buffer ZipWriter that ping-pongs through `spawn_blocking` in
 /// phase 2 (one write per leaf, returned for the next iteration).
 type ZipBuf = zip::ZipWriter<Cursor<Vec<u8>>>;
+
+/// One leaf read into an owned, `Send` description for the HDF5 deep-export.
+/// Phase A (executor) reads each leaf into this; phase B (`spawn_blocking`)
+/// drives the `!Send` HDF5 builder from it.
+#[cfg(feature = "hdf5-serializer")]
+enum CollectedH5Leaf {
+    Array {
+        /// Parent group path ("a/b"); empty = file root.
+        group_path: String,
+        /// Dataset name (the array's own key).
+        name: String,
+        data: bytes::Bytes,
+        /// numpy dtype kind char (`f`/`i`/`u`).
+        kind: char,
+        itemsize: usize,
+        big_endian: bool,
+        shape: Vec<usize>,
+    },
+    Table {
+        /// Group path for the table (its key); each column becomes a dataset
+        /// beneath it.
+        group_path: String,
+        batch: arrow::record_batch::RecordBatch,
+    },
+}
+
+/// Deep-export the container subtree as a single HDF5 file — Python
+/// `container.serialize_hdf5`. Walks like the zip export, reads each leaf on the
+/// executor (phase A), then builds the HDF5 tree on `spawn_blocking` (phase B,
+/// since rust-hdf5 is blocking and `!Send`). Numeric arrays and table columns
+/// become 1-D datasets; intermediate containers become groups. Sparse/awkward
+/// and depth-truncated leaves (the zip export's JSON "crumbs") are skipped —
+/// HDF5 has no crumb placeholder, and Python's `walk` yields no dataset shape
+/// for those families either.
+#[cfg(feature = "hdf5-serializer")]
+async fn container_full_hdf5(
+    state: &AppState,
+    segments: &[String],
+    path: &str,
+    access_filter: Option<&tiled_core::queries::AccessBlobFilter>,
+    params: &HashMap<String, String>,
+) -> Result<bytes::Bytes, ServerError> {
+    use tiled_serialization::hdf5_container::Hdf5TreeBuilder;
+
+    let walked;
+    let container: &dyn ContainerAdapter = if segments.is_empty() {
+        state.root_tree.as_ref()
+    } else {
+        walked = core::walk_tree(state.root_tree.as_ref(), segments).await?;
+        walked.as_container().ok_or_else(|| {
+            ServerError::WrongType(format!("'{}' is not a container", segments.join("/")))
+        })?
+    };
+    let max_depth: Option<usize> = params
+        .get("max_depth")
+        .and_then(|s| s.parse::<usize>().ok())
+        .map(|d| d.min(DEPTH_LIMIT));
+
+    let mut entries: Vec<ZipEntry> = Vec::new();
+    collect_zip_entries(
+        container,
+        "",
+        path,
+        access_filter,
+        &mut entries,
+        0,
+        max_depth,
+    )
+    .await?;
+
+    // Phase A: read each leaf on the executor into an owned, Send description.
+    // The same cumulative bytesize cap as the zip export guards memory (the whole
+    // tree is held decoded before the single-file build).
+    let mut collected: Vec<CollectedH5Leaf> = Vec::new();
+    let mut cumulative_bytes: usize = 0;
+    for ZipEntry { name, leaf } in entries {
+        match leaf {
+            ZipLeaf::Array(arc) => {
+                let slice = tiled_core::ndslice::NDSlice::empty();
+                let nd = arc.read(&slice).await.map_err(ServerError::from)?;
+                cumulative_bytes += nd.data.len();
+                check_response_size(
+                    cumulative_bytes,
+                    state.response_bytesize_limit,
+                    "Select a subset of the data to request a smaller chunk.",
+                )?;
+                // "a/b/key.bin" → group "a/b", dataset "key"; "key.bin" → root.
+                let stem = name.strip_suffix(".bin").unwrap_or(&name);
+                let (group_path, leaf_name) = match stem.rsplit_once('/') {
+                    Some((g, l)) => (g.to_string(), l.to_string()),
+                    None => (String::new(), stem.to_string()),
+                };
+                collected.push(CollectedH5Leaf::Array {
+                    group_path,
+                    name: leaf_name,
+                    kind: nd.dtype.kind.to_numpy_char(),
+                    itemsize: nd.dtype.element_size(),
+                    big_endian: nd.dtype.endianness.to_numpy_char() == '>',
+                    shape: nd.shape.clone(),
+                    data: nd.data,
+                });
+            }
+            ZipLeaf::Table(arc) => {
+                let table = arc.read(None).await.map_err(ServerError::from)?;
+                let leaf_bytes: usize = table
+                    .batches
+                    .iter()
+                    .map(|b| b.get_array_memory_size())
+                    .sum();
+                cumulative_bytes += leaf_bytes;
+                check_response_size(
+                    cumulative_bytes,
+                    state.response_bytesize_limit,
+                    "Select a subset of the data to request a smaller chunk.",
+                )?;
+                // Concat multi-batch streams so each column is one contiguous
+                // dataset. "a/b/t.arrow" → group "a/b/t" with one dataset per
+                // column (the table key becomes a group, per Python's walk).
+                let batch = if table.batches.is_empty() {
+                    arrow::record_batch::RecordBatch::new_empty(table.schema.clone())
+                } else if table.batches.len() == 1 {
+                    table.batches.into_iter().next().unwrap()
+                } else {
+                    arrow::compute::concat_batches(&table.schema, &table.batches)
+                        .map_err(|e| ServerError::Internal(format!("arrow concat: {e}")))?
+                };
+                let group_path = name.strip_suffix(".arrow").unwrap_or(&name).to_string();
+                collected.push(CollectedH5Leaf::Table { group_path, batch });
+            }
+            ZipLeaf::Crumb(_) => continue,
+        }
+    }
+
+    // Phase B: build the HDF5 tree off the async executor.
+    let h5 = tokio::task::spawn_blocking(move || -> Result<bytes::Bytes, ServerError> {
+        let mut builder =
+            Hdf5TreeBuilder::new().map_err(|e| ServerError::Internal(format!("hdf5 init: {e}")))?;
+        for leaf in collected {
+            match leaf {
+                CollectedH5Leaf::Array {
+                    group_path,
+                    name,
+                    data,
+                    kind,
+                    itemsize,
+                    big_endian,
+                    shape,
+                } => {
+                    builder
+                        .add_array(
+                            &group_path,
+                            &name,
+                            &data,
+                            kind,
+                            itemsize,
+                            big_endian,
+                            &shape,
+                        )
+                        .map_err(|e| ServerError::Internal(format!("hdf5 array '{name}': {e}")))?;
+                }
+                CollectedH5Leaf::Table { group_path, batch } => {
+                    builder
+                        .add_table_columns(&group_path, &batch)
+                        .map_err(|e| {
+                            ServerError::Internal(format!("hdf5 table '{group_path}': {e}"))
+                        })?;
+                }
+            }
+        }
+        builder
+            .finish()
+            .map_err(|e| ServerError::Internal(format!("hdf5 finish: {e}")))
+    })
+    .await
+    .map_err(|e| ServerError::Internal(format!("hdf5 build task failed: {e}")))??;
+
+    Ok(h5)
+}
 
 /// Maximum walk depth for zip export — mirrors Python `DEPTH_LIMIT = 5`
 /// (`tiled/server/core.py:62`).

@@ -1164,6 +1164,56 @@ async fn container_full_explicit_unsupported_accept_returns_406() {
     );
 }
 
+/// Serialization M4 (HDF5 deep-export): GET /container/full/?format=h5 walks the
+/// subtree and emits one self-contained HDF5 file — each numeric array a
+/// dataset, nested containers groups (Python `container.serialize_hdf5`). Only
+/// built with the `hdf5-serializer` feature (system libhdf5). Dataset values and
+/// the group/column layout are covered by the tiled-serialization builder unit
+/// tests; here we assert the router walks → reads → builds → returns a valid
+/// `.h5` with the right content-type (a 200 + magic also proves the nested
+/// `subgroup/nested_arr` leaf was read and written, else the build would 500).
+#[cfg(feature = "hdf5-serializer")]
+#[tokio::test]
+async fn container_full_hdf5_export_emits_valid_hdf5() {
+    let app = build_app();
+    let (status, headers, body) =
+        get_with_headers(&app, "/api/v1/container/full/?format=h5", &[]).await;
+    assert_eq!(status, 200, "hdf5 deep-export must succeed");
+    let ct = headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        ct.starts_with("application/x-hdf5"),
+        "hdf5 export content-type must be application/x-hdf5; got {ct}"
+    );
+    // HDF5 superblock signature: \x89 H D F \r \n \x1a \n.
+    assert!(
+        body.len() > 8 && &body[..8] == b"\x89HDF\r\n\x1a\n",
+        "body must be a valid HDF5 file (magic signature)"
+    );
+}
+
+/// The HDF5 deep-export is also reachable via `Accept: application/x-hdf5` (not
+/// just `?format=h5`) — the `(Container, application/x-hdf5)` registration makes
+/// content negotiation resolve it, matching Python's registered serializer.
+#[cfg(feature = "hdf5-serializer")]
+#[tokio::test]
+async fn container_full_hdf5_via_accept_header() {
+    let app = build_app();
+    let (status, _headers, body) = get_with_headers(
+        &app,
+        "/api/v1/container/full/",
+        &[("accept", "application/x-hdf5")],
+    )
+    .await;
+    assert_eq!(status, 200, "hdf5 deep-export via Accept must succeed");
+    assert!(
+        body.len() > 8 && &body[..8] == b"\x89HDF\r\n\x1a\n",
+        "body must be a valid HDF5 file (magic signature)"
+    );
+}
+
 /// Serialization M4b: `application/json` for a container returns the recursive
 /// `{contents, metadata}` tree (Python `serialize_json`, container.py:91-115),
 /// resolvable via BOTH `Accept: application/json` and `?format=json`. The

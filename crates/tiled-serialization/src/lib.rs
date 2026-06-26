@@ -17,6 +17,8 @@ pub mod hdf5_array;
 #[cfg(feature = "hdf5")]
 mod hdf5_common;
 #[cfg(feature = "hdf5")]
+pub mod hdf5_container;
+#[cfg(feature = "hdf5")]
 pub mod hdf5_table;
 #[cfg(feature = "image")]
 pub mod image_array;
@@ -51,5 +53,7 @@ pub fn default_registry() -> SerializationRegistry {
     hdf5_array::register_hdf5_serializer(&reg);
     #[cfg(feature = "hdf5")]
     hdf5_table::register_hdf5_table_serializer(&reg);
+    #[cfg(feature = "hdf5")]
+    hdf5_container::register_hdf5_container_serializer(&reg);
     reg
 }
