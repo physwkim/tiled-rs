@@ -7,7 +7,7 @@ edition.workspace = true
 default = ["oidc"]
 oidc = ["dep:reqwest", "dep:sha2"]
 saml = ["dep:samael"]
-ldap = []
+ldap = ["dep:ldap3", "dep:regex"]
 pam = ["dep:libc"]
 
 [dependencies]
@@ -33,6 +33,11 @@ axum = { workspace = true }
 reqwest = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
 samael = { version = "0.0.21", features = ["xmlsec"], optional = true }
+# LDAP authenticator. rustls TLS keeps the dependency pure-Rust (no OpenSSL);
+# the async (tokio) API is used. `regex` validates usernames against the
+# configured pattern (LDAP-injection guard) and escapes CN commas.
+ldap3 = { version = "0.12", default-features = false, features = ["tls-rustls", "tls-rustls-ring"], optional = true }
+regex = { workspace = true, optional = true }
 # PAM is bound via a minimal portable FFI surface (pam_start/pam_authenticate/
 # pam_end + a conversation callback) over the system `libpam`, so it builds on
 # both Linux-PAM and macOS/BSD OpenPAM. `libc` supplies the C allocator that

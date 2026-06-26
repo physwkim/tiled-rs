@@ -22,6 +22,9 @@ pub mod error;
 #[cfg(feature = "oidc")]
 pub mod external_oidc;
 pub mod jwt;
+/// LDAP username/password authenticator. Gated on `ldap` (pure-Rust `ldap3`).
+#[cfg(feature = "ldap")]
+pub mod ldap;
 pub mod migrate;
 /// OIDC authorization-code (PKCE browser) flow — DB-backed pending-state store
 /// (G6). Gated on `oidc`; the `0008_add_oidc_flow_states` migration runs
@@ -54,6 +57,8 @@ pub use external_oidc::{
     OidcProvider, ValidatedToken, discover_oidc,
 };
 pub use jwt::{AccessClaims, Issuer, RefreshClaims};
+#[cfg(feature = "ldap")]
+pub use ldap::{LdapAuthenticator, LdapConfig};
 #[cfg(feature = "oidc")]
 pub use oidc_flow::OidcFlowState;
 #[cfg(feature = "pam")]
