@@ -26,6 +26,10 @@ const SQLITE_MIGRATIONS: &[(&str, &str)] = &[
         "0005_tag_registry",
         include_str!("../migrations/sqlite/0005_tag_registry.sql"),
     ),
+    (
+        "0006_add_session_state",
+        include_str!("../migrations/sqlite/0006_add_session_state.sql"),
+    ),
 ];
 
 const POSTGRES_MIGRATIONS: &[(&str, &str)] = &[
@@ -48,6 +52,10 @@ const POSTGRES_MIGRATIONS: &[(&str, &str)] = &[
     (
         "0005_tag_registry",
         include_str!("../migrations/postgres/0005_tag_registry.sql"),
+    ),
+    (
+        "0006_add_session_state",
+        include_str!("../migrations/postgres/0006_add_session_state.sql"),
     ),
 ];
 

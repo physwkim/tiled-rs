@@ -31,6 +31,13 @@ pub struct AccessClaims {
     /// Scope strings the bearer is allowed to exercise.
     #[serde(default)]
     pub scopes: ScopeSet,
+    /// OBO session state — mirrors the `state` column of the session named by
+    /// `sid` (Python tiled embeds `session.state` here, authentication.py:857).
+    /// Carries the upstream IdP access/refresh tokens for an Entra code-flow
+    /// session; `{}` otherwise. `default` keeps pre-`state` tokens decodable
+    /// (they yield `null`, treated as "no state" like Python's `.get("state")`).
+    #[serde(default)]
+    pub state: serde_json::Value,
     /// `"access"` — enforced by `verify_access` so a refresh token can't
     /// be presented as an access token (symmetric with `RefreshClaims.typ`).
     pub typ: String,
@@ -148,6 +155,7 @@ impl Issuer {
         principal_uuid: &str,
         session_uuid: &str,
         scopes: ScopeSet,
+        state: serde_json::Value,
     ) -> Result<String> {
         let now = Utc::now();
         let claims = AccessClaims {
@@ -156,6 +164,7 @@ impl Issuer {
             iat: now.timestamp(),
             exp: (now + self.access_ttl).timestamp(),
             scopes,
+            state,
             typ: "access".into(),
         };
         let token = encode(&Header::new(Algorithm::HS256), &claims, &self.encoding)?;
@@ -224,18 +233,77 @@ mod tests {
         let issuer = Issuer::new(b"this-is-a-test-secret-32-bytes-long!!").unwrap();
         let scopes = ScopeSet::from_iter([Scope::ReadMetadata, Scope::ReadData]);
         let token = issuer
-            .issue_access("p-uuid", "s-uuid", scopes.clone())
+            .issue_access("p-uuid", "s-uuid", scopes.clone(), serde_json::json!({}))
             .unwrap();
         let claims = issuer.verify_access(&token).unwrap();
         assert_eq!(claims.sub, "p-uuid");
         assert_eq!(claims.sid, "s-uuid");
         assert_eq!(claims.scopes, scopes);
+        assert_eq!(claims.state, serde_json::json!({}));
+    }
+
+    // G3 OBO: the session `state` round-trips through the access token's
+    // `state` claim verbatim (Python embeds session.state, authentication.py:857).
+    #[test]
+    fn access_token_carries_obo_state() {
+        let issuer = Issuer::new(b"this-is-a-test-secret-32-bytes-long!!").unwrap();
+        let state = serde_json::json!({
+            "entra_access_token": "eyJ-upstream-access",
+            "entra_refresh_token": "0.AX-upstream-refresh",
+        });
+        let token = issuer
+            .issue_access("p", "s", ScopeSet::default(), state.clone())
+            .unwrap();
+        let claims = issuer.verify_access(&token).unwrap();
+        assert_eq!(
+            claims.state, state,
+            "the OBO state must survive issue → verify unchanged"
+        );
+        assert_eq!(
+            claims
+                .state
+                .pointer("/entra_access_token")
+                .and_then(|v| v.as_str()),
+            Some("eyJ-upstream-access")
+        );
+    }
+
+    // A token minted before the `state` claim existed (or any token omitting
+    // it) must still decode — `#[serde(default)]` yields `null`, treated as
+    // "no state" like Python's `decoded.get("state")`.
+    #[test]
+    fn access_token_without_state_claim_decodes_to_null() {
+        // Hand-encode an access token lacking `state`, matching the pre-G3 shape.
+        let now = Utc::now();
+        #[derive(serde::Serialize)]
+        struct LegacyAccess {
+            sub: String,
+            sid: String,
+            iat: i64,
+            exp: i64,
+            scopes: ScopeSet,
+            typ: String,
+        }
+        let legacy = LegacyAccess {
+            sub: "p".into(),
+            sid: "s".into(),
+            iat: now.timestamp(),
+            exp: (now + Duration::minutes(15)).timestamp(),
+            scopes: ScopeSet::default(),
+            typ: "access".into(),
+        };
+        let issuer = Issuer::new(b"this-is-a-test-secret-32-bytes-long!!").unwrap();
+        let token = encode(&Header::new(Algorithm::HS256), &legacy, &issuer.encoding).unwrap();
+        let claims = issuer.verify_access(&token).unwrap();
+        assert_eq!(claims.state, serde_json::Value::Null);
     }
 
     #[test]
     fn refresh_token_typ_enforced() {
         let issuer = Issuer::new(b"this-is-a-test-secret-32-bytes-long!!").unwrap();
-        let access = issuer.issue_access("p", "s", ScopeSet::default()).unwrap();
+        let access = issuer
+            .issue_access("p", "s", ScopeSet::default(), serde_json::json!({}))
+            .unwrap();
         // Presenting an access token as a refresh fails on `typ`.
         assert!(matches!(
             issuer.verify_refresh(&access).unwrap_err(),
@@ -264,7 +332,9 @@ mod tests {
         let issuer = Issuer::new(b"this-is-a-test-secret-32-bytes-long!!")
             .unwrap()
             .with_ttls(Duration::seconds(-3), Duration::days(7));
-        let token = issuer.issue_access("p", "s", ScopeSet::default()).unwrap();
+        let token = issuer
+            .issue_access("p", "s", ScopeSet::default(), serde_json::json!({}))
+            .unwrap();
         assert!(
             issuer.verify_access(&token).is_err(),
             "token expired 3s ago must be rejected with leeway=0 (was accepted under 5s leeway)"
@@ -293,7 +363,7 @@ mod tests {
         // A token minted before rotation, signed with the now-old secret.
         let token_old = Issuer::new(OLD)
             .unwrap()
-            .issue_access("p", "s", ScopeSet::default())
+            .issue_access("p", "s", ScopeSet::default(), serde_json::json!({}))
             .unwrap();
 
         // After rotation the list is [NEW, OLD]: the pre-rotation token still
@@ -305,7 +375,9 @@ mod tests {
         );
 
         // …and a freshly issued token is signed with NEW (the first key):
-        let token_new = rotated.issue_access("p", "s", ScopeSet::default()).unwrap();
+        let token_new = rotated
+            .issue_access("p", "s", ScopeSet::default(), serde_json::json!({}))
+            .unwrap();
         assert!(
             Issuer::new(NEW).unwrap().verify_access(&token_new).is_ok(),
             "new tokens must verify under the first (signing) key"
@@ -331,7 +403,9 @@ mod tests {
         let issuer = Issuer::with_secrets(&[NEW, OLD])
             .unwrap()
             .with_ttls(Duration::seconds(-3), Duration::days(7));
-        let token = issuer.issue_access("p", "s", ScopeSet::default()).unwrap();
+        let token = issuer
+            .issue_access("p", "s", ScopeSet::default(), serde_json::json!({}))
+            .unwrap();
         match issuer.verify_access(&token).unwrap_err() {
             AuthError::Jwt(e) => assert!(
                 matches!(e.kind(), ErrorKind::ExpiredSignature),

@@ -25,6 +25,11 @@ pub struct SessionRecord {
     pub revoked: bool,
     pub scopes: ScopeSet,
     pub time_created: DateTime<Utc>,
+    /// OBO session state — a JSON object embedded verbatim in every access
+    /// token's `state` claim (Python `Session.state`, authentication.py:857).
+    /// For an Entra code-flow login it carries `entra_access_token` /
+    /// `entra_refresh_token`; `{}` for every other session.
+    pub state: serde_json::Value,
 }
 
 /// Marker trait implemented by [`AuthDb`] so the rest of the crate can
@@ -38,37 +43,42 @@ impl AuthDb {
         principal_id: i64,
         scopes: ScopeSet,
         expires_at: DateTime<Utc>,
+        state: serde_json::Value,
     ) -> Result<SessionRecord> {
         let new_uuid = Uuid::new_v4().to_string();
         let scopes_json = scopes.to_json();
         let expires_iso = expires_at.to_rfc3339();
         match self.pool() {
             AuthPool::Sqlite(pool) => {
+                // SQLite stores `state` as TEXT JSON, mirroring `scopes`.
+                let state_json = state.to_string();
                 let row = sqlx::query(
-                    "INSERT INTO sessions (principal_id, uuid, expiration_time, scopes)
-                     VALUES (?, ?, ?, ?)
+                    "INSERT INTO sessions (principal_id, uuid, expiration_time, scopes, state)
+                     VALUES (?, ?, ?, ?, ?)
                      RETURNING id, principal_id, uuid, time_last_used,
-                               expiration_time, revoked, scopes, time_created",
+                               expiration_time, revoked, scopes, time_created, state",
                 )
                 .bind(principal_id)
                 .bind(&new_uuid)
                 .bind(&expires_iso)
                 .bind(&scopes_json)
+                .bind(&state_json)
                 .fetch_one(pool)
                 .await?;
                 session_from_sqlite(&row)
             }
             AuthPool::Postgres(pool) => {
                 let row = sqlx::query(
-                    "INSERT INTO sessions (principal_id, uuid, expiration_time, scopes)
-                     VALUES ($1, $2, $3::timestamptz, $4::jsonb)
+                    "INSERT INTO sessions (principal_id, uuid, expiration_time, scopes, state)
+                     VALUES ($1, $2, $3::timestamptz, $4::jsonb, $5::jsonb)
                      RETURNING id, principal_id, uuid, time_last_used,
-                               expiration_time, revoked, scopes, time_created",
+                               expiration_time, revoked, scopes, time_created, state",
                 )
                 .bind(principal_id)
                 .bind(&new_uuid)
                 .bind(&expires_iso)
                 .bind(&scopes_json)
+                .bind(&state)
                 .fetch_one(pool)
                 .await?;
                 session_from_postgres(&row)
@@ -81,7 +91,7 @@ impl AuthDb {
             AuthPool::Sqlite(pool) => {
                 let row = sqlx::query(
                     "SELECT id, principal_id, uuid, time_last_used, expiration_time,
-                            revoked, scopes, time_created
+                            revoked, scopes, time_created, state
                        FROM sessions WHERE uuid = ?",
                 )
                 .bind(uuid)
@@ -93,7 +103,7 @@ impl AuthDb {
             AuthPool::Postgres(pool) => {
                 let row = sqlx::query(
                     "SELECT id, principal_id, uuid, time_last_used, expiration_time,
-                            revoked, scopes, time_created
+                            revoked, scopes, time_created, state
                        FROM sessions WHERE uuid = $1",
                 )
                 .bind(uuid)
@@ -192,6 +202,7 @@ impl AuthDb {
 
 fn session_from_sqlite(row: &sqlx::sqlite::SqliteRow) -> Result<SessionRecord> {
     let scopes_text: String = row.get("scopes");
+    let state_text: String = row.get("state");
     Ok(SessionRecord {
         id: row.get("id"),
         principal_id: row.get("principal_id"),
@@ -204,6 +215,7 @@ fn session_from_sqlite(row: &sqlx::sqlite::SqliteRow) -> Result<SessionRecord> {
         revoked: row.get::<i64, _>("revoked") != 0,
         scopes: ScopeSet::from_json(&scopes_text)?,
         time_created: parse_dt_sqlite(row.get::<String, _>("time_created"))?,
+        state: serde_json::from_str(&state_text)?,
     })
 }
 
@@ -219,5 +231,6 @@ fn session_from_postgres(row: &sqlx::postgres::PgRow) -> Result<SessionRecord> {
         revoked: row.get("revoked"),
         scopes,
         time_created: row.get("time_created"),
+        state: row.get("state"),
     })
 }

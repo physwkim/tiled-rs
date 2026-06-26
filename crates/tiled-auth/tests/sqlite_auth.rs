@@ -91,6 +91,7 @@ async fn migrate_and_principal_lifecycle() {
             "0003_add_session_refresh_count".to_string(),
             "0004_add_access_tags".to_string(),
             "0005_tag_registry".to_string(),
+            "0006_add_session_state".to_string(),
         ]
     );
 
@@ -175,12 +176,19 @@ async fn session_revocation_blocks_jwt() {
     let (p, _) = db.ensure_principal("dummy", "alice").await.unwrap();
     let scopes = ScopeSet::from_iter([Scope::ReadMetadata]);
     let session = db
-        .create_session(p.id, scopes.clone(), Utc::now() + Duration::hours(1))
+        .create_session(
+            p.id,
+            scopes.clone(),
+            Utc::now() + Duration::hours(1),
+            serde_json::json!({}),
+        )
         .await
         .unwrap();
 
     let issuer = Issuer::new(b"this-is-a-test-secret-32-bytes-long!!").unwrap();
-    let token = issuer.issue_access(&p.uuid, &session.uuid, scopes).unwrap();
+    let token = issuer
+        .issue_access(&p.uuid, &session.uuid, scopes, session.state.clone())
+        .unwrap();
     let claims = issuer.verify_access(&token).unwrap();
     assert_eq!(claims.sub, p.uuid);
 
@@ -189,6 +197,54 @@ async fn session_revocation_blocks_jwt() {
     db.revoke_session(&session.uuid).await.unwrap();
     let s = db.lookup_session(&session.uuid).await.unwrap();
     assert!(s.revoked);
+}
+
+// G3 OBO: the session `state` JSON persists through create_session →
+// lookup_session unchanged (the upstream Entra tokens a downstream OBO
+// exchange reads).
+#[tokio::test]
+async fn session_state_roundtrips_through_db() {
+    let (db, _dir) = fresh_db().await;
+    let (p, _) = db.ensure_principal("entra", "opaque-oid").await.unwrap();
+    let scopes = ScopeSet::from_iter([Scope::ReadMetadata]);
+    let state = serde_json::json!({
+        "entra_access_token": "upstream-at",
+        "entra_refresh_token": "upstream-rt",
+    });
+    let session = db
+        .create_session(p.id, scopes, Utc::now() + Duration::hours(1), state.clone())
+        .await
+        .unwrap();
+    // The returned record carries the state we inserted.
+    assert_eq!(session.state, state);
+    // And it persists: a fresh lookup reads the same JSON back.
+    let looked_up = db.lookup_session(&session.uuid).await.unwrap();
+    assert_eq!(looked_up.state, state);
+    assert_eq!(
+        looked_up
+            .state
+            .pointer("/entra_refresh_token")
+            .and_then(|v| v.as_str()),
+        Some("upstream-rt")
+    );
+}
+
+// A non-OIDC session stores `{}` (the column default), not null.
+#[tokio::test]
+async fn session_state_defaults_to_empty_object() {
+    let (db, _dir) = fresh_db().await;
+    let (p, _) = db.ensure_principal("dummy", "bob").await.unwrap();
+    let session = db
+        .create_session(
+            p.id,
+            ScopeSet::default(),
+            Utc::now() + Duration::hours(1),
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+    let looked_up = db.lookup_session(&session.uuid).await.unwrap();
+    assert_eq!(looked_up.state, serde_json::json!({}));
 }
 
 #[tokio::test]

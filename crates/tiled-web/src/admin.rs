@@ -189,7 +189,13 @@ async fn login_submit(
     let scopes = ScopeSet::for_role(&principal.role).intersect(&state.default_login_scopes);
     let session_ttl = issuer.refresh_ttl;
     let session = match db
-        .create_session(principal.id, scopes.clone(), Utc::now() + session_ttl)
+        .create_session(
+            principal.id,
+            scopes.clone(),
+            Utc::now() + session_ttl,
+            // Admin password login: no upstream IdP tokens to carry.
+            serde_json::json!({}),
+        )
         .await
     {
         Ok(s) => s,
@@ -198,7 +204,12 @@ async fn login_submit(
             return error_login("login failed");
         }
     };
-    let access_token = match issuer.issue_access(&principal.uuid, &session.uuid, scopes) {
+    let access_token = match issuer.issue_access(
+        &principal.uuid,
+        &session.uuid,
+        scopes,
+        session.state.clone(),
+    ) {
         Ok(t) => t,
         Err(e) => {
             tracing::error!(error = %e, "admin login: issue_access failed");

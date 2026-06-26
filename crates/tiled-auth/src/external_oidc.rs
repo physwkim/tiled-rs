@@ -499,7 +499,7 @@ impl ExternalOidcValidator {
         state_param: &str,
         code: &str,
         redirect_uri: &str,
-    ) -> Result<ValidatedToken> {
+    ) -> Result<CodeFlowSession> {
         // Consume (and validate) the pending state.
         let pending = self.flow_store.take(state_param).ok_or_else(|| {
             AuthError::Unauthorized(
@@ -567,8 +567,16 @@ impl ExternalOidcValidator {
             AuthError::Validation("token response is missing the 'id_token' field".into())
         })?;
 
-        self.validate_id_token(provider, id_token, &pending.nonce)
-            .await
+        let token = self
+            .validate_id_token(provider, id_token, &pending.nonce)
+            .await?;
+        // Capture the upstream IdP tokens for OBO (Entra only; `{}` otherwise),
+        // mirroring EntraAuthenticator.authenticate (authenticators.py:497-502).
+        let session_state = build_session_state(provider, &body);
+        Ok(CodeFlowSession {
+            token,
+            session_state,
+        })
     }
 
     /// Validate an id_token returned from the token endpoint.
@@ -693,6 +701,21 @@ pub struct ValidatedToken {
     pub scopes: Option<ScopeSet>,
 }
 
+/// Outcome of a completed authorization-code exchange ([`ExternalOidcValidator::exchange_code_flow`]):
+/// the validated identity plus the OBO session state to persist.
+///
+/// `session_state` is a JSON object embedded verbatim in the resulting tiled
+/// access token's `state` claim (mirrors Python `UserSessionState.state` →
+/// `Session.state`). For an [`IdentityMapping::Entra`] provider it carries the
+/// upstream `entra_access_token` / `entra_refresh_token` (when the IdP returned
+/// them) so downstream services can perform on-behalf-of exchanges; for every
+/// other provider it is the empty object `{}`.
+#[derive(Debug, Clone)]
+pub struct CodeFlowSession {
+    pub token: ValidatedToken,
+    pub session_state: serde_json::Value,
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -809,6 +832,37 @@ fn normalize_entra_username(raw: &str) -> String {
     } else {
         trimmed.to_string()
     }
+}
+
+/// Build the OBO session state from a code-flow token-endpoint response.
+///
+/// Mirrors `EntraAuthenticator.authenticate` (authenticators.py:497-502): for
+/// an [`IdentityMapping::Entra`] provider, store whichever of
+/// `access_token` / `refresh_token` the IdP returned under
+/// `entra_access_token` / `entra_refresh_token`. Every other provider — and a
+/// response lacking those fields — yields the empty object `{}` (Python's
+/// `OIDCAuthenticator.authenticate` returns an empty state). The single owner
+/// of OBO-state derivation; no other code constructs these keys.
+fn build_session_state(
+    provider: &OidcProvider,
+    token_response: &serde_json::Value,
+) -> serde_json::Value {
+    let mut state = serde_json::Map::new();
+    if provider.identity_mapping == IdentityMapping::Entra {
+        if let Some(at) = token_response.get("access_token").and_then(|v| v.as_str()) {
+            state.insert(
+                "entra_access_token".into(),
+                serde_json::Value::String(at.to_string()),
+            );
+        }
+        if let Some(rt) = token_response.get("refresh_token").and_then(|v| v.as_str()) {
+            state.insert(
+                "entra_refresh_token".into(),
+                serde_json::Value::String(rt.to_string()),
+            );
+        }
+    }
+    serde_json::Value::Object(state)
 }
 
 /// Translate a token's `scp` claim into tiled scopes via a provider's
@@ -1090,6 +1144,60 @@ mod tests {
         // Standard mode must not enrich claims with Entra fields.
         assert!(vt.claims.get("user").is_none());
         assert!(vt.claims.get("entra_sub").is_none());
+    }
+
+    // --- G3 OBO session state ---
+
+    #[test]
+    fn build_session_state_entra_stores_both_obo_tokens() {
+        let mut provider = test_provider();
+        provider.identity_mapping = IdentityMapping::Entra;
+        let token_response = serde_json::json!({
+            "id_token": "ignored",
+            "access_token": "upstream-access",
+            "refresh_token": "upstream-refresh",
+            "token_type": "Bearer",
+        });
+        let state = build_session_state(&provider, &token_response);
+        assert_eq!(
+            state["entra_access_token"].as_str(),
+            Some("upstream-access")
+        );
+        assert_eq!(
+            state["entra_refresh_token"].as_str(),
+            Some("upstream-refresh")
+        );
+        // Only the two OBO keys — nothing else from the response leaks in.
+        assert_eq!(state.as_object().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn build_session_state_entra_stores_only_present_tokens() {
+        let mut provider = test_provider();
+        provider.identity_mapping = IdentityMapping::Entra;
+        // No refresh_token in the response (IdP did not issue offline_access).
+        let token_response = serde_json::json!({"access_token": "only-access"});
+        let state = build_session_state(&provider, &token_response);
+        assert_eq!(state["entra_access_token"].as_str(), Some("only-access"));
+        assert!(
+            state.get("entra_refresh_token").is_none(),
+            "an absent refresh_token must not be stored"
+        );
+    }
+
+    #[test]
+    fn build_session_state_standard_is_empty_object() {
+        let provider = test_provider(); // Standard mapping
+        let token_response = serde_json::json!({
+            "access_token": "upstream-access",
+            "refresh_token": "upstream-refresh",
+        });
+        let state = build_session_state(&provider, &token_response);
+        assert_eq!(
+            state,
+            serde_json::json!({}),
+            "a non-Entra provider stores no OBO tokens (Python OIDCAuthenticator returns empty)"
+        );
     }
 
     fn test_provider() -> OidcProvider {

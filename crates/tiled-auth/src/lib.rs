@@ -35,8 +35,8 @@ pub use db::AuthDb;
 pub use error::{AuthError, Result};
 #[cfg(feature = "oidc")]
 pub use external_oidc::{
-    ExternalOidcValidator, IdentityMapping, OidcDiscovery, OidcProvider, PendingAuth,
-    PendingAuthStore, ValidatedToken, discover_oidc,
+    CodeFlowSession, ExternalOidcValidator, IdentityMapping, OidcDiscovery, OidcProvider,
+    PendingAuth, PendingAuthStore, ValidatedToken, discover_oidc,
 };
 pub use jwt::{AccessClaims, Issuer, RefreshClaims};
 pub use principal::{Identity, IdentityView, Principal, PrincipalDetail};

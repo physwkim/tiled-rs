@@ -517,6 +517,7 @@ async fn refresh_does_not_widen_a_narrowed_session() {
             alice.id,
             narrow,
             chrono::Utc::now() + chrono::Duration::hours(1),
+            serde_json::json!({}),
         )
         .await
         .unwrap();
@@ -1378,12 +1379,18 @@ async fn session_revoke_by_id_own_session_and_ownership_check() {
             bob_p.id,
             tiled_auth::ScopeSet::full(),
             chrono::Utc::now() + chrono::Duration::hours(1),
+            serde_json::json!({}),
         )
         .await
         .unwrap();
     let issuer = tiled_auth::Issuer::new(b"this-is-a-test-secret-32-bytes-long!!").unwrap();
     let bob_access = issuer
-        .issue_access(&bob_p.uuid, &bob_session.uuid, tiled_auth::ScopeSet::full())
+        .issue_access(
+            &bob_p.uuid,
+            &bob_session.uuid,
+            tiled_auth::ScopeSet::full(),
+            serde_json::json!({}),
+        )
         .unwrap();
     let bob_bearer = format!("Bearer {bob_access}");
 
@@ -1832,6 +1839,19 @@ async fn build_code_flow_app(
     Arc<tiled_auth::ExternalOidcValidator>,
     tempfile::TempDir,
 ) {
+    build_code_flow_app_with_mapping(token_endpoint, tiled_auth::IdentityMapping::Standard).await
+}
+
+/// Like [`build_code_flow_app`] but with a configurable identity mapping, so a
+/// test can exercise the Entra OBO path (G3).
+async fn build_code_flow_app_with_mapping(
+    token_endpoint: &str,
+    identity_mapping: tiled_auth::IdentityMapping,
+) -> (
+    axum::Router,
+    Arc<tiled_auth::ExternalOidcValidator>,
+    tempfile::TempDir,
+) {
     use jsonwebtoken::Algorithm;
     use tiled_auth::{AuthDb, ExternalOidcValidator, Issuer, OidcProvider};
 
@@ -1849,7 +1869,7 @@ async fn build_code_flow_app(
             issuer: "https://mock-idp.test/".into(),
             audiences: vec!["tiled-code-client".into()],
             subject_claim: "sub".into(),
-            identity_mapping: tiled_auth::IdentityMapping::Standard,
+            identity_mapping,
             algorithms: vec![Algorithm::HS256],
             scopes_map: std::collections::HashMap::new(),
             client_id: Some("tiled-code-client".into()),
@@ -2168,6 +2188,157 @@ async fn oidc_callback_with_mock_idp_mints_session() {
         body.pointer("/identity/id").and_then(|v| v.as_str()),
         Some("bob"),
         "identity.id must be the sub from the id_token"
+    );
+}
+
+/// G3 OBO: an Entra code-flow login stores the upstream access/refresh tokens
+/// and embeds them in the tiled access token's `state` claim — on the initial
+/// login AND, unchanged, across a refresh.
+#[tokio::test]
+async fn oidc_callback_entra_embeds_obo_tokens_and_survives_refresh() {
+    use axum::Router;
+    use axum::body::Bytes;
+    use axum::routing::post;
+    use chrono::{Duration, Utc};
+    use tower::ServiceExt as _; // app.clone().oneshot twice
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let token_endpoint = format!("http://127.0.0.1:{port}/token");
+
+    let known_nonce = "entra-obo-nonce";
+    let known_state = "entra-obo-state";
+    let id_token = mint_code_flow_id_token("entra-oid-xyz", known_nonce);
+    let id_token_clone = id_token.clone();
+    // The mock IdP returns BOTH upstream tokens (Entra issues a refresh_token
+    // when offline_access was requested).
+    let mock_app = Router::new().route(
+        "/token",
+        post(move |_body: Bytes| {
+            let token = id_token_clone.clone();
+            async move {
+                axum::Json(serde_json::json!({
+                    "id_token": token,
+                    "access_token": "entra-upstream-access",
+                    "refresh_token": "entra-upstream-refresh",
+                    "token_type": "Bearer",
+                }))
+            }
+        }),
+    );
+    tokio::spawn(async move {
+        axum::serve(listener, mock_app).await.unwrap();
+    });
+
+    let (app, validator, _dir) =
+        build_code_flow_app_with_mapping(&token_endpoint, tiled_auth::IdentityMapping::Entra).await;
+    validator.inject_pending_auth_for_test(
+        known_state.into(),
+        tiled_auth::PendingAuth {
+            provider: "mock-idp".into(),
+            code_verifier: "verifier".into(),
+            nonce: known_nonce.into(),
+            expires_at: Utc::now() + Duration::minutes(10),
+        },
+    );
+
+    // --- initial login via callback ---
+    let callback_uri =
+        format!("/api/v1/auth/provider/mock-idp/callback?code=c&state={known_state}");
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(&callback_uri)
+                .header("host", "localhost:8000")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "Entra callback must mint a session"
+    );
+    let body_bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+    let access_token = body
+        .get("access_token")
+        .and_then(|v| v.as_str())
+        .expect("access_token present");
+    let refresh_token = body
+        .get("refresh_token")
+        .and_then(|v| v.as_str())
+        .expect("refresh_token present")
+        .to_string();
+
+    // Decode the tiled access token (same secret build_code_flow_app uses) and
+    // assert the OBO state is embedded.
+    let issuer = tiled_auth::Issuer::new(b"code-flow-test-secret-32bytes!!!").unwrap();
+    let claims = issuer.verify_access(access_token).unwrap();
+    assert_eq!(
+        claims
+            .state
+            .pointer("/entra_access_token")
+            .and_then(|v| v.as_str()),
+        Some("entra-upstream-access"),
+        "access token must carry the upstream Entra access token"
+    );
+    assert_eq!(
+        claims
+            .state
+            .pointer("/entra_refresh_token")
+            .and_then(|v| v.as_str()),
+        Some("entra-upstream-refresh"),
+    );
+
+    // --- refresh: the OBO state must survive unchanged ---
+    let refresh_resp = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/auth/refresh")
+                .header("host", "localhost:8000")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "refresh_token": refresh_token }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        refresh_resp.status(),
+        StatusCode::OK,
+        "refresh must succeed"
+    );
+    let rbytes = axum::body::to_bytes(refresh_resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let rbody: serde_json::Value = serde_json::from_slice(&rbytes).unwrap();
+    let new_access = rbody
+        .get("access_token")
+        .and_then(|v| v.as_str())
+        .expect("refreshed access_token");
+    let new_claims = issuer.verify_access(new_access).unwrap();
+    assert_eq!(
+        new_claims
+            .state
+            .pointer("/entra_access_token")
+            .and_then(|v| v.as_str()),
+        Some("entra-upstream-access"),
+        "the OBO state must survive a token refresh unchanged"
+    );
+    assert_eq!(
+        new_claims
+            .state
+            .pointer("/entra_refresh_token")
+            .and_then(|v| v.as_str()),
+        Some("entra-upstream-refresh"),
     );
 }
 

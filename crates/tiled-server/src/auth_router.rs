@@ -99,11 +99,18 @@ pub async fn login(
             principal.id,
             scopes.clone(),
             Utc::now() + issuer.refresh_ttl,
+            // Non-OIDC login: no upstream tokens to carry.
+            serde_json::json!({}),
         )
         .await
         .map_err(map_auth_err)?;
     let access = issuer
-        .issue_access(&principal.uuid, &session.uuid, scopes)
+        .issue_access(
+            &principal.uuid,
+            &session.uuid,
+            scopes,
+            session.state.clone(),
+        )
         .map_err(map_auth_err)?;
     let refresh = issuer
         .issue_refresh(&principal.uuid, &session.uuid)
@@ -158,8 +165,10 @@ pub async fn refresh(
         .map_err(map_auth_err)?
         .ok_or_else(|| ServerError::Unauthorized(OPAQUE_SESSION_ERR.into()))?;
     let scopes = crate::app::mint_session_scopes(&principal, &state).intersect(&session.scopes);
+    // Re-embed the stored OBO session state unchanged so the upstream tokens
+    // survive refresh (Python re-reads session.state in create_tokens_from_session).
     let access = issuer
-        .issue_access(&claims.sub, &claims.sid, scopes)
+        .issue_access(&claims.sub, &claims.sid, scopes, session.state.clone())
         .map_err(map_auth_err)?;
     let new_refresh = issuer
         .issue_refresh(&claims.sub, &claims.sid)
@@ -278,11 +287,18 @@ pub async fn device_token(
                     principal_id,
                     scopes.clone(),
                     Utc::now() + issuer.refresh_ttl,
+                    // Device-code grant: no upstream tokens to carry.
+                    serde_json::json!({}),
                 )
                 .await
                 .map_err(map_auth_err)?;
             let access = issuer
-                .issue_access(&principal.uuid, &session.uuid, scopes)
+                .issue_access(
+                    &principal.uuid,
+                    &session.uuid,
+                    scopes,
+                    session.state.clone(),
+                )
                 .map_err(map_auth_err)?;
             let refresh = issuer
                 .issue_refresh(&principal.uuid, &session.uuid)
@@ -893,10 +909,11 @@ pub async fn oidc_callback(
         provider
     );
 
-    let validated = validator
+    let code_flow = validator
         .exchange_code_flow(state_param, code, &redirect_uri)
         .await
         .map_err(map_auth_err)?;
+    let validated = code_flow.token;
 
     let (principal, identity) = db
         .ensure_principal(&validated.provider, &validated.sub)
@@ -907,16 +924,25 @@ pub async fn oidc_callback(
     let role_scopes = tiled_auth::ScopeSet::for_role(&principal.role);
     let scopes = role_scopes.intersect(&state.default_login_scopes);
 
+    // Persist the OBO session state (Entra access/refresh tokens for an Entra
+    // provider; `{}` otherwise) so it is embedded in the access token below and
+    // re-embedded on every refresh — Python EntraAuthenticator (authentication.py:857).
     let session = db
         .create_session(
             principal.id,
             scopes.clone(),
             Utc::now() + issuer.refresh_ttl,
+            code_flow.session_state,
         )
         .await
         .map_err(map_auth_err)?;
     let access = issuer
-        .issue_access(&principal.uuid, &session.uuid, scopes)
+        .issue_access(
+            &principal.uuid,
+            &session.uuid,
+            scopes,
+            session.state.clone(),
+        )
         .map_err(map_auth_err)?;
     let refresh = issuer
         .issue_refresh(&principal.uuid, &session.uuid)
@@ -1040,11 +1066,18 @@ pub async fn saml_acs(
             principal.id,
             scopes.clone(),
             Utc::now() + issuer.refresh_ttl,
+            // Non-OIDC login: no upstream tokens to carry.
+            serde_json::json!({}),
         )
         .await
         .map_err(map_auth_err)?;
     let access = issuer
-        .issue_access(&principal.uuid, &session.uuid, scopes)
+        .issue_access(
+            &principal.uuid,
+            &session.uuid,
+            scopes,
+            session.state.clone(),
+        )
         .map_err(map_auth_err)?;
     let refresh = issuer
         .issue_refresh(&principal.uuid, &session.uuid)
