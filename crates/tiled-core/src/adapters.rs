@@ -233,6 +233,52 @@ pub trait RaggedAdapterRead: BaseAdapter {
     /// semantics, matching Python `RaggedAdapter.read`
     /// (`tiled/adapters/ragged.py:73-75`).
     fn read<'a>(&'a self, slice: &'a NDSlice) -> BoxFuture<'a, Result<RaggedData>>;
+
+    /// The write face of this adapter, or `None` if it is read-only.
+    ///
+    /// Python's in-memory `RaggedAdapter` has no write methods; only
+    /// `RaggedSQLAdapter` does (`tiled/adapters/ragged.py`). Mirrors
+    /// [`AwkwardAdapterRead::as_writable`].
+    fn as_writable(&self) -> Option<&dyn RaggedAdapterWrite> {
+        None
+    }
+}
+
+/// Write face for ragged adapters backed by writable storage.
+///
+/// Mirrors Python `RaggedSQLAdapter`'s write/write_block/patch
+/// (`tiled/adapters/ragged.py:249-352`). The data currency is a JSON
+/// list-of-lists (`serde_json::Value`) — the same shape `RaggedData.json_value`
+/// carries — so the adapter owns the JSON↔Awkward-buffer encoding internally
+/// (it holds the structure that fixes the form/dtype), keeping this trait free
+/// of any dependency on the buffer codec.
+pub trait RaggedAdapterWrite: RaggedAdapterRead {
+    /// Write the whole array as a single chunk at block 0. `PUT /ragged/full`
+    /// routes here. Python `RaggedSQLAdapter.write` (ragged.py:249-250).
+    fn write<'a>(&'a self, data: &'a serde_json::Value) -> BoxFuture<'a, Result<()>> {
+        self.write_block(data, 0)
+    }
+
+    /// Write one chunk at `block` along axis 0. `PUT /ragged/block` routes here.
+    /// A duplicate `block` is a [`TiledError::Conflict`]. Python
+    /// `RaggedSQLAdapter.write_block` (ragged.py:252-275).
+    fn write_block<'a>(
+        &'a self,
+        data: &'a serde_json::Value,
+        block: usize,
+    ) -> BoxFuture<'a, Result<()>>;
+
+    /// Append a chunk, extending axis 0 (`extend=True`), and return the grown
+    /// structure for the caller to persist. `PATCH /ragged/full` routes here.
+    /// Only appending along the leftmost dimension is supported, and
+    /// `extend=false` (overwrite) is rejected — Python
+    /// `RaggedSQLAdapter.patch` (ragged.py:277-352).
+    fn patch<'a>(
+        &'a self,
+        data: &'a serde_json::Value,
+        offset: &'a [usize],
+        extend: bool,
+    ) -> BoxFuture<'a, Result<RaggedStructure>>;
 }
 
 // ---------------------------------------------------------------------------

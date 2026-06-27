@@ -23,8 +23,17 @@ use std::str::FromStr;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 
+use tiled_core::adapters::{
+    BaseAdapter, BoxFuture, RaggedAdapterRead, RaggedAdapterWrite, RaggedData,
+};
 use tiled_core::error::{Result, TiledError};
-use tiled_serialization::ragged::BufferMap;
+use tiled_core::ndslice::NDSlice;
+use tiled_core::structures::{RaggedStructure, Spec, StructureFamily};
+use tiled_serialization::ragged::{
+    BufferMap, awkward_form_json, buffers_to_json, expected_from_buffers, json_to_buffers,
+};
+
+use crate::ragged_adapter::{RaggedAdapter, json_leaf_count};
 
 /// One chunk loaded from storage: its `chunk_index` and its buffer map.
 pub type ChunkRow = (i64, BufferMap);
@@ -246,6 +255,278 @@ fn validate_identifier(s: &str) -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// RaggedSQLAdapter — read/write/patch over RaggedSqlStore
+// ---------------------------------------------------------------------------
+
+/// SQL-backed ragged adapter — the read+write counterpart of Python
+/// `RaggedSQLAdapter` (`tiled/adapters/ragged.py:81-356`).
+///
+/// Holds a [`RaggedSqlStore`] (chunk storage) plus the node's
+/// [`RaggedStructure`], metadata and specs. The structure fixes the Awkward
+/// form (dtype + raggedness pattern), so this adapter owns the JSON↔buffer
+/// encoding: write paths encode a JSON list-of-lists chunk into buffers and
+/// `append_chunk` it; the read path loads every chunk, decodes each back to
+/// JSON, concatenates, then reuses the in-memory [`RaggedAdapter`]'s tested
+/// slicing.
+///
+/// The catalog persists the structure, so `patch` does not mutate `self`; it
+/// returns the grown structure for the caller to write back (L4/L5).
+pub struct RaggedSQLAdapter {
+    store: RaggedSqlStore,
+    structure: RaggedStructure,
+    metadata: serde_json::Value,
+    specs: Vec<Spec>,
+}
+
+impl RaggedSQLAdapter {
+    /// Build an adapter over the chunk table named `table_name` in
+    /// `database_url`, scoped to `dataset_id`. The buffer-key columns are
+    /// derived from `structure`'s Awkward form (so they match what the write
+    /// path produces), via [`expected_from_buffers`] over [`awkward_form_json`].
+    pub fn new(
+        database_url: impl Into<String>,
+        table_name: impl Into<String>,
+        dataset_id: i64,
+        structure: RaggedStructure,
+        metadata: serde_json::Value,
+        specs: Vec<Spec>,
+    ) -> Result<Self> {
+        let form = awkward_form_json(&structure)
+            .map_err(|e| TiledError::Serialization(format!("ragged form: {e}")))?;
+        let buffer_keys: Vec<String> = expected_from_buffers(&form)
+            .into_iter()
+            .map(|(key, _dtype)| key)
+            .collect();
+        let store = RaggedSqlStore::new(database_url, table_name, dataset_id, buffer_keys)?;
+        Ok(Self {
+            store,
+            structure,
+            metadata,
+            specs,
+        })
+    }
+
+    /// Create the backing chunk table (delegates to the store). Used by the
+    /// catalog create path.
+    pub async fn init_storage(&self) -> Result<()> {
+        self.store.init_storage().await
+    }
+
+    /// Load every chunk and reconstruct the full JSON list-of-lists, in
+    /// `chunk_index` order — Python `read`'s load+`from_buffers`+`concatenate`
+    /// (without the axis-0 chunk-narrowing, which is a pure load optimization;
+    /// concatenating all chunks then slicing yields the identical result).
+    async fn reconstruct_full(&self) -> Result<serde_json::Value> {
+        let form = awkward_form_json(&self.structure)
+            .map_err(|e| TiledError::Serialization(format!("ragged form: {e}")))?;
+        let chunks0 = self
+            .structure
+            .chunks
+            .first()
+            .and_then(|c| c.as_ref())
+            .ok_or_else(|| {
+                TiledError::Validation("ragged structure has no axis-0 chunk partitioning".into())
+            })?;
+
+        let rows = self.store.load_chunks(&[]).await?;
+        let mut out: Vec<serde_json::Value> = Vec::new();
+        for (chunk_index, buffers) in &rows {
+            let idx = usize::try_from(*chunk_index).map_err(|_| {
+                TiledError::Validation(format!("negative ragged chunk_index {chunk_index}"))
+            })?;
+            let length = *chunks0.get(idx).ok_or_else(|| {
+                TiledError::Validation(format!(
+                    "chunk_index {chunk_index} has no declared length in structure.chunks[0]"
+                ))
+            })?;
+            let chunk_json = buffers_to_json(&form, length, buffers)
+                .map_err(|e| TiledError::Serialization(format!("ragged from_buffers: {e}")))?;
+            let arr = chunk_json.as_array().ok_or_else(|| {
+                TiledError::Serialization("reconstructed ragged chunk is not a JSON array".into())
+            })?;
+            out.extend(arr.iter().cloned());
+        }
+        Ok(serde_json::Value::Array(out))
+    }
+
+    /// Encode one JSON list-of-lists chunk into Awkward buffers using this
+    /// adapter's form, and append it at `chunk_index`. Shared by `write_block`
+    /// and `patch`. Returns the chunk's row count (Awkward length).
+    async fn encode_and_append(&self, chunk_index: i64, data: &serde_json::Value) -> Result<usize> {
+        let (length, buffers) = json_to_buffers(&self.structure, data)
+            .map_err(|e| TiledError::Serialization(format!("ragged to_buffers: {e}")))?;
+        self.store.append_chunk(chunk_index, &buffers).await?;
+        Ok(length)
+    }
+}
+
+impl BaseAdapter for RaggedSQLAdapter {
+    fn structure_family(&self) -> StructureFamily {
+        StructureFamily::Ragged
+    }
+    fn metadata(&self) -> &serde_json::Value {
+        &self.metadata
+    }
+    fn specs(&self) -> &[Spec] {
+        &self.specs
+    }
+}
+
+impl RaggedAdapterRead for RaggedSQLAdapter {
+    fn structure(&self) -> &RaggedStructure {
+        &self.structure
+    }
+
+    fn read<'a>(&'a self, slice: &'a NDSlice) -> BoxFuture<'a, Result<RaggedData>> {
+        Box::pin(async move {
+            let full = self.reconstruct_full().await?;
+            // Delegate slicing + sliced-structure recomputation to the
+            // in-memory adapter, which already implements and tests the exact
+            // numpy/awkward basic-indexing semantics.
+            let mem = RaggedAdapter::new(
+                full,
+                self.structure.clone(),
+                self.metadata.clone(),
+                self.specs.clone(),
+            );
+            mem.read(slice).await
+        })
+    }
+
+    fn as_writable(&self) -> Option<&dyn RaggedAdapterWrite> {
+        Some(self)
+    }
+}
+
+impl RaggedAdapterWrite for RaggedSQLAdapter {
+    fn write_block<'a>(
+        &'a self,
+        data: &'a serde_json::Value,
+        block: usize,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            self.encode_and_append(block as i64, data).await?;
+            Ok(())
+        })
+    }
+
+    fn patch<'a>(
+        &'a self,
+        data: &'a serde_json::Value,
+        offset: &'a [usize],
+        extend: bool,
+    ) -> BoxFuture<'a, Result<RaggedStructure>> {
+        Box::pin(async move {
+            // Python rejects overwrite and empty offset up front.
+            if !extend {
+                return Err(TiledError::Validation(
+                    "Overwriting existing data is not supported".into(),
+                ));
+            }
+            if offset.is_empty() {
+                return Err(TiledError::Validation(
+                    "`offset` must contain at least one dimension".into(),
+                ));
+            }
+
+            let s = &self.structure;
+            let shape0 = s.shape.first().copied().flatten().ok_or_else(|| {
+                TiledError::Validation("first dimension of a ragged array must be known".into())
+            })?;
+            let ndim_fixed = ndim_fixed(s);
+
+            // Only appending along the leftmost dimension is supported: the
+            // offset must start exactly at the current length, all trailing
+            // offsets zero, and it must not address a ragged axis.
+            if offset[0] != shape0
+                || offset[1..].iter().any(|&x| x != 0)
+                || offset.len() > ndim_fixed
+            {
+                return Err(TiledError::Validation(
+                    "Only appending along the leftmost dimension is supported".into(),
+                ));
+            }
+
+            // The appended data must match the existing array along the fixed
+            // (non-ragged) dimensions shape[1..ndim_fixed].
+            let data_fixed = fixed_dim_lengths(data, ndim_fixed)?;
+            let self_fixed: Vec<usize> = s.shape[1..ndim_fixed]
+                .iter()
+                .map(|d| d.unwrap_or(0))
+                .collect();
+            if data_fixed != self_fixed {
+                return Err(TiledError::Validation(
+                    "The shape of the data does not match the existing array along the fixed dimensions"
+                        .into(),
+                ));
+            }
+
+            // Append at the next chunk index (number of existing chunks).
+            let chunk_index = chunks0_len(s);
+            let length = self.encode_and_append(chunk_index as i64, data).await?;
+
+            // Grow the structure for the caller to persist: axis-0 length and
+            // chunk list extend by `length`, size grows by the appended leaf
+            // count (Python `data.size`).
+            let mut grown = s.clone();
+            grown.shape[0] = Some(shape0 + length);
+            match grown.chunks.first_mut() {
+                Some(Some(c0)) => c0.push(length),
+                _ => {
+                    return Err(TiledError::Validation(
+                        "ragged structure has no axis-0 chunk partitioning to extend".into(),
+                    ));
+                }
+            }
+            grown.size += json_leaf_count(data);
+            Ok(grown)
+        })
+    }
+}
+
+/// Number of leading fixed-size (known-integer) dimensions — Python
+/// `RaggedStructure.ndim_fixed` (`structures/ragged.py:219-221`).
+fn ndim_fixed(s: &RaggedStructure) -> usize {
+    s.shape
+        .iter()
+        .position(|d| d.is_none())
+        .unwrap_or(s.shape.len())
+}
+
+/// Current number of axis-0 chunks — Python `len(chunks[0] or ())`.
+fn chunks0_len(s: &RaggedStructure) -> usize {
+    s.chunks
+        .first()
+        .and_then(|c| c.as_ref())
+        .map_or(0, Vec::len)
+}
+
+/// Lengths of the appended data along the fixed dimensions `1..ndim_fixed`,
+/// read by descending into the first element at each level. Used to validate a
+/// `patch` against `shape[1..ndim_fixed]`. Empty for the common `[N, None]`
+/// case (`ndim_fixed == 1`).
+fn fixed_dim_lengths(data: &serde_json::Value, ndim_fixed: usize) -> Result<Vec<usize>> {
+    let mut out = Vec::with_capacity(ndim_fixed.saturating_sub(1));
+    let mut cur = data;
+    for d in 1..ndim_fixed {
+        let first = cur.as_array().and_then(|a| a.first()).ok_or_else(|| {
+            TiledError::Validation(format!(
+                "appended data cannot determine fixed dimension {d} (not nested deeply enough \
+                 or empty)"
+            ))
+        })?;
+        let len = first.as_array().map(Vec::len).ok_or_else(|| {
+            TiledError::Validation(format!(
+                "appended data is not nested deeply enough for fixed dimension {d}"
+            ))
+        })?;
+        out.push(len);
+        cur = first;
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -385,5 +666,192 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, TiledError::Validation(_)));
+    }
+}
+
+#[cfg(test)]
+mod adapter_tests {
+    use super::*;
+    use tiled_core::dtype::{BuiltinDType, DType, Endianness, Kind};
+    use tiled_core::ndslice::NDSlice;
+    use tiled_core::structures::Resizable;
+
+    fn url(dir: &tempfile::TempDir) -> String {
+        format!("sqlite://{}", dir.path().join("ragged.db").display())
+    }
+
+    /// A `[N, None]` float64 ragged structure with the given axis-0 chunking.
+    fn f64_structure(chunk_lengths: Vec<usize>, size: usize) -> RaggedStructure {
+        let n: usize = chunk_lengths.iter().sum();
+        RaggedStructure {
+            data_type: DType::Builtin(BuiltinDType::new(Endianness::Little, Kind::Float, 8)),
+            shape: vec![Some(n), None],
+            size,
+            chunks: vec![Some(chunk_lengths), None],
+            dims: None,
+            resizable: Resizable::default(),
+        }
+    }
+
+    fn make(dir: &tempfile::TempDir, structure: RaggedStructure) -> RaggedSQLAdapter {
+        RaggedSQLAdapter::new(
+            url(dir),
+            "ragged_data",
+            1,
+            structure,
+            serde_json::json!({}),
+            vec![],
+        )
+        .unwrap()
+    }
+
+    // boundary: write the whole array as one chunk, read it back unchanged.
+    #[tokio::test]
+    async fn write_full_then_read_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = make(&dir, f64_structure(vec![3], 6));
+        adapter.init_storage().await.unwrap();
+
+        let data = serde_json::json!([[1.0, 2.0, 3.0], [4.0], [5.0, 6.0]]);
+        adapter.write(&data).await.unwrap();
+
+        let read = adapter.read(&NDSlice::empty()).await.unwrap();
+        assert_eq!(read.json_value, data);
+    }
+
+    // boundary: two separately-written blocks reconstruct in chunk order.
+    #[tokio::test]
+    async fn write_block_multi_chunk_then_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = make(&dir, f64_structure(vec![2, 1], 6));
+        adapter.init_storage().await.unwrap();
+
+        adapter
+            .write_block(&serde_json::json!([[1.0, 2.0], [3.0]]), 0)
+            .await
+            .unwrap();
+        adapter
+            .write_block(&serde_json::json!([[4.0, 5.0, 6.0]]), 1)
+            .await
+            .unwrap();
+
+        let read = adapter.read(&NDSlice::empty()).await.unwrap();
+        assert_eq!(
+            read.json_value,
+            serde_json::json!([[1.0, 2.0], [3.0], [4.0, 5.0, 6.0]])
+        );
+    }
+
+    // boundary: a partial slice is applied to the reconstructed array.
+    #[tokio::test]
+    async fn read_with_slice_selects_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = make(&dir, f64_structure(vec![3], 6));
+        adapter.init_storage().await.unwrap();
+        adapter
+            .write(&serde_json::json!([[1.0, 2.0, 3.0], [4.0], [5.0, 6.0]]))
+            .await
+            .unwrap();
+
+        let read = adapter
+            .read(&NDSlice::from_numpy_str("0:2").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(read.json_value, serde_json::json!([[1.0, 2.0, 3.0], [4.0]]));
+        assert_eq!(read.structure.shape, vec![Some(2), None]);
+    }
+
+    // boundary: patch(extend) on an empty array appends a chunk and grows shape,
+    // chunks, and size; the grown structure reads back the appended rows.
+    #[tokio::test]
+    async fn patch_extend_appends_and_grows() {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = make(&dir, f64_structure(vec![], 0));
+        adapter.init_storage().await.unwrap();
+
+        let data = serde_json::json!([[1.0, 2.0], [3.0]]);
+        let grown = adapter.patch(&data, &[0], true).await.unwrap();
+        assert_eq!(grown.shape, vec![Some(2), None]);
+        assert_eq!(grown.chunks, vec![Some(vec![2]), None]);
+        assert_eq!(grown.size, 3);
+
+        // Re-resolve with the grown structure (as the catalog would) and read.
+        let reader = make(&dir, grown);
+        let read = reader.read(&NDSlice::empty()).await.unwrap();
+        assert_eq!(read.json_value, data);
+    }
+
+    // boundary: a second patch appends at the next chunk index; full read sees
+    // both chunks concatenated.
+    #[tokio::test]
+    async fn patch_extend_twice_concatenates() {
+        let dir = tempfile::tempdir().unwrap();
+        let a0 = make(&dir, f64_structure(vec![], 0));
+        a0.init_storage().await.unwrap();
+
+        let g1 = a0
+            .patch(&serde_json::json!([[1.0, 2.0], [3.0]]), &[0], true)
+            .await
+            .unwrap();
+        let a1 = make(&dir, g1);
+        let g2 = a1
+            .patch(&serde_json::json!([[4.0, 5.0, 6.0]]), &[2], true)
+            .await
+            .unwrap();
+        assert_eq!(g2.shape, vec![Some(3), None]);
+        assert_eq!(g2.chunks, vec![Some(vec![2, 1]), None]);
+        assert_eq!(g2.size, 6);
+
+        let reader = make(&dir, g2);
+        let read = reader.read(&NDSlice::empty()).await.unwrap();
+        assert_eq!(
+            read.json_value,
+            serde_json::json!([[1.0, 2.0], [3.0], [4.0, 5.0, 6.0]])
+        );
+    }
+
+    // boundary: extend=false (overwrite) is rejected — Python NotImplementedError.
+    #[tokio::test]
+    async fn patch_without_extend_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = make(&dir, f64_structure(vec![], 0));
+        adapter.init_storage().await.unwrap();
+        let err = adapter
+            .patch(&serde_json::json!([[1.0]]), &[0], false)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, TiledError::Validation(_)));
+    }
+
+    // boundary: an offset that does not start at the current length is rejected
+    // (only leftmost append is supported).
+    #[tokio::test]
+    async fn patch_non_appending_offset_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        // shape0 == 0, so offset [5] is not an append at the end.
+        let adapter = make(&dir, f64_structure(vec![], 0));
+        adapter.init_storage().await.unwrap();
+        let err = adapter
+            .patch(&serde_json::json!([[1.0]]), &[5], true)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, TiledError::Validation(_)));
+    }
+
+    // boundary: re-writing an existing block is a Conflict at the adapter level.
+    #[tokio::test]
+    async fn write_block_duplicate_is_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let adapter = make(&dir, f64_structure(vec![2], 3));
+        adapter.init_storage().await.unwrap();
+        adapter
+            .write_block(&serde_json::json!([[1.0, 2.0], [3.0]]), 0)
+            .await
+            .unwrap();
+        let err = adapter
+            .write_block(&serde_json::json!([[4.0], [5.0]]), 0)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, TiledError::Conflict(_)));
     }
 }

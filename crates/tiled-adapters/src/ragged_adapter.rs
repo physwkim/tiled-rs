@@ -337,7 +337,7 @@ fn sliced_structure(
 
 /// Count scalar (non-array) leaves in a nested JSON value — the ragged array's
 /// total element count (`RaggedStructure.size`).
-fn json_leaf_count(value: &serde_json::Value) -> usize {
+pub(crate) fn json_leaf_count(value: &serde_json::Value) -> usize {
     match value.as_array() {
         Some(arr) => arr.iter().map(json_leaf_count).sum(),
         None => 1,
