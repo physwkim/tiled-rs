@@ -720,6 +720,88 @@ async fn table_write_full_roundtrip() {
     assert_eq!(x_col.values(), &[1, 2, 3]);
 }
 
+#[tokio::test]
+async fn table_write_partition_and_append_roundtrip() {
+    use arrow::array::Int64Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use tiled_core::data_source::{DataSource, Management};
+    use tiled_core::structures::{AnyStructure, StructureFamily, TableStructure};
+
+    let (base, _wd, _db) = spawn_write_server().await;
+    let client = from_uri(&base).await.unwrap();
+    let root = client.into_container().unwrap();
+
+    // Managed CSV tables are single-partition (partition 0 == the whole file),
+    // so this exercises write_partition(0) + append_partition(0) against the
+    // real /table/partition PUT + PATCH routes and the CSV writable adapter.
+    let table_structure = TableStructure {
+        arrow_schema: String::new(),
+        npartitions: 1,
+        columns: vec!["n".into()],
+        resizable: Default::default(),
+    };
+    let ds = DataSource {
+        structure_family: StructureFamily::Table,
+        structure: Some(AnyStructure::Table(table_structure)),
+        id: None,
+        mimetype: Some("text/csv".into()),
+        parameters: serde_json::json!({}),
+        properties: serde_json::json!({}),
+        assets: vec![],
+        management: Management::Writable,
+    };
+    root.create_node(
+        "w_part",
+        StructureFamily::Table,
+        serde_json::json!({}),
+        vec![],
+        vec![ds],
+    )
+    .await
+    .expect("create table node");
+
+    let tbl = root.get("w_part").await.unwrap().into_table().unwrap();
+
+    let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
+    let make = |vals: Vec<i64>| -> arrow::array::RecordBatch {
+        arrow::array::RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vals)) as arrow::array::ArrayRef],
+        )
+        .unwrap()
+    };
+
+    // Concatenate every batch's `n` column across all partitions, in order.
+    let read_all = |parts: Vec<tiled_client::TablePartition>| -> Vec<i64> {
+        let mut all = Vec::new();
+        for part in &parts {
+            for b in &part.batches {
+                let col = b
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("n is Int64");
+                all.extend_from_slice(col.values());
+            }
+        }
+        all
+    };
+
+    // PUT partition 0 = [1, 2, 3].
+    tbl.write_partition(0, &schema, &[make(vec![1, 2, 3])])
+        .await
+        .expect("write_partition 0");
+    let after_write = tbl.read(None).await.expect("read after write_partition");
+    assert_eq!(read_all(after_write), vec![1, 2, 3]);
+
+    // PATCH partition 0 appends [4, 5] → [1, 2, 3, 4, 5].
+    tbl.append_partition(0, &schema, &[make(vec![4, 5])])
+        .await
+        .expect("append_partition 0");
+    let after_append = tbl.read(None).await.expect("read after append_partition");
+    assert_eq!(read_all(after_append), vec![1, 2, 3, 4, 5]);
+}
+
 // ---------------------------------------------------------------------------
 // Scope 3: ContainerClient::create_container, delete_contents
 // ---------------------------------------------------------------------------

@@ -153,27 +153,71 @@ impl TableClient {
     pub async fn write(&self, schema: &SchemaRef, batches: &[RecordBatch]) -> Result<()> {
         let link = self.base.require_link("full")?;
         let url = Url::parse(link)?;
-
-        let mut buf = Vec::new();
-        {
-            let mut writer = arrow::ipc::writer::FileWriter::try_new(&mut buf, schema.as_ref())
-                .map_err(|e| ClientError::Invalid(format!("Arrow IPC writer: {e}")))?;
-            for batch in batches {
-                writer
-                    .write(batch)
-                    .map_err(|e| ClientError::Invalid(format!("Arrow IPC write: {e}")))?;
-            }
-            writer
-                .finish()
-                .map_err(|e| ClientError::Invalid(format!("Arrow IPC finish: {e}")))?;
-        }
-        let body = bytes::Bytes::from(buf);
+        let body = encode_arrow_ipc(schema, batches)?;
 
         let _permit = self.base.context.data_fetch_permit().await;
         retry(|| async {
             self.base
                 .context
                 .put_bytes(&url, body.clone())
+                .await
+                .map(|_| ())
+        })
+        .await
+    }
+
+    /// Overwrite one partition. Encodes `batches` as an Arrow IPC FILE stream
+    /// and sends it to `PUT /api/v1/table/partition?partition=N` with
+    /// `Content-Type: <Arrow IPC FILE>`. Mirrors Python
+    /// `DataFrameClient.write_partition(partition, dataframe)`
+    /// (`dataframe.py:241-261`). The server validates the partition index and
+    /// that the column names match the node's declared columns.
+    pub async fn write_partition(
+        &self,
+        partition: usize,
+        schema: &SchemaRef,
+        batches: &[RecordBatch],
+    ) -> Result<()> {
+        let link = self.base.require_link("partition")?;
+        let mut url = Url::parse(link)?;
+        url.query_pairs_mut()
+            .append_pair("partition", &partition.to_string());
+        let body = encode_arrow_ipc(schema, batches)?;
+
+        let _permit = self.base.context.data_fetch_permit().await;
+        retry(|| async {
+            self.base
+                .context
+                .put_bytes_typed(&url, body.clone(), ARROW_FILE_MIME_TYPE)
+                .await
+                .map(|_| ())
+        })
+        .await
+    }
+
+    /// Append rows to one partition. Encodes `batches` as an Arrow IPC FILE
+    /// stream and sends it to `PATCH /api/v1/table/partition?partition=N` with
+    /// `Content-Type: <Arrow IPC FILE>`. Mirrors Python
+    /// `DataFrameClient.append_partition(partition, dataframe)`
+    /// (`dataframe.py:263-285`). Rows are appended to the existing partition
+    /// data rather than overwriting it.
+    pub async fn append_partition(
+        &self,
+        partition: usize,
+        schema: &SchemaRef,
+        batches: &[RecordBatch],
+    ) -> Result<()> {
+        let link = self.base.require_link("partition")?;
+        let mut url = Url::parse(link)?;
+        url.query_pairs_mut()
+            .append_pair("partition", &partition.to_string());
+        let body = encode_arrow_ipc(schema, batches)?;
+
+        let _permit = self.base.context.data_fetch_permit().await;
+        retry(|| async {
+            self.base
+                .context
+                .patch_bytes_typed(&url, body.clone(), ARROW_FILE_MIME_TYPE)
                 .await
                 .map(|_| ())
         })
@@ -203,4 +247,24 @@ impl TableClient {
         }
         Ok(out)
     }
+}
+
+/// Encode `batches` as an Arrow IPC FILE stream — the body shape every table
+/// write endpoint (`/table/full`, `/table/partition`) expects. All batches
+/// must share `schema`.
+fn encode_arrow_ipc(schema: &SchemaRef, batches: &[RecordBatch]) -> Result<bytes::Bytes> {
+    let mut buf = Vec::new();
+    {
+        let mut writer = arrow::ipc::writer::FileWriter::try_new(&mut buf, schema.as_ref())
+            .map_err(|e| ClientError::Invalid(format!("Arrow IPC writer: {e}")))?;
+        for batch in batches {
+            writer
+                .write(batch)
+                .map_err(|e| ClientError::Invalid(format!("Arrow IPC write: {e}")))?;
+        }
+        writer
+            .finish()
+            .map_err(|e| ClientError::Invalid(format!("Arrow IPC finish: {e}")))?;
+    }
+    Ok(bytes::Bytes::from(buf))
 }
