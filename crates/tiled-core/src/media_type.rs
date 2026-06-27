@@ -25,6 +25,9 @@ pub mod mime {
     pub const ZIP: &str = "application/zip";
     pub const NETCDF: &str = "application/netcdf";
     pub const ZARR: &str = "application/x-zarr";
+    /// SQL-backed ragged array storage — Python `RAGGED_SQL_MIMETYPE`
+    /// (`tiled/mimetypes.py`). The managed-write backend for ragged nodes.
+    pub const RAGGED_SQL: &str = "application/x-ragged+sql";
 }
 
 /// Content encodings (compression).

@@ -18,6 +18,7 @@
 
 #![cfg(feature = "sql-adapter")]
 
+use std::path::Path;
 use std::str::FromStr;
 
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
@@ -26,6 +27,7 @@ use sqlx::{Row, SqlitePool};
 use tiled_core::adapters::{
     BaseAdapter, BoxFuture, RaggedAdapterRead, RaggedAdapterWrite, RaggedData,
 };
+use tiled_core::data_source::Asset;
 use tiled_core::error::{Result, TiledError};
 use tiled_core::ndslice::NDSlice;
 use tiled_core::structures::{RaggedStructure, Spec, StructureFamily};
@@ -277,6 +279,11 @@ pub struct RaggedSQLAdapter {
     structure: RaggedStructure,
     metadata: serde_json::Value,
     specs: Vec<Spec>,
+    /// Whether write/patch are exposed via [`RaggedAdapterRead::as_writable`].
+    /// Set by the resolver only when the backing SQLite file lives under
+    /// writable storage — the same containment gate the file-backed adapters
+    /// (`NpyAdapter::into_writable`, etc.) use. Defaults to read-only.
+    writable: bool,
 }
 
 impl RaggedSQLAdapter {
@@ -284,6 +291,9 @@ impl RaggedSQLAdapter {
     /// `database_url`, scoped to `dataset_id`. The buffer-key columns are
     /// derived from `structure`'s Awkward form (so they match what the write
     /// path produces), via [`expected_from_buffers`] over [`awkward_form_json`].
+    ///
+    /// Read-only by default; call [`into_writable`](Self::into_writable) to
+    /// expose the write face.
     pub fn new(
         database_url: impl Into<String>,
         table_name: impl Into<String>,
@@ -304,7 +314,17 @@ impl RaggedSQLAdapter {
             structure,
             metadata,
             specs,
+            writable: false,
         })
+    }
+
+    /// Mark this adapter writable, exposing `write`/`write_block`/`patch` via
+    /// [`RaggedAdapterRead::as_writable`]. The resolver calls this only when the
+    /// backing file is under writable storage.
+    #[must_use]
+    pub fn into_writable(mut self) -> Self {
+        self.writable = true;
+        self
     }
 
     /// Create the backing chunk table (delegates to the store). Used by the
@@ -395,7 +415,7 @@ impl RaggedAdapterRead for RaggedSQLAdapter {
     }
 
     fn as_writable(&self) -> Option<&dyn RaggedAdapterWrite> {
-        Some(self)
+        self.writable.then_some(self as &dyn RaggedAdapterWrite)
     }
 }
 
@@ -525,6 +545,108 @@ fn fixed_dim_lengths(data: &serde_json::Value, ndim_fixed: usize) -> Result<Vec<
         cur = first;
     }
     Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// init_storage — the managed-create entry point
+// ---------------------------------------------------------------------------
+
+/// Fixed table name inside a ragged node's dedicated SQLite file. Unlike
+/// Python's shared SQLStorage (one database, MD5-hashed table names, a
+/// `_dataset_id` sequence), each Rust ragged node gets its own `.sqlite` file,
+/// so a constant table name and dataset id are unambiguous.
+const RAGGED_TABLE_NAME: &str = "ragged_data";
+const RAGGED_DATASET_ID: i64 = 1;
+
+/// What [`init_storage_ragged_sql`] generated: the SQLite `data_uri`, the
+/// table name and dataset id to persist as the data-source parameters, and the
+/// single asset describing the database file.
+#[derive(Debug, Clone)]
+pub struct RaggedSqlInit {
+    pub data_uri: String,
+    pub table_name: String,
+    pub dataset_id: i64,
+    pub assets: Vec<Asset>,
+}
+
+/// Initialize SQLite storage for a managed ragged node and create its chunk
+/// table. The ragged analog of [`crate::init_storage_npy`]: it places a
+/// per-node `{key}.sqlite` file under `writable_root` (path components
+/// validated to forbid traversal), creates the chunk table sized to
+/// `structure`'s Awkward buffer keys, and returns the `sqlite://` `data_uri`
+/// plus the `table_name`/`dataset_id` parameters the resolver later reads.
+///
+/// Mirrors Python `RaggedSQLAdapter.init_storage` → `SQLAdapter.init_storage`
+/// (`tiled/adapters/ragged.py:128-151`, `sql.py`), with SQLite-per-node
+/// storage standing in for Python's shared SQLStorage.
+pub async fn init_storage_ragged_sql(
+    writable_root: &Path,
+    path_parts: &[String],
+    structure: &RaggedStructure,
+) -> Result<RaggedSqlInit> {
+    if !writable_root.is_absolute() {
+        return Err(TiledError::Internal(format!(
+            "writable storage root {} is not absolute",
+            writable_root.display()
+        )));
+    }
+    if path_parts.is_empty() {
+        return Err(TiledError::Validation(
+            "init_storage: node path is empty".into(),
+        ));
+    }
+    for part in path_parts {
+        if part.is_empty()
+            || part == "."
+            || part == ".."
+            || part.contains('/')
+            || part.contains('\\')
+            || part.contains('\0')
+        {
+            return Err(TiledError::Validation(format!(
+                "init_storage: unsafe path component {part:?}"
+            )));
+        }
+    }
+
+    let (key, ancestors) = path_parts.split_last().expect("non-empty checked above");
+    let mut dir = writable_root.to_path_buf();
+    for a in ancestors {
+        dir.push(a);
+    }
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| TiledError::Internal(format!("init_storage mkdir {}: {e}", dir.display())))?;
+    let file = dir.join(format!("{key}.sqlite"));
+
+    // `file` is under the absolute `writable_root`, so `display()` begins with
+    // `/` and `sqlite://` + that path yields the `sqlite:///abs/...` form sqlx's
+    // SqliteConnectOptions::from_str accepts (and the resolver re-derives the
+    // path from for the writable-containment check).
+    let data_uri = format!("sqlite://{}", file.display());
+
+    let adapter = RaggedSQLAdapter::new(
+        data_uri.clone(),
+        RAGGED_TABLE_NAME,
+        RAGGED_DATASET_ID,
+        structure.clone(),
+        serde_json::Value::Null,
+        Vec::new(),
+    )?;
+    adapter.init_storage().await?;
+
+    let asset = Asset {
+        data_uri: data_uri.clone(),
+        is_directory: false,
+        parameter: Some("data_uri".into()),
+        num: None,
+        id: None,
+    };
+    Ok(RaggedSqlInit {
+        data_uri,
+        table_name: RAGGED_TABLE_NAME.to_string(),
+        dataset_id: RAGGED_DATASET_ID,
+        assets: vec![asset],
+    })
 }
 
 #[cfg(test)]
@@ -835,6 +957,74 @@ mod adapter_tests {
             .patch(&serde_json::json!([[1.0]]), &[5], true)
             .await
             .unwrap_err();
+        assert!(matches!(err, TiledError::Validation(_)));
+    }
+
+    // boundary: a plain adapter hides its write face; into_writable() exposes it.
+    #[tokio::test]
+    async fn writability_gate_respects_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let read_only = make(&dir, f64_structure(vec![1], 1));
+        assert!(
+            read_only.as_writable().is_none(),
+            "default adapter must be read-only"
+        );
+        let writable = make(&dir, f64_structure(vec![1], 1)).into_writable();
+        assert!(
+            writable.as_writable().is_some(),
+            "into_writable must expose the write face"
+        );
+    }
+
+    // boundary: init_storage_ragged_sql creates a per-node sqlite file + table
+    // that an adapter can empty-read, write, and read back through.
+    #[tokio::test]
+    async fn init_storage_ragged_sql_creates_working_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let structure = f64_structure(vec![2], 3);
+        let init = init_storage_ragged_sql(dir.path(), &["mynode".to_string()], &structure)
+            .await
+            .unwrap();
+        assert!(init.data_uri.starts_with("sqlite://"));
+        assert_eq!(init.table_name, "ragged_data");
+        assert_eq!(init.dataset_id, 1);
+        assert_eq!(init.assets.len(), 1);
+        assert!(
+            dir.path().join("mynode.sqlite").exists(),
+            "the per-node sqlite file must be created on disk"
+        );
+
+        let adapter = RaggedSQLAdapter::new(
+            init.data_uri,
+            init.table_name,
+            init.dataset_id,
+            structure,
+            serde_json::json!({}),
+            vec![],
+        )
+        .unwrap();
+        // A brand-new table reads back as an empty array.
+        let empty = adapter.read(&NDSlice::empty()).await.unwrap();
+        assert_eq!(empty.json_value, serde_json::json!([]));
+        // Write then read round-trips through the created table.
+        adapter
+            .write(&serde_json::json!([[1.0, 2.0], [3.0]]))
+            .await
+            .unwrap();
+        let read = adapter.read(&NDSlice::empty()).await.unwrap();
+        assert_eq!(read.json_value, serde_json::json!([[1.0, 2.0], [3.0]]));
+    }
+
+    // boundary: nested path parts place the file under the ancestor dirs; a
+    // traversal component is rejected.
+    #[tokio::test]
+    async fn init_storage_ragged_sql_rejects_traversal() {
+        let dir = tempfile::tempdir().unwrap();
+        let structure = f64_structure(vec![1], 1);
+        let err =
+            init_storage_ragged_sql(dir.path(), &["..".to_string(), "x".to_string()], &structure)
+                .await
+                .unwrap_err();
         assert!(matches!(err, TiledError::Validation(_)));
     }
 

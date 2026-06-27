@@ -59,7 +59,9 @@ pub use netcdf_adapter::netcdf_from_path;
 pub use parquet_adapter::{ParquetAdapter, init_storage_parquet};
 pub use png_jpeg_adapter::ImageAdapter;
 #[cfg(feature = "sql-adapter")]
-pub use ragged_sql_adapter::{ChunkRow, RaggedSqlStore};
+pub use ragged_sql_adapter::{
+    ChunkRow, RaggedSQLAdapter, RaggedSqlInit, RaggedSqlStore, init_storage_ragged_sql,
+};
 #[cfg(feature = "parquet")]
 pub use sparse_blocks_parquet_adapter::SparseBlocksParquetAdapter;
 #[cfg(feature = "sql-adapter")]
