@@ -5,6 +5,8 @@ edition.workspace = true
 
 [dependencies]
 tiled-core = { workspace = true }
+# Client-side ragged write encoding (Awkward zipped-buffers body).
+tiled-serialization = { workspace = true }
 reqwest = { workspace = true, features = ["cookies"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -43,7 +45,6 @@ default = []
 [dev-dependencies]
 tiled-server = { workspace = true }
 tiled-adapters = { workspace = true }
-tiled-serialization = { workspace = true }
 tiled-auth = { workspace = true }
 tiled-catalog = { workspace = true }
 tokio = { workspace = true, features = ["full"] }

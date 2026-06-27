@@ -572,9 +572,21 @@ impl Context {
         Ok(resp)
     }
 
-    /// PUT or PATCH a raw-bytes body; shared by array/table write paths.
-    async fn bytes_write(&self, method: Method, url: &Url, body: bytes::Bytes) -> Result<Response> {
-        let req = self.request(method, url).await?.body(body);
+    /// PUT or PATCH a raw-bytes body; shared by array/table write paths. When
+    /// `content_type` is `Some`, it is set as the `Content-Type` header (the
+    /// ragged write paths send `application/zip`); array/table writes leave it
+    /// unset (raw octet-stream / Arrow IPC the server reads positionally).
+    async fn bytes_write(
+        &self,
+        method: Method,
+        url: &Url,
+        body: bytes::Bytes,
+        content_type: Option<&str>,
+    ) -> Result<Response> {
+        let mut req = self.request(method, url).await?.body(body);
+        if let Some(ct) = content_type {
+            req = req.header(reqwest::header::CONTENT_TYPE, ct);
+        }
         let req = self.add_csrf(req).await;
         let resp = self.send_with_auth(req).await?;
         self.maybe_capture_csrf(&resp).await;
@@ -586,11 +598,34 @@ impl Context {
     }
 
     pub async fn put_bytes(&self, url: &Url, body: bytes::Bytes) -> Result<Response> {
-        self.bytes_write(Method::PUT, url, body).await
+        self.bytes_write(Method::PUT, url, body, None).await
     }
 
     pub async fn patch_bytes(&self, url: &Url, body: bytes::Bytes) -> Result<Response> {
-        self.bytes_write(Method::PATCH, url, body).await
+        self.bytes_write(Method::PATCH, url, body, None).await
+    }
+
+    /// PUT a raw-bytes body with an explicit `Content-Type` (the ragged write
+    /// paths send `application/zip`).
+    pub async fn put_bytes_typed(
+        &self,
+        url: &Url,
+        body: bytes::Bytes,
+        content_type: &str,
+    ) -> Result<Response> {
+        self.bytes_write(Method::PUT, url, body, Some(content_type))
+            .await
+    }
+
+    /// PATCH a raw-bytes body with an explicit `Content-Type`.
+    pub async fn patch_bytes_typed(
+        &self,
+        url: &Url,
+        body: bytes::Bytes,
+        content_type: &str,
+    ) -> Result<Response> {
+        self.bytes_write(Method::PATCH, url, body, Some(content_type))
+            .await
     }
 
     pub async fn delete(&self, url: &Url) -> Result<Response> {

@@ -390,11 +390,33 @@ fn to_zipped_buffers(
     let structure = RaggedStructure::from_json(metadata)
         .map_err(|e| format!("ragged/zip: cannot parse RaggedStructure from metadata: {e}"))?;
 
+    zip_buffers_body(&structure, &value)
+}
+
+/// Build the `application/zip` ragged write body from a structure and a JSON
+/// list-of-lists — the client serialize direction (Python's client
+/// `to_zipped_buffers`, `tiled/client/ragged.py`). Produces the exact bytes the
+/// registered `application/zip` serializer emits and the inverse of
+/// [`from_zipped_buffers`], so a Rust client's write body is byte-compatible
+/// with both the Rust and Python servers.
+pub fn to_zipped_buffers_from_json(
+    structure: &RaggedStructure,
+    json: &serde_json::Value,
+) -> Result<bytes::Bytes, SerializeError> {
+    zip_buffers_body(structure, json)
+}
+
+/// Form + buffers + ZIP packing shared by the registered serializer and the
+/// public client-side [`to_zipped_buffers_from_json`].
+fn zip_buffers_body(
+    structure: &RaggedStructure,
+    value: &serde_json::Value,
+) -> Result<bytes::Bytes, SerializeError> {
     // Form + buffers come from the shared codec (same path the write
     // deserialize and the SQL adapter use), so the ZIP wire bytes stay
     // identical to before this refactor.
-    let form_json = awkward_form_json(&structure)?;
-    let (length, buffers) = json_to_buffers(&structure, &value)?;
+    let form_json = awkward_form_json(structure)?;
+    let (length, buffers) = json_to_buffers(structure, value)?;
 
     // Pack into ZIP (uncompressed, matching Python's ZIP_STORED).
     let mut out = Vec::<u8>::new();
