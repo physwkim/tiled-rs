@@ -5705,18 +5705,15 @@ async fn catalog_metadata_resource(
     })
 }
 
+/// Map a DB `structure_family` string to the enum. Delegates to the canonical
+/// [`StructureFamily`](tiled_core::structures::StructureFamily) `FromStr` so it
+/// stays in lockstep with every family the core knows — this used to be a local
+/// `match` that drifted and omitted `ragged`, 422-ing every ragged node read
+/// once ragged became catalog-creatable.
 fn parse_structure_family(s: &str) -> Result<tiled_core::structures::StructureFamily, ServerError> {
-    use tiled_core::structures::StructureFamily as SF;
-    match s {
-        "container" => Ok(SF::Container),
-        "array" => Ok(SF::Array),
-        "table" => Ok(SF::Table),
-        "sparse" => Ok(SF::Sparse),
-        "awkward" => Ok(SF::Awkward),
-        other => Err(ServerError::Validation(format!(
-            "unknown structure_family in DB: {other}"
-        ))),
-    }
+    s.parse().map_err(|e: tiled_core::TiledError| {
+        ServerError::Validation(format!("unknown structure_family in DB: {s} ({e})"))
+    })
 }
 
 /// Distinct (wall-clock, counter) seed used to synthesise IDs when the
