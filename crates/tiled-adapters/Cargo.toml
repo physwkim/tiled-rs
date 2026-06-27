@@ -9,7 +9,7 @@ csv-adapter = ["dep:csv"]
 parquet = ["dep:parquet"]
 arrow-ipc = []
 excel-adapter = ["dep:calamine"]
-sql-adapter = ["dep:sqlx"]
+sql-adapter = ["dep:sqlx", "dep:tiled-serialization"]
 hdf5 = ["dep:rust-hdf5"]
 netcdf-adapter = ["dep:rust-hdf5", "dep:netcdf3"]
 tiff = ["dep:tiff", "dep:image"]
@@ -17,6 +17,9 @@ zarr = ["dep:zarrs", "dep:object_store"]
 
 [dependencies]
 tiled-core = { workspace = true }
+# Needed only for the Awkward buffer codec (ragged::BufferMap and friends),
+# which lives in the always-compiled `ragged` module. Enabled by `sql-adapter`.
+tiled-serialization = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 bytes = { workspace = true }

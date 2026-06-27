@@ -34,6 +34,12 @@ pub enum TiledError {
     #[error("Database error: {0}")]
     Database(String),
 
+    /// A write that conflicts with existing state — e.g. a duplicate ragged
+    /// `chunk_index`. The server maps this to HTTP 409 (parity with Python
+    /// tiled's `Conflicts`, which a duplicate-chunk write raises).
+    #[error("Conflict: {0}")]
+    Conflict(String),
+
     #[error("Internal error: {0}")]
     Internal(String),
 

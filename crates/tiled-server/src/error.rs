@@ -153,6 +153,9 @@ impl From<tiled_core::TiledError> for ServerError {
             // ContainerAdapter::search carries this in its TiledError Result.
             tiled_core::TiledError::UnsupportedQuery(msg) => Self::UnsupportedQuery(msg),
             tiled_core::TiledError::UnsupportedMediaType(msg) => Self::UnsupportedMediaType(msg),
+            // A write that conflicts with existing state (e.g. a duplicate
+            // ragged chunk_index) → 409, parity with Python tiled's `Conflicts`.
+            tiled_core::TiledError::Conflict(msg) => Self::Conflict(msg),
             tiled_core::TiledError::Internal(msg) => Self::Internal(msg),
             other => Self::Internal(other.to_string()),
         }
