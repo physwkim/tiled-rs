@@ -56,6 +56,12 @@ pub trait ArrayAdapterRead: BaseAdapter {
     }
 }
 
+/// `(shape, chunks)` of an array after an [`ArrayAdapterWrite::patch`]: the
+/// per-axis extents and the regular chunk grid — exactly the two fields
+/// Python's catalog adapter writes back to the structure row
+/// (catalog/adapter.py:1664).
+pub type ArrayShapeChunks = (Vec<usize>, Vec<Vec<usize>>);
+
 pub trait ArrayAdapterWrite: ArrayAdapterRead {
     /// Overwrite the whole array. `data.shape` must equal the array's shape
     /// (`structure().shape`). `PUT /array/full` routes here.
@@ -79,6 +85,27 @@ pub trait ArrayAdapterWrite: ArrayAdapterRead {
         Box::pin(async move {
             Err(crate::error::TiledError::Validation(
                 "append is not supported by this adapter".into(),
+            ))
+        })
+    }
+
+    /// Write `data` into the slice that starts at `offset`, optionally extending
+    /// the array to fit, and return the array's `(shape, chunks)` afterwards.
+    /// `PATCH /array/full` routes here. Mirrors Python `ZarrArrayAdapter.patch`
+    /// (adapters/zarr.py:128-186): per axis the new extent is
+    /// `max(current, data_len + offset)`; when that grows the array it is allowed
+    /// only if `extend` is true, otherwise a [`TiledError::Conflict`] (HTTP 409)
+    /// is returned. Only growth-capable stores (zarr) implement it; the default
+    /// errors so the route shape is backend-independent.
+    fn patch<'a>(
+        &'a self,
+        _data: DynNDArray,
+        _offset: &'a [usize],
+        _extend: bool,
+    ) -> BoxFuture<'a, Result<ArrayShapeChunks>> {
+        Box::pin(async move {
+            Err(crate::error::TiledError::Validation(
+                "patch is not supported by this adapter".into(),
             ))
         })
     }
