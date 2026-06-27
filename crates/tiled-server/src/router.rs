@@ -2914,6 +2914,318 @@ pub async fn ragged_full(
 }
 
 // ---------------------------------------------------------------------------
+// Ragged write handlers: PUT /ragged/full, PUT /ragged/block, PATCH /ragged/full
+// ---------------------------------------------------------------------------
+//
+// Mirror Python `put_ragged_full` / `put_ragged_block` / `patch_ragged_full`
+// (router.py:908-1047). Only an internally-managed ragged node whose backing
+// SQLite database lives under the server's writable storage is writable — the
+// resolver decides this and gates `as_writable()` on it — so a non-writable
+// node answers 405. Without the `sql-adapter` feature no ragged node is ever
+// writable, so these routes uniformly answer 405; the routes themselves are
+// unconditional because they reference only the always-present ragged write
+// trait and the ZIP decoder, never the SQL backend directly.
+
+/// Parse a `?`-query boolean the way FastAPI does: absent → `default`; a value
+/// of `false`/`0`/`no`/`off` (case-insensitive) is false, anything else true.
+fn query_bool(params: &HashMap<String, String>, key: &str, default: bool) -> bool {
+    match params.get(key) {
+        None => default,
+        Some(v) => !matches!(
+            v.to_ascii_lowercase().as_str(),
+            "false" | "0" | "no" | "off"
+        ),
+    }
+}
+
+/// Parse a comma-separated list of non-negative integers (`?offset=`, `?shape=`,
+/// `?block=`). A malformed value is a 400, matching Python's query-param
+/// patterns (`^[0-9]+(,[0-9]+)*$`).
+fn parse_csv_usize(s: &str) -> Result<Vec<usize>, ServerError> {
+    s.split(',')
+        .map(|p| {
+            p.trim().parse::<usize>().map_err(|_| {
+                ServerError::BadRequest(format!(
+                    "expected comma-separated non-negative integers, got {s:?}"
+                ))
+            })
+        })
+        .collect()
+}
+
+/// The request `Content-Type`, lower-cased media type only (no parameters).
+fn content_type_of(headers: &HeaderMap) -> String {
+    headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Deserialize a ragged write body into the JSON list-of-lists the adapter
+/// consumes, per the request Content-Type. Mirrors Python's
+/// `deserialization_registry.dispatch("ragged", media_type)`: `application/json`
+/// is the list-of-lists verbatim; `application/zip` is the Awkward
+/// zipped-buffers form, decoded back to a list-of-lists.
+fn deserialize_ragged_body(
+    content_type: &str,
+    body: &[u8],
+) -> Result<serde_json::Value, ServerError> {
+    let media = content_type
+        .split(';')
+        .next()
+        .unwrap_or(content_type)
+        .trim();
+    match media {
+        "" | tiled_core::media_type::mime::JSON => serde_json::from_slice(body).map_err(|e| {
+            ServerError::Validation(format!(
+                "ragged JSON body is not a valid list-of-lists: {e}"
+            ))
+        }),
+        tiled_core::media_type::mime::ZIP => tiled_serialization::ragged::from_zipped_buffers(body)
+            .map_err(|e| {
+                ServerError::Validation(format!(
+                    "ragged zipped-buffers body could not be decoded: {e}"
+                ))
+            }),
+        other => Err(ServerError::UnsupportedMediaType(format!(
+            "ragged write: unsupported Content-Type {other:?} \
+             (use application/json or application/zip)"
+        ))),
+    }
+}
+
+/// Walk the tree to a ragged node and confirm it is writable, or map to the
+/// right error: 404 if the node is not a ragged array, 405 if it is not
+/// writable. Returns the read-face `Arc`; the caller re-derives the write face
+/// (the resolver's `writable` flag is stable, so `as_writable()` stays `Some`).
+async fn resolve_writable_ragged(
+    state: &AppState,
+    segments: &[String],
+) -> Result<Arc<dyn tiled_core::adapters::RaggedAdapterRead>, ServerError> {
+    let adapter = core::walk_tree(state.root_tree.as_ref(), segments).await?;
+    let ragged = adapter.as_ragged_arc().ok_or_else(|| {
+        ServerError::WrongType(format!("'{}' is not a ragged array", segments.join("/")))
+    })?;
+    if ragged.as_writable().is_none() {
+        return Err(ServerError::MethodNotAllowed(
+            "this ragged node is not writable; only internally-managed ragged arrays \
+             whose SQLite store is under the server's writable storage accept writes"
+                .into(),
+        ));
+    }
+    Ok(ragged)
+}
+
+/// Signal subscribers that a ragged node's data changed (closest existing
+/// event), mirroring the array write routes' streaming notification.
+fn publish_ragged_change(state: &AppState, segments: &[String], partition: Option<usize>) {
+    let path = segments.join("/");
+    state.streaming_bus.publish(
+        &path,
+        crate::streaming::UpdateKind::DataAppended { partition },
+    );
+}
+
+/// Persist a ragged `patch`'s grown structure to the catalog and return the
+/// structure to send back. Faithful to Python `CatalogRaggedAdapter.patch`
+/// (catalog/adapter.py:1736-1777): only `shape` and `chunks` are written back,
+/// preserving the data source's original `size`.
+async fn persist_ragged_patch(
+    state: &AppState,
+    segments: &[String],
+    new_structure: &tiled_core::structures::RaggedStructure,
+) -> Result<serde_json::Value, ServerError> {
+    let catalog = state.catalog.as_ref().ok_or_else(|| {
+        ServerError::Internal(
+            "ragged patch requires a catalog to persist the grown structure".into(),
+        )
+    })?;
+    let node = catalog
+        .lookup(segments)
+        .await
+        .map_err(map_catalog_err)?
+        .ok_or_else(|| ServerError::NotFound(format!("node '{}' not found", segments.join("/"))))?;
+    let data_sources = catalog
+        .list_data_sources(node.id)
+        .await
+        .map_err(map_catalog_err)?;
+    let ds = data_sources.first().ok_or_else(|| {
+        ServerError::Internal(format!(
+            "ragged node '{}' has no data source to update",
+            segments.join("/")
+        ))
+    })?;
+
+    let new_json = serde_json::to_value(new_structure)
+        .map_err(|e| ServerError::Internal(format!("serialize ragged structure: {e}")))?;
+    let mut persisted = ds.structure.clone();
+    if let (Some(obj), Some(new_obj)) = (persisted.as_object_mut(), new_json.as_object()) {
+        if let Some(shape) = new_obj.get("shape") {
+            obj.insert("shape".into(), shape.clone());
+        }
+        if let Some(chunks) = new_obj.get("chunks") {
+            obj.insert("chunks".into(), chunks.clone());
+        }
+    }
+    catalog
+        .update_data_source(ds.id, persisted.clone(), ds.parameters.clone())
+        .await
+        .map_err(map_catalog_err)?;
+    Ok(persisted)
+}
+
+// PUT /api/v1/ragged/full/{*path} — write the whole ragged array as chunk 0.
+pub async fn ragged_full_put(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    auth: crate::AuthContext,
+    body: bytes::Bytes,
+) -> Result<impl IntoResponse, ServerError> {
+    auth.require(tiled_auth::Scope::WriteData)?;
+    let segments = segments_from_uri(&uri, "/api/v1/ragged/full/");
+    let _ = resolve_entry(
+        &state,
+        auth.clone(),
+        &segments,
+        tiled_auth::Scope::WriteData,
+    )
+    .await?;
+
+    let persist = query_bool(&params, "persist", true);
+    let ragged = resolve_writable_ragged(&state, &segments).await?;
+    let writable = ragged
+        .as_writable()
+        .expect("resolve_writable_ragged guarantees a writable face");
+
+    // Python streams unconditionally then skips the write when !persist; the
+    // Rust bus only signals "data changed", so with !persist nothing changed
+    // and we neither deserialize nor publish.
+    if persist {
+        let data = deserialize_ragged_body(&content_type_of(&headers), &body)?;
+        writable.write(&data).await.map_err(ServerError::from)?;
+        publish_ragged_change(&state, &segments, None);
+    }
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+// PUT /api/v1/ragged/block/{*path}?block=i — write one chunk.
+pub async fn ragged_block_put(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    auth: crate::AuthContext,
+    body: bytes::Bytes,
+) -> Result<impl IntoResponse, ServerError> {
+    auth.require(tiled_auth::Scope::WriteData)?;
+    let segments = segments_from_uri(&uri, "/api/v1/ragged/block/");
+
+    // `?block=i,j,…` is required (Python `parse_block_param`); for ragged only
+    // the leftmost index (the chunk index) is meaningful.
+    let block_str = params.get("block").ok_or_else(|| {
+        ServerError::BadRequest("ragged block write requires a ?block= index".into())
+    })?;
+    let block = parse_csv_usize(block_str)?;
+    let chunk_index = *block
+        .first()
+        .ok_or_else(|| ServerError::BadRequest("?block= must have at least one index".into()))?;
+
+    let _ = resolve_entry(
+        &state,
+        auth.clone(),
+        &segments,
+        tiled_auth::Scope::WriteData,
+    )
+    .await?;
+
+    let persist = query_bool(&params, "persist", true);
+    let ragged = resolve_writable_ragged(&state, &segments).await?;
+    let writable = ragged
+        .as_writable()
+        .expect("resolve_writable_ragged guarantees a writable face");
+
+    if persist {
+        let data = deserialize_ragged_body(&content_type_of(&headers), &body)?;
+        writable
+            .write_block(&data, chunk_index)
+            .await
+            .map_err(ServerError::from)?;
+        publish_ragged_change(&state, &segments, Some(chunk_index));
+    }
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+// PATCH /api/v1/ragged/full/{*path}?shape=…&offset=…&extend=…&persist=…
+// Append a chunk along the leftmost dimension, growing the structure.
+pub async fn ragged_full_patch(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    auth: crate::AuthContext,
+    body: bytes::Bytes,
+) -> Result<impl IntoResponse, ServerError> {
+    auth.require(tiled_auth::Scope::WriteData)?;
+    let segments = segments_from_uri(&uri, "/api/v1/ragged/full/");
+
+    let extend = query_bool(&params, "extend", false);
+    let persist = query_bool(&params, "persist", true);
+    // Python rejects extend=true with persist=false up front (router.py:1006).
+    if extend && !persist {
+        return Err(ServerError::BadRequest(
+            "Cannot PATCH a ragged array with both parameters extend=true and \
+             persist=false. To extend the array, you must persist the changes. \
+             To skip persisting the changes, you must not extend the array."
+                .into(),
+        ));
+    }
+    // `?shape=` and `?offset=` are required query params (Python `shape_param`
+    // / `offset_param`). `shape` feeds Python's streaming metadata only, which
+    // this port does not maintain, so it is validated for parity but unused;
+    // `offset` drives the append.
+    let _shape =
+        parse_csv_usize(params.get("shape").ok_or_else(|| {
+            ServerError::BadRequest("ragged patch requires a ?shape= param".into())
+        })?)?;
+    let offset = parse_csv_usize(params.get("offset").ok_or_else(|| {
+        ServerError::BadRequest("ragged patch requires an ?offset= param".into())
+    })?)?;
+
+    let _ = resolve_entry(
+        &state,
+        auth.clone(),
+        &segments,
+        tiled_auth::Scope::WriteData,
+    )
+    .await?;
+
+    let ragged = resolve_writable_ragged(&state, &segments).await?;
+    let writable = ragged
+        .as_writable()
+        .expect("resolve_writable_ragged guarantees a writable face");
+
+    // !persist: return the current structure unchanged, no write (Python
+    // patch_ragged_full returns entry.structure() before deserializing).
+    if !persist {
+        let structure_json = serde_json::to_value(ragged.structure())
+            .map_err(|e| ServerError::Internal(format!("serialize ragged structure: {e}")))?;
+        return Ok(Json(structure_json));
+    }
+
+    let data = deserialize_ragged_body(&content_type_of(&headers), &body)?;
+    let new_structure = writable
+        .patch(&data, &offset, extend)
+        .await
+        .map_err(ServerError::from)?;
+    let persisted = persist_ragged_patch(&state, &segments, &new_structure).await?;
+    publish_ragged_change(&state, &segments, None);
+    Ok(Json(persisted))
+}
+
+// ---------------------------------------------------------------------------
 // Awkward array read+write handlers
 // ---------------------------------------------------------------------------
 //
