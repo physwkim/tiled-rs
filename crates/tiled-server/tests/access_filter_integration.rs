@@ -331,7 +331,7 @@ async fn patch_status(app: &axum::Router, uri: &str, bearer: Option<&str>) -> St
 /// Verify: PATCH /array/full on a tag-restricted node returns 404 for a
 /// principal that is not granted the required tag (F1 regression).
 ///
-/// F1 wired array_append through resolve_entry(WriteData). resolve_entry_catalog
+/// F1 wired array_patch through resolve_entry(WriteData). resolve_entry_catalog
 /// calls narrow_for_node per path segment; TagBasedPolicy returns empty scopes for
 /// a principal with no matching tag grant. The narrowed auth then fails the
 /// ReadMetadata check → ServerError::NotFound → HTTP 404.
@@ -423,7 +423,14 @@ async fn array_append_denied_by_tag_policy_returns_404() {
     let token = login(&app, "alice", "wonderland").await;
     let bearer = format!("Bearer {token}");
 
-    let status = patch_status(&app, "/api/v1/array/full/restricted_array", Some(&bearer)).await;
+    // Send valid patch params so the request is well-formed; the policy gate
+    // (resolve_entry) still denies before the adapter is reached → 404.
+    let status = patch_status(
+        &app,
+        "/api/v1/array/full/restricted_array?offset=0&shape=1",
+        Some(&bearer),
+    )
+    .await;
     assert_eq!(
         status,
         StatusCode::NOT_FOUND,

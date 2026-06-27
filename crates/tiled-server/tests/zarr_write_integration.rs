@@ -350,7 +350,7 @@ async fn block_put_writes_one_chunk_leaving_others_intact() {
 }
 
 #[tokio::test]
-async fn append_grows_array_and_syncs_catalog_structure() {
+async fn patch_extends_array_and_syncs_catalog_structure() {
     let (app, _writable_dir, _db_dir) = build_write_app().await;
     let ds = DataSource {
         structure_family: StructureFamily::Array,
@@ -381,21 +381,24 @@ async fn append_grows_array_and_syncs_catalog_structure() {
         bytes_request(&app, Method::PUT, "/api/v1/array/full/arr", None, payload).await;
     assert_eq!(status, StatusCode::OK, "seed write failed");
 
-    // PATCH /array/full?append_along=0 with 2 new f64 → new length 6.
+    // PATCH /array/full?offset=4&shape=2&extend=true writes 2 new f64 into the
+    // slice [4:6], growing the array from length 4 to 6. The response is the
+    // updated ArrayStructure JSON (shape + recomputed chunks).
     let appended: Vec<u8> = [5.5f64, 6.5].iter().flat_map(|v| v.to_le_bytes()).collect();
     let req = Request::builder()
         .method(Method::PATCH)
-        .uri("/api/v1/array/full/arr?append_along=0")
+        .uri("/api/v1/array/full/arr?offset=4&shape=2&extend=true")
         .body(Body::from(appended))
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK, "append failed");
+    assert_eq!(resp.status(), StatusCode::OK, "patch extend failed");
     let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
         .await
         .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(json["axis"], 0);
-    assert_eq!(json["new_size"], 6);
+    // Regular chunk size 2 expands [2,2] (shape 4) into [2,2,2] (shape 6).
+    assert_eq!(json["shape"], serde_json::json!([6]));
+    assert_eq!(json["chunks"], serde_json::json!([[2, 2, 2]]));
 
     // GET /array/full returns all 6 values (data grew on disk).
     let (status, back) = bytes_request(
@@ -426,6 +429,6 @@ async fn append_grows_array_and_syncs_catalog_structure() {
     assert_eq!(
         meta["data"]["attributes"]["structure"]["shape"],
         serde_json::json!([6]),
-        "catalog structure shape not synced after append"
+        "catalog structure shape not synced after patch"
     );
 }

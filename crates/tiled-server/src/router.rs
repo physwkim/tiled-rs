@@ -1408,17 +1408,24 @@ fn parse_range(header: &str, total: usize) -> Option<(usize, usize)> {
 }
 
 // ---------------------------------------------------------------------------
-// PATCH /api/v1/array/full/{*path}?append_along=N — extend an array
+// PATCH /api/v1/array/full/{*path}?offset=…&shape=…&extend=…&persist=…
 // ---------------------------------------------------------------------------
 //
-// Upstream tiled PR #802. Body is the raw bytes to append along axis
-// `append_along` (default 0). The route forwards to
-// `ArrayAdapterWrite::append`; adapters that don't override the trait
-// default get a 422 explaining "not supported by this adapter". The
-// resulting axis length is published on the streaming bus as a
-// `data-appended` event so subscribers see the new shape live.
+// Faithful port of Python `patch_array_full` (server/router.py:2097-2155) +
+// `CatalogArrayAdapter.patch` (catalog/adapter.py:1643-1680). The body is the
+// raw C-order bytes of the incoming data block (numpy `array.tobytes()`), whose
+// shape is given by `?shape=`; the block is written INTO the array at `?offset=`,
+// growing the shape when the slice overflows and `extend=true`. The response is
+// the updated ArrayStructure JSON the client uses to refresh its cached
+// structure.
+//
+//   - extend && !persist        → 400 (must persist to extend)
+//   - node not writable         → 405 ("cannot accept array data")
+//   - slice overflows, !extend  → 409 Conflict (raised by the zarr adapter)
+//   - !persist                  → stream-only: return the current structure,
+//                                 do not deserialize or write
 
-pub async fn array_append(
+pub async fn array_patch(
     State(state): State<AppState>,
     OriginalUri(uri): OriginalUri,
     Query(params): Query<HashMap<String, String>>,
@@ -1427,7 +1434,29 @@ pub async fn array_append(
 ) -> Result<impl IntoResponse, ServerError> {
     auth.require(tiled_auth::Scope::WriteData)?;
     let segments = segments_from_uri(&uri, "/api/v1/array/full/");
-    // H2: per-node policy check (matches every other data handler).
+
+    let extend = query_bool(&params, "extend", false);
+    let persist = query_bool(&params, "persist", true);
+    // Python rejects extend=true with persist=false up front (router.py:2112).
+    if extend && !persist {
+        return Err(ServerError::BadRequest(
+            "Cannot PATCH an array with both parameters extend=true and \
+             persist=false. To extend the array, you must persist the changes. \
+             To skip persisting the changes, you must not extend the array."
+                .into(),
+        ));
+    }
+    // `?shape=` (incoming data block shape) and `?offset=` (where to place it)
+    // are required query params (Python `shape_param` / `offset_param`).
+    let shape =
+        parse_csv_usize(params.get("shape").ok_or_else(|| {
+            ServerError::BadRequest("array patch requires a ?shape= param".into())
+        })?)?;
+    let offset = parse_csv_usize(params.get("offset").ok_or_else(|| {
+        ServerError::BadRequest("array patch requires an ?offset= param".into())
+    })?)?;
+
+    // Per-node policy check (matches every other data handler) → 404 on denial.
     let _ = resolve_entry(
         &state,
         auth.clone(),
@@ -1436,115 +1465,102 @@ pub async fn array_append(
     )
     .await?;
 
-    let append_along: usize = params
-        .get("append_along")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-
-    // The async tree walk resolves each hop on the executor and hands back an
-    // owned `Arc` clone of the leaf; validation + the async append then run on
-    // the executor (a writable store that offloads `append` does so internally).
     let adapter = core::walk_tree(state.root_tree.as_ref(), &segments).await?;
     let array_adapter: Arc<dyn tiled_core::adapters::ArrayAdapterRead> =
         adapter.as_array_arc().ok_or_else(|| {
             ServerError::WrongType(format!("'{}' is not an array", segments.join("/")))
         })?;
-
+    // Python returns 405 when the node has no `patch` (catalog/adapter.py exposes
+    // it only for writable zarr nodes); a read-only array adapter answers 405.
     let writable = array_adapter.as_writable().ok_or_else(|| {
-        ServerError::Validation(
-            "this array adapter does not support append; only adapters whose \
-                 underlying store can grow (zarr, ND-streaming) implement it"
-                .into(),
-        )
+        ServerError::MethodNotAllowed("This node cannot accept array data.".into())
     })?;
-    let structure = array_adapter.structure();
-    if append_along >= structure.shape.len() {
-        return Err(ServerError::Validation(format!(
-            "append_along={append_along} out of range (ndim={})",
-            structure.shape.len()
-        )));
+
+    // !persist: stream-only. Python returns entry.structure() before
+    // deserializing or writing (catalog/adapter.py:1648-1649).
+    if !persist {
+        let structure_json = serde_json::to_value(array_adapter.structure())
+            .map_err(|e| ServerError::Internal(format!("serialize array structure: {e}")))?;
+        return Ok(Json(structure_json));
     }
-    // Construct a DynNDArray view over the request body. Shape is the
-    // existing structure's shape with `shape[append_along]` swapped for
-    // the inferred number of new elements (body bytes / element size /
-    // product of remaining dims).
-    let elem_size = match &structure.data_type {
-        tiled_core::dtype::DType::Builtin(b) => b.element_size(),
+
+    // Deserialize the body into the incoming data block (raw C-order bytes in the
+    // node's dtype, shape from `?shape=`). Only builtin dtypes round-trip the
+    // octet-stream wire.
+    let dtype = match &array_adapter.structure().data_type {
+        tiled_core::dtype::DType::Builtin(b) => b.clone(),
         _ => {
             return Err(ServerError::Validation(
-                "append: only Builtin dtypes are supported".into(),
+                "array patch: only builtin (non-struct) dtypes are supported".into(),
             ));
         }
     };
-    let mut new_shape = structure.shape.clone();
-    let other_axes: usize = structure
-        .shape
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| *i != append_along)
-        .map(|(_, d)| *d)
-        .product();
-    if elem_size == 0 || other_axes == 0 {
-        return Err(ServerError::Validation(
-            "append: structure has zero-element-size or zero-area cross-section".into(),
-        ));
-    }
-    let row_bytes = other_axes * elem_size;
-    if !body.len().is_multiple_of(row_bytes) {
+    let elem = dtype.element_size();
+    let nelem: usize = shape.iter().product();
+    let expected = nelem * elem;
+    if body.len() != expected {
         return Err(ServerError::Validation(format!(
-            "append: body length {} is not a multiple of cross-section bytes {row_bytes}",
-            body.len()
+            "array patch: body is {} bytes but shape {shape:?} of {elem}-byte \
+             elements needs {expected}",
+            body.len(),
         )));
     }
-    let added_along_axis = body.len() / row_bytes;
-    new_shape[append_along] = added_along_axis;
-    let dtype = match &structure.data_type {
-        tiled_core::dtype::DType::Builtin(b) => b.clone(),
-        _ => unreachable!("checked above"),
-    };
-    let payload = tiled_core::dtype::DynNDArray::new(body, dtype, new_shape);
-    let new_axis_len = writable
-        .append(payload, append_along)
+    let data = tiled_core::dtype::DynNDArray::new(body, dtype, shape);
+
+    let (new_shape, new_chunks) = writable
+        .patch(data, &offset, extend)
         .await
         .map_err(ServerError::from)?;
-
-    // Keep the catalog structure in sync with the grown store, so GET /metadata
-    // reports the new shape (Python tiled updates the DB on append too). Rather
-    // than recompute the chunk grid here, re-resolve and read the authoritative
-    // structure back from the store.
-    if let Some(catalog) = &state.catalog
-        && let Some(node) = catalog.lookup(&segments).await.map_err(map_catalog_err)?
-    {
-        let data_sources = catalog
-            .list_data_sources(node.id)
-            .await
-            .map_err(map_catalog_err)?;
-        if let Some(ds) = data_sources.first() {
-            let fresh = core::walk_tree(state.root_tree.as_ref(), &segments).await?;
-            if let Some(fresh_array) = fresh.as_array_arc() {
-                let new_structure = serde_json::to_value(
-                    tiled_core::structures::AnyStructure::Array(fresh_array.structure().clone()),
-                )
-                .map_err(|e| ServerError::Internal(format!("serialize structure: {e}")))?;
-                catalog
-                    .update_data_source(ds.id, new_structure, ds.parameters.clone())
-                    .await
-                    .map_err(map_catalog_err)?;
-            }
-        }
-    }
+    let persisted = persist_array_patch(&state, &segments, &new_shape, &new_chunks).await?;
 
     let path = segments.join("/");
     state.streaming_bus.publish(
         &path,
-        crate::streaming::UpdateKind::DataAppended {
-            partition: Some(append_along),
-        },
+        crate::streaming::UpdateKind::DataAppended { partition: None },
     );
-    Ok(Json(serde_json::json!({
-        "axis": append_along,
-        "new_size": new_axis_len,
-    })))
+    Ok(Json(persisted))
+}
+
+/// Persist an array `patch`'s new `(shape, chunks)` to the catalog and return
+/// the updated structure to send back. Faithful to Python
+/// `CatalogArrayAdapter.patch` (catalog/adapter.py:1661-1680): clone the stored
+/// structure row and overwrite only `shape` and `chunks`, leaving `data_type`,
+/// `dims`, and `resizable` intact.
+async fn persist_array_patch(
+    state: &AppState,
+    segments: &[String],
+    new_shape: &[usize],
+    new_chunks: &[Vec<usize>],
+) -> Result<serde_json::Value, ServerError> {
+    let catalog = state.catalog.as_ref().ok_or_else(|| {
+        ServerError::Internal("array patch requires a catalog to persist the new structure".into())
+    })?;
+    let node = catalog
+        .lookup(segments)
+        .await
+        .map_err(map_catalog_err)?
+        .ok_or_else(|| ServerError::NotFound(format!("node '{}' not found", segments.join("/"))))?;
+    let data_sources = catalog
+        .list_data_sources(node.id)
+        .await
+        .map_err(map_catalog_err)?;
+    let ds = data_sources.first().ok_or_else(|| {
+        ServerError::Internal(format!(
+            "array node '{}' has no data source to update",
+            segments.join("/")
+        ))
+    })?;
+
+    let mut persisted = ds.structure.clone();
+    if let Some(obj) = persisted.as_object_mut() {
+        obj.insert("shape".into(), serde_json::json!(new_shape));
+        obj.insert("chunks".into(), serde_json::json!(new_chunks));
+    }
+    catalog
+        .update_data_source(ds.id, persisted.clone(), ds.parameters.clone())
+        .await
+        .map_err(map_catalog_err)?;
+    Ok(persisted)
 }
 
 // ---------------------------------------------------------------------------

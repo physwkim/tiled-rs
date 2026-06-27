@@ -1934,7 +1934,7 @@ async fn array_route_on_a_missing_path_still_returns_404() {
 }
 
 // server-L6: the CORS AllowList preflight must advertise PATCH. The data API
-// exposes PATCH routes (array_append at /array/full, patch_metadata at
+// exposes PATCH routes (array_patch at /array/full, patch_metadata at
 // /metadata), so a browser preflight for a PATCH request must succeed. Before
 // the fix, allow_methods omitted PATCH and the preflight's
 // Access-Control-Allow-Methods header excluded it, so browsers blocked every
@@ -1963,7 +1963,7 @@ async fn cors_preflight_advertises_patch_in_allow_methods() {
         .to_ascii_uppercase();
     assert!(
         allow_methods.contains("PATCH"),
-        "CORS preflight must advertise PATCH (array_append + patch_metadata are PATCH routes); \
+        "CORS preflight must advertise PATCH (array_patch + patch_metadata are PATCH routes); \
          got Access-Control-Allow-Methods: {allow_methods}"
     );
 }
