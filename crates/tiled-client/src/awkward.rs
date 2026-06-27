@@ -109,6 +109,61 @@ impl AwkwardClient {
             raw_zip: zipped,
         })
     }
+
+    /// Write the whole awkward array by replacing its buffer map. `buffers`
+    /// maps each form key to its raw buffer bytes (the same `node{N}-data` /
+    /// `node{N}-offsets` layout `awkward.to_buffers` produces). The map is
+    /// packed into an uncompressed (`ZIP_STORED`) archive and sent to
+    /// `PUT /api/v1/awkward/full` with `Content-Type: application/zip`.
+    ///
+    /// Mirrors Python `AwkwardClient.write` (awkward.py:38-51): the form and
+    /// length already live in the node's structure, so only the buffer map
+    /// travels on the wire — `to_zipped_buffers` writes only `container.items()`
+    /// (serialization/awkward.py:22-24), which the server's
+    /// `unpack_zip_to_buffers` reads back verbatim.
+    pub async fn write(
+        &self,
+        buffers: std::collections::HashMap<String, bytes::Bytes>,
+    ) -> Result<()> {
+        let body = pack_named_buffers(&buffers)?;
+        let url = Url::parse(self.base.require_link("full")?)?;
+        let _permit = self.base.context.data_fetch_permit().await;
+        retry(|| async {
+            self.base
+                .context
+                .put_bytes_typed(&url, body.clone(), "application/zip")
+                .await
+                .map(|_| ())
+        })
+        .await
+    }
+}
+
+/// Pack a form-key→bytes buffer map into an uncompressed (`ZIP_STORED`) ZIP
+/// archive — the inverse of [`unzip_named_buffers`]. Matches the server's
+/// `pack_buffers_to_zip` and Python's `to_zipped_buffers`
+/// (serialization/awkward.py:14-25), which stores each buffer uncompressed so
+/// the archive keeps random access and Tiled's own compression layer applies
+/// over the whole payload.
+fn pack_named_buffers(
+    buffers: &std::collections::HashMap<String, bytes::Bytes>,
+) -> Result<bytes::Bytes> {
+    use std::io::{Cursor, Write};
+    use zip::write::SimpleFileOptions;
+
+    let cursor = Cursor::new(Vec::<u8>::new());
+    let mut zip = zip::ZipWriter::new(cursor);
+    let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    for (name, data) in buffers {
+        zip.start_file(name, opts)
+            .map_err(|e| ClientError::Invalid(format!("awkward zip start_file {name}: {e}")))?;
+        zip.write_all(data)
+            .map_err(|e| ClientError::Invalid(format!("awkward zip write {name}: {e}")))?;
+    }
+    let cursor = zip
+        .finish()
+        .map_err(|e| ClientError::Invalid(format!("awkward zip finish: {e}")))?;
+    Ok(bytes::Bytes::from(cursor.into_inner()))
 }
 
 /// Collect every `form_key` declared in an awkward form, sorted and

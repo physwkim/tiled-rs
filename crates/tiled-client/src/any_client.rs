@@ -238,4 +238,14 @@ impl AnyClient {
             }),
         }
     }
+
+    pub fn into_awkward(self) -> Result<AwkwardClient> {
+        match self {
+            Self::Awkward(a) => Ok(a),
+            other => Err(ClientError::StructureMismatch {
+                expected: "awkward".into(),
+                got: other.structure_family().to_string(),
+            }),
+        }
+    }
 }

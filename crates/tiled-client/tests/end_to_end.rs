@@ -69,6 +69,14 @@ fn build_root() -> MapAdapter {
 /// Spawn the server on an ephemeral port and return its base URL.
 async fn spawn_server(api_key: Option<String>) -> String {
     let root_tree: Arc<dyn tiled_core::adapters::ContainerAdapter> = Arc::new(build_root());
+    spawn_server_with_root(root_tree, api_key).await
+}
+
+/// Spawn the server over an arbitrary in-memory root tree on an ephemeral port.
+async fn spawn_server_with_root(
+    root_tree: Arc<dyn tiled_core::adapters::ContainerAdapter>,
+    api_key: Option<String>,
+) -> String {
     let registry = Arc::new(tiled_serialization::default_registry());
 
     let state = tiled_server::AppState {
@@ -800,6 +808,64 @@ async fn table_write_partition_and_append_roundtrip() {
         .expect("append_partition 0");
     let after_append = tbl.read(None).await.expect("read after append_partition");
     assert_eq!(read_all(after_append), vec![1, 2, 3, 4, 5]);
+}
+
+/// Build an in-memory root holding one writable awkward node (`ak`) with a
+/// single `node0-data` buffer of 3 float64 values. Awkward is not wired into
+/// the catalog/file-resolver write path, so the client write method is
+/// exercised against a directly-served in-memory `AwkwardAdapter` (writable).
+fn build_awkward_root() -> Arc<dyn tiled_core::adapters::ContainerAdapter> {
+    use std::collections::HashMap;
+    use tiled_adapters::AwkwardAdapter;
+    use tiled_core::structures::AwkwardStructure;
+
+    let structure = AwkwardStructure {
+        length: 3,
+        form: serde_json::json!({
+            "class": "NumpyArray",
+            "primitive": "float64",
+            "form_key": "node0",
+            "inner_shape": [],
+            "itemsize": 8
+        }),
+    };
+    let mut buffers: HashMap<String, Bytes> = HashMap::new();
+    buffers.insert(
+        "node0-data".into(),
+        Bytes::from(vec![
+            0u8, 0, 0, 0, 0, 0, 0xF0, 0x3F, // 1.0 f64 LE
+            0, 0, 0, 0, 0, 0, 0, 0x40, // 2.0 f64 LE
+            0, 0, 0, 0, 0, 0, 8, 0x40, // 3.0 f64 LE
+        ]),
+    );
+    let adapter = AwkwardAdapter::new(buffers, structure);
+    let mut mapping = IndexMap::new();
+    mapping.insert("ak".to_string(), AnyAdapter::Awkward(Arc::new(adapter)));
+    Arc::new(MapAdapter::new(mapping, serde_json::json!({}), vec![]))
+}
+
+#[tokio::test]
+async fn awkward_write_roundtrip() {
+    use std::collections::HashMap;
+
+    let base = spawn_server_with_root(build_awkward_root(), None).await;
+    let client = from_uri(&base).await.unwrap();
+    let root = client.into_container().unwrap();
+    let ak = root.get("ak").await.unwrap().into_awkward().unwrap();
+
+    // Overwrite node0-data with two float64 values [4.0, 5.0].
+    let new_data: Vec<u8> = vec![
+        0, 0, 0, 0, 0, 0, 0x10, 0x40, // 4.0 f64 LE
+        0, 0, 0, 0, 0, 0, 0x14, 0x40, // 5.0 f64 LE
+    ];
+    let mut buffers: HashMap<String, Bytes> = HashMap::new();
+    buffers.insert("node0-data".into(), Bytes::from(new_data.clone()));
+    ak.write(buffers).await.expect("awkward write");
+
+    // Read back and verify the buffer map round-trips through the zip wire.
+    let back = ak.read().await.expect("awkward read");
+    assert_eq!(back.buffers.len(), 1);
+    assert_eq!(&back.buffers["node0-data"][..], &new_data[..]);
 }
 
 // ---------------------------------------------------------------------------
