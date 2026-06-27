@@ -228,4 +228,14 @@ impl AnyClient {
             }),
         }
     }
+
+    pub fn into_ragged(self) -> Result<RaggedClient> {
+        match self {
+            Self::Ragged(r) => Ok(r),
+            other => Err(ClientError::StructureMismatch {
+                expected: "ragged".into(),
+                got: other.structure_family().to_string(),
+            }),
+        }
+    }
 }

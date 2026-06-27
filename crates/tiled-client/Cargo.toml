@@ -43,8 +43,10 @@ blosc2-pure-rs = { workspace = true }
 default = []
 
 [dev-dependencies]
-tiled-server = { workspace = true }
-tiled-adapters = { workspace = true }
+# sql-adapter: the ragged-SQL managed-write backend, exercised by the ragged
+# write end-to-end test.
+tiled-server = { workspace = true, features = ["sql-adapter"] }
+tiled-adapters = { workspace = true, features = ["sql-adapter"] }
 tiled-auth = { workspace = true }
 tiled-catalog = { workspace = true }
 tokio = { workspace = true, features = ["full"] }

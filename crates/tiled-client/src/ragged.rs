@@ -19,6 +19,10 @@ use crate::utils::{decode_response, retry};
 /// (`tiled/serialization/ragged.py:90-111`).
 const RAGGED_ZIP_MIME: &str = "application/zip";
 
+/// The ragged read Accept type — the JSON list-of-lists (the server's default
+/// ragged media type).
+const RAGGED_JSON_MIME: &str = "application/json";
+
 #[derive(Debug, Clone)]
 pub struct RaggedClient {
     base: BaseClient,
@@ -48,6 +52,20 @@ impl RaggedClient {
             ParsedStructure::Ragged(s) => s,
             _ => unreachable!("RaggedClient guards on construction"),
         }
+    }
+
+    /// Read the whole ragged array as a JSON list-of-lists. Requests
+    /// `links["full"]` (`GET /ragged/full`) with `Accept: application/json`, the
+    /// server's default ragged media type. The read counterpart of
+    /// [`write`](RaggedClient::write); higher-level conversion to a typed array
+    /// is left to the caller.
+    pub async fn read(&self) -> Result<serde_json::Value> {
+        let url = Url::parse(self.base.require_link("full")?)?;
+        let _permit = self.base.context.data_fetch_permit().await;
+        let bytes =
+            retry(|| async { self.base.context.get_bytes(&url, RAGGED_JSON_MIME).await }).await?;
+        serde_json::from_slice(&bytes)
+            .map_err(|e| ClientError::Invalid(format!("ragged read: response is not JSON: {e}")))
     }
 
     /// Encode a JSON list-of-lists into the `application/zip` write body using

@@ -525,6 +525,132 @@ async fn array_write_block_roundtrip() {
 }
 
 // ---------------------------------------------------------------------------
+// Scope 1b: RaggedClient::write, patch, write_block (SQL-backed managed write)
+// ---------------------------------------------------------------------------
+
+/// A managed ragged int64 node: shape `[rows, None]`, one chunk of `rows`.
+#[cfg(test)]
+fn ragged_int64_ds(
+    rows: usize,
+    chunks0: Vec<usize>,
+    size: usize,
+) -> tiled_core::data_source::DataSource {
+    use tiled_core::data_source::{DataSource, Management};
+    use tiled_core::dtype::{BuiltinDType, DType};
+    use tiled_core::structures::{AnyStructure, RaggedStructure, StructureFamily};
+
+    let structure = RaggedStructure {
+        data_type: DType::Builtin(BuiltinDType::new(Endianness::Little, Kind::Integer, 8)),
+        shape: vec![Some(rows), None],
+        size,
+        chunks: vec![Some(chunks0), None],
+        dims: None,
+        resizable: Default::default(),
+    };
+    DataSource {
+        structure_family: StructureFamily::Ragged,
+        structure: Some(AnyStructure::Ragged(structure)),
+        id: None,
+        mimetype: Some("application/x-ragged+sql".into()),
+        parameters: serde_json::json!({}),
+        properties: serde_json::json!({}),
+        assets: vec![],
+        management: Management::Writable,
+    }
+}
+
+/// POST /metadata creates a managed ragged node; PUT /ragged/full writes the
+/// list-of-lists; GET /ragged/full reads it back; PATCH /ragged/full extends it.
+#[tokio::test]
+async fn ragged_write_full_read_and_patch_roundtrip() {
+    use tiled_core::structures::StructureFamily;
+
+    let (base, _wd, _db) = spawn_write_server().await;
+    let client = from_uri(&base).await.unwrap();
+    let root = client.into_container().unwrap();
+
+    // One chunk of 2 rows; 4 leaf elements total ([1,2,3] + [4]).
+    let ds = ragged_int64_ds(2, vec![2], 4);
+    root.create_node(
+        "rag",
+        StructureFamily::Ragged,
+        serde_json::json!({}),
+        vec![],
+        vec![ds],
+    )
+    .await
+    .expect("create ragged node");
+
+    let rag = root.get("rag").await.unwrap().into_ragged().unwrap();
+
+    // Write the whole array, then read it back unchanged.
+    let data = serde_json::json!([[1, 2, 3], [4]]);
+    rag.write(&data, true).await.expect("ragged write");
+    let read_back = rag.read().await.expect("ragged read");
+    assert_eq!(read_back, data, "ragged full round-trip mismatch");
+
+    // Extend: append one row at offset [2] (the current leftmost length).
+    let new_rows = serde_json::json!([[5, 6]]);
+    let new_structure = rag
+        .patch(&new_rows, &[2], true, true)
+        .await
+        .expect("ragged patch");
+    assert_eq!(
+        new_structure.shape[0],
+        Some(3),
+        "patch must grow the leftmost dimension to 3"
+    );
+
+    // The grown array reads back as the concatenation.
+    let after = rag.read().await.expect("ragged read after patch");
+    assert_eq!(
+        after,
+        serde_json::json!([[1, 2, 3], [4], [5, 6]]),
+        "ragged read after patch mismatch"
+    );
+}
+
+/// PUT /ragged/block writes individual chunks of a multi-partition ragged node;
+/// GET /ragged/full reads the concatenation.
+#[tokio::test]
+async fn ragged_write_block_roundtrip() {
+    use tiled_core::structures::StructureFamily;
+
+    let (base, _wd, _db) = spawn_write_server().await;
+    let client = from_uri(&base).await.unwrap();
+    let root = client.into_container().unwrap();
+
+    // Two chunks: chunk 0 has 2 rows, chunk 1 has 1 row; 6 leaf elements total.
+    let ds = ragged_int64_ds(3, vec![2, 1], 6);
+    root.create_node(
+        "rag_blocks",
+        StructureFamily::Ragged,
+        serde_json::json!({}),
+        vec![],
+        vec![ds],
+    )
+    .await
+    .expect("create ragged node");
+
+    let rag = root.get("rag_blocks").await.unwrap().into_ragged().unwrap();
+
+    // Write the two chunks out of order to prove chunk_index ordering on read.
+    rag.write_block(&serde_json::json!([[4, 5, 6]]), &[1], true)
+        .await
+        .expect("write_block 1");
+    rag.write_block(&serde_json::json!([[1, 2], [3]]), &[0], true)
+        .await
+        .expect("write_block 0");
+
+    let read_back = rag.read().await.expect("ragged read");
+    assert_eq!(
+        read_back,
+        serde_json::json!([[1, 2], [3], [4, 5, 6]]),
+        "ragged block round-trip mismatch (chunks must concatenate in index order)"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Scope 2: TableClient::write
 // ---------------------------------------------------------------------------
 
