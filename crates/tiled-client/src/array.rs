@@ -4,7 +4,8 @@
 //! dask + numpy + slicing; here we expose the wire-level moves: `read_block`
 //! to fetch one chunk, `read` to concatenate everything as raw bytes, `write`
 //! to overwrite the whole array, `write_block` to overwrite one chunk, and
-//! `append` to grow an axis. Higher-level reshaping is left to the caller.
+//! `patch` to write a data block into a slice (optionally extending the shape).
+//! Higher-level reshaping is left to the caller.
 
 use tiled_core::structures::ArrayStructure;
 use url::Url;
@@ -13,13 +14,6 @@ use crate::base::{BaseClient, Item, ParsedStructure};
 use crate::context::Context;
 use crate::error::{ClientError, Result};
 use crate::utils::{OCTET_STREAM_MIME_TYPE, decode_response, retry};
-
-/// Returned by `ArrayClient::append`.
-#[derive(Debug, Clone)]
-pub struct AppendResult {
-    pub axis: usize,
-    pub new_size: usize,
-}
 
 /// A single block of array bytes plus the dtype/shape needed to interpret it.
 #[derive(Debug, Clone)]
@@ -175,28 +169,53 @@ impl ArrayClient {
         .await
     }
 
-    /// Append rows along `append_along` (default 0). `data` is the C-order
-    /// buffer for the new rows — matches `PATCH /api/v1/array/full?append_along=N`.
-    pub async fn append(&self, data: bytes::Bytes, append_along: usize) -> Result<AppendResult> {
-        let link = self.base.require_link("full")?;
-        let mut url = Url::parse(link)?;
+    /// Write a `data` block into a slice of the array at `offset`, optionally
+    /// extending the shape when the slice overflows. `data` is the C-order
+    /// element buffer of the block whose dimensions are `shape`. Mirrors Python
+    /// `ArrayClient.patch` (client/array.py:341-444):
+    /// `PATCH /api/v1/array/full?offset=<csv>&shape=<csv>&extend=<bool>[&persist=false]`,
+    /// body = `array.tobytes()`.
+    ///
+    /// Returns the updated [`ArrayStructure`] the server reports. The Python
+    /// client mutates its cached `self._structure`; here `&self` is immutable, so
+    /// the caller refreshes from the returned structure (mirrors
+    /// [`RaggedClient::patch`](crate::ragged::RaggedClient::patch)).
+    ///
+    /// `persist = false` streams the update to subscribers without writing to
+    /// storage and returns the unchanged structure; the server rejects
+    /// `extend = true` with `persist = false` (400). A slice that overflows the
+    /// shape without `extend` returns 409, surfaced as a [`ClientError`].
+    pub async fn patch(
+        &self,
+        data: bytes::Bytes,
+        shape: &[usize],
+        offset: &[usize],
+        extend: bool,
+        persist: bool,
+    ) -> Result<ArrayStructure> {
+        let csv = |v: &[usize]| {
+            v.iter()
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let mut url = Url::parse(self.base.require_link("full")?)?;
         url.query_pairs_mut()
-            .append_pair("append_along", &append_along.to_string());
+            .append_pair("offset", &csv(offset))
+            .append_pair("shape", &csv(shape))
+            .append_pair("extend", if extend { "true" } else { "false" });
+        // Python adds `persist` only for the non-default `false` (array.py:417).
+        if !persist {
+            url.query_pairs_mut().append_pair("persist", "false");
+        }
         let _permit = self.base.context.data_fetch_permit().await;
         retry(|| async {
-            let resp = self.base.context.patch_bytes(&url, data.clone()).await?;
-            let v = decode_response::<serde_json::Value>(resp).await?;
-            Ok(AppendResult {
-                axis: v
-                    .get("axis")
-                    .and_then(|x| x.as_u64())
-                    .unwrap_or(append_along as u64) as usize,
-                new_size: v
-                    .get("new_size")
-                    .and_then(|x| x.as_u64())
-                    .ok_or_else(|| ClientError::Invalid("append: missing new_size".into()))?
-                    as usize,
-            })
+            let resp = self
+                .base
+                .context
+                .patch_bytes_typed(&url, data.clone(), OCTET_STREAM_MIME_TYPE)
+                .await?;
+            decode_response::<ArrayStructure>(resp).await
         })
         .await
     }

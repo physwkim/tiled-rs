@@ -45,8 +45,10 @@ default = []
 [dev-dependencies]
 # sql-adapter: the ragged-SQL managed-write backend, exercised by the ragged
 # write end-to-end test.
-tiled-server = { workspace = true, features = ["sql-adapter"] }
-tiled-adapters = { workspace = true, features = ["sql-adapter"] }
+# zarr-adapter / zarr: the writable array backend, exercised by the array
+# patch (slice-write + extend) end-to-end test — npy arrays cannot extend.
+tiled-server = { workspace = true, features = ["sql-adapter", "zarr-adapter"] }
+tiled-adapters = { workspace = true, features = ["sql-adapter", "zarr"] }
 tiled-auth = { workspace = true }
 tiled-catalog = { workspace = true }
 tokio = { workspace = true, features = ["full"] }

@@ -411,7 +411,7 @@ async fn spawn_write_server() -> (String, tempfile::TempDir, tempfile::TempDir) 
 }
 
 // ---------------------------------------------------------------------------
-// Scope 1: ArrayClient::write, write_block, append
+// Scope 1: ArrayClient::write, write_block, patch
 // ---------------------------------------------------------------------------
 
 /// POST /metadata creates a managed array node; PUT /array/full writes data;
@@ -530,6 +530,116 @@ async fn array_write_block_roundtrip() {
         .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
         .collect();
     assert_eq!(got, values.to_vec());
+}
+
+/// PATCH /array/full writes a data block into a slice (`offset`/`shape`) and,
+/// with `extend=true`, grows the array. Tested by invariant boundary: an
+/// in-bounds slice write (no grow), an overflowing slice without `extend`
+/// (409 Conflict), and an overflowing slice with `extend` (grow + read back).
+#[tokio::test]
+async fn array_patch_slice_write_and_extend_roundtrip() {
+    use tiled_core::data_source::{DataSource, Management};
+    use tiled_core::dtype::{BuiltinDType, DType, Endianness, Kind};
+    use tiled_core::structures::{AnyStructure, ArrayStructure, StructureFamily};
+
+    // Flatten every block of a 1-D array read into one Vec<f64>.
+    async fn read_f64s(arr: &tiled_client::ArrayClient) -> Vec<f64> {
+        arr.read()
+            .await
+            .expect("read")
+            .iter()
+            .flat_map(|b| {
+                b.data
+                    .chunks_exact(8)
+                    .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+            })
+            .collect()
+    }
+
+    let (base, _wd, _db) = spawn_write_server().await;
+    let client = from_uri(&base).await.unwrap();
+    let root = client.into_container().unwrap();
+
+    // A managed zarr array, shape [4], regular chunk size 2 (so an extend
+    // recomputes the chunk grid). npy cannot extend — zarr is the writable
+    // array backend.
+    let structure = ArrayStructure {
+        data_type: DType::Builtin(BuiltinDType::new(Endianness::Little, Kind::Float, 8)),
+        chunks: vec![vec![2, 2]],
+        shape: vec![4],
+        dims: None,
+        resizable: Default::default(),
+    };
+    let ds = DataSource {
+        structure_family: StructureFamily::Array,
+        structure: Some(AnyStructure::Array(structure)),
+        id: None,
+        mimetype: Some("application/x-zarr".into()),
+        parameters: serde_json::json!({}),
+        properties: serde_json::json!({}),
+        assets: vec![],
+        management: Management::Writable,
+    };
+    root.create_node(
+        "z_arr",
+        StructureFamily::Array,
+        serde_json::json!({}),
+        vec![],
+        vec![ds],
+    )
+    .await
+    .expect("create_node");
+
+    let arr = root.get("z_arr").await.unwrap().into_array().unwrap();
+
+    // Seed [1.5, 2.5, 3.5, 4.5].
+    let seed: bytes::Bytes = [1.5f64, 2.5, 3.5, 4.5]
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+    arr.write(seed).await.expect("seed write");
+
+    // (1) In-bounds slice write: place [9.0, 9.0] at offset [1], no extend.
+    let block: bytes::Bytes = [9.0f64, 9.0].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let s = arr
+        .patch(block, &[2], &[1], false, true)
+        .await
+        .expect("in-bounds patch");
+    assert_eq!(
+        s.shape,
+        vec![4],
+        "in-bounds write must not change the shape"
+    );
+    assert_eq!(read_f64s(&arr).await, vec![1.5, 9.0, 9.0, 4.5]);
+
+    // (2) Overflowing slice without extend → 409 Conflict, surfaced as an error.
+    let overflow: bytes::Bytes = [5.5f64, 6.5].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let err = arr.patch(overflow.clone(), &[2], &[4], false, true).await;
+    assert!(
+        err.is_err(),
+        "a slice past the end without extend must be rejected (409)"
+    );
+
+    // (3) Overflowing slice with extend → grows to shape [6], chunks [[2,2,2]].
+    let grown = arr
+        .patch(overflow, &[2], &[4], true, true)
+        .await
+        .expect("extend patch");
+    assert_eq!(
+        grown.shape,
+        vec![6],
+        "extend must grow the array to length 6"
+    );
+    assert_eq!(grown.chunks, vec![vec![2, 2, 2]]);
+
+    // The client's cached structure is immutable; re-fetch to read the grown
+    // array through the refreshed chunk grid.
+    let arr2 = root.get("z_arr").await.unwrap().into_array().unwrap();
+    assert_eq!(
+        read_f64s(&arr2).await,
+        vec![1.5, 9.0, 9.0, 4.5, 5.5, 6.5],
+        "grown array read-back mismatch"
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -43,7 +43,7 @@ pub mod utils;
 pub mod xarray_client;
 
 pub use any_client::AnyClient;
-pub use array::{AppendResult, ArrayBlock, ArrayClient};
+pub use array::{ArrayBlock, ArrayClient};
 pub use auth::{
     AuthProvider, ProviderMode, TiledAuth, TokenStore, Tokens, WhoAmI, default_token_cache_dir,
     device_code_grant, password_grant, prompt_for_credentials, token_directory_for_server,
