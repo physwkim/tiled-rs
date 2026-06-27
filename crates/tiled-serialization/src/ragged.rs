@@ -59,6 +59,97 @@ pub fn register_ragged_serializers(registry: &SerializationRegistry) {
 }
 
 // ---------------------------------------------------------------------------
+// Public buffer-codec API (write + read directions)
+//
+// These expose the Awkward form/buffer machinery the ZIP serializer already
+// uses so the write path (server deserialize → buffers) and the SQL-backed
+// ragged adapter (chunk buffers → list-of-lists) can reuse it without
+// reimplementing `awkward.to_buffers`/`from_buffers`/`_buffers_from_data`.
+// ---------------------------------------------------------------------------
+
+/// An Awkward buffer map: `{form_key}-data` / `{form_key}-offsets` → raw
+/// little-endian bytes. The unit of storage for one ragged chunk.
+pub type BufferMap = HashMap<String, Vec<u8>>;
+
+/// Canonical Awkward form JSON for a ragged structure.
+///
+/// Mirrors Python `RaggedStructure.awkward_form` (`structures/ragged.py:164`).
+/// Errors if the structure's dtype has no Awkward primitive (e.g. a struct
+/// dtype), matching the dtype guard the ZIP serializer already applies.
+pub fn awkward_form_json(structure: &RaggedStructure) -> Result<serde_json::Value, SerializeError> {
+    let primitive = dtype_to_primitive(&structure.data_type)
+        .ok_or_else(|| format!("ragged: unsupported dtype {:?}", structure.data_type))?;
+    Ok(build_awkward_form_json(&structure.shape, &primitive))
+}
+
+/// Buffer keys a form expects, each paired with its numpy dtype string.
+///
+/// Mirrors Python `awkward.forms.Form.expected_from_buffers()` keys/dtypes:
+/// every `NumpyArray` contributes a `{form_key}-data` buffer of its primitive,
+/// every `ListOffsetArray` a `{form_key}-offsets` buffer of `int64`, and
+/// `RegularArray` contributes none of its own (it only reshapes its content).
+/// The returned order is a stable depth-first walk (outermost form first).
+pub fn expected_from_buffers(form: &serde_json::Value) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    expected_from_buffers_into(form, &mut out);
+    out
+}
+
+fn expected_from_buffers_into(form: &serde_json::Value, out: &mut Vec<(String, String)>) {
+    let class = form["class"].as_str().unwrap_or("");
+    let form_key = form["form_key"].as_str().unwrap_or("");
+    match class {
+        "NumpyArray" => {
+            let primitive = form["primitive"].as_str().unwrap_or("float64").to_string();
+            out.push((format!("{form_key}-data"), primitive));
+        }
+        "ListOffsetArray" => {
+            out.push((format!("{form_key}-offsets"), "int64".to_string()));
+            expected_from_buffers_into(&form["content"], out);
+        }
+        "RegularArray" => {
+            expected_from_buffers_into(&form["content"], out);
+        }
+        _ => {}
+    }
+}
+
+/// Build Awkward buffers from a JSON list-of-lists body + its structure.
+///
+/// The `application/json` deserialize direction — Python `from_json` →
+/// `_buffers_from_data` (`serialization/ragged.py:79-87,22-67`). Returns the
+/// top-level array length and the `{form_key}-data`/`{form_key}-offsets`
+/// buffer map (raw little-endian bytes). The same `(length, buffers)` the ZIP
+/// serializer packs, minus the ZIP container.
+pub fn json_to_buffers(
+    structure: &RaggedStructure,
+    json: &serde_json::Value,
+) -> Result<(usize, BufferMap), SerializeError> {
+    let primitive = dtype_to_primitive(&structure.data_type)
+        .ok_or_else(|| format!("ragged: unsupported dtype {:?}", structure.data_type))?;
+    let form = build_awkward_form_json(&structure.shape, &primitive);
+    let rows = json
+        .as_array()
+        .ok_or("ragged: top-level JSON must be an array")?;
+    let length = rows.len();
+    let mut buffers: BufferMap = HashMap::new();
+    collect_buffers(&form, json, &primitive, &mut buffers)?;
+    Ok((length, buffers))
+}
+
+/// Reconstruct a JSON list-of-lists from a form + length + buffer map.
+///
+/// The read direction — Python `awkward.from_buffers(form, length, buffers)`
+/// then `.tolist()`. Inverse of [`json_to_buffers`].
+pub fn buffers_to_json(
+    form: &serde_json::Value,
+    length: usize,
+    buffers: &BufferMap,
+) -> Result<serde_json::Value, SerializeError> {
+    reconstruct_lists(form, length, buffers)
+}
+
+// ---------------------------------------------------------------------------
 // JSON serializer
 // ---------------------------------------------------------------------------
 
@@ -299,18 +390,11 @@ fn to_zipped_buffers(
     let structure = RaggedStructure::from_json(metadata)
         .map_err(|e| format!("ragged/zip: cannot parse RaggedStructure from metadata: {e}"))?;
 
-    let primitive = dtype_to_primitive(&structure.data_type)
-        .ok_or_else(|| format!("ragged/zip: unsupported dtype {:?}", structure.data_type))?;
-
-    let form_json = build_awkward_form_json(&structure.shape, &primitive);
-
-    let rows = value
-        .as_array()
-        .ok_or("ragged/zip: top-level JSON must be an array")?;
-    let length = rows.len();
-
-    let mut buffers: HashMap<String, Vec<u8>> = HashMap::new();
-    collect_buffers(&form_json, &value, &primitive, &mut buffers)?;
+    // Form + buffers come from the shared codec (same path the write
+    // deserialize and the SQL adapter use), so the ZIP wire bytes stay
+    // identical to before this refactor.
+    let form_json = awkward_form_json(&structure)?;
+    let (length, buffers) = json_to_buffers(&structure, &value)?;
 
     // Pack into ZIP (uncompressed, matching Python's ZIP_STORED).
     let mut out = Vec::<u8>::new();
@@ -352,6 +436,20 @@ fn to_zipped_buffers(
 ///
 /// Mirrors `tiled/serialization/ragged.py:114-128` (`from_zipped_buffers`).
 pub fn from_zipped_buffers(data: &[u8]) -> Result<serde_json::Value, SerializeError> {
+    let (form_json, length, buffers) = zip_to_buffers(data)?;
+    reconstruct_lists(&form_json, length, &buffers)
+}
+
+/// Extract the raw `(form, length, buffers)` components from a zipped-buffers
+/// body, without reconstructing the list-of-lists.
+///
+/// The `application/zip` deserialize direction used by the write path: the
+/// server stores these buffers per chunk. Inverse of the packing in
+/// [`to_zipped_buffers`]; the front half of [`from_zipped_buffers`] factored
+/// out so the adapter can keep the buffers instead of materializing rows.
+pub fn zip_to_buffers(
+    data: &[u8],
+) -> Result<(serde_json::Value, usize, BufferMap), SerializeError> {
     let cursor = std::io::Cursor::new(data);
     let mut zip = zip::ZipArchive::new(cursor)?;
 
@@ -389,7 +487,7 @@ pub fn from_zipped_buffers(data: &[u8]) -> Result<serde_json::Value, SerializeEr
         buffers.insert(name.clone(), buf);
     }
 
-    reconstruct_lists(&form_json, length, &buffers)
+    Ok((form_json, length, buffers))
 }
 
 // ---------------------------------------------------------------------------
@@ -1075,6 +1173,73 @@ mod tests {
         let zip_bytes = to_zipped_buffers(&json_bytes, &meta).unwrap();
         let reconstructed = from_zipped_buffers(&zip_bytes).unwrap();
         assert_eq!(reconstructed, original);
+    }
+
+    // ------------------------------------------------------------------
+    // Public buffer-codec API (write/read directions used by the SQL adapter
+    // and the write-path deserializers).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn awkward_form_json_matches_form_builder() {
+        // The pub structure-level helper agrees with the shape-level builder.
+        let structure = f64_structure(3);
+        assert_eq!(
+            awkward_form_json(&structure).unwrap(),
+            build_awkward_form_json(&[Some(3), None], "float64")
+        );
+    }
+
+    #[test]
+    fn expected_from_buffers_lists_offsets_and_data_keys() {
+        let form = awkward_form_json(&f64_structure(3)).unwrap();
+        let keys = expected_from_buffers(&form);
+        // shape [3, None] float64 → one offsets buffer (outer list) and one
+        // data buffer (inner numpy leaf), in outermost-first order.
+        assert_eq!(
+            keys,
+            vec![
+                ("node0-offsets".to_string(), "int64".to_string()),
+                ("node1-data".to_string(), "float64".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn json_to_buffers_round_trips_through_buffers_to_json() {
+        let structure = f64_structure(3);
+        let json = sample_json(); // [[1,2,3],[4],[5,6]]
+        let (length, buffers) = json_to_buffers(&structure, &json).unwrap();
+        assert_eq!(length, 3, "top-level length is the row count");
+
+        // Offsets/data byte content matches what the ZIP serializer writes.
+        let offsets: Vec<i64> = buffers["node0-offsets"]
+            .chunks_exact(8)
+            .map(|b| i64::from_le_bytes(b.try_into().unwrap()))
+            .collect();
+        assert_eq!(offsets, vec![0, 3, 4, 6]);
+
+        let form = awkward_form_json(&structure).unwrap();
+        let back = buffers_to_json(&form, length, &buffers).unwrap();
+        assert_eq!(back, json);
+    }
+
+    #[test]
+    fn zip_to_buffers_returns_form_length_and_buffers() {
+        let json_bytes = serde_json::to_vec(&sample_json()).unwrap();
+        let meta = serde_json::to_value(f64_structure(3)).unwrap();
+        let zip_bytes = to_zipped_buffers(&json_bytes, &meta).unwrap();
+
+        let (form, length, buffers) = zip_to_buffers(&zip_bytes).unwrap();
+        assert_eq!(length, 3);
+        assert_eq!(form["class"], "ListOffsetArray");
+        assert!(buffers.contains_key("node0-offsets"));
+        assert!(buffers.contains_key("node1-data"));
+        // And the components reconstruct the original list-of-lists.
+        assert_eq!(
+            buffers_to_json(&form, length, &buffers).unwrap(),
+            sample_json()
+        );
     }
 
     // ------------------------------------------------------------------
