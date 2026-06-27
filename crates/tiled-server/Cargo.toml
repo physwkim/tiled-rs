@@ -12,6 +12,9 @@ hdf5-adapter = ["tiled-adapters/hdf5"]
 netcdf-adapter = ["tiled-adapters/netcdf-adapter"]
 zarr-adapter = ["tiled-adapters/zarr"]
 excel-adapter = ["tiled-adapters/excel-adapter"]
+# SQL-backed ragged-array managed write storage (RaggedSQLAdapter). Pulls in
+# sqlx via tiled-adapters, so it is opt-in like the other storage backends.
+sql-adapter = ["tiled-adapters/sql-adapter"]
 image-serializer = ["tiled-serialization/image"]
 parquet-serializer = ["tiled-serialization/parquet"]
 # HDF5 export serializers (array/table/sparse leaves + the container deep-export

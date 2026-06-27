@@ -165,6 +165,37 @@ impl LeafResolver for FileLeafResolver {
             let asset = assets.first().ok_or_else(|| {
                 CatalogError::Validation(format!("data_source {} has no assets", ds.id))
             })?;
+
+            // Ragged-SQL nodes resolve from a `sqlite://` data_uri plus the SQL
+            // coordinates persisted as data-source parameters, not from a
+            // file:// header read — so they branch out before `uri_to_path`
+            // (which only accepts file://) and before the file-adapter path.
+            #[cfg(feature = "sql-adapter")]
+            if ds.mimetype == tiled_core::media_type::mime::RAGGED_SQL {
+                let scope = self.scope.clone();
+                let writable_storage = catalog.writable_storage().to_vec();
+                let data_uri = asset.data_uri.clone();
+                let structure_json = ds.structure.clone();
+                let parameters = ds.parameters.clone();
+                let metadata = node.metadata.clone();
+                // The only blocking work is the two `canonicalize` containment
+                // checks; adapter construction itself opens no connection.
+                return tokio::task::spawn_blocking(move || {
+                    build_ragged_sql_adapter(
+                        &scope,
+                        &writable_storage,
+                        &data_uri,
+                        &structure_json,
+                        &parameters,
+                        metadata,
+                    )
+                })
+                .await
+                .map_err(|e| {
+                    CatalogError::Validation(format!("ragged-SQL resolve task failed: {e}"))
+                })?;
+            }
+
             let path = uri_to_path(&asset.data_uri)?;
             let scope = self.scope.clone();
             // Write-containment mirror of `scope`: an adapter is built writable
@@ -356,6 +387,84 @@ fn build_leaf_adapter(
         }
     };
     Ok(any_adapter)
+}
+
+/// Build a ragged-SQL leaf adapter from a `sqlite://` data_uri and the SQL
+/// coordinates the create path persisted as data-source parameters. Pure
+/// blocking work (two `canonicalize` containment checks); construction opens no
+/// connection, so it is only ever called inside `spawn_blocking`.
+///
+/// Read containment (`check_allowed`) applies exactly as for file adapters: a
+/// registered `sqlite://` path is served only when it lives under the read
+/// allow-list. Writability is gated on writable-storage containment, the same
+/// single gate the file adapters use — so `as_writable().is_some()` ⟹ the
+/// database file is under writable storage.
+#[cfg(feature = "sql-adapter")]
+fn build_ragged_sql_adapter(
+    scope: &ReadScope,
+    writable_storage: &[PathBuf],
+    data_uri: &str,
+    structure_json: &serde_json::Value,
+    parameters: &serde_json::Value,
+    metadata: serde_json::Value,
+) -> std::result::Result<AnyAdapter, CatalogError> {
+    let path = sqlite_uri_to_path(data_uri)?;
+    check_allowed(scope, &path)?;
+    let writable = is_writable_path(writable_storage, &path);
+
+    let structure = tiled_core::structures::RaggedStructure::from_json(structure_json)
+        .map_err(|e| CatalogError::Validation(e.to_string()))?;
+    let table_name = parameters
+        .get("table_name")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            CatalogError::Validation(
+                "ragged-SQL data source is missing the `table_name` parameter".into(),
+            )
+        })?;
+    let dataset_id = parameters
+        .get("dataset_id")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| {
+            CatalogError::Validation(
+                "ragged-SQL data source is missing the `dataset_id` parameter".into(),
+            )
+        })?;
+
+    let mut adapter = tiled_adapters::RaggedSQLAdapter::new(
+        data_uri.to_string(),
+        table_name,
+        dataset_id,
+        structure,
+        metadata,
+        Vec::new(),
+    )
+    .map_err(|e| CatalogError::Validation(e.to_string()))?;
+    if writable {
+        adapter = adapter.into_writable();
+    }
+    Ok(AnyAdapter::Ragged(Arc::new(adapter)))
+}
+
+/// Decode a `sqlite://` data_uri into its backing database file path, for the
+/// read allow-list and writable-containment checks. The create path emits
+/// `sqlite://{absolute_path}` (i.e. `sqlite:///abs/...`); strip the scheme and
+/// any `?query` suffix sqlx would accept and require the result to be absolute,
+/// so a `sqlite://relative` URI cannot slip past the containment checks.
+#[cfg(feature = "sql-adapter")]
+fn sqlite_uri_to_path(uri: &str) -> std::result::Result<PathBuf, CatalogError> {
+    let rest = uri.strip_prefix("sqlite://").ok_or_else(|| {
+        CatalogError::Validation(format!(
+            "ragged data_uri {uri} must use the sqlite:// scheme"
+        ))
+    })?;
+    let path_part = rest.split('?').next().unwrap_or(rest);
+    if !path_part.starts_with('/') {
+        return Err(CatalogError::Validation(format!(
+            "ragged data_uri {uri} has no absolute sqlite path"
+        )));
+    }
+    Ok(PathBuf::from(path_part))
 }
 
 /// Decode a `data_uri` into a local filesystem path.

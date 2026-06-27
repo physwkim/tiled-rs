@@ -3957,8 +3957,14 @@ async fn create_node_core(
             let generate = generate_storage
                 && !catalog.writable_storage().is_empty()
                 && ds.management != tiled_core::data_source::Management::External;
-            let (mimetype, assets) = if generate {
-                managed_init_storage(catalog, ds, &segments, &node.key)?
+            // `parameters` mirrors what the data source advertises: for the
+            // register/external path it is the client-supplied value verbatim;
+            // for a server-generated managed create it is whatever
+            // `managed_init_storage` returns — most backends pass the client
+            // parameters through unchanged, but the ragged-SQL backend injects
+            // the server-chosen `table_name`/`dataset_id` the resolver needs.
+            let (mimetype, assets, parameters) = if generate {
+                managed_init_storage(catalog, ds, &segments, &node.key).await?
             } else {
                 if !generate_storage
                     && ds.management != tiled_core::data_source::Management::External
@@ -3979,7 +3985,11 @@ async fn create_node_core(
                         num: a.num.map(|n| n as i32),
                     })
                     .collect();
-                (ds.mimetype.clone().unwrap_or_default(), assets)
+                (
+                    ds.mimetype.clone().unwrap_or_default(),
+                    assets,
+                    ds.parameters.clone(),
+                )
             };
             let structure_json = ds
                 .structure
@@ -3990,7 +4000,7 @@ async fn create_node_core(
                 structure_family: ds_family_str(ds.structure_family).to_string(),
                 structure: structure_json,
                 mimetype,
-                parameters: ds.parameters.clone(),
+                parameters,
                 management: format!("{:?}", ds.management).to_lowercase(),
                 assets,
             };
@@ -4090,6 +4100,9 @@ fn default_creation_mimetype(
         SF::Table => Ok("application/x-parquet"),
         #[cfg(all(not(feature = "parquet-adapter"), feature = "csv-adapter"))]
         SF::Table => Ok("text/csv"),
+        // Ragged nodes have one managed-write backend: SQL-backed storage.
+        #[cfg(feature = "sql-adapter")]
+        SF::Ragged => Ok(tiled_core::media_type::mime::RAGGED_SQL),
         other => Err(ServerError::UnsupportedMediaType(format!(
             "no managed-write backend for {} nodes in this build \
              (array: application/x-zarr or application/x-npy; \
@@ -4109,12 +4122,19 @@ fn default_creation_mimetype(
 /// created under writable storage yet must stay read-only, which this build's
 /// containment (writable ⟺ under writable storage) cannot yet express, so they
 /// are refused rather than created writable-by-accident.
-fn managed_init_storage(
+async fn managed_init_storage(
     catalog: &tiled_catalog::Catalog,
     ds: &tiled_core::data_source::DataSource,
     parent_segments: &[String],
     key: &str,
-) -> Result<(String, Vec<tiled_catalog::data_source::AssetSpec>), ServerError> {
+) -> Result<
+    (
+        String,
+        Vec<tiled_catalog::data_source::AssetSpec>,
+        serde_json::Value,
+    ),
+    ServerError,
+> {
     use tiled_core::data_source::Management;
 
     if ds.management != Management::Writable {
@@ -4143,13 +4163,17 @@ fn managed_init_storage(
     let mut path_parts: Vec<String> = parent_segments.to_vec();
     path_parts.push(key.to_string());
 
+    // Most backends persist the client-supplied parameters verbatim; the
+    // ragged-SQL arm replaces this with its server-generated SQL coordinates.
+    let parameters = ds.parameters.clone();
+
     match mimetype.as_str() {
         "application/x-npy" | "application/x-numpy" | "npy" => {
             let structure = managed_array_structure(ds, &mimetype)?;
             let (_data_uri, assets) =
                 tiled_adapters::init_storage_npy(writable_root, &path_parts, &structure)
                     .map_err(ServerError::from)?;
-            Ok((mimetype, to_asset_specs(assets)))
+            Ok((mimetype, to_asset_specs(assets), parameters))
         }
         "application/x-zarr" => {
             #[cfg(feature = "zarr-adapter")]
@@ -4158,7 +4182,7 @@ fn managed_init_storage(
                 let (_data_uri, assets) =
                     tiled_adapters::init_storage_zarr(writable_root, &path_parts, &structure)
                         .map_err(ServerError::from)?;
-                Ok((mimetype, to_asset_specs(assets)))
+                Ok((mimetype, to_asset_specs(assets), parameters))
             }
             #[cfg(not(feature = "zarr-adapter"))]
             {
@@ -4174,7 +4198,7 @@ fn managed_init_storage(
                 let (_data_uri, assets) =
                     tiled_adapters::init_storage_csv(writable_root, &path_parts, &structure)
                         .map_err(ServerError::from)?;
-                Ok((mimetype, to_asset_specs(assets)))
+                Ok((mimetype, to_asset_specs(assets), parameters))
             }
             #[cfg(not(feature = "csv-adapter"))]
             {
@@ -4190,7 +4214,7 @@ fn managed_init_storage(
                 let (_data_uri, assets) =
                     tiled_adapters::init_storage_parquet(writable_root, &path_parts, &structure)
                         .map_err(ServerError::from)?;
-                Ok((mimetype, to_asset_specs(assets)))
+                Ok((mimetype, to_asset_specs(assets), parameters))
             }
             #[cfg(not(feature = "parquet-adapter"))]
             {
@@ -4199,11 +4223,62 @@ fn managed_init_storage(
                 ))
             }
         }
+        tiled_core::media_type::mime::RAGGED_SQL => {
+            #[cfg(feature = "sql-adapter")]
+            {
+                let structure = managed_ragged_structure(ds, &mimetype)?;
+                let init =
+                    tiled_adapters::init_storage_ragged_sql(writable_root, &path_parts, &structure)
+                        .await
+                        .map_err(ServerError::from)?;
+                // The resolver rebuilds the adapter from these SQL coordinates;
+                // merge them onto any client parameters (server values win).
+                let mut params = match parameters {
+                    serde_json::Value::Object(map) => map,
+                    _ => serde_json::Map::new(),
+                };
+                params.insert("table_name".into(), init.table_name.clone().into());
+                params.insert("dataset_id".into(), init.dataset_id.into());
+                Ok((
+                    mimetype,
+                    to_asset_specs(init.assets),
+                    serde_json::Value::Object(params),
+                ))
+            }
+            #[cfg(not(feature = "sql-adapter"))]
+            {
+                Err(ServerError::UnsupportedMediaType(
+                    "ragged-SQL support not built in".into(),
+                ))
+            }
+        }
         other => Err(ServerError::UnsupportedMediaType(format!(
             "managed writes are not supported for mimetype {other} in this build \
              (supported: application/x-zarr, application/x-npy for array nodes; \
-             application/x-parquet, text/csv for table nodes)"
+             application/x-parquet, text/csv for table nodes; \
+             application/x-ragged+sql for ragged nodes)"
         ))),
+    }
+}
+
+/// Validate that a managed ragged-mimetype create carries a ragged structure and
+/// return it. The ragged analog of [`managed_array_structure`].
+#[cfg(feature = "sql-adapter")]
+fn managed_ragged_structure(
+    ds: &tiled_core::data_source::DataSource,
+    mimetype: &str,
+) -> Result<tiled_core::structures::RaggedStructure, ServerError> {
+    if ds.structure_family != tiled_core::structures::StructureFamily::Ragged {
+        return Err(ServerError::UnsupportedMediaType(format!(
+            "mimetype {mimetype} is only valid for ragged nodes, not {}",
+            ds_family_str(ds.structure_family)
+        )));
+    }
+    match &ds.structure {
+        Some(tiled_core::structures::AnyStructure::Ragged(r)) => Ok(r.clone()),
+        _ => Err(ServerError::Validation(
+            "a managed ragged create requires a ragged structure (shape + chunks + size)".into(),
+        )),
     }
 }
 
