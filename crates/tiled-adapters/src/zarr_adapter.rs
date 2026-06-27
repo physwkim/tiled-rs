@@ -18,7 +18,9 @@ use zarrs::array::{ArrayBuilder, DataType, FillValue};
 use zarrs::array_subset::ArraySubset;
 use zarrs::filesystem::FilesystemStore;
 
-use tiled_core::adapters::{ArrayAdapterRead, ArrayAdapterWrite, BaseAdapter, BoxFuture};
+use tiled_core::adapters::{
+    ArrayAdapterRead, ArrayAdapterWrite, ArrayShapeChunks, BaseAdapter, BoxFuture,
+};
 use tiled_core::data_source::Asset;
 use tiled_core::dtype::{BuiltinDType, DType, DynNDArray, Endianness, Kind};
 use tiled_core::error::{Result, TiledError};
@@ -307,6 +309,88 @@ impl ArrayAdapterWrite for ZarrAdapter {
             })
             .await
             .map_err(|e| TiledError::Internal(format!("zarr append spawn: {e}")))?
+        })
+    }
+
+    fn patch<'a>(
+        &'a self,
+        data: DynNDArray,
+        offset: &'a [usize],
+        extend: bool,
+    ) -> BoxFuture<'a, Result<ArrayShapeChunks>> {
+        // Write `data` into the slice starting at `offset`; per axis the new
+        // extent is max(current, data + offset). If that grows the array it is
+        // allowed only when `extend` is set, otherwise a Conflict (409) — same
+        // policy as Python ZarrArrayAdapter.patch (adapters/zarr.py:155-186).
+        // zarrs has no Clone and `set_shape` needs `&mut`, so (like `append`)
+        // re-open a fresh mutable Array, resize + persist metadata when needed,
+        // write the subset, then recompute the regular chunk grid for the new
+        // shape.
+        let store_root = self.store_root.clone();
+        let array_path = self.array_path.clone();
+        let old_shape = self.structure.shape.clone();
+        let offset = offset.to_vec();
+        Box::pin(async move {
+            let ndim = old_shape.len();
+            if data.shape.len() != ndim {
+                return Err(TiledError::Validation(format!(
+                    "patch data ndim {} does not match array ndim {ndim}",
+                    data.shape.len()
+                )));
+            }
+            if offset.len() > ndim {
+                return Err(TiledError::Validation(format!(
+                    "patch offset has {} dims, array has {ndim}",
+                    offset.len()
+                )));
+            }
+            // Normalize the offset to ndim, trailing axes default to 0 — matches
+            // Python's `normalized_offset` (adapters/zarr.py:156-157).
+            let mut norm_offset = vec![0usize; ndim];
+            norm_offset[..offset.len()].copy_from_slice(&offset);
+            let mut new_shape = vec![0usize; ndim];
+            for ax in 0..ndim {
+                new_shape[ax] = old_shape[ax].max(data.shape[ax] + norm_offset[ax]);
+            }
+            let grew = new_shape != old_shape;
+            if grew && !extend {
+                return Err(TiledError::Conflict(format!(
+                    "Slice at offset {norm_offset:?} with shape {:?} does not fit within \
+                     current array shape {old_shape:?}. Use ?extend=true to extend the array \
+                     dimensions to fit.",
+                    data.shape
+                )));
+            }
+            let start: Vec<u64> = norm_offset.iter().map(|&o| o as u64).collect();
+            let block_shape: Vec<u64> = data.shape.iter().map(|&d| d as u64).collect();
+            let new_shape_u64: Vec<u64> = new_shape.iter().map(|&d| d as u64).collect();
+            let bytes = data.data.to_vec();
+            let new_shape_out = new_shape.clone();
+            tokio::task::spawn_blocking(move || {
+                let store = Arc::new(
+                    FilesystemStore::new(&store_root)
+                        .map_err(|e| TiledError::Internal(format!("zarr store: {e}")))?,
+                );
+                let mut array = Array::open(store, &array_path)
+                    .map_err(|e| TiledError::Internal(format!("zarr open: {e}")))?;
+                if grew {
+                    array.set_shape(new_shape_u64);
+                    array
+                        .store_metadata()
+                        .map_err(|e| TiledError::Internal(format!("zarr store_metadata: {e}")))?;
+                }
+                let subset = ArraySubset::new_with_start_shape(start, block_shape)
+                    .map_err(|e| TiledError::Validation(format!("zarr subset: {e}")))?;
+                array
+                    .store_array_subset(&subset, bytes)
+                    .map_err(|e| TiledError::Internal(format!("zarr store: {e}")))?;
+                // Regular chunk grid for the (possibly grown) shape — the same
+                // derivation the read path uses to build `structure().chunks`.
+                let new_chunks = build_chunk_grid(&array, &new_shape_out);
+                Ok::<ArrayShapeChunks, TiledError>((new_shape_out, new_chunks))
+            })
+            .await
+            .map_err(|e| TiledError::Internal(format!("zarr patch spawn: {e}")))?
         })
     }
 }
@@ -950,5 +1034,139 @@ mod tests {
         // Non-append axis width mismatch (width 2 != 3).
         let bad = DynNDArray::new(Bytes::from(vec![0u8; 16]), dt(), vec![1, 2]);
         assert!(w.append(bad, 0).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn patch_writes_in_bounds_slice_without_extend() {
+        let root = tempfile::tempdir().unwrap();
+        let root_abs = root.path().canonicalize().unwrap();
+        init_storage_zarr(
+            &root_abs,
+            &["arr".into()],
+            &f64_structure(vec![4], vec![vec![2, 2]]),
+        )
+        .unwrap();
+        let store_root = root_abs.join("arr.zarr");
+        let dt = || BuiltinDType::new(Endianness::native(), Kind::Float, 8);
+        let rw = ZarrAdapter::from_path(
+            store_root.clone(),
+            MANAGED_ARRAY_PATH,
+            serde_json::json!({}),
+        )
+        .unwrap()
+        .into_writable();
+        let w = rw.as_writable().unwrap();
+        w.write(DynNDArray::new(
+            f64_le(&[1.0, 2.0, 3.0, 4.0]),
+            dt(),
+            vec![4],
+        ))
+        .await
+        .unwrap();
+
+        // Overwrite indices 1..3 with [9, 9] — in bounds, no growth, no extend.
+        let (shape, chunks) = w
+            .patch(
+                DynNDArray::new(f64_le(&[9.0, 9.0]), dt(), vec![2]),
+                &[1],
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(shape, vec![4]);
+        assert_eq!(chunks, vec![vec![2, 2]]);
+
+        let fresh =
+            ZarrAdapter::from_path(store_root, MANAGED_ARRAY_PATH, serde_json::json!({})).unwrap();
+        let all = fresh
+            .read(&NDSlice::from_numpy_str("").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(read_f64(&all), vec![1.0, 9.0, 9.0, 4.0]);
+    }
+
+    #[tokio::test]
+    async fn patch_extends_array_when_slice_overflows() {
+        let root = tempfile::tempdir().unwrap();
+        let root_abs = root.path().canonicalize().unwrap();
+        init_storage_zarr(
+            &root_abs,
+            &["arr".into()],
+            &f64_structure(vec![4], vec![vec![2, 2]]),
+        )
+        .unwrap();
+        let store_root = root_abs.join("arr.zarr");
+        let dt = || BuiltinDType::new(Endianness::native(), Kind::Float, 8);
+        let rw = ZarrAdapter::from_path(
+            store_root.clone(),
+            MANAGED_ARRAY_PATH,
+            serde_json::json!({}),
+        )
+        .unwrap()
+        .into_writable();
+        let w = rw.as_writable().unwrap();
+        w.write(DynNDArray::new(
+            f64_le(&[1.0, 2.0, 3.0, 4.0]),
+            dt(),
+            vec![4],
+        ))
+        .await
+        .unwrap();
+
+        // Patch [5, 6] at offset 4 with extend → grows the array to length 6.
+        let (shape, chunks) = w
+            .patch(
+                DynNDArray::new(f64_le(&[5.0, 6.0]), dt(), vec![2]),
+                &[4],
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(shape, vec![6]);
+        assert_eq!(chunks, vec![vec![2, 2, 2]]);
+
+        let fresh =
+            ZarrAdapter::from_path(store_root, MANAGED_ARRAY_PATH, serde_json::json!({})).unwrap();
+        assert_eq!(fresh.structure().shape, vec![6]);
+        let all = fresh
+            .read(&NDSlice::from_numpy_str("").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(read_f64(&all), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    }
+
+    #[tokio::test]
+    async fn patch_without_extend_conflicts_when_slice_overflows() {
+        let root = tempfile::tempdir().unwrap();
+        let root_abs = root.path().canonicalize().unwrap();
+        init_storage_zarr(
+            &root_abs,
+            &["arr".into()],
+            &f64_structure(vec![4], vec![vec![2, 2]]),
+        )
+        .unwrap();
+        let rw = ZarrAdapter::from_path(
+            root_abs.join("arr.zarr"),
+            MANAGED_ARRAY_PATH,
+            serde_json::json!({}),
+        )
+        .unwrap()
+        .into_writable();
+        let w = rw.as_writable().unwrap();
+        let dt = || BuiltinDType::new(Endianness::native(), Kind::Float, 8);
+
+        // Slice [4..6] overflows the length-4 array; without extend → Conflict.
+        let err = w
+            .patch(
+                DynNDArray::new(f64_le(&[5.0, 6.0]), dt(), vec![2]),
+                &[4],
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, TiledError::Conflict(_)),
+            "expected Conflict, got {err:?}"
+        );
     }
 }
