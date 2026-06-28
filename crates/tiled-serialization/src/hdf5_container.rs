@@ -19,10 +19,11 @@
 //! container's metadata → file (root group) attrs, each intermediate container's
 //! metadata → group attrs, each array's metadata → dataset attrs, and a table
 //! node's metadata → its group's attrs. Scalar JSON values map to scalar
-//! attributes and a homogeneous JSON array maps to a 1-D array attribute
-//! (Python's `attrs.update`/`create` running each value through `numpy.asarray`);
-//! a value h5py cannot store — a nested object, a null, a mixed-kind or nested
-//! array — fails the whole export, the same fail-fast contract as Python's
+//! attributes and a homogeneous JSON array maps to an array attribute — nested
+//! rectangular arrays to N-D ones (Python's `attrs.update`/`create` running each
+//! value through `numpy.asarray`); a value h5py cannot store — a nested object, a
+//! null, a mixed-kind or `null`-bearing array, or a ragged (non-rectangular)
+//! nested array — fails the whole export, the same fail-fast contract as Python's
 //! `except TypeError: raise SerializationError`. See
 //! [`crate::hdf5_common::write_file_attrs`].
 //!
@@ -359,10 +360,11 @@ mod tests {
         );
     }
 
-    /// Homogeneous array metadata lands as 1-D HDF5 array attributes — Python's
-    /// `attrs.update`/`create` running each list through `numpy.asarray`. File and
-    /// group array attrs are checked by name (rust-hdf5 reads only dataset attr
-    /// *values*); dataset numeric array attrs are checked by value via `read_raw`.
+    /// Homogeneous array metadata lands as HDF5 array attributes (nested
+    /// rectangular arrays as N-D) — Python's `attrs.update`/`create` running each
+    /// list through `numpy.asarray`. File and group array attrs are checked by name
+    /// (rust-hdf5 reads only dataset attr *values*); dataset numeric array attrs
+    /// are checked by value via `read_raw` (row-major bytes, N-D flattened).
     #[test]
     fn builder_writes_array_metadata_as_attrs() {
         let mut builder = Hdf5TreeBuilder::new().unwrap();
@@ -389,6 +391,7 @@ mod tests {
                     "scales": [0.5, 1.5],
                     "labels": ["x", "y"],
                     "empty": [],
+                    "grid": [[1, 2], [3, 4]],
                 }),
             )
             .unwrap();
@@ -431,15 +434,27 @@ mod tests {
             .collect();
         assert_eq!(scales, vec![0.5, 1.5]);
 
+        // Nested 2-D int array: read_raw is row-major, so [[1,2],[3,4]] -> 1,2,3,4.
+        let grid: Vec<i64> = ds
+            .attr("grid")
+            .unwrap()
+            .read_raw()
+            .unwrap()
+            .chunks_exact(8)
+            .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(grid, vec![1, 2, 3, 4]);
+
         // String array and empty array attrs exist on the dataset.
         assert!(ds.attr("labels").is_ok());
         assert!(ds.attr("empty").is_ok());
     }
 
-    /// Python parity: metadata values h5py cannot store still fail the whole
-    /// export (h5py's `TypeError → SerializationError`). After array attrs landed,
-    /// only genuinely unstorable values fail: a nested object, a null, a
-    /// mixed-kind array, and — a rust-hdf5 1-D-only divergence — a nested array.
+    /// Python parity: metadata values h5py cannot store fail the whole export
+    /// (h5py's `TypeError → SerializationError`). Rectangular homogeneous arrays
+    /// (incl. nested) are storable; the unstorable cases are a nested object, a
+    /// null, a mixed-kind array, a ragged nested array, and an array mixing arrays
+    /// and scalars at one level.
     #[test]
     fn builder_rejects_unstorable_metadata() {
         // Nested object.
@@ -463,11 +478,18 @@ mod tests {
             .expect_err("a mixed-kind array metadata value must fail the export");
         assert!(err.to_string().contains("mixed"));
 
-        // Nested numeric array: Python stores 2-D; rust-hdf5 array attrs are 1-D only.
+        // Ragged nested array: numpy cannot build a rectangular array.
         let err = Hdf5TreeBuilder::new()
             .unwrap()
-            .set_root_attrs(&serde_json::json!({"matrix": [[1, 2], [3, 4]]}))
-            .expect_err("a nested numeric array must fail the export (1-D-only API)");
-        assert!(err.to_string().contains("matrix"));
+            .set_root_attrs(&serde_json::json!({"ragged": [[1, 2], [3]]}))
+            .expect_err("a ragged nested array must fail the export");
+        assert!(err.to_string().contains("ragged"));
+
+        // Array mixing sub-arrays and scalars at one level.
+        let err = Hdf5TreeBuilder::new()
+            .unwrap()
+            .set_root_attrs(&serde_json::json!({"jagged": [1, [2, 3]]}))
+            .expect_err("an array mixing arrays and scalars must fail the export");
+        assert!(err.to_string().contains("jagged"));
     }
 }

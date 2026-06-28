@@ -14,9 +14,10 @@
 //! (Python also copies it onto each per-column dataset; with one dataset per
 //! column the file is the single natural carrier, and the columns stay
 //! attribute-free.) Scalar JSON values map to scalar attributes and homogeneous
-//! JSON arrays to 1-D array attributes; a value h5py cannot store (nested object,
-//! null, mixed-kind or nested array) fails the export, the same fail-fast as
-//! Python's `except TypeError: raise SerializationError` (see
+//! JSON arrays to array attributes (nested rectangular arrays → N-D); a value
+//! h5py cannot store (nested object, null, mixed-kind or `null`-bearing array, or
+//! a ragged nested array) fails the export, the same fail-fast as Python's
+//! `except TypeError: raise SerializationError` (see
 //! [`crate::hdf5_common::write_file_attrs`]). Output is a
 //! self-contained `.h5` file; like [`crate::hdf5_array`], `rust-hdf5` only writes
 //! through a file path, so we round-trip through a temp file.

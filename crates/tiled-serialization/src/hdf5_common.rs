@@ -24,20 +24,33 @@ pub(crate) type DynError = Box<dyn std::error::Error + Send + Sync>;
 /// A target that can carry HDF5 attributes: a file (root attrs), a group
 /// (node attrs), or a dataset (leaf attrs). It unifies the two distinct
 /// rust-hdf5 attribute APIs — `set_attr_string`/`set_attr_numeric` plus their
-/// `_array` counterparts on files/groups, the `new_attr` builder on datasets —
-/// so [`write_metadata_attrs`] serves all three with one mapping. The `put_*`
-/// methods write scalar attributes; the `put_*_array` methods write 1-D array
-/// attributes (Python's `attrs.update`/`create` storing a homogeneous list as a
-/// numpy array).
+/// `_array`/`_array_nd` counterparts on files/groups, the `new_attr` builder on
+/// datasets — so [`write_metadata_attrs`] serves all three with one mapping. The
+/// `put_*` methods write scalar attributes; the `put_*_array_nd` methods write an
+/// N-D array attribute with the given row-major `values` and `shape` (Python's
+/// `attrs.update`/`create` storing a homogeneous, possibly nested, list as a
+/// numpy array). A flat list is just the rank-1 case (`shape == [len]`).
 trait AttrTarget {
     fn put_str(&self, name: &str, value: &str) -> Result<(), DynError>;
     fn put_bool(&self, name: &str, value: bool) -> Result<(), DynError>;
     fn put_i64(&self, name: &str, value: i64) -> Result<(), DynError>;
     fn put_f64(&self, name: &str, value: f64) -> Result<(), DynError>;
-    fn put_str_array(&self, name: &str, values: &[&str]) -> Result<(), DynError>;
-    fn put_bool_array(&self, name: &str, values: &[HBool]) -> Result<(), DynError>;
-    fn put_i64_array(&self, name: &str, values: &[i64]) -> Result<(), DynError>;
-    fn put_f64_array(&self, name: &str, values: &[f64]) -> Result<(), DynError>;
+    fn put_str_array_nd(
+        &self,
+        name: &str,
+        values: &[&str],
+        shape: &[usize],
+    ) -> Result<(), DynError>;
+    fn put_bool_array_nd(
+        &self,
+        name: &str,
+        values: &[HBool],
+        shape: &[usize],
+    ) -> Result<(), DynError>;
+    fn put_i64_array_nd(&self, name: &str, values: &[i64], shape: &[usize])
+    -> Result<(), DynError>;
+    fn put_f64_array_nd(&self, name: &str, values: &[f64], shape: &[usize])
+    -> Result<(), DynError>;
 }
 
 impl AttrTarget for H5File {
@@ -57,20 +70,40 @@ impl AttrTarget for H5File {
         self.set_attr_numeric(name, &value)?;
         Ok(())
     }
-    fn put_str_array(&self, name: &str, values: &[&str]) -> Result<(), DynError> {
-        self.set_attr_string_array(name, values)?;
+    fn put_str_array_nd(
+        &self,
+        name: &str,
+        values: &[&str],
+        shape: &[usize],
+    ) -> Result<(), DynError> {
+        self.set_attr_string_array_nd(name, values, shape)?;
         Ok(())
     }
-    fn put_bool_array(&self, name: &str, values: &[HBool]) -> Result<(), DynError> {
-        self.set_attr_array_numeric(name, values)?;
+    fn put_bool_array_nd(
+        &self,
+        name: &str,
+        values: &[HBool],
+        shape: &[usize],
+    ) -> Result<(), DynError> {
+        self.set_attr_array_numeric_nd(name, values, shape)?;
         Ok(())
     }
-    fn put_i64_array(&self, name: &str, values: &[i64]) -> Result<(), DynError> {
-        self.set_attr_array_numeric(name, values)?;
+    fn put_i64_array_nd(
+        &self,
+        name: &str,
+        values: &[i64],
+        shape: &[usize],
+    ) -> Result<(), DynError> {
+        self.set_attr_array_numeric_nd(name, values, shape)?;
         Ok(())
     }
-    fn put_f64_array(&self, name: &str, values: &[f64]) -> Result<(), DynError> {
-        self.set_attr_array_numeric(name, values)?;
+    fn put_f64_array_nd(
+        &self,
+        name: &str,
+        values: &[f64],
+        shape: &[usize],
+    ) -> Result<(), DynError> {
+        self.set_attr_array_numeric_nd(name, values, shape)?;
         Ok(())
     }
 }
@@ -92,20 +125,40 @@ impl AttrTarget for H5Group {
         self.set_attr_numeric(name, &value)?;
         Ok(())
     }
-    fn put_str_array(&self, name: &str, values: &[&str]) -> Result<(), DynError> {
-        self.set_attr_string_array(name, values)?;
+    fn put_str_array_nd(
+        &self,
+        name: &str,
+        values: &[&str],
+        shape: &[usize],
+    ) -> Result<(), DynError> {
+        self.set_attr_string_array_nd(name, values, shape)?;
         Ok(())
     }
-    fn put_bool_array(&self, name: &str, values: &[HBool]) -> Result<(), DynError> {
-        self.set_attr_array_numeric(name, values)?;
+    fn put_bool_array_nd(
+        &self,
+        name: &str,
+        values: &[HBool],
+        shape: &[usize],
+    ) -> Result<(), DynError> {
+        self.set_attr_array_numeric_nd(name, values, shape)?;
         Ok(())
     }
-    fn put_i64_array(&self, name: &str, values: &[i64]) -> Result<(), DynError> {
-        self.set_attr_array_numeric(name, values)?;
+    fn put_i64_array_nd(
+        &self,
+        name: &str,
+        values: &[i64],
+        shape: &[usize],
+    ) -> Result<(), DynError> {
+        self.set_attr_array_numeric_nd(name, values, shape)?;
         Ok(())
     }
-    fn put_f64_array(&self, name: &str, values: &[f64]) -> Result<(), DynError> {
-        self.set_attr_array_numeric(name, values)?;
+    fn put_f64_array_nd(
+        &self,
+        name: &str,
+        values: &[f64],
+        shape: &[usize],
+    ) -> Result<(), DynError> {
+        self.set_attr_array_numeric_nd(name, values, shape)?;
         Ok(())
     }
 }
@@ -139,30 +192,50 @@ impl AttrTarget for H5Dataset {
             .write_numeric(&value)?;
         Ok(())
     }
-    fn put_str_array(&self, name: &str, values: &[&str]) -> Result<(), DynError> {
+    fn put_str_array_nd(
+        &self,
+        name: &str,
+        values: &[&str],
+        shape: &[usize],
+    ) -> Result<(), DynError> {
         self.new_attr::<VarLenUnicode>()
-            .shape([values.len()])
+            .shape(shape)
             .create(name)?
             .write_string_array(values)?;
         Ok(())
     }
-    fn put_bool_array(&self, name: &str, values: &[HBool]) -> Result<(), DynError> {
+    fn put_bool_array_nd(
+        &self,
+        name: &str,
+        values: &[HBool],
+        shape: &[usize],
+    ) -> Result<(), DynError> {
         self.new_attr::<HBool>()
-            .shape([values.len()])
+            .shape(shape)
             .create(name)?
             .write_array(values)?;
         Ok(())
     }
-    fn put_i64_array(&self, name: &str, values: &[i64]) -> Result<(), DynError> {
+    fn put_i64_array_nd(
+        &self,
+        name: &str,
+        values: &[i64],
+        shape: &[usize],
+    ) -> Result<(), DynError> {
         self.new_attr::<i64>()
-            .shape([values.len()])
+            .shape(shape)
             .create(name)?
             .write_array(values)?;
         Ok(())
     }
-    fn put_f64_array(&self, name: &str, values: &[f64]) -> Result<(), DynError> {
+    fn put_f64_array_nd(
+        &self,
+        name: &str,
+        values: &[f64],
+        shape: &[usize],
+    ) -> Result<(), DynError> {
         self.new_attr::<f64>()
-            .shape([values.len()])
+            .shape(shape)
             .create(name)?
             .write_array(values)?;
         Ok(())
@@ -174,17 +247,16 @@ impl AttrTarget for H5Dataset {
 /// Mirrors Python `serialize_hdf5`'s `file/group.attrs.update(metadata)` and
 /// `dataset.attrs.create(k, v)`, where h5py runs each value through
 /// `numpy.asarray`: the four scalar JSON kinds (string/bool/integer/float) map
-/// to scalar attributes, and a homogeneous JSON array maps to a 1-D array
-/// attribute (`[1,2,3]` → int array, any-float → float array, `[true,false]` →
-/// bool array, `["a","b"]` → vlen-string array; an empty array is a float64
-/// empty array, matching `numpy.asarray([])`). Anything h5py cannot store —
-/// a nested object, a `null`, a `null`-bearing or mixed-kind array — is a hard
-/// error that fails the whole export, the same fail-fast contract as Python's
-/// `except TypeError: raise SerializationError`, surfaced here as an `Err`.
-///
-/// One divergence remains, dictated by the rust-hdf5 array-attr API being 1-D
-/// only: a nested *numeric* array (`[[1,2],[3,4]]`), which Python would store as
-/// a 2-D array, is rejected here rather than stored.
+/// to scalar attributes, and a homogeneous JSON array maps to an array attribute
+/// (`[1,2,3]` → int array, any-float → float array, `[true,false]` → bool array,
+/// `["a","b"]` → vlen-string array; an empty array is a float64 empty array,
+/// matching `numpy.asarray([])`). A *nested* rectangular homogeneous array maps
+/// to an N-D array attribute (`[[1,2],[3,4]]` → 2×2 int array), exactly as
+/// `numpy.asarray` infers the shape. Anything h5py cannot store — a nested
+/// object, a `null`, a `null`-bearing or mixed-kind array, or a ragged
+/// (non-rectangular) nested array — is a hard error that fails the whole export,
+/// the same fail-fast contract as Python's `except TypeError: raise
+/// SerializationError`, surfaced here as an `Err`.
 ///
 /// (A non-object `meta`, e.g. `Null`, writes nothing — there are no attrs to set.)
 fn write_metadata_attrs<T: AttrTarget>(target: &T, meta: &Value) -> Result<(), DynError> {
@@ -222,41 +294,54 @@ fn write_metadata_attrs<T: AttrTarget>(target: &T, meta: &Value) -> Result<(), D
     Ok(())
 }
 
-/// Write a homogeneous JSON array as a 1-D HDF5 array attribute on `target`.
+/// Write a homogeneous (possibly nested) JSON array as an N-D HDF5 array
+/// attribute on `target`.
 ///
-/// Mirrors h5py running the list through `numpy.asarray`: the element kind picks
-/// the on-disk type. An empty list is a float64 empty array (numpy's default
-/// dtype for `[]`). A mixed-kind list, a `null`-bearing list, or a nested array
-/// has no homogeneous numpy dtype h5py can store as a 1-D attribute and is a hard
-/// error (Python's `TypeError → SerializationError`).
+/// Mirrors h5py running the list through `numpy.asarray`: [`flatten_nd`] infers
+/// the rectangular shape and the row-major leaf order, then the homogeneous leaf
+/// kind picks the on-disk type. An array with no leaves is a float64 array
+/// (numpy's default dtype for `[]`). A mixed-kind leaf set, a `null`-bearing
+/// list, a ragged nested array, or one mixing arrays and scalars at a level has
+/// no homogeneous numpy dtype h5py can store and is a hard error (Python's
+/// `TypeError → SerializationError`).
 fn write_array_attr<T: AttrTarget>(target: &T, key: &str, arr: &[Value]) -> Result<(), DynError> {
-    if arr.is_empty() {
-        // numpy.asarray([]) is a float64 array of shape (0,).
-        return target.put_f64_array(key, &[]);
+    let (shape, leaves) = flatten_nd(key, arr)?;
+
+    if leaves.is_empty() {
+        // numpy.asarray of an array with no leaves defaults to float64.
+        return target.put_f64_array_nd(key, &[], &shape);
     }
-    if arr.iter().all(Value::is_boolean) {
-        let values: Vec<HBool> = arr
+    if leaves.iter().all(|v| v.is_boolean()) {
+        let values: Vec<HBool> = leaves
             .iter()
             .map(|v| HBool::from(v.as_bool().expect("checked is_boolean")))
             .collect();
-        return target.put_bool_array(key, &values);
+        return target.put_bool_array_nd(key, &values, &shape);
     }
-    if arr.iter().all(Value::is_string) {
-        let values: Vec<&str> = arr
+    if leaves.iter().all(|v| v.is_string()) {
+        let values: Vec<&str> = leaves
             .iter()
             .map(|v| v.as_str().expect("checked is_string"))
             .collect();
-        return target.put_str_array(key, &values);
+        return target.put_str_array_nd(key, &values, &shape);
     }
-    if arr.iter().all(Value::is_number) {
-        // int array if every element fits i64, else float array — numpy's
-        // promotion rule (a single non-integer value floats the whole array),
-        // matching the scalar Number arm's i64-then-f64 fallback.
-        if let Some(ints) = arr.iter().map(Value::as_i64).collect::<Option<Vec<i64>>>() {
-            return target.put_i64_array(key, &ints);
+    if leaves.iter().all(|v| v.is_number()) {
+        // int array if every leaf fits i64, else float array — numpy's promotion
+        // rule (a single non-integer value floats the whole array), matching the
+        // scalar Number arm's i64-then-f64 fallback.
+        if let Some(ints) = leaves
+            .iter()
+            .map(|v| v.as_i64())
+            .collect::<Option<Vec<i64>>>()
+        {
+            return target.put_i64_array_nd(key, &ints, &shape);
         }
-        if let Some(floats) = arr.iter().map(Value::as_f64).collect::<Option<Vec<f64>>>() {
-            return target.put_f64_array(key, &floats);
+        if let Some(floats) = leaves
+            .iter()
+            .map(|v| v.as_f64())
+            .collect::<Option<Vec<f64>>>()
+        {
+            return target.put_f64_array_nd(key, &floats, &shape);
         }
         return Err(format!(
             "metadata attribute '{key}': numeric array has a value not representable \
@@ -265,11 +350,65 @@ fn write_array_attr<T: AttrTarget>(target: &T, key: &str, arr: &[Value]) -> Resu
         .into());
     }
     Err(format!(
-        "metadata attribute '{key}' is a mixed-kind, null-bearing, or nested array that \
-         HDF5 cannot store as a 1-D attribute; export fails (Python's h5py raises the same \
-         as SerializationError)"
+        "metadata attribute '{key}' is a mixed-kind or null-bearing array that HDF5 \
+         cannot store as an attribute; export fails (Python's h5py raises the same as \
+         SerializationError)"
     )
     .into())
+}
+
+/// Infer the rectangular shape of a (possibly nested) JSON array and collect its
+/// leaves in row-major order, the way `numpy.asarray` does.
+///
+/// A level is either all-arrays (descend, every sub-array must share one inner
+/// shape) or all-leaves (the scalars at that level). An empty array contributes
+/// a zero-length dimension and no leaves. Errors mirror the cases where
+/// `numpy.asarray` cannot build a rectangular homogeneous array — so h5py raises
+/// `TypeError`/`ValueError` and Python's serializer fails the export:
+/// a level that mixes arrays and scalars, or a ragged set of sub-arrays whose
+/// inner shapes differ.
+#[allow(clippy::type_complexity)]
+fn flatten_nd<'a>(key: &str, arr: &'a [Value]) -> Result<(Vec<usize>, Vec<&'a Value>), DynError> {
+    if arr.is_empty() {
+        // A zero-length dimension with no leaves (numpy.asarray([]) → shape (0,)).
+        return Ok((vec![0], Vec::new()));
+    }
+    let all_arrays = arr.iter().all(Value::is_array);
+    if !all_arrays {
+        if arr.iter().any(Value::is_array) {
+            return Err(format!(
+                "metadata attribute '{key}' mixes arrays and scalars at one nesting level; \
+                 numpy cannot build a rectangular array, so the export fails (Python's h5py \
+                 raises the same as SerializationError)"
+            )
+            .into());
+        }
+        // Leaf level: this dimension's length, and the scalars as leaves.
+        return Ok((vec![arr.len()], arr.iter().collect()));
+    }
+    // All sub-arrays: every one must flatten to the same inner shape (rectangular).
+    let mut leaves: Vec<&Value> = Vec::new();
+    let mut inner_shape: Option<Vec<usize>> = None;
+    for sub in arr {
+        let sub_arr = sub.as_array().expect("checked is_array");
+        let (s, mut l) = flatten_nd(key, sub_arr)?;
+        match &inner_shape {
+            None => inner_shape = Some(s),
+            Some(prev) if *prev != s => {
+                return Err(format!(
+                    "metadata attribute '{key}' is a ragged (non-rectangular) nested array; \
+                     numpy cannot build a rectangular array, so the export fails (Python's \
+                     h5py raises the same as SerializationError)"
+                )
+                .into());
+            }
+            Some(_) => {}
+        }
+        leaves.append(&mut l);
+    }
+    let mut shape = vec![arr.len()];
+    shape.extend(inner_shape.expect("arr is non-empty"));
+    Ok((shape, leaves))
 }
 
 /// Write a metadata object as attributes on a file (HDF5 root attrs).
