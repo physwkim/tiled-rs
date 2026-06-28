@@ -40,6 +40,18 @@ pub fn file_uri_to_path(uri: &str) -> Option<PathBuf> {
     if url.scheme() != "file" {
         return None;
     }
+    // Reject any non-empty authority. The `url` crate already normalizes the
+    // `localhost` host away (`file://localhost/a/b` == `file:///a/b`, matching
+    // Python's `urlparse`), so a *remaining* host is a real remote/UNC
+    // authority — never a local managed asset, on either platform. Guarding
+    // here is also what keeps the helper robust on Windows: `to_file_path()`'s
+    // Windows branch turns a host into a `\\host` UNC path that is not
+    // absolute, tripping its internal `debug_assert!(path.is_absolute())`
+    // (panic in debug builds) or returning a bogus non-absolute path (release).
+    // Refusing the host before that call removes the dual behavior structurally.
+    if url.host_str().is_some() {
+        return None;
+    }
     let path = url.to_file_path().ok()?;
     // Reject a root-only path. The `url` crate normalizes `file://` (no path) to
     // `file:///`, i.e. the filesystem root; the old hand-rolled parser rejected
