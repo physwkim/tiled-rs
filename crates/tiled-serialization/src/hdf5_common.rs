@@ -21,16 +21,23 @@ use serde_json::Value;
 
 pub(crate) type DynError = Box<dyn std::error::Error + Send + Sync>;
 
-/// A target that can carry HDF5 scalar attributes: a file (root attrs), a group
+/// A target that can carry HDF5 attributes: a file (root attrs), a group
 /// (node attrs), or a dataset (leaf attrs). It unifies the two distinct
-/// rust-hdf5 attribute APIs — `set_attr_string`/`set_attr_numeric` on
-/// files/groups, the `new_attr` builder on datasets — so [`write_scalar_attrs`]
-/// serves all three with one mapping.
+/// rust-hdf5 attribute APIs — `set_attr_string`/`set_attr_numeric` plus their
+/// `_array` counterparts on files/groups, the `new_attr` builder on datasets —
+/// so [`write_metadata_attrs`] serves all three with one mapping. The `put_*`
+/// methods write scalar attributes; the `put_*_array` methods write 1-D array
+/// attributes (Python's `attrs.update`/`create` storing a homogeneous list as a
+/// numpy array).
 trait AttrTarget {
     fn put_str(&self, name: &str, value: &str) -> Result<(), DynError>;
     fn put_bool(&self, name: &str, value: bool) -> Result<(), DynError>;
     fn put_i64(&self, name: &str, value: i64) -> Result<(), DynError>;
     fn put_f64(&self, name: &str, value: f64) -> Result<(), DynError>;
+    fn put_str_array(&self, name: &str, values: &[&str]) -> Result<(), DynError>;
+    fn put_bool_array(&self, name: &str, values: &[HBool]) -> Result<(), DynError>;
+    fn put_i64_array(&self, name: &str, values: &[i64]) -> Result<(), DynError>;
+    fn put_f64_array(&self, name: &str, values: &[f64]) -> Result<(), DynError>;
 }
 
 impl AttrTarget for H5File {
@@ -50,6 +57,22 @@ impl AttrTarget for H5File {
         self.set_attr_numeric(name, &value)?;
         Ok(())
     }
+    fn put_str_array(&self, name: &str, values: &[&str]) -> Result<(), DynError> {
+        self.set_attr_string_array(name, values)?;
+        Ok(())
+    }
+    fn put_bool_array(&self, name: &str, values: &[HBool]) -> Result<(), DynError> {
+        self.set_attr_array_numeric(name, values)?;
+        Ok(())
+    }
+    fn put_i64_array(&self, name: &str, values: &[i64]) -> Result<(), DynError> {
+        self.set_attr_array_numeric(name, values)?;
+        Ok(())
+    }
+    fn put_f64_array(&self, name: &str, values: &[f64]) -> Result<(), DynError> {
+        self.set_attr_array_numeric(name, values)?;
+        Ok(())
+    }
 }
 
 impl AttrTarget for H5Group {
@@ -67,6 +90,22 @@ impl AttrTarget for H5Group {
     }
     fn put_f64(&self, name: &str, value: f64) -> Result<(), DynError> {
         self.set_attr_numeric(name, &value)?;
+        Ok(())
+    }
+    fn put_str_array(&self, name: &str, values: &[&str]) -> Result<(), DynError> {
+        self.set_attr_string_array(name, values)?;
+        Ok(())
+    }
+    fn put_bool_array(&self, name: &str, values: &[HBool]) -> Result<(), DynError> {
+        self.set_attr_array_numeric(name, values)?;
+        Ok(())
+    }
+    fn put_i64_array(&self, name: &str, values: &[i64]) -> Result<(), DynError> {
+        self.set_attr_array_numeric(name, values)?;
+        Ok(())
+    }
+    fn put_f64_array(&self, name: &str, values: &[f64]) -> Result<(), DynError> {
+        self.set_attr_array_numeric(name, values)?;
         Ok(())
     }
 }
@@ -100,20 +139,55 @@ impl AttrTarget for H5Dataset {
             .write_numeric(&value)?;
         Ok(())
     }
+    fn put_str_array(&self, name: &str, values: &[&str]) -> Result<(), DynError> {
+        self.new_attr::<VarLenUnicode>()
+            .shape([values.len()])
+            .create(name)?
+            .write_string_array(values)?;
+        Ok(())
+    }
+    fn put_bool_array(&self, name: &str, values: &[HBool]) -> Result<(), DynError> {
+        self.new_attr::<HBool>()
+            .shape([values.len()])
+            .create(name)?
+            .write_array(values)?;
+        Ok(())
+    }
+    fn put_i64_array(&self, name: &str, values: &[i64]) -> Result<(), DynError> {
+        self.new_attr::<i64>()
+            .shape([values.len()])
+            .create(name)?
+            .write_array(values)?;
+        Ok(())
+    }
+    fn put_f64_array(&self, name: &str, values: &[f64]) -> Result<(), DynError> {
+        self.new_attr::<f64>()
+            .shape([values.len()])
+            .create(name)?
+            .write_array(values)?;
+        Ok(())
+    }
 }
 
-/// Write a JSON metadata object as HDF5 scalar attributes on `target`.
+/// Write a JSON metadata object as HDF5 attributes on `target`.
 ///
 /// Mirrors Python `serialize_hdf5`'s `file/group.attrs.update(metadata)` and
-/// `dataset.attrs.create(k, v)`. Python raises `SerializationError` for any value
-/// h5py cannot store as an attribute; rust-hdf5 0.2.20 writes only *scalar*
-/// attributes (no array attrs — its `AttrBuilder::shape` only supports scalars),
-/// so the four scalar JSON kinds (string/bool/integer/float) map to attributes
-/// and every other value — array, nested object, null — is a hard error that
-/// fails the whole export. That is the same fail-fast contract as Python's
+/// `dataset.attrs.create(k, v)`, where h5py runs each value through
+/// `numpy.asarray`: the four scalar JSON kinds (string/bool/integer/float) map
+/// to scalar attributes, and a homogeneous JSON array maps to a 1-D array
+/// attribute (`[1,2,3]` → int array, any-float → float array, `[true,false]` →
+/// bool array, `["a","b"]` → vlen-string array; an empty array is a float64
+/// empty array, matching `numpy.asarray([])`). Anything h5py cannot store —
+/// a nested object, a `null`, a `null`-bearing or mixed-kind array — is a hard
+/// error that fails the whole export, the same fail-fast contract as Python's
 /// `except TypeError: raise SerializationError`, surfaced here as an `Err`.
+///
+/// One divergence remains, dictated by the rust-hdf5 array-attr API being 1-D
+/// only: a nested *numeric* array (`[[1,2],[3,4]]`), which Python would store as
+/// a 2-D array, is rejected here rather than stored.
+///
 /// (A non-object `meta`, e.g. `Null`, writes nothing — there are no attrs to set.)
-fn write_scalar_attrs<T: AttrTarget>(target: &T, meta: &Value) -> Result<(), DynError> {
+fn write_metadata_attrs<T: AttrTarget>(target: &T, meta: &Value) -> Result<(), DynError> {
     let Some(obj) = meta.as_object() else {
         return Ok(());
     };
@@ -134,11 +208,12 @@ fn write_scalar_attrs<T: AttrTarget>(target: &T, meta: &Value) -> Result<(), Dyn
                     .into());
                 }
             }
-            Value::Array(_) | Value::Object(_) | Value::Null => {
+            Value::Array(arr) => write_array_attr(target, key, arr)?,
+            Value::Object(_) | Value::Null => {
                 return Err(format!(
-                    "metadata attribute '{key}' has a non-scalar value (array/object/null) \
-                     that HDF5 cannot store as an attribute; export fails (Python's h5py \
-                     raises the same as SerializationError)"
+                    "metadata attribute '{key}' has a value (nested object / null) that \
+                     HDF5 cannot store as an attribute; export fails (Python's h5py raises \
+                     the same as SerializationError)"
                 )
                 .into());
             }
@@ -147,14 +222,64 @@ fn write_scalar_attrs<T: AttrTarget>(target: &T, meta: &Value) -> Result<(), Dyn
     Ok(())
 }
 
+/// Write a homogeneous JSON array as a 1-D HDF5 array attribute on `target`.
+///
+/// Mirrors h5py running the list through `numpy.asarray`: the element kind picks
+/// the on-disk type. An empty list is a float64 empty array (numpy's default
+/// dtype for `[]`). A mixed-kind list, a `null`-bearing list, or a nested array
+/// has no homogeneous numpy dtype h5py can store as a 1-D attribute and is a hard
+/// error (Python's `TypeError → SerializationError`).
+fn write_array_attr<T: AttrTarget>(target: &T, key: &str, arr: &[Value]) -> Result<(), DynError> {
+    if arr.is_empty() {
+        // numpy.asarray([]) is a float64 array of shape (0,).
+        return target.put_f64_array(key, &[]);
+    }
+    if arr.iter().all(Value::is_boolean) {
+        let values: Vec<HBool> = arr
+            .iter()
+            .map(|v| HBool::from(v.as_bool().expect("checked is_boolean")))
+            .collect();
+        return target.put_bool_array(key, &values);
+    }
+    if arr.iter().all(Value::is_string) {
+        let values: Vec<&str> = arr
+            .iter()
+            .map(|v| v.as_str().expect("checked is_string"))
+            .collect();
+        return target.put_str_array(key, &values);
+    }
+    if arr.iter().all(Value::is_number) {
+        // int array if every element fits i64, else float array — numpy's
+        // promotion rule (a single non-integer value floats the whole array),
+        // matching the scalar Number arm's i64-then-f64 fallback.
+        if let Some(ints) = arr.iter().map(Value::as_i64).collect::<Option<Vec<i64>>>() {
+            return target.put_i64_array(key, &ints);
+        }
+        if let Some(floats) = arr.iter().map(Value::as_f64).collect::<Option<Vec<f64>>>() {
+            return target.put_f64_array(key, &floats);
+        }
+        return Err(format!(
+            "metadata attribute '{key}': numeric array has a value not representable \
+             as i64 or f64"
+        )
+        .into());
+    }
+    Err(format!(
+        "metadata attribute '{key}' is a mixed-kind, null-bearing, or nested array that \
+         HDF5 cannot store as a 1-D attribute; export fails (Python's h5py raises the same \
+         as SerializationError)"
+    )
+    .into())
+}
+
 /// Write a metadata object as attributes on a file (HDF5 root attrs).
 pub(crate) fn write_file_attrs(file: &H5File, meta: &Value) -> Result<(), DynError> {
-    write_scalar_attrs(file, meta)
+    write_metadata_attrs(file, meta)
 }
 
 /// Write a metadata object as attributes on a group (node attrs).
 pub(crate) fn write_group_attrs(group: &H5Group, meta: &Value) -> Result<(), DynError> {
-    write_scalar_attrs(group, meta)
+    write_metadata_attrs(group, meta)
 }
 
 /// Write a raw numeric byte buffer as a dataset `name` (shape `shape`) under
@@ -232,7 +357,7 @@ where
     }
     let dataset = group.new_dataset::<T>().shape(shape).create(name)?;
     dataset.write_raw(&typed)?;
-    write_scalar_attrs(&dataset, attrs)?;
+    write_metadata_attrs(&dataset, attrs)?;
     Ok(())
 }
 

@@ -13,9 +13,11 @@
 //! group) attributes — Python `serialize_hdf5`'s `file.attrs.update(metadata)`.
 //! (Python also copies it onto each per-column dataset; with one dataset per
 //! column the file is the single natural carrier, and the columns stay
-//! attribute-free.) Only scalar JSON values map; a non-scalar value fails the
-//! export, the same fail-fast as Python's `except TypeError: raise
-//! SerializationError` (see [`crate::hdf5_common::write_file_attrs`]). Output is a
+//! attribute-free.) Scalar JSON values map to scalar attributes and homogeneous
+//! JSON arrays to 1-D array attributes; a value h5py cannot store (nested object,
+//! null, mixed-kind or nested array) fails the export, the same fail-fast as
+//! Python's `except TypeError: raise SerializationError` (see
+//! [`crate::hdf5_common::write_file_attrs`]). Output is a
 //! self-contained `.h5` file; like [`crate::hdf5_array`], `rust-hdf5` only writes
 //! through a file path, so we round-trip through a temp file.
 //!
@@ -251,7 +253,7 @@ mod tests {
         let batch =
             RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2]))]).unwrap();
         let meta = serde_json::json!({
-            "sample": "NaCl", "temperature": 300, "scale": 1.5, "ok": true,
+            "sample": "NaCl", "temperature": 300, "scale": 1.5, "ok": true, "tags": [1, 2, 3],
         });
         let ser = registry()
             .dispatch(StructureFamily::Table, mime::HDF5)
@@ -261,7 +263,8 @@ mod tests {
         std::fs::write(tmp.path(), &h5).unwrap();
         let file = rust_hdf5::H5File::open(tmp.path()).unwrap();
         let attrs = file.attr_names().unwrap();
-        for key in ["sample", "temperature", "scale", "ok"] {
+        // Four scalar kinds plus a homogeneous array attr ("tags").
+        for key in ["sample", "temperature", "scale", "ok", "tags"] {
             assert!(
                 attrs.contains(&key.to_string()),
                 "file attr '{key}' must be present; got {attrs:?}"
@@ -269,22 +272,26 @@ mod tests {
         }
     }
 
-    /// Python parity: a non-scalar metadata value fails the export, mirroring
-    /// h5py's `TypeError → SerializationError` (rust-hdf5 writes no array attrs).
+    /// Python parity: a metadata value h5py cannot store fails the export,
+    /// mirroring h5py's `TypeError → SerializationError`. A homogeneous array is
+    /// now storable, so the unstorable case here is a nested object.
     #[test]
-    fn table_hdf5_non_scalar_metadata_fails() {
+    fn table_hdf5_unstorable_metadata_fails() {
         let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
         let batch =
             RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1]))]).unwrap();
         let ser = registry()
             .dispatch(StructureFamily::Table, mime::HDF5)
             .unwrap();
-        let err = ser(&ipc_bytes(&batch), &serde_json::json!({"tags": [1, 2, 3]}))
-            .expect_err("non-scalar metadata must fail the export")
-            .to_string();
+        let err = ser(
+            &ipc_bytes(&batch),
+            &serde_json::json!({"calibration": {"slope": 1.0}}),
+        )
+        .expect_err("unstorable (nested-object) metadata must fail the export")
+        .to_string();
         assert!(
-            err.contains("tags") && err.contains("non-scalar"),
-            "error must name the offending key and reason: {err}"
+            err.contains("calibration"),
+            "error must name the offending key: {err}"
         );
     }
 }

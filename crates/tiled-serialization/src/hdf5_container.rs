@@ -18,11 +18,13 @@
 //! Node metadata is written as HDF5 attributes, matching Python: the root
 //! container's metadata → file (root group) attrs, each intermediate container's
 //! metadata → group attrs, each array's metadata → dataset attrs, and a table
-//! node's metadata → its group's attrs. Only *scalar* JSON values map (string,
-//! integer, float, bool) — rust-hdf5 0.2.20 writes no array attributes — so a
-//! non-scalar metadata value (nested object, array, null) fails the whole export,
-//! the same fail-fast contract as Python's `except TypeError: raise
-//! SerializationError`. See [`crate::hdf5_common::write_file_attrs`].
+//! node's metadata → its group's attrs. Scalar JSON values map to scalar
+//! attributes and a homogeneous JSON array maps to a 1-D array attribute
+//! (Python's `attrs.update`/`create` running each value through `numpy.asarray`);
+//! a value h5py cannot store — a nested object, a null, a mixed-kind or nested
+//! array — fails the whole export, the same fail-fast contract as Python's
+//! `except TypeError: raise SerializationError`. See
+//! [`crate::hdf5_common::write_file_attrs`].
 //!
 //! Remaining parity gaps (UNFIXED, library-bound): sparse/awkward leaves are
 //! skipped — Python's `walk` has no defined dataset shape for them either — and
@@ -357,35 +359,115 @@ mod tests {
         );
     }
 
-    /// Python parity: a non-scalar metadata value (nested object / array / null)
-    /// fails the whole export, mirroring h5py's `TypeError → SerializationError`.
-    /// rust-hdf5 writes only scalar attributes, so there is no array-attr fallback.
+    /// Homogeneous array metadata lands as 1-D HDF5 array attributes — Python's
+    /// `attrs.update`/`create` running each list through `numpy.asarray`. File and
+    /// group array attrs are checked by name (rust-hdf5 reads only dataset attr
+    /// *values*); dataset numeric array attrs are checked by value via `read_raw`.
     #[test]
-    fn builder_rejects_non_scalar_metadata() {
+    fn builder_writes_array_metadata_as_attrs() {
         let mut builder = Hdf5TreeBuilder::new().unwrap();
-        let err = builder
-            .set_root_attrs(&serde_json::json!({"tags": [1, 2, 3]}))
-            .expect_err("a non-scalar (array) metadata value must fail the export");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("tags") && msg.contains("non-scalar"),
-            "error must name the offending key and reason: {msg}"
+        builder
+            .set_root_attrs(&serde_json::json!({"ints": [1, 2, 3], "names": ["a", "b"]}))
+            .unwrap();
+        builder.register_group_attrs(
+            "grp".to_string(),
+            serde_json::json!({"flags": [true, false]}),
         );
 
-        // Nested object is equally rejected, on a dataset's metadata.
-        let data: Vec<u8> = 1.0f64.to_le_bytes().to_vec();
-        let err = builder
+        let img: Vec<u8> = [1.0f64, 2.0].iter().flat_map(|v| v.to_le_bytes()).collect();
+        builder
             .add_array(
-                "",
-                "d",
-                &data,
+                "grp",
+                "img",
+                &img,
                 'f',
                 8,
                 false,
-                &[1],
-                &serde_json::json!({"calibration": {"slope": 1.0}}),
+                &[2],
+                &serde_json::json!({
+                    "dims": [4, 8, 12],
+                    "scales": [0.5, 1.5],
+                    "labels": ["x", "y"],
+                    "empty": [],
+                }),
             )
+            .unwrap();
+
+        let bytes = builder.finish().unwrap();
+        let tmp = tempfile::Builder::new().suffix(".h5").tempfile().unwrap();
+        std::fs::write(tmp.path(), &bytes).unwrap();
+        let file = rust_hdf5::H5File::open(tmp.path()).unwrap();
+
+        // Root + group array attrs present by name.
+        let root_attrs = file.attr_names().unwrap();
+        assert!(root_attrs.contains(&"ints".to_string()));
+        assert!(root_attrs.contains(&"names".to_string()));
+        let grp_attrs = file
+            .root_group()
+            .group("grp")
+            .unwrap()
+            .attr_names()
+            .unwrap();
+        assert!(grp_attrs.contains(&"flags".to_string()));
+
+        // Dataset numeric array attrs by value: decode the raw little-endian bytes.
+        let ds = file.dataset("grp/img").unwrap();
+        let dims: Vec<i64> = ds
+            .attr("dims")
+            .unwrap()
+            .read_raw()
+            .unwrap()
+            .chunks_exact(8)
+            .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(dims, vec![4, 8, 12]);
+        let scales: Vec<f64> = ds
+            .attr("scales")
+            .unwrap()
+            .read_raw()
+            .unwrap()
+            .chunks_exact(8)
+            .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(scales, vec![0.5, 1.5]);
+
+        // String array and empty array attrs exist on the dataset.
+        assert!(ds.attr("labels").is_ok());
+        assert!(ds.attr("empty").is_ok());
+    }
+
+    /// Python parity: metadata values h5py cannot store still fail the whole
+    /// export (h5py's `TypeError → SerializationError`). After array attrs landed,
+    /// only genuinely unstorable values fail: a nested object, a null, a
+    /// mixed-kind array, and — a rust-hdf5 1-D-only divergence — a nested array.
+    #[test]
+    fn builder_rejects_unstorable_metadata() {
+        // Nested object.
+        let err = Hdf5TreeBuilder::new()
+            .unwrap()
+            .set_root_attrs(&serde_json::json!({"calibration": {"slope": 1.0}}))
             .expect_err("a nested-object metadata value must fail the export");
         assert!(err.to_string().contains("calibration"));
+
+        // Null value.
+        let err = Hdf5TreeBuilder::new()
+            .unwrap()
+            .set_root_attrs(&serde_json::json!({"missing": null}))
+            .expect_err("a null metadata value must fail the export");
+        assert!(err.to_string().contains("missing"));
+
+        // Mixed-kind array.
+        let err = Hdf5TreeBuilder::new()
+            .unwrap()
+            .set_root_attrs(&serde_json::json!({"mixed": [1, "a"]}))
+            .expect_err("a mixed-kind array metadata value must fail the export");
+        assert!(err.to_string().contains("mixed"));
+
+        // Nested numeric array: Python stores 2-D; rust-hdf5 array attrs are 1-D only.
+        let err = Hdf5TreeBuilder::new()
+            .unwrap()
+            .set_root_attrs(&serde_json::json!({"matrix": [[1, 2], [3, 4]]}))
+            .expect_err("a nested numeric array must fail the export (1-D-only API)");
+        assert!(err.to_string().contains("matrix"));
     }
 }
