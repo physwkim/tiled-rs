@@ -271,11 +271,7 @@ impl CooAdapter {
             _ => unreachable!("data_type is always a builtin dtype"),
         };
         let elem = data_dtype.element_size();
-        let nnz = if elem == 0 {
-            0
-        } else {
-            data_bytes.len() / elem
-        };
+        let nnz = data_bytes.len().checked_div(elem).unwrap_or(0);
         let coord_arrays: Vec<DynNDArray> = coords
             .iter()
             .map(|dim_coords| {

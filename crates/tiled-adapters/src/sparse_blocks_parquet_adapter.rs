@@ -135,11 +135,7 @@ impl SparseBlocksParquetAdapter {
         let dtype = self.data_dtype();
         let coord_dtype = self.coord_dtype();
         let elem = dtype.element_size();
-        let nnz = if elem == 0 {
-            0
-        } else {
-            data_bytes.len() / elem
-        };
+        let nnz = data_bytes.len().checked_div(elem).unwrap_or(0);
         let coord_arrays: Vec<DynNDArray> = coords
             .iter()
             .map(|dim_coords| {
