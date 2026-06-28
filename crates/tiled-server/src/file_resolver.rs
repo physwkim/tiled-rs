@@ -448,9 +448,10 @@ fn build_ragged_sql_adapter(
 
 /// Decode a `sqlite://` data_uri into its backing database file path, for the
 /// read allow-list and writable-containment checks. The create path emits
-/// `sqlite://{absolute_path}` (i.e. `sqlite:///abs/...`); strip the scheme and
-/// any `?query` suffix sqlx would accept and require the result to be absolute,
-/// so a `sqlite://relative` URI cannot slip past the containment checks.
+/// `sqlite://{absolute_path}`: `sqlite:///abs/...` on Unix, `sqlite://C:\...` on
+/// Windows. Strip the scheme and any `?query` suffix sqlx would accept and
+/// require the result to be absolute, so a `sqlite://relative` URI cannot slip
+/// past the containment checks.
 #[cfg(feature = "sql-adapter")]
 fn sqlite_uri_to_path(uri: &str) -> std::result::Result<PathBuf, CatalogError> {
     let rest = uri.strip_prefix("sqlite://").ok_or_else(|| {
@@ -459,12 +460,18 @@ fn sqlite_uri_to_path(uri: &str) -> std::result::Result<PathBuf, CatalogError> {
         ))
     })?;
     let path_part = rest.split('?').next().unwrap_or(rest);
-    if !path_part.starts_with('/') {
+    let path = PathBuf::from(path_part);
+    // Use the platform's own notion of absoluteness rather than a leading-`/`
+    // test: on Windows the create path emits a drive-letter path (`C:\...`) that
+    // is absolute but does not start with `/`, so the old check rejected every
+    // managed ragged write there (HTTP 500). `is_absolute()` accepts both
+    // `/abs/...` and `C:\...` while still rejecting `sqlite://relative`.
+    if !path.is_absolute() {
         return Err(CatalogError::Validation(format!(
             "ragged data_uri {uri} has no absolute sqlite path"
         )));
     }
-    Ok(PathBuf::from(path_part))
+    Ok(path)
 }
 
 /// Decode a `data_uri` into a local filesystem path.
