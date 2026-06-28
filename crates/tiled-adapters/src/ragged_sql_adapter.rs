@@ -569,6 +569,24 @@ pub struct RaggedSqlInit {
     pub assets: Vec<Asset>,
 }
 
+/// Render `path` for embedding in a `sqlite://` data_uri. Strips the Windows
+/// extended-length (verbatim) `\\?\` prefix that `std::fs::canonicalize` emits
+/// on the writable-storage root: it contains '?', the URL query delimiter, so
+/// `sqlite://\\?\C:\...` parses as a bogus query and sqlx rejects the connection
+/// (managed ragged create → HTTP 500). The remaining `C:\...` form is what both
+/// sqlx and the resolver's `sqlite_uri_to_path` accept. No-op on Unix and on
+/// non-verbatim Windows paths. (A local writable-storage dir canonicalizes to a
+/// verbatim *disk* path `\\?\C:\...`, never a verbatim UNC path, so the simple
+/// prefix strip is sufficient here.)
+fn sqlite_uri_path(path: &Path) -> String {
+    let s = path.to_string_lossy();
+    #[cfg(windows)]
+    if let Some(stripped) = s.strip_prefix(r"\\?\") {
+        return stripped.to_string();
+    }
+    s.into_owned()
+}
+
 /// Initialize SQLite storage for a managed ragged node and create its chunk
 /// table. The ragged analog of [`crate::init_storage_npy`]: it places a
 /// per-node `{key}.sqlite` file under `writable_root` (path components
@@ -618,11 +636,14 @@ pub async fn init_storage_ragged_sql(
         .map_err(|e| TiledError::Internal(format!("init_storage mkdir {}: {e}", dir.display())))?;
     let file = dir.join(format!("{key}.sqlite"));
 
-    // `file` is under the absolute `writable_root`, so `display()` begins with
-    // `/` and `sqlite://` + that path yields the `sqlite:///abs/...` form sqlx's
-    // SqliteConnectOptions::from_str accepts (and the resolver re-derives the
-    // path from for the writable-containment check).
-    let data_uri = format!("sqlite://{}", file.display());
+    // `file` is under the absolute `writable_root`. `sqlite://` + that path is
+    // the form sqlx's SqliteConnectOptions::from_str accepts (and the resolver
+    // re-derives the path from for the writable-containment check):
+    // `sqlite:///abs/...` on Unix, `sqlite://C:\...` on Windows. The path must
+    // be rendered without the Windows extended-length `\\?\` verbatim prefix —
+    // see `sqlite_uri_path` — because that prefix contains '?', the URL query
+    // delimiter, and would otherwise truncate the data_uri.
+    let data_uri = format!("sqlite://{}", sqlite_uri_path(&file));
 
     let adapter = RaggedSQLAdapter::new(
         data_uri.clone(),
@@ -1013,6 +1034,71 @@ mod adapter_tests {
             .unwrap();
         let read = adapter.read(&NDSlice::empty()).await.unwrap();
         assert_eq!(read.json_value, serde_json::json!([[1.0, 2.0], [3.0]]));
+    }
+
+    // boundary: a *canonicalized* writable_root. On Windows std::fs::canonicalize
+    // emits the extended-length verbatim form (\\?\C:\...) whose '?' is the URL
+    // query delimiter, so the old format!("sqlite://{}", display()) produced a
+    // data_uri sqlx rejected (managed ragged create → HTTP 500). The server
+    // canonicalizes its writable-storage root, so this is the real boundary the
+    // earlier raw-tempdir test did not cover. On Unix canonicalize adds no such
+    // prefix, so this is a happy-path no-regression there.
+    #[tokio::test]
+    async fn init_storage_ragged_sql_works_with_canonicalized_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let structure = f64_structure(vec![2], 3);
+        let init = init_storage_ragged_sql(&root, &["node".to_string()], &structure)
+            .await
+            .unwrap();
+        // The data_uri must carry no '?' before the (optional) sqlx query, else
+        // the path was truncated by the verbatim prefix.
+        let after_scheme = init.data_uri.strip_prefix("sqlite://").unwrap();
+        assert!(
+            !after_scheme.contains('?'),
+            "sqlite data_uri path must not contain '?': {}",
+            init.data_uri
+        );
+
+        // The adapter built from that data_uri must connect, write, and read back.
+        let adapter = RaggedSQLAdapter::new(
+            init.data_uri,
+            init.table_name,
+            init.dataset_id,
+            structure,
+            serde_json::json!({}),
+            vec![],
+        )
+        .unwrap();
+        adapter
+            .write(&serde_json::json!([[1.0, 2.0], [3.0]]))
+            .await
+            .unwrap();
+        let read = adapter.read(&NDSlice::empty()).await.unwrap();
+        assert_eq!(read.json_value, serde_json::json!([[1.0, 2.0], [3.0]]));
+    }
+
+    // sqlite_uri_path strips only the Windows verbatim prefix; everything else
+    // is rendered verbatim (and contains no '?').
+    #[test]
+    fn sqlite_uri_path_strips_verbatim_prefix() {
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                sqlite_uri_path(Path::new(r"\\?\C:\data\rag.sqlite")),
+                r"C:\data\rag.sqlite"
+            );
+            // A non-verbatim Windows path is unchanged.
+            assert_eq!(
+                sqlite_uri_path(Path::new(r"C:\data\rag.sqlite")),
+                r"C:\data\rag.sqlite"
+            );
+        }
+        #[cfg(unix)]
+        assert_eq!(
+            sqlite_uri_path(Path::new("/data/rag.sqlite")),
+            "/data/rag.sqlite"
+        );
     }
 
     // boundary: nested path parts place the file under the ancestor dirs; a
