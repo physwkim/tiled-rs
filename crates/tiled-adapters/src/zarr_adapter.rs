@@ -486,9 +486,14 @@ pub fn init_storage_zarr(
         .store_metadata()
         .map_err(|e| TiledError::Internal(format!("zarr store_metadata: {e}")))?;
 
-    // `store_root` is under the absolute `writable_root`, so `display()` begins
-    // with `/` and yields the `file:///abs/...` form `uri_to_path` expects.
-    let data_uri = format!("file://{}", store_root.display());
+    // Cross-platform `file://` URI for the absolute store root (forward slashes,
+    // `file:///C:/...` on Windows). See `tiled_core::file_uri`.
+    let data_uri = tiled_core::file_uri::path_to_file_uri(&store_root).ok_or_else(|| {
+        TiledError::Internal(format!(
+            "init_storage: store root is not absolute: {}",
+            store_root.display()
+        ))
+    })?;
     let asset = Asset {
         data_uri: data_uri.clone(),
         is_directory: true,
@@ -819,7 +824,10 @@ mod tests {
         assert!(store_root.is_dir(), "zarr store dir not created");
         assert_eq!(assets.len(), 1);
         assert!(assets[0].is_directory, "zarr asset must be a directory");
-        assert_eq!(data_uri, format!("file://{}", store_root.display()));
+        assert_eq!(
+            data_uri,
+            tiled_core::file_uri::path_to_file_uri(&store_root).unwrap()
+        );
 
         // Read back: zero fill, correct shape, and the multi-chunk grid recovered.
         let adapter =

@@ -5233,17 +5233,16 @@ fn parse_asset_id(params: &HashMap<String, String>) -> Result<i64, ServerError> 
 }
 
 /// Convert an asset `file://` data_uri to a filesystem path (Python
-/// `path_from_uri`, utils.py:745). `url::Url::to_file_path` handles the
-/// `file://host/path` and `file:///path` forms plus percent-decoding.
+/// `path_from_uri`, utils.py:745) via the shared cross-platform
+/// [`tiled_core::file_uri`] parser, which handles the `file://host/path` and
+/// `file:///path` forms (and `file:///C:/...` on Windows) plus percent-decoding.
 fn path_from_file_uri(uri: &str) -> Result<std::path::PathBuf, ServerError> {
     // The `file:` prefix is validated by the caller before this runs, so a
     // failure here means the stored data_uri is corrupt — a server-side data
     // integrity problem, not bad client input. Classify as Internal (500) so
     // the URI is logged server-side and not echoed to the client.
-    let url = url::Url::parse(uri)
-        .map_err(|e| ServerError::Internal(format!("invalid asset data_uri '{uri}': {e}")))?;
-    url.to_file_path()
-        .map_err(|_| ServerError::Internal(format!("asset data_uri is not a file path: {uri}")))
+    tiled_core::file_uri::file_uri_to_path(uri)
+        .ok_or_else(|| ServerError::Internal(format!("invalid asset data_uri '{uri}'")))
 }
 
 /// Shared prelude for both asset endpoints, in Python's check order

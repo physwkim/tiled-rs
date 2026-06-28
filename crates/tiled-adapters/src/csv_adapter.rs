@@ -289,10 +289,14 @@ pub fn init_storage_csv(
     let header = format!("{}\n", structure.columns.join(","));
     std::fs::write(&file, header)
         .map_err(|e| TiledError::Internal(format!("init_storage write {}: {e}", file.display())))?;
-    // `file` is under `writable_root` (absolute), so `display()` starts with
-    // `/` and `file://` + that path yields the `file:///abs/...` form the read
-    // resolver's `uri_to_path` expects.
-    let data_uri = format!("file://{}", file.display());
+    // Cross-platform `file://` URI for the absolute file path (forward slashes,
+    // `file:///C:/...` on Windows). See `tiled_core::file_uri`.
+    let data_uri = tiled_core::file_uri::path_to_file_uri(&file).ok_or_else(|| {
+        TiledError::Internal(format!(
+            "init_storage: storage path is not absolute: {}",
+            file.display()
+        ))
+    })?;
     let asset = Asset {
         data_uri: data_uri.clone(),
         is_directory: false,

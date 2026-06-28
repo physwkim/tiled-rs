@@ -140,7 +140,7 @@ async fn add_asset(cat: &Catalog, key: &str, data_uri: &str, is_directory: bool)
 }
 
 fn file_uri(path: &std::path::Path) -> String {
-    format!("file://{}", path.display())
+    tiled_core::file_uri::path_to_file_uri(path).unwrap()
 }
 
 async fn get_parts(app: &axum::Router, uri: &str) -> (StatusCode, axum::http::HeaderMap, Bytes) {

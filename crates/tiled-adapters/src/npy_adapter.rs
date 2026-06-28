@@ -309,10 +309,14 @@ pub fn init_storage_npy(
         structure.shape.clone(),
     );
     write_atomic(&file, &npy_bytes(&zeros))?;
-    // `file` is under `writable_root`, which is absolute, so `display()`
-    // begins with `/` and `file://` + that path yields the `file:///abs/...`
-    // form the read resolver's `uri_to_path` expects.
-    let data_uri = format!("file://{}", file.display());
+    // Cross-platform `file://` URI for the absolute file path (forward slashes,
+    // `file:///C:/...` on Windows). See `tiled_core::file_uri`.
+    let data_uri = tiled_core::file_uri::path_to_file_uri(&file).ok_or_else(|| {
+        TiledError::Internal(format!(
+            "init_storage: storage path is not absolute: {}",
+            file.display()
+        ))
+    })?;
     let asset = Asset {
         data_uri: data_uri.clone(),
         is_directory: false,
@@ -563,9 +567,13 @@ mod tests {
         };
         let parts = vec!["outer".to_string(), "leaf".to_string()];
         let (data_uri, assets) = init_storage_npy(root.path(), &parts, &structure).unwrap();
-        // URI is file://<root>/outer/leaf.npy and the skeleton exists.
+        // URI is the cross-platform file:// form of <root>/outer/leaf.npy and
+        // the skeleton exists.
         let expected = root.path().join("outer").join("leaf.npy");
-        assert_eq!(data_uri, format!("file://{}", expected.display()));
+        assert_eq!(
+            data_uri,
+            tiled_core::file_uri::path_to_file_uri(&expected).unwrap()
+        );
         assert!(expected.exists());
         assert_eq!(assets.len(), 1);
         assert!(!assets[0].is_directory);

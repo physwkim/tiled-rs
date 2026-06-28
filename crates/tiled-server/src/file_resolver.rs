@@ -476,22 +476,15 @@ fn sqlite_uri_to_path(uri: &str) -> std::result::Result<PathBuf, CatalogError> {
 /// skipping the scheme. (Previously a `starts_with('/')` fallback accepted
 /// scheme-less absolute paths — that bypass is N1 and is removed here.)
 ///
-/// Both authority forms decode to the absolute path that begins at the first
-/// `/` after the scheme: `file:///a/b/c` (empty authority) and
-/// `file://localhost/a/b/c` (host authority) both yield `/a/b/c`, matching
-/// `urlparse`.
+/// Both authority forms decode to the same absolute path: `file:///a/b/c`
+/// (empty authority) and `file://localhost/a/b/c` (host authority) both yield
+/// `/a/b/c`. Delegates to the shared cross-platform [`tiled_core::file_uri`]
+/// parser, so the form a write path produced (`file:///C:/...` on Windows)
+/// round-trips here.
 fn uri_to_path(uri: &str) -> std::result::Result<PathBuf, CatalogError> {
-    let rest = uri.strip_prefix("file://").ok_or_else(|| {
-        CatalogError::Validation(format!("data_uri {uri} must use the file:// scheme"))
-    })?;
-    // `rest` is `<authority><path>`; the path is everything from the first
-    // `/`. No `/` means a malformed `file://` with no absolute path.
-    match rest.find('/') {
-        Some(i) => Ok(PathBuf::from(&rest[i..])),
-        None => Err(CatalogError::Validation(format!(
-            "data_uri {uri} has no absolute file:// path"
-        ))),
-    }
+    tiled_core::file_uri::file_uri_to_path(uri).ok_or_else(|| {
+        CatalogError::Validation(format!("data_uri {uri} must be a valid file:// path"))
+    })
 }
 
 #[cfg(test)]

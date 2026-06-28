@@ -286,7 +286,14 @@ pub fn init_storage_parquet(
     writer
         .close()
         .map_err(|e| TiledError::Internal(format!("init_storage parquet close: {e}")))?;
-    let data_uri = format!("file://{}", file.display());
+    // Cross-platform `file://` URI for the absolute file path (forward slashes,
+    // `file:///C:/...` on Windows). See `tiled_core::file_uri`.
+    let data_uri = tiled_core::file_uri::path_to_file_uri(&file).ok_or_else(|| {
+        TiledError::Internal(format!(
+            "init_storage: storage path is not absolute: {}",
+            file.display()
+        ))
+    })?;
     let asset = Asset {
         data_uri: data_uri.clone(),
         is_directory: false,

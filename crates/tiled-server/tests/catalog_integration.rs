@@ -451,7 +451,7 @@ async fn delete_internally_managed_requires_external_only_false() {
     // Asset path is under the test tempdir and never created on disk, so the
     // forced delete below — which now reclaims managed file:// assets — has no
     // real file to touch (keeps the test hermetic).
-    let data_uri = format!("file://{}", dir.path().join("frame.h5").display());
+    let data_uri = tiled_core::file_uri::path_to_file_uri(&dir.path().join("frame.h5")).unwrap();
 
     // Register an array node carrying a *writable* data source.
     let register = |key: &str| {

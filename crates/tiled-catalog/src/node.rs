@@ -112,17 +112,15 @@ SELECT a.data_uri AS data_uri, a.is_directory AS is_directory
   JOIN subtree s ON ds.node_id = s.id
  WHERE ds.management <> 'external'";
 
-/// Decode a `file://` URI to its absolute path, matching the server's
-/// `uri_to_path` (tiled-server `file_resolver.rs`): strip the scheme and take
-/// everything from the first `/` after the authority. Returns `None` for any
-/// non-`file://` scheme or a URI with no path, so the caller skips assets it
-/// cannot (and must not) remove — e.g. sqlite/duckdb/postgresql storage URIs,
-/// which this port never writes. No percent-decoding, matching the read-side
-/// resolver so a stored `data_uri` maps to the same path on delete as on read.
+/// Decode a `file://` URI to its absolute path via the shared cross-platform
+/// parser ([`tiled_core::file_uri`]), the same one the server's read resolver
+/// (`uri_to_path`) and asset endpoint (`path_from_file_uri`) use, so a stored
+/// `data_uri` maps to the same path on delete as on read. Returns `None` for
+/// any non-`file://` scheme or a URI with no path, so the caller skips assets
+/// it cannot (and must not) remove — e.g. sqlite/duckdb/postgresql storage
+/// URIs, which this port never writes.
 fn file_uri_to_path(uri: &str) -> Option<PathBuf> {
-    let rest = uri.strip_prefix("file://")?;
-    let i = rest.find('/')?;
-    Some(PathBuf::from(&rest[i..]))
+    tiled_core::file_uri::file_uri_to_path(uri)
 }
 
 /// Resolve the real filesystem path to remove for a managed asset, enforcing the

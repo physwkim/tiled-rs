@@ -185,7 +185,8 @@ async fn delete_refuses_internally_managed_subtree() {
                 // Under the tempdir (never created on disk) so the forced delete
                 // below removes nothing real — keeps the test hermetic now that
                 // delete reclaims managed file:// assets.
-                data_uri: format!("file://{}", dir.path().join("frame.h5").display()),
+                data_uri: tiled_core::file_uri::path_to_file_uri(&dir.path().join("frame.h5"))
+                    .unwrap(),
                 is_directory: false,
                 parameter: "data_uri".into(),
                 num: None,
@@ -247,7 +248,7 @@ async fn delete_reclaims_managed_files_keeps_external() {
     let external_file = storage.join("external.bin");
     fs::write(&external_file, b"external-bytes").unwrap();
 
-    let file_uri = |p: &std::path::Path| format!("file://{}", p.display());
+    let file_uri = |p: &std::path::Path| tiled_core::file_uri::path_to_file_uri(p).unwrap();
 
     // container/{mfile (writable file), mdir (writable dir), ext (external file)}
     let container = cat
@@ -414,8 +415,13 @@ async fn restricted_delete_refuses_managed_asset_outside_allowed_dirs() {
         .unwrap()
         .with_managed_delete_dirs(vec![allowed.clone()]);
     cat.migrate().await.unwrap();
-    let node_id =
-        register_managed_leaf(&cat, "leaf", format!("file://{}", victim.display()), false).await;
+    let node_id = register_managed_leaf(
+        &cat,
+        "leaf",
+        tiled_core::file_uri::path_to_file_uri(&victim).unwrap(),
+        false,
+    )
+    .await;
 
     let err = cat.delete_node(node_id, false).await.unwrap_err();
     assert!(
@@ -444,8 +450,13 @@ async fn restricted_delete_allows_managed_asset_inside_allowed_dirs() {
         .unwrap()
         .with_managed_delete_dirs(vec![allowed.clone()]);
     cat.migrate().await.unwrap();
-    let node_id =
-        register_managed_leaf(&cat, "leaf", format!("file://{}", managed.display()), false).await;
+    let node_id = register_managed_leaf(
+        &cat,
+        "leaf",
+        tiled_core::file_uri::path_to_file_uri(&managed).unwrap(),
+        false,
+    )
+    .await;
 
     cat.delete_node(node_id, false).await.unwrap();
     assert!(
@@ -469,8 +480,13 @@ async fn restricted_empty_dirs_denies_managed_delete() {
         .unwrap()
         .with_managed_delete_dirs(vec![]);
     cat.migrate().await.unwrap();
-    let node_id =
-        register_managed_leaf(&cat, "leaf", format!("file://{}", victim.display()), false).await;
+    let node_id = register_managed_leaf(
+        &cat,
+        "leaf",
+        tiled_core::file_uri::path_to_file_uri(&victim).unwrap(),
+        false,
+    )
+    .await;
 
     let err = cat.delete_node(node_id, false).await.unwrap_err();
     assert!(
@@ -494,8 +510,13 @@ async fn restricted_delete_skips_absent_managed_file() {
         .unwrap()
         .with_managed_delete_dirs(vec![]);
     cat.migrate().await.unwrap();
-    let node_id =
-        register_managed_leaf(&cat, "leaf", format!("file://{}", missing.display()), false).await;
+    let node_id = register_managed_leaf(
+        &cat,
+        "leaf",
+        tiled_core::file_uri::path_to_file_uri(&missing).unwrap(),
+        false,
+    )
+    .await;
 
     cat.delete_node(node_id, false).await.unwrap();
     assert!(
@@ -523,7 +544,7 @@ async fn write_validate_refuses_managed_uri_outside_allowed_dirs() {
         .with_managed_delete_dirs(vec![allowed]);
 
     // Not-yet-created leaf under an out-of-storage dir.
-    let uri = format!("file://{}", outside.join("new.bin").display());
+    let uri = tiled_core::file_uri::path_to_file_uri(&outside.join("new.bin")).unwrap();
     let err = cat.validate_managed_data_uri(&uri).unwrap_err();
     assert!(
         matches!(err, tiled_catalog::CatalogError::Validation(ref m) if m.contains("outside the configured storage")),
@@ -546,13 +567,18 @@ async fn write_validate_allows_managed_uri_inside_allowed_dirs() {
         .unwrap()
         .with_managed_delete_dirs(vec![allowed.clone()]);
 
-    let uri = format!("file://{}", allowed.join("sub/new.bin").display());
+    let uri = tiled_core::file_uri::path_to_file_uri(&allowed.join("sub/new.bin")).unwrap();
     cat.validate_managed_data_uri(&uri)
         .expect("in-storage not-yet-created managed asset must validate");
 }
 
-/// A `..` component is rejected outright (it could escape the allow-list once a
-/// non-existent tail is joined); a managed write path never needs one.
+/// A managed `data_uri` that uses `..` to climb out of the allow-list is
+/// refused. The shared cross-platform parser ([`tiled_core::file_uri`])
+/// canonicalizes the URI per RFC 3986, collapsing `..` segments, so
+/// `<allowed>/../secret.bin` resolves to a sibling of `allowed` and is caught by
+/// the containment gate (rather than by `resolve_write_target`'s literal `..`
+/// check, which a normalized path can no longer reach). The security property —
+/// the escape is refused — is unchanged; only the failing gate differs.
 #[tokio::test]
 async fn write_validate_rejects_parent_dir_escape() {
     use std::fs;
@@ -565,10 +591,10 @@ async fn write_validate_rejects_parent_dir_escape() {
         .unwrap()
         .with_managed_delete_dirs(vec![allowed.clone()]);
 
-    let uri = format!("file://{}", allowed.join("../secret.bin").display());
+    let uri = tiled_core::file_uri::path_to_file_uri(&allowed.join("../secret.bin")).unwrap();
     let err = cat.validate_managed_data_uri(&uri).unwrap_err();
     assert!(
-        matches!(err, tiled_catalog::CatalogError::Validation(ref m) if m.contains("must not contain '..'")),
+        matches!(err, tiled_catalog::CatalogError::Validation(ref m) if m.contains("outside the configured storage directories")),
         "a parent-dir escape must be refused, got {err:?}"
     );
 }
