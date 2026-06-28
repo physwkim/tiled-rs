@@ -9,6 +9,43 @@ This is the first changelog for the project; the `[0.1.1]` entry summarizes the
 work merged on the `catalog-m4-async-container` branch since the `v0.1.0` tag
 (124 commits). Earlier history is not retroactively itemized.
 
+## [0.1.2] - 2026-06-29
+
+Cross-platform release: continuous integration on Linux, macOS, and Windows, and
+the build/runtime fixes to make the full test suite green on all three. No API
+changes — this is a bug-fix release over `0.1.1`.
+
+### Added
+
+- **CI**: GitHub Actions workflow — `rustfmt` + `clippy` (warnings as errors) on
+  one host, and a `cargo nextest` test matrix across `ubuntu-latest`,
+  `macos-latest`, and `windows-latest` (default, pure-Rust feature set), plus a
+  `tiled-serialization` `hdf5`-feature job. nextest runs with `--no-fail-fast`
+  so a single failure does not mask the rest of the cross-platform surface.
+
+### Fixed
+
+- **Windows/Linux link — duplicate `LZ4F_*` C symbols**: two providers of the
+  liblz4 frame ABI in one binary (`lz4-sys` via `blosc-src`, and `lz4-pure-rs`
+  via `blosc2-pure-rs`) collided at link time. Resolved per target —
+  `-Wl,--allow-multiple-definition` on Linux, `/FORCE:MULTIPLE` on Windows MSVC.
+- **Windows compile**: cfg-gate the `SIGTERM` handler so non-Unix targets build.
+- **Cross-platform `file://` data_uri**: build and parse managed-asset `file://`
+  URIs through the `url` crate so they round-trip on Windows (`file:///C:/...`)
+  instead of the Unix-only `format!("file://{}")`; `file_uri_to_path` now rejects
+  a host authority before `to_file_path`, removing a Windows panic on
+  `file://host/...`.
+- **Windows ragged-SQL writes**: `sqlite_uri_to_path` accepts drive-letter
+  absolute paths (`C:\...`) instead of requiring a leading `/`; the `sqlite://`
+  data_uri is built with the Windows extended-length `\\?\` verbatim prefix
+  stripped, so its `?` is not mis-parsed as a sqlx query delimiter (managed
+  ragged creates returned HTTP 500 on Windows).
+- **Asset download traversal guard**: reject a `relative_path` that is absolute
+  under either OS convention (a POSIX `/...` root or a Windows `\...`/drive
+  path), not just `std::Path::is_absolute`, which is platform-specific.
+- **Clippy 1.96**: `checked_div` for sparse `nnz`; `sort_by_key` over a manual
+  `sort_by`.
+
 ## [0.1.1] - 2026-06-28
 
 This release fills in the **write path**, a set of new **read adapters** and
@@ -123,5 +160,6 @@ bringing the server and client substantially closer to Python `tiled` parity.
 - Drop the query string from the request trace span (L2).
 - Keep the OIDC test `TempDir` alive to fix a `SQLITE_CANTOPEN` flake.
 
+[0.1.2]: https://github.com/physwkim/tiled-rs/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/physwkim/tiled-rs/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/physwkim/tiled-rs/releases/tag/v0.1.0

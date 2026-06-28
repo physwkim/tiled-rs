@@ -5401,7 +5401,7 @@ dependencies = [
 
 [[package]]
 name = "tiled"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -5415,7 +5415,7 @@ dependencies = [
 
 [[package]]
 name = "tiled-access"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5429,7 +5429,7 @@ dependencies = [
 
 [[package]]
 name = "tiled-adapters"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "arrow",
  "base64",
@@ -5459,7 +5459,7 @@ dependencies = [
 
 [[package]]
 name = "tiled-auth"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "argon2",
@@ -5490,7 +5490,7 @@ dependencies = [
 
 [[package]]
 name = "tiled-catalog"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5509,7 +5509,7 @@ dependencies = [
 
 [[package]]
 name = "tiled-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -5540,7 +5540,7 @@ dependencies = [
 
 [[package]]
 name = "tiled-client"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "arrow",
@@ -5586,7 +5586,7 @@ dependencies = [
 
 [[package]]
 name = "tiled-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "arrow",
  "base64",
@@ -5602,7 +5602,7 @@ dependencies = [
 
 [[package]]
 name = "tiled-mongo"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "arrow",
  "base64",
@@ -5623,7 +5623,7 @@ dependencies = [
 
 [[package]]
 name = "tiled-serialization"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "arrow",
  "base64",
@@ -5649,7 +5649,7 @@ dependencies = [
 
 [[package]]
 name = "tiled-server"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "arrow",
  "axum",
@@ -5693,7 +5693,7 @@ dependencies = [
 
 [[package]]
 name = "tiled-web"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "askama",
  "axum",

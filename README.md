@@ -1,6 +1,10 @@
 # tiled-rs
 
+[![CI](https://github.com/physwkim/tiled-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/physwkim/tiled-rs/actions/workflows/ci.yml)
+
 Rust port of [Tiled](https://github.com/bluesky/tiled) — a structured scientific data access service from Brookhaven National Laboratory.
+
+Builds and tests on Linux, macOS, and Windows with the default, pure-Rust feature set (rustls TLS, bundled SQLite, pure-Rust HDF5/NetCDF/Excel/Mongo client).
 
 ## Benchmark: Python Tiled vs tiled-rs
 
