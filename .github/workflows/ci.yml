@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+# A newer push to the same ref cancels the in-flight run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # Format + lint on a single OS (cheap, fast feedback). Warnings are errors.
+  lint:
+    name: lint (fmt + clippy)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: rustfmt
+        run: cargo fmt --all --check
+      - name: clippy (default features)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: clippy (tiled-serialization, hdf5 feature)
+        run: cargo clippy -p tiled-serialization --all-targets --locked --features hdf5 -- -D warnings
+
+  # Build + test on all three host platforms with the DEFAULT feature set.
+  # Default features are pure-Rust end to end: rustls TLS (no OpenSSL), bundled
+  # SQLite + pure-Rust Postgres via sqlx, pure-Rust HDF5/NetCDF/Excel/Mongo
+  # client. The native-library features are intentionally NOT built here —
+  # `saml` needs libxml2 + xmlsec1, `pam` binds the system libpam and is
+  # Unix-only — so `--all-features` is deliberately avoided to keep the matrix
+  # green on Windows without per-OS system-library provisioning.
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+      - name: build (default features)
+        run: cargo build --workspace --locked
+      - name: test (default features)
+        run: cargo nextest run --workspace --locked
+      - name: test (tiled-serialization, hdf5 feature — pure-Rust)
+        run: cargo nextest run -p tiled-serialization --locked --features hdf5
+      - name: doctests (default features)
+        run: cargo test --doc --workspace --locked
