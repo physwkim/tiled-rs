@@ -19,7 +19,7 @@ exclude = ["crates/tiled-web-spa"]
 resolver = "3"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "BSD-3-Clause"
 
