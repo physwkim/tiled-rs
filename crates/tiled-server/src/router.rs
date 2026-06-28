@@ -5309,7 +5309,14 @@ pub async fn get_asset_bytes(
                  manifest provided by /asset/manifest/...?id={asset_id}"
             )));
         };
-        if std::path::Path::new(rel).is_absolute() {
+        // Reject an absolute path under *either* OS convention. std::Path's
+        // is_absolute() is platform-specific — on Windows a POSIX "/etc/passwd"
+        // is not "absolute", so it would slip past this guard and `join` below
+        // would resolve it to a real on-disk path (404 instead of the intended
+        // 400). A leading '/' or '\\' covers the POSIX/UNC roots; a Windows
+        // drive-letter path ("C:\\...") is caught by is_absolute on Windows.
+        if std::path::Path::new(rel).is_absolute() || rel.starts_with('/') || rel.starts_with('\\')
+        {
             return Err(ServerError::BadRequest(
                 "relative_path query parameter must be a *relative* path".into(),
             ));
