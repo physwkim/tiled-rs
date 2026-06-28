@@ -405,6 +405,9 @@ fn build_demo_tree() -> MapAdapter {
 async fn shutdown_signal() {
     let ctrl_c = tokio::signal::ctrl_c();
 
+    // SIGTERM is Unix-only; `tokio::signal::unix` does not exist on Windows, so
+    // gate it by target. Non-Unix platforms fall back to Ctrl-C (SIGINT).
+    #[cfg(unix)]
     match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
         Ok(mut sigterm) => {
             tokio::select! {
@@ -417,6 +420,12 @@ async fn shutdown_signal() {
             let _ = ctrl_c.await;
             tracing::info!("Received SIGINT, shutting down gracefully");
         }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = ctrl_c.await;
+        tracing::info!("Received Ctrl-C, shutting down gracefully");
     }
 }
 
