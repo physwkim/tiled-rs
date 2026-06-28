@@ -57,9 +57,12 @@ jobs:
       - uses: taiki-e/install-action@nextest
       - name: build (default features)
         run: cargo build --workspace --locked
+      # `--no-fail-fast`: run every test and report all failures, instead of
+      # nextest aborting at the first one (which hides the rest of the surface,
+      # especially during cross-platform bring-up).
       - name: test (default features)
-        run: cargo nextest run --workspace --locked
+        run: cargo nextest run --workspace --locked --no-fail-fast
       - name: test (tiled-serialization, hdf5 feature — pure-Rust)
-        run: cargo nextest run -p tiled-serialization --locked --features hdf5
+        run: cargo nextest run -p tiled-serialization --locked --features hdf5 --no-fail-fast
       - name: doctests (default features)
         run: cargo test --doc --workspace --locked
