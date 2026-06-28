@@ -36,20 +36,29 @@ rustflags = ["-L", "native=/opt/homebrew/opt/libxml2/lib"]
 [target.'cfg(all(target_os = "macos", target_arch = "x86_64"))']
 rustflags = ["-L", "native=/usr/local/opt/libxml2/lib"]
 
-# Linux only: tolerate duplicate C `LZ4F_*` symbols at link time.
+# Linux (GNU/LLD) and Windows (MSVC link.exe): tolerate duplicate C `LZ4F_*`
+# symbols at link time.
 #
-# `zarrs`'s default `blosc` codec pulls `blosc-src` (the C blosc1 bindings). That
-# crate compiles blosc1's vendored `internal-complibs` LZ4 (including lz4frame.c
-# → `LZ4F_*`) AND links `lz4-sys` (which also exports `LZ4F_*`), so one binary
-# ends up with two definitions of every `LZ4F_*`. The macOS linker (ld64) and the
-# MSVC linker tolerate this (first definition wins); GNU/LLD on Linux rejects it
-# with "duplicate symbol", which broke the Linux test-binary link in CI while
-# macOS/Windows were unaffected.
+# One binary ends up with TWO providers of the C `LZ4F_*` frame ABI:
+#   1. `lz4-sys` (C liblz4, `lz4frame.c`) <- `blosc-src` (C blosc1 bindings)
+#      <- `zarrs`'s default `blosc` codec.
+#   2. `lz4-pure-rs` (pure-Rust, but exports the SAME C `LZ4F_*` ABI as a drop-in;
+#      its lib is named `lz4`) <- `blosc2-pure-rs` <- `tiled-server` directly.
+# So `LZ4F_compressBegin` & friends are each defined twice. Confirmed in CI on both
+# OSes: the C `lz4frame.o` from `liblz4_sys` vs the `lz4` codegen unit from
+# `lz4-pure-rs` (`liblz4-*.rlib`). macOS's ld64 tolerates this (first definition
+# wins); GNU/LLD on Linux rejects it as "duplicate symbol" and MSVC link.exe
+# rejects it as `LNK2005` "already defined" (exit 1169) — both broke the
+# test-binary link in CI while macOS was unaffected.
 #
-# Both copies are the same upstream liblz4, so letting the first win is safe.
-# `--allow-multiple-definition` restores the macOS/Windows behavior on Linux and
-# keeps blosc-compressed zarr readable (Python-tiled parity) without forking
-# zarrs or dropping the codec. rust-hdf5's own lz4/blosc are pure-Rust
-# (lz4_flex/lz4-pure-rs) with no C `LZ4F_*` symbols, so they are not involved.
+# Both copies are the same upstream liblz4 frame format, so letting the first win
+# is safe. `--allow-multiple-definition` (GNU/LLD) and `/FORCE:MULTIPLE` (MSVC)
+# restore ld64's first-wins behavior, keeping blosc-compressed zarr readable
+# (Python-tiled parity) without forking either crate or dropping a codec. Note:
+# rust-hdf5's pure-Rust lz4/blosc crates are NOT exempt here — `lz4-pure-rs`
+# (via `blosc2-pure-rs`) is one of the two conflicting providers, not a bystander.
 [target.'cfg(target_os = "linux")']
 rustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition"]
+
+[target.'cfg(all(target_os = "windows", target_env = "msvc"))']
+rustflags = ["-C", "link-arg=/FORCE:MULTIPLE"]
