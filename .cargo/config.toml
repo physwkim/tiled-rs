@@ -35,3 +35,21 @@ rustflags = ["-L", "native=/opt/homebrew/opt/libxml2/lib"]
 
 [target.'cfg(all(target_os = "macos", target_arch = "x86_64"))']
 rustflags = ["-L", "native=/usr/local/opt/libxml2/lib"]
+
+# Linux only: tolerate duplicate C `LZ4F_*` symbols at link time.
+#
+# `zarrs`'s default `blosc` codec pulls `blosc-src` (the C blosc1 bindings). That
+# crate compiles blosc1's vendored `internal-complibs` LZ4 (including lz4frame.c
+# → `LZ4F_*`) AND links `lz4-sys` (which also exports `LZ4F_*`), so one binary
+# ends up with two definitions of every `LZ4F_*`. The macOS linker (ld64) and the
+# MSVC linker tolerate this (first definition wins); GNU/LLD on Linux rejects it
+# with "duplicate symbol", which broke the Linux test-binary link in CI while
+# macOS/Windows were unaffected.
+#
+# Both copies are the same upstream liblz4, so letting the first win is safe.
+# `--allow-multiple-definition` restores the macOS/Windows behavior on Linux and
+# keeps blosc-compressed zarr readable (Python-tiled parity) without forking
+# zarrs or dropping the codec. rust-hdf5's own lz4/blosc are pure-Rust
+# (lz4_flex/lz4-pure-rs) with no C `LZ4F_*` symbols, so they are not involved.
+[target.'cfg(target_os = "linux")']
+rustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition"]
