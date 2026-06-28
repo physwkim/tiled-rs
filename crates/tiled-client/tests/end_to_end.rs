@@ -169,7 +169,7 @@ async fn read_full_sparse_assembles_all_blocks() {
     let mut got: Vec<((i64, i64), f64)> = (0..block.data.len())
         .map(|i| ((block.coords[0][i], block.coords[1][i]), block.data[i]))
         .collect();
-    got.sort_by(|a, b| a.0.cmp(&b.0));
+    got.sort_by_key(|a| a.0);
     assert_eq!(
         got,
         vec![((1, 1), 10.0), ((2, 2), 20.0)],
