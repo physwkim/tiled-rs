@@ -491,6 +491,10 @@ fn uri_to_path(uri: &str) -> std::result::Result<PathBuf, CatalogError> {
 mod tests {
     use super::*;
 
+    // The decoded path string is platform-specific: a drive-less `/data/...`
+    // is absolute on Unix but not on Windows (`to_file_path` needs a drive),
+    // so each platform asserts its own absolute form.
+    #[cfg(unix)]
     #[test]
     fn uri_to_path_accepts_empty_authority() {
         assert_eq!(
@@ -499,12 +503,32 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn uri_to_path_accepts_empty_authority() {
+        assert_eq!(
+            uri_to_path("file:///C:/data/scan001.h5").unwrap(),
+            PathBuf::from(r"C:\data\scan001.h5")
+        );
+    }
+
+    // file://localhost/... -> same path as file:///... (url strips localhost),
+    // matching Python's urlparse; the decoded path is platform-specific.
+    #[cfg(unix)]
     #[test]
     fn uri_to_path_strips_host_authority() {
-        // file://localhost/a/b -> /a/b, matching Python's urlparse.
         assert_eq!(
             uri_to_path("file://localhost/a/b").unwrap(),
             PathBuf::from("/a/b")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn uri_to_path_strips_host_authority() {
+        assert_eq!(
+            uri_to_path("file://localhost/C:/a/b").unwrap(),
+            PathBuf::from(r"C:\a\b")
         );
     }
 

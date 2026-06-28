@@ -616,9 +616,14 @@ async fn write_validate_empty_dirs_denies() {
         .await
         .unwrap()
         .with_managed_delete_dirs(vec![]);
-    let err = cat
-        .validate_managed_data_uri("file:///some/where.bin")
-        .unwrap_err();
+    // The data_uri must decode to a real absolute file path on the host
+    // platform, else it is treated as non-managed and accepted unchanged. A
+    // drive-less `/some/...` is absolute on Unix but not on Windows.
+    #[cfg(unix)]
+    let managed_uri = "file:///some/where.bin";
+    #[cfg(windows)]
+    let managed_uri = "file:///C:/some/where.bin";
+    let err = cat.validate_managed_data_uri(managed_uri).unwrap_err();
     assert!(
         matches!(err, tiled_catalog::CatalogError::Validation(_)),
         "empty Restricted scope must deny managed register, got {err:?}"

@@ -88,6 +88,11 @@ mod tests {
     // --- parse semantics (ported from the tiled-server uri_to_path tests so the
     //     unified helper keeps the same security-relevant behavior) ---
 
+    // An empty authority decodes to the host's absolute path. The path string
+    // is platform-specific: a drive-less `/data/...` is a valid absolute path on
+    // Unix but not on Windows (no drive letter), so `to_file_path()` only
+    // accepts the drive-letter form there.
+    #[cfg(unix)]
     #[test]
     fn accepts_empty_authority() {
         assert_eq!(
@@ -96,13 +101,33 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn accepts_empty_authority() {
+        assert_eq!(
+            file_uri_to_path("file:///C:/data/scan001.h5"),
+            Some(PathBuf::from(r"C:\data\scan001.h5"))
+        );
+    }
+
+    // file://localhost/... -> the same path as file:///... (url strips the
+    // localhost host), matching Python's urlparse. The decoded path is
+    // platform-specific for the same reason as `accepts_empty_authority`.
     #[cfg(unix)]
     #[test]
     fn strips_host_authority() {
-        // file://localhost/a/b -> /a/b, matching Python's urlparse.
         assert_eq!(
             file_uri_to_path("file://localhost/a/b"),
             Some(PathBuf::from("/a/b"))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn strips_host_authority() {
+        assert_eq!(
+            file_uri_to_path("file://localhost/C:/a/b"),
+            Some(PathBuf::from(r"C:\a\b"))
         );
     }
 
