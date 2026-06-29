@@ -247,9 +247,9 @@ impl ContainerClient {
     /// builder covers equality, inequality, and numeric comparisons.
     ///
     /// ```no_run
-    /// use crate::client::queries::{FullText, Key};
-    /// # use crate::client::ContainerClient;
-    /// # async fn run(c: ContainerClient) -> crate::client::Result<()> {
+    /// use tiled_rs::client::queries::{FullText, Key};
+    /// # use tiled_rs::client::ContainerClient;
+    /// # async fn run(c: ContainerClient) -> tiled_rs::client::Result<()> {
     /// let items = c.search(Key::new("color").eq("red")).keys().await?;
     /// # Ok(()) }
     /// ```

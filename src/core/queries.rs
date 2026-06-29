@@ -670,7 +670,7 @@ fn decode_single_query(
 /// Builder for metadata key queries (mirrors Python `Key` class).
 ///
 /// ```
-/// use crate::core::queries::{Key, Query};
+/// use tiled_rs::core::queries::{Key, Query};
 ///
 /// let q = Key::new("color").eq("red");
 /// let q = Key::new("temperature").gt(300);

@@ -8,9 +8,9 @@
 //! ## Quickstart
 //!
 //! ```no_run
-//! use crate::client::from_uri;
+//! use tiled_rs::client::from_uri;
 //!
-//! # async fn run() -> crate::client::Result<()> {
+//! # async fn run() -> tiled_rs::client::Result<()> {
 //! let client = from_uri("http://localhost:8000").await?;
 //! let root = client.into_container()?;
 //! for key in root.keys().await? {

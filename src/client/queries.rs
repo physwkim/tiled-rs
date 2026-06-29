@@ -15,9 +15,9 @@
 //! # Examples
 //!
 //! ```no_run
-//! use crate::client::queries::{FullText, Key, Query, Regex, StructureFamily, StructureFamilyQuery};
-//! # use crate::client::ContainerClient;
-//! # async fn run(c: ContainerClient) -> crate::client::Result<()> {
+//! use tiled_rs::client::queries::{FullText, Key, Query, Regex, StructureFamily, StructureFamilyQuery};
+//! # use tiled_rs::client::ContainerClient;
+//! # async fn run(c: ContainerClient) -> tiled_rs::client::Result<()> {
 //! // Full-text search
 //! let items = c.clone().search(Query::FullText(FullText { text: "hello".into() })).keys().await?;
 //! // Key equality
