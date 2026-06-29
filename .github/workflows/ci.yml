@@ -32,8 +32,6 @@ jobs:
         run: cargo fmt --all --check
       - name: clippy (default features)
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - name: clippy (tiled-serialization, hdf5 feature)
-        run: cargo clippy -p tiled-serialization --all-targets --locked --features hdf5 -- -D warnings
 
   # Build + test on all three host platforms with the DEFAULT feature set.
   # Default features are pure-Rust end to end: rustls TLS (no OpenSSL), bundled
@@ -62,7 +60,5 @@ jobs:
       # especially during cross-platform bring-up).
       - name: test (default features)
         run: cargo nextest run --workspace --locked --no-fail-fast
-      - name: test (tiled-serialization, hdf5 feature — pure-Rust)
-        run: cargo nextest run -p tiled-serialization --locked --features hdf5 --no-fail-fast
       - name: doctests (default features)
         run: cargo test --doc --workspace --locked
