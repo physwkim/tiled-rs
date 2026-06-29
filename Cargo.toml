@@ -253,7 +253,7 @@ percent-encoding = "2"
 hmac = "0.12"
 json-patch = "3"
 zip = "2"
-rust-embed = "8"
+rust-embed = { version = "8", features = ["interpolate-folder-path"] }
 mime_guess = "2"
 askama = "0.12"
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }

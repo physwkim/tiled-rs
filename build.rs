@@ -1,15 +1,18 @@
 //! Drive the WASM SPA build at host-crate compile time.
 //!
-//! `assets/spa/` is gitignored — populated fresh on every build:
+//! The bundle is staged into `$OUT_DIR/spa/` — never the source tree, so
+//! `cargo publish`'s "build script modified the package" check stays
+//! happy. Populated fresh on every build:
 //!   * if `trunk` is on PATH and the sibling `tiled-web-spa/` crate
 //!     exists, run `trunk build --release` and copy `dist/*` into
-//!     `assets/spa/`;
+//!     `$OUT_DIR/spa/`;
 //!   * otherwise copy the committed `assets/spa-placeholder/` (a static
-//!     HTML/CSS shell) into `assets/spa/`.
+//!     HTML/CSS shell) into `$OUT_DIR/spa/`.
 //!
-//! Either way, `rust-embed` finds a populated directory at compile
-//! time. Set `TILED_SKIP_SPA_BUILD=1` to bypass — useful in CI when the
-//! bundle is already pre-staged in `assets/spa/`.
+//! Either way, `rust-embed` finds a populated directory (it embeds from
+//! `$OUT_DIR/spa/` via folder-path interpolation) at compile time. Set
+//! `TILED_SKIP_SPA_BUILD=1` to bypass — useful when the bundle is already
+//! pre-staged in `$OUT_DIR/spa/`.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -22,13 +25,17 @@ fn main() {
     if std::env::var_os("CARGO_FEATURE_WEB").is_none() {
         return;
     }
+    // OUT_DIR is the only directory a build script may write to; staging the
+    // SPA bundle here (not under the source tree) is what lets `cargo publish`
+    // verify the tarball without flagging a modified source directory.
+    let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR set by cargo"));
+    let dst = out_dir.join("spa");
     if std::env::var_os("TILED_SKIP_SPA_BUILD").is_some() {
-        println!("cargo:warning=TILED_SKIP_SPA_BUILD set; reusing existing assets/spa/");
+        println!("cargo:warning=TILED_SKIP_SPA_BUILD set; reusing existing $OUT_DIR/spa/");
         return;
     }
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let spa_crate = manifest_dir.join("crates").join("tiled-web-spa");
-    let dst = manifest_dir.join("assets").join("spa");
     let placeholder = manifest_dir.join("assets").join("spa-placeholder");
 
     println!("cargo:rerun-if-changed=assets/spa-placeholder");
@@ -58,12 +65,12 @@ fn main() {
             panic!("trunk build failed (status={status})");
         }
         let dist = spa_crate.join("dist");
-        wipe_and_copy(&dist, &dst).expect("copy dist -> assets/spa");
+        wipe_and_copy(&dist, &dst).expect("copy dist -> $OUT_DIR/spa");
     } else {
         if spa_crate.exists() {
             println!("cargo:warning=trunk not in PATH; falling back to assets/spa-placeholder/");
         }
-        wipe_and_copy(&placeholder, &dst).expect("copy spa-placeholder -> assets/spa");
+        wipe_and_copy(&placeholder, &dst).expect("copy spa-placeholder -> $OUT_DIR/spa");
     }
 }
 

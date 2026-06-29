@@ -1,6 +1,6 @@
 //! Embedded SPA bundle.
 //!
-//! Compile-time embed of `assets/spa/`. The directory is populated by
+//! Compile-time embed of `$OUT_DIR/spa/`. The directory is populated by
 //! `build.rs`: `trunk build` output if trunk is on PATH, otherwise the
 //! committed `assets/spa-placeholder/` is copied in. Routes:
 //!   - `GET /` → `index.html`
@@ -23,7 +23,7 @@ use axum::{
 use rust_embed::RustEmbed;
 
 #[derive(RustEmbed)]
-#[folder = "assets/spa/"]
+#[folder = "$OUT_DIR/spa/"]
 struct SpaAssets;
 
 #[derive(Clone)]
