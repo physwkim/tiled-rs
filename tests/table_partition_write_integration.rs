@@ -7,13 +7,11 @@
 //! Uses the CSV backend (always present) against a SQLite catalog + real
 //! FileLeafResolver with a configured writable-storage root.
 
-// Every test here drives the CSV table backend, which is the default table
-// serialization only when the parquet table backend is off. With
-// `parquet-adapter` enabled (a crate default) the parquet path is the default
-// and these CSV-specific assertions do not apply — gate the whole file so its
-// helpers compile out alongside its tests (each test is already
-// `#[cfg(not(feature = "parquet-adapter"))]`).
-#![cfg(not(feature = "parquet-adapter"))]
+// Every test here pins `mimetype: text/csv` on the created node (see
+// `create_table_body`), so the CSV table backend is exercised regardless of
+// which table writer is the build's *default*. These assertions are a
+// backend-independent round-trip (write rows, read them back), so they run
+// under the default features even with `parquet-adapter` enabled.
 
 use std::sync::Arc;
 
@@ -133,7 +131,6 @@ async fn send(app: &axum::Router, req: Request<Body>) -> (StatusCode, Vec<u8>) {
 }
 
 /// PUT /table/partition: overwrite partition 0, then read back via GET.
-#[cfg(not(feature = "parquet-adapter"))]
 #[tokio::test]
 async fn put_table_partition_write_then_read() {
     let (app, _writable_dir, _db_dir) = build_write_app().await;
@@ -204,7 +201,6 @@ async fn put_table_partition_write_then_read() {
 }
 
 /// PUT /table/partition out-of-range index returns 400.
-#[cfg(not(feature = "parquet-adapter"))]
 #[tokio::test]
 async fn put_table_partition_oob_returns_400() {
     let (app, _writable_dir, _db_dir) = build_write_app().await;
@@ -246,7 +242,6 @@ async fn put_table_partition_oob_returns_400() {
 }
 
 /// PATCH /table/partition: write then append, verify accumulated rows.
-#[cfg(not(feature = "parquet-adapter"))]
 #[tokio::test]
 async fn patch_table_partition_append_rows() {
     let (app, _writable_dir, _db_dir) = build_write_app().await;

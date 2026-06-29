@@ -293,9 +293,18 @@ fn build_leaf_adapter(
             }
         }
         "application/vnd.apache.arrow.file" => {
-            let adapter = crate::adapters::ArrowIpcAdapter::from_path(path, metadata)
-                .map_err(|e| CatalogError::Validation(e.to_string()))?;
-            AnyAdapter::Table(Arc::new(adapter))
+            #[cfg(feature = "arrow-ipc")]
+            {
+                let adapter = crate::adapters::ArrowIpcAdapter::from_path(path, metadata)
+                    .map_err(|e| CatalogError::Validation(e.to_string()))?;
+                AnyAdapter::Table(Arc::new(adapter))
+            }
+            #[cfg(not(feature = "arrow-ipc"))]
+            {
+                return Err(CatalogError::Validation(
+                    "arrow IPC support not built in".into(),
+                ));
+            }
         }
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => {
             #[cfg(feature = "excel-adapter")]

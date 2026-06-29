@@ -157,7 +157,7 @@ default = [
     "image", "image-serializer", "tiff", "tiff-adapter",
     "hdf5", "hdf5-adapter", "hdf5-serializer", "netcdf-adapter",
     "zarr", "zarr-adapter", "excel-adapter", "sql-adapter",
-    "sqlite", "oidc", "ldap", "web", "npy",
+    "sqlite", "ldap", "web", "npy",
 ]
 
 # --- serializers / always-pure-Rust toggles (deps now non-optional) ---
@@ -197,7 +197,10 @@ npy = ["dep:ndarray"]
 web = []
 
 # --- authentication ---
-oidc = []
+# OIDC (external SSO: code/device flows) is always built in: it pulls no extra
+# dependencies (reqwest/jwt/serde are non-optional) and the server/CLI assume it
+# is present, so a toggle would be fiction. ldap/saml/pam stay opt-in because
+# they each gate a real dependency.
 ldap = ["dep:ldap3"]
 # opt-in: system C libraries / not available on Windows
 saml = ["dep:samael"]

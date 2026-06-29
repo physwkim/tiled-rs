@@ -19,7 +19,6 @@ pub mod authenticator;
 pub mod db;
 pub mod device_code;
 pub mod error;
-#[cfg(feature = "oidc")]
 pub mod external_oidc;
 pub mod jwt;
 /// LDAP username/password authenticator. Gated on `ldap` (pure-Rust `ldap3`).
@@ -27,19 +26,14 @@ pub mod jwt;
 pub mod ldap;
 pub mod migrate;
 /// OIDC authorization-code (PKCE browser) flow — DB-backed pending-state store
-/// (G6). Gated on `oidc`; the `0008_add_oidc_flow_states` migration runs
-/// unconditionally (a harmless empty table when the feature is off).
-#[cfg(feature = "oidc")]
+/// (G6). The `0008_add_oidc_flow_states` migration runs unconditionally.
 pub mod oidc_flow;
 /// PAM (Pluggable Authentication Modules) username/password authenticator.
 /// Gated on `pam`, which links the system `libpam`.
 #[cfg(feature = "pam")]
 pub mod pam;
-/// IdP-brokered OAuth2 device-code flow (pending-session store). Gated on
-/// `oidc` because it is meaningful only with an external OIDC provider; the
-/// `0007_add_pending_sessions` migration runs unconditionally (a harmless
-/// empty table when the feature is off).
-#[cfg(feature = "oidc")]
+/// IdP-brokered OAuth2 device-code flow (pending-session store). The
+/// `0007_add_pending_sessions` migration runs unconditionally.
 pub mod pending_session;
 pub mod principal;
 #[cfg(feature = "saml")]
@@ -51,7 +45,6 @@ pub use api_key::{ApiKeyCreate, ApiKeyRecord, KeyMaterial};
 pub use authenticator::{Authenticator, DummyAuthenticator, ProxiedHeaderAuthenticator, Subject};
 pub use db::AuthDb;
 pub use error::{AuthError, Result};
-#[cfg(feature = "oidc")]
 pub use external_oidc::{
     AuthorizeRedirect, CodeFlowSession, ExternalOidcValidator, IdentityMapping, OidcDiscovery,
     OidcProvider, ValidatedToken, discover_oidc,
@@ -59,11 +52,9 @@ pub use external_oidc::{
 pub use jwt::{AccessClaims, Issuer, RefreshClaims};
 #[cfg(feature = "ldap")]
 pub use ldap::{LdapAuthenticator, LdapConfig};
-#[cfg(feature = "oidc")]
 pub use oidc_flow::OidcFlowState;
 #[cfg(feature = "pam")]
 pub use pam::{PamAuthenticator, PamConfig};
-#[cfg(feature = "oidc")]
 pub use pending_session::{PendingSessionInit, PendingSessionRecord, PendingSessionStatus};
 pub use principal::{Identity, IdentityView, Principal, PrincipalDetail};
 #[cfg(feature = "saml")]

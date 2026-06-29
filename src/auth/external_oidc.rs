@@ -32,8 +32,6 @@
 //! where the two requests land on different processes. This validator is
 //! stateless w.r.t. the flow — it only builds URLs and exchanges codes.
 
-#![cfg(feature = "oidc")]
-
 use std::collections::HashMap;
 use std::sync::Arc;
 
