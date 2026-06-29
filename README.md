@@ -54,17 +54,33 @@ curl http://localhost:8000/api/v1/search/    # Browse entries
 
 ## Project Structure
 
+A single crate (`tiled-rs`, library name `tiled_rs`) that builds the `tiled`
+binary. Each subsystem is a module under `src/`:
+
 ```
 tiled-rs/
+├── src/
+│   ├── lib.rs            # Library crate root (module declarations)
+│   ├── main.rs           # Binary entry point (the `tiled` CLI)
+│   ├── core/             # Types, traits, schemas, wire format, queries
+│   ├── serialization/    # Serialization registry (JSON, CSV, Arrow IPC, Parquet, HDF5, ...)
+│   ├── catalog/          # SQL-backed catalog (nodes, adapter, search, migrations)
+│   ├── adapters/         # Format adapters (CSV, Parquet, Arrow, HDF5, Zarr, NPY, Excel, ...)
+│   ├── auth/             # Authentication (JWT, OIDC, LDAP, SAML, PAM, API keys, sessions)
+│   ├── access/           # Per-node access policies
+│   ├── server/           # Axum HTTP server (router, app, state, file resolver)
+│   ├── web/              # Web admin UI / SPA serving (feature `web`)
+│   ├── client/           # Async Rust client for the Tiled HTTP API
+│   ├── cli/              # CLI (serve, config) and the production app builder
+│   └── mongo/            # MongoDB streaming file handlers
 ├── crates/
-│   ├── tiled-core           # Types, traits, schemas, wire format
-│   ├── tiled-adapters       # MapAdapter, ArrayAdapter (in-memory)
-│   ├── tiled-serialization  # Serialization registry (octet-stream, CSV, Arrow IPC)
-│   ├── tiled-server         # Axum HTTP server (5 API + 2 operational endpoints)
-│   └── tiled-cli            # CLI (serve --demo)
-├── benchmarks/              # Python vs Rust comparison scripts
-└── src/main.rs              # Entry point
+│   └── tiled-web-spa/    # WASM single-page app (separate crate, built by build.rs)
+├── benchmarks/           # Python vs Rust comparison scripts
+└── tests/                # Integration tests
 ```
+
+All pure-Rust features are enabled by default; only `saml` and `pam` (which
+link system C libraries and are unavailable on Windows) are opt-in.
 
 ## API Endpoints
 
