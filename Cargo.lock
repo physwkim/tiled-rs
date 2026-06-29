@@ -5400,316 +5400,76 @@ dependencies = [
 ]
 
 [[package]]
-name = "tiled"
-version = "0.1.2"
-dependencies = [
- "anyhow",
- "clap",
- "tiled-cli",
- "tiled-core",
- "tiled-server",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "tiled-access"
-version = "0.1.2"
-dependencies = [
- "anyhow",
- "async-trait",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tiled-auth",
- "tiled-core",
- "tokio",
-]
-
-[[package]]
-name = "tiled-adapters"
-version = "0.1.2"
-dependencies = [
- "arrow",
- "base64",
- "bytes",
- "calamine",
- "csv",
- "image",
- "indexmap",
- "netcdf3",
- "object_store",
- "parquet",
- "regex",
- "rust-hdf5",
- "serde",
- "serde_json",
- "sqlx",
- "tempfile",
- "thiserror 2.0.18",
- "tiff 0.9.1",
- "tiled-core",
- "tiled-serialization",
- "tokio",
- "tracing",
- "zarrs",
- "zip 2.4.2",
-]
-
-[[package]]
-name = "tiled-auth"
+name = "tiled-rs"
 version = "0.1.2"
 dependencies = [
  "anyhow",
  "argon2",
+ "arrow",
+ "askama",
  "async-trait",
  "axum",
  "base64",
- "chrono",
- "jsonwebtoken",
- "ldap3",
- "libc",
- "rand 0.8.5",
- "regex",
- "reqwest",
- "samael",
- "serde",
- "serde_json",
- "serde_yaml",
- "sha2",
- "sqlx",
- "subtle",
- "tempfile",
- "thiserror 2.0.18",
- "tiled-core",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "tiled-catalog"
-version = "0.1.2"
-dependencies = [
- "anyhow",
- "async-trait",
- "chrono",
- "indexmap",
- "serde",
- "serde_json",
- "sqlx",
- "tempfile",
- "thiserror 2.0.18",
- "tiled-core",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "tiled-cli"
-version = "0.1.2"
-dependencies = [
- "anyhow",
- "axum",
+ "blosc2-pure-rs",
  "bytes",
+ "calamine",
  "chrono",
  "clap",
- "indexmap",
- "rand 0.8.5",
- "serde",
- "serde_json",
- "serde_yaml",
- "sqlx",
- "tempfile",
- "tiled-access",
- "tiled-adapters",
- "tiled-auth",
- "tiled-catalog",
- "tiled-core",
- "tiled-mongo",
- "tiled-serialization",
- "tiled-server",
- "tiled-web",
- "tokio",
- "tower",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "tiled-client"
-version = "0.1.2"
-dependencies = [
- "anyhow",
- "arrow",
- "async-trait",
- "axum",
- "blosc2-pure-rs",
- "bytes",
- "chrono",
  "csv",
+ "dashmap",
  "dirs",
- "futures",
- "http",
- "indexmap",
- "mime_guess",
- "notify",
- "parquet",
- "percent-encoding",
- "regex",
- "reqwest",
- "rmp-serde",
- "rpassword",
- "serde",
- "serde_bytes",
- "serde_json",
- "serde_yaml",
- "sqlx",
- "tempfile",
- "thiserror 2.0.18",
- "tiled-adapters",
- "tiled-auth",
- "tiled-catalog",
- "tiled-core",
- "tiled-serialization",
- "tiled-server",
- "tokio",
- "tokio-tungstenite 0.24.0",
- "tracing",
- "url",
- "walkdir",
- "webbrowser",
- "zip 2.4.2",
-]
-
-[[package]]
-name = "tiled-core"
-version = "0.1.2"
-dependencies = [
- "arrow",
- "base64",
- "bytes",
- "chrono",
- "regex",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "url",
- "uuid",
-]
-
-[[package]]
-name = "tiled-mongo"
-version = "0.1.2"
-dependencies = [
- "arrow",
- "base64",
- "bytes",
- "image",
- "indexmap",
- "mongodb",
- "ndarray 0.16.1",
- "rust-hdf5",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tiff 0.9.1",
- "tiled-core",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "tiled-serialization"
-version = "0.1.2"
-dependencies = [
- "arrow",
- "base64",
- "bytes",
- "chrono",
- "csv",
- "dashmap",
  "flate2",
- "image",
- "lz4_flex",
- "parquet",
- "rmp-serde",
- "rust-hdf5",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tiff 0.9.1",
- "tiled-core",
- "zip 2.4.2",
- "zstd",
-]
-
-[[package]]
-name = "tiled-server"
-version = "0.1.2"
-dependencies = [
- "arrow",
- "axum",
- "base64",
- "blosc2-pure-rs",
- "bytes",
- "chrono",
- "dashmap",
  "form_urlencoded",
  "futures",
  "hmac",
+ "http",
+ "image",
  "indexmap",
  "jmespath",
  "json-patch",
  "jsonwebtoken",
+ "ldap3",
+ "libc",
+ "lz4_flex",
+ "mime_guess",
+ "mongodb",
+ "ndarray 0.16.1",
+ "netcdf3",
+ "notify",
+ "object_store",
+ "parquet",
  "percent-encoding",
  "rand 0.8.5",
+ "regex",
  "reqwest",
  "rmp-serde",
+ "rpassword",
+ "rust-embed",
+ "rust-hdf5",
+ "samael",
  "serde",
+ "serde_bytes",
  "serde_json",
+ "serde_yaml",
  "sha2",
+ "sqlx",
  "subtle",
  "tempfile",
  "thiserror 2.0.18",
- "tiled-access",
- "tiled-adapters",
- "tiled-auth",
- "tiled-catalog",
- "tiled-core",
- "tiled-serialization",
- "tiled-web",
+ "tiff 0.9.1",
  "tokio",
- "tokio-tungstenite 0.28.0",
+ "tokio-tungstenite 0.24.0",
  "tower",
  "tower-http",
  "tracing",
+ "tracing-subscriber",
  "url",
+ "uuid",
+ "walkdir",
+ "webbrowser",
+ "zarrs",
  "zip 2.4.2",
-]
-
-[[package]]
-name = "tiled-web"
-version = "0.1.2"
-dependencies = [
- "askama",
- "axum",
- "chrono",
- "mime_guess",
- "rust-embed",
- "serde",
- "serde_json",
- "sqlx",
- "tempfile",
- "tiled-auth",
- "tiled-core",
- "tokio",
- "tower",
- "tower-http",
- "tracing",
+ "zstd",
 ]
 
 [[package]]

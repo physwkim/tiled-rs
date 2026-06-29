@@ -9,7 +9,7 @@ use clap::Parser;
 )]
 struct Cli {
     #[command(subcommand)]
-    command: tiled_cli::Command,
+    command: tiled_rs::cli::Command,
 }
 
 #[tokio::main]
@@ -22,5 +22,5 @@ async fn main() -> Result<()> {
         .init();
 
     let cli = Cli::parse();
-    tiled_cli::run(cli.command).await
+    tiled_rs::cli::run(cli.command).await
 }

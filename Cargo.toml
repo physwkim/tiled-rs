@@ -1,20 +1,8 @@
 [workspace]
-members = [
-    "crates/tiled-core",
-    "crates/tiled-catalog",
-    "crates/tiled-adapters",
-    "crates/tiled-serialization",
-    "crates/tiled-auth",
-    "crates/tiled-access",
-    "crates/tiled-server",
-    "crates/tiled-web",
-    "crates/tiled-client",
-    "crates/tiled-cli",
-    "crates/tiled-mongo",
-]
-# tiled-web-spa is a WASM-target crate built independently by trunk with
-# its own release profile (opt-level=z, lto=fat). Excluded so a host
-# `cargo build` doesn't pull it onto the wrong target.
+# Single-crate layout: the root package below is the sole workspace member.
+# tiled-web-spa is a WASM-target crate built independently by trunk with its
+# own release profile (opt-level=z, lto=fat). Excluded so a host `cargo build`
+# doesn't pull it onto the wrong target.
 exclude = ["crates/tiled-web-spa"]
 resolver = "3"
 
@@ -140,30 +128,155 @@ mongodb = { version = "3", features = ["sync"] }
 # Redis
 redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
 
-# Internal crates
-tiled-core = { path = "crates/tiled-core" }
-tiled-catalog = { path = "crates/tiled-catalog" }
-tiled-adapters = { path = "crates/tiled-adapters" }
-tiled-serialization = { path = "crates/tiled-serialization" }
-tiled-auth = { path = "crates/tiled-auth" }
-tiled-access = { path = "crates/tiled-access" }
-tiled-server = { path = "crates/tiled-server" }
-tiled-web = { path = "crates/tiled-web" }
-tiled-client = { path = "crates/tiled-client" }
-tiled-cli = { path = "crates/tiled-cli" }
-tiled-mongo = { path = "crates/tiled-mongo" }
-
 [package]
-name = "tiled"
+name = "tiled-rs"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+description = "Rust port of Tiled — a structured scientific data access service (server, client, adapters, auth)."
+repository = "https://github.com/physwkim/tiled-rs"
+readme = "README.md"
+
+[lib]
+name = "tiled_rs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tiled"
+path = "src/main.rs"
+
+[features]
+# Everything pure-Rust and cross-platform is ON by default. The only opt-in
+# features are `saml` and `pam`, which pull system C libraries (libxml2/xmlsec1
+# for SAML, libpam for PAM) — `pam` does not exist on Windows. Keeping them
+# opt-in preserves the pure-Rust default and the green Linux/macOS/Windows CI.
+default = [
+    "json", "arrow-ipc", "msgpack",
+    "csv", "csv-adapter",
+    "parquet", "parquet-adapter", "parquet-serializer",
+    "image", "image-serializer", "tiff", "tiff-adapter",
+    "hdf5", "hdf5-adapter", "hdf5-serializer", "netcdf-adapter",
+    "zarr", "zarr-adapter", "excel-adapter", "sql-adapter",
+    "sqlite", "oidc", "ldap", "web", "npy",
+]
+
+# --- serializers / always-pure-Rust toggles (deps now non-optional) ---
+json = []
+arrow-ipc = []
+msgpack = []
+csv = []
+
+# --- read adapters ---
+csv-adapter = []
+parquet = []
+parquet-adapter = ["parquet"]
+excel-adapter = ["dep:calamine"]
+netcdf-adapter = ["dep:rust-hdf5", "dep:netcdf3"]
+zarr = ["dep:zarrs", "dep:object_store"]
+zarr-adapter = ["zarr"]
+sql-adapter = []
+
+# --- export serializers (server-level aliases over the low-level toggles) ---
+parquet-serializer = ["parquet"]
+image = ["dep:tiff", "dep:image"]
+image-serializer = ["image"]
+tiff = ["dep:tiff", "dep:image"]
+tiff-adapter = ["tiff"]
+hdf5 = ["dep:rust-hdf5", "dep:tempfile"]
+hdf5-adapter = ["hdf5"]
+hdf5-serializer = ["hdf5"]
+
+# --- catalog backends (markers; sqlx always carries sqlite + postgres) ---
+sqlite = []
+postgres = []
+
+# --- mongo file handlers ---
+npy = ["dep:ndarray"]
+
+# --- web admin UI / SPA ---
+web = []
+
+# --- authentication ---
+oidc = []
+ldap = ["dep:ldap3"]
+# opt-in: system C libraries / not available on Windows
+saml = ["dep:samael"]
+pam = ["dep:libc"]
 
 [dependencies]
-tiled-core = { workspace = true }
-tiled-server = { workspace = true }
-tiled-cli = { workspace = true }
-tokio = { workspace = true }
+# Core (always-on, workspace-pinned)
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+bytes = { workspace = true }
+arrow = { workspace = true }
+base64 = { workspace = true }
+regex = { workspace = true }
+url = { workspace = true }
+dashmap = { workspace = true }
+flate2 = { workspace = true }
+zstd = { workspace = true }
+lz4_flex = { workspace = true }
+jsonwebtoken = { workspace = true }
+subtle = { workspace = true }
+sha2 = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-anyhow = { workspace = true }
+mongodb = { workspace = true }
+indexmap = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+futures = { workspace = true }
+rmp-serde = { workspace = true }
+jmespath = { workspace = true }
+blosc2-pure-rs = { workspace = true }
+csv = { workspace = true }
+parquet = { workspace = true }
 clap = { workspace = true }
+sqlx = { workspace = true }
+tokio = { workspace = true, features = ["fs", "io-util"] }
+reqwest = { workspace = true, features = ["cookies"] }
+
+# Always-on (crate-literal versions)
+argon2 = "0.5"
+rand = "0.8"
+async-trait = "0.1"
+percent-encoding = "2"
+hmac = "0.12"
+json-patch = "3"
+zip = "2"
+rust-embed = "8"
+mime_guess = "2"
+askama = "0.12"
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+dirs = "5"
+http = "1"
+rpassword = "7"
+webbrowser = "1"
+walkdir = "2"
+serde_bytes = "0.11"
+notify = "7"
+
+# Feature-gated (optional)
+rust-hdf5 = { workspace = true, optional = true }
+tempfile = { workspace = true, optional = true }
+tiff = { workspace = true, optional = true }
+image = { workspace = true, optional = true }
+zarrs = { workspace = true, optional = true }
+object_store = { workspace = true, optional = true }
+calamine = { workspace = true, optional = true }
+netcdf3 = { workspace = true, optional = true }
+ndarray = { workspace = true, optional = true }
+ldap3 = { version = "0.12", default-features = false, features = ["tls-rustls", "tls-rustls-ring"], optional = true }
+samael = { version = "0.0.21", features = ["xmlsec"], optional = true }
+libc = { version = "0.2", optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+form_urlencoded = "1"
