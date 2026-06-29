@@ -94,7 +94,12 @@ tempfile = "3"
 
 # Image formats (feature-gated)
 tiff = "0.9"
-image = "0.25"
+# Only the formats tiled-rs actually serves are enabled (file_resolver.rs
+# routes image/png, image/jpeg, image/tiff). Dropping image's default
+# format set removes the AVIF encoder chain (ravif -> rav1e ->
+# bitstream-io -> core2), whose core2 0.4.0 is yanked with no non-yanked
+# `^0.4` replacement.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "tiff"] }
 
 # HDF5 (feature-gated) — pure-Rust HDF5 reader/writer, no system libhdf5.
 # The adapter reads the dtype class + sign via H5Dataset::datatype() (added in
