@@ -56,16 +56,21 @@ impl Default for WebhookConfig {
     }
 }
 
-/// Spawn the dispatcher task. Returns immediately. The task runs for
-/// the lifetime of the server; if the streaming bus's broadcast lags,
-/// missed events are surfaced as warnings (a webhook miss is far less
-/// catastrophic than a corrupted state, so we log + continue).
+/// Register the dispatcher task with `background` (upstream tiled #1018:
+/// the dispatcher must not be a detached `tokio::spawn` — it needs to be
+/// findable and awaitable at shutdown). Returns immediately; the task runs
+/// until `background`'s owner calls `shutdown()`, or the streaming bus is
+/// dropped. If the streaming bus's broadcast lags, missed events are
+/// surfaced as warnings (a webhook miss is far less catastrophic than a
+/// corrupted state, so we log + continue).
 pub fn spawn(
     catalog: Catalog,
     bus: StreamingBus,
     config: WebhookConfig,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+    background: &crate::server::state::BackgroundTasks,
+) {
+    let mut cancel = background.cancellation();
+    background.spawn(async move {
         let client = match reqwest::Client::builder()
             .timeout(config.request_timeout)
             .redirect(reqwest::redirect::Policy::none())
@@ -84,28 +89,37 @@ pub fn spawn(
         // tree — exactly what the webhook dispatcher wants.
         let mut rx = bus.subscribe("");
         loop {
-            match rx.recv().await {
-                Ok(env) => {
-                    let event_type = match envelope_event_type(&env) {
-                        Some(t) => t,
-                        None => continue, // unknown event kind
-                    };
-                    if let Err(e) =
-                        dispatch_event(&catalog, &client, &config, &env, event_type).await
-                    {
-                        tracing::warn!(target: "tiled.webhooks", "dispatch failed: {e}");
+            tokio::select! {
+                biased;
+                _ = cancel.changed() => {
+                    tracing::info!(target: "tiled.webhooks", "dispatcher stopping: shutdown signalled");
+                    break;
+                }
+                msg = rx.recv() => {
+                    match msg {
+                        Ok(env) => {
+                            let event_type = match envelope_event_type(&env) {
+                                Some(t) => t,
+                                None => continue, // unknown event kind
+                            };
+                            if let Err(e) =
+                                dispatch_event(&catalog, &client, &config, &env, event_type).await
+                            {
+                                tracing::warn!(target: "tiled.webhooks", "dispatch failed: {e}");
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
+                            tracing::warn!(
+                                target: "tiled.webhooks",
+                                "streaming bus lagged by {missed} events; webhook deliveries skipped"
+                            );
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
-                    tracing::warn!(
-                        target: "tiled.webhooks",
-                        "streaming bus lagged by {missed} events; webhook deliveries skipped"
-                    );
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
         }
-    })
+    });
 }
 
 fn envelope_event_type(env: &UpdateEnvelope) -> Option<&'static str> {
@@ -153,6 +167,20 @@ async fn dispatch_event(
         let payload = payload.clone();
         let event_id = event_id.clone();
         let event_type = event_type.to_string();
+        // Distinct from the dispatcher loop above (upstream #1018 scope:
+        // "webhook_dispatch spawn isn't registered with graceful
+        // shutdown", singular — the process-lifetime dispatcher, not this
+        // per-delivery task): each of these is bounded by
+        // `config.max_attempts` retries capped at `config.max_wait` each
+        // (seconds to low minutes), not process-lifetime, so it stays a
+        // plain detached `tokio::spawn`. Registering it with
+        // `BackgroundTasks` too would make graceful shutdown block on
+        // in-flight third-party HTTP delivery attempts, which is a
+        // separate behavior change #1018 doesn't ask for. Residual gap:
+        // a delivery still in flight when the process exits is cut off
+        // before `deliver` calls `finalize_delivery`, leaving its
+        // `webhook_deliveries` row `pending` rather than `failed`/
+        // `success` — pre-existing behavior, unchanged by this fix.
         tokio::spawn(async move {
             if let Err(e) = deliver(
                 &catalog,
@@ -318,4 +346,36 @@ fn uuid_v4() -> String {
         h(8, 10),
         h(10, 16)
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::state::BackgroundTasks;
+
+    /// Upstream tiled #1018 regression: the dispatcher must register with
+    /// `BackgroundTasks` and select on its cancellation signal, not run in
+    /// a bare detached `tokio::spawn`. If the dispatcher loop ever regresses
+    /// to `rx.recv().await` with no cancellation branch, it never notices
+    /// `shutdown()`'s signal and loops forever on the still-open streaming
+    /// bus — this test's `timeout` then fails instead of the test hanging.
+    #[tokio::test]
+    async fn dispatcher_stops_when_shutdown_is_signalled() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = format!("sqlite://{}", dir.path().join("catalog.db").display());
+        let catalog = Catalog::connect(&uri).await.unwrap();
+        catalog.migrate().await.unwrap();
+
+        let bus = StreamingBus::new();
+        let background = BackgroundTasks::new();
+        spawn(catalog, bus, WebhookConfig::default(), &background);
+
+        // Let the task actually start (subscribe to the bus) before
+        // signalling shutdown.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        tokio::time::timeout(Duration::from_secs(2), background.shutdown())
+            .await
+            .expect("dispatcher must stop once shutdown() is signalled, not hang");
+    }
 }

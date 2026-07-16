@@ -852,8 +852,14 @@ pub async fn run(command: Command) -> Result<()> {
                     .as_ref()
                     .map(|c| c.exact_count_limit)
                     .unwrap_or(config::default_exact_count_limit()),
+                background_tasks: crate::server::state::BackgroundTasks::new(),
             };
 
+            // Keep a handle to the background-task owner before `state` is
+            // consumed by `build_app` — `run()` is the sole caller allowed
+            // to call `shutdown()` on it (upstream tiled #1018), and it must
+            // do so after the listener below stops accepting connections.
+            let background_tasks = state.background_tasks.clone();
             let app = crate::server::build_app(state);
 
             // Bind via the (host, port) tuple rather than format!("{host}:{port}").
@@ -875,6 +881,12 @@ pub async fn run(command: Command) -> Result<()> {
             axum::serve(listener, app)
                 .with_graceful_shutdown(shutdown_signal())
                 .await?;
+            // The listener has stopped accepting new connections and every
+            // in-flight HTTP request has completed; now signal and await
+            // every registered background task exactly once (upstream
+            // tiled #1018) before the process exits.
+            tracing::info!("HTTP listener stopped; waiting for background tasks to finish");
+            background_tasks.shutdown().await;
             Ok(())
         }
         Command::Catalog { command } => match command {

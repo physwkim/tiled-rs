@@ -57,6 +57,7 @@ async fn build_test_app() -> (axum::Router, tempfile::TempDir) {
         request_timeout_secs: 30,
         expose_raw_assets: true,
         exact_count_limit: u64::MAX,
+        background_tasks: tiled_rs::server::state::BackgroundTasks::new(),
     };
     (tiled_rs::server::build_app(state), dir)
 }
@@ -1540,6 +1541,7 @@ async fn exact_count_limit_caps_meta_count() {
         request_timeout_secs: 30,
         expose_raw_assets: true,
         exact_count_limit: 2,
+        background_tasks: tiled_rs::server::state::BackgroundTasks::new(),
     };
     let app = tiled_rs::server::build_app(state);
 
