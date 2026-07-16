@@ -106,8 +106,10 @@ impl ArrayAdapterRead for CsvArrayAdapter {
 /// the shape `[nrows, ncols]`, and the chosen Arrow BuiltinDType.
 ///
 /// Dtype promotion: int64 if all inferred columns are integer types; float64
-/// if any column is a float type.  Anything else (strings, booleans) causes a
-/// Validation error — this adapter is for numeric-only CSVs.
+/// if any column is a float type, if any cell is empty (see the missing-value
+/// handling below), or if any column is all-empty (Arrow infers `Null`, which
+/// pandas reads as an all-NaN float64 column). Anything else (strings, booleans)
+/// causes a Validation error — this adapter is for numeric-only CSVs.
 fn read_csv_array(path: &std::path::Path) -> Result<(DynNDArray, Vec<usize>, BuiltinDType)> {
     // Infer schema from the first 64 rows.
     let f = std::fs::File::open(path)
@@ -222,13 +224,21 @@ fn read_csv_array(path: &std::path::Path) -> Result<(DynNDArray, Vec<usize>, Bui
     Ok((array, shape, dtype))
 }
 
-/// Returns `true` (float64) if any column is a float type, `false` (int64) if
-/// all are integer types. Errors on non-numeric column types.
+/// Returns `true` (float64) if the array must be float64, `false` (int64) if
+/// every column is integer-typed. Errors on non-numeric column types.
+///
+/// A `DataType::Null` column is Arrow's inference for a column whose cells are
+/// all empty. pandas/dask `read_csv` reads such a column as an all-NaN float64
+/// column (a missing value has no integer representation), so it promotes the
+/// array to float64 here — the same promotion the partial-null path applies via
+/// `has_null`, and consistent with float decoding an all-null column to NaN.
 fn decide_dtype<'a>(fields: impl Iterator<Item = &'a DataType>) -> Result<bool> {
     let mut has_float = false;
     for dt in fields {
         match dt {
-            DataType::Float16 | DataType::Float32 | DataType::Float64 => has_float = true,
+            DataType::Float16 | DataType::Float32 | DataType::Float64 | DataType::Null => {
+                has_float = true
+            }
             DataType::Int8
             | DataType::Int16
             | DataType::Int32
@@ -470,6 +480,86 @@ mod tests {
             cells[3]
         );
         assert_eq!(cells[4], 50.0);
+    }
+
+    // Invariant boundary — a column whose cells are ALL empty. Arrow infers it as
+    // `DataType::Null` (not a numeric type), which `decide_dtype` used to reject
+    // outright. pandas/dask `read_csv` reads an all-empty column as an all-NaN
+    // float64 column, so the whole array must promote to float64 with that column
+    // entirely NaN, matching the partial-empty promotion.
+    #[tokio::test]
+    async fn all_empty_column_among_ints_promotes_to_float_nan() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("emptycol.csv");
+        // col0 = [1,2,3] int; col1 entirely empty (trailing comma each row).
+        write_csv(&p, "1,\n2,\n3,\n");
+        let adapter = CsvArrayAdapter::from_path(p, serde_json::Value::Null).unwrap();
+        let arr = adapter.read(&NDSlice::empty()).await.unwrap();
+        assert_eq!(
+            arr.dtype.kind,
+            Kind::Float,
+            "an all-empty column must promote the array to float64, as pandas does"
+        );
+        assert_eq!(arr.shape, vec![3, 2]);
+        let cells = f64_cells(&arr);
+        // row-major: [1, NaN, 2, NaN, 3, NaN]
+        assert_eq!(cells[0], 1.0);
+        assert!(
+            cells[1].is_nan(),
+            "empty col1 row0 must be NaN, got {}",
+            cells[1]
+        );
+        assert_eq!(cells[2], 2.0);
+        assert!(
+            cells[3].is_nan(),
+            "empty col1 row1 must be NaN, got {}",
+            cells[3]
+        );
+        assert_eq!(cells[4], 3.0);
+        assert!(
+            cells[5].is_nan(),
+            "empty col1 row2 must be NaN, got {}",
+            cells[5]
+        );
+    }
+
+    // Invariant boundary — every column all-empty (a file that is all empty cells
+    // but has detectable column structure, e.g. `",\n,\n"`). Every column infers
+    // as `Null`; the array is float64 with every cell NaN, matching pandas.
+    #[tokio::test]
+    async fn all_empty_columns_file_is_all_nan_float() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("allempty.csv");
+        // 3 rows × 2 cols, every cell empty.
+        write_csv(&p, ",\n,\n,\n");
+        let adapter = CsvArrayAdapter::from_path(p, serde_json::Value::Null).unwrap();
+        let arr = adapter.read(&NDSlice::empty()).await.unwrap();
+        assert_eq!(arr.dtype.kind, Kind::Float);
+        assert_eq!(arr.shape, vec![3, 2]);
+        let cells = f64_cells(&arr);
+        assert_eq!(cells.len(), 6);
+        assert!(
+            cells.iter().all(|v| v.is_nan()),
+            "every cell of an all-empty file must be NaN, got {cells:?}"
+        );
+    }
+
+    // Boundary — a file of only blank lines has no parseable columns. Arrow infers
+    // a 0-field schema and errors at read; pandas raises EmptyDataError ("No
+    // columns to parse from file") for the same input, so an error is the
+    // parity-correct outcome. This is pre-existing behavior; the all-empty-column
+    // promotion above does not change it (the error is raised at CSV read, before
+    // dtype promotion). Documented here to pin it.
+    #[tokio::test]
+    async fn blank_lines_file_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("blank.csv");
+        write_csv(&p, "\n\n\n");
+        let r = CsvArrayAdapter::from_path(p, serde_json::Value::Null);
+        assert!(
+            r.is_err(),
+            "a file of only blank lines has no columns; pandas raises EmptyDataError"
+        );
     }
 
     #[tokio::test]
