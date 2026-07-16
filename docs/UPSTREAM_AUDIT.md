@@ -88,7 +88,7 @@ fix problems in code we never wrote.
 | #1364 / #1343 / #1326 / #1351 / #1339 / #1218 / #287 / #262 | various gaps | initial-port gap commits (`d48e5f4`, `ec00c22`). |
 | #564  | confirmation_message on Authenticators | `ProviderInfo.confirmation_message` already passed through to SPA. |
 | #1196 / #1197 | Subscription Executor | tokio runtime + bus already covers it. |
-| #1391 | Allow empty `sort=` param | `parse_sort` drops truly-empty items (`router.rs:523-525`), test `empty_param_yields_no_sorting` (`:6105`); the `Vec<(String,String)>` parser never had pydantic's strict regex, so the 422 never existed here. |
+| #1391 | Allow empty `sort=` param | `parse_sort` drops truly-empty items (`router.rs:523-525`), test `empty_param_yields_no_sorting` (`:6604`); the `Vec<(String,String)>` parser never had pydantic's strict regex, so the 422 never existed here. |
 | #1381 | EntraAuthenticator: code-flow secret, `scp`-absent scopes, human username | `external_oidc.rs`: `client_secret` + code flow (`:121`, `:476`); `translate_scp` grants the union of all mapped scopes when `scp` is absent/empty (`:1008-1013`); `derive_entra_identity` derives a human-readable username (`:872`). |
 | #1382 | Downstream-OBO token storage | `exchange_code_flow` stores `entra_access_token`/`entra_refresh_token` in the session `state` claim (`external_oidc.rs:819`, `:968-980`) — the OBO-carrier substrate from #465. |
 | #1383 | Readable-username priority + `extra_scopes` for OBO `aud` | Username from nameID/preferred_username/upn/email (`derive_entra_identity`, `external_oidc.rs:872`); `extra_scopes` appended to the token-POST `scope` so the returned `access_token` carries the resource `aud` (`:515`, doc `:126-137`). |
@@ -117,10 +117,10 @@ raises `ValueError` (`tiled/adapters/utils.py`, same commit). This port
 has no such reconciliation: every read resolves a *fresh* leaf adapter
 (`FileLeafResolver::resolve`, `src/server/file_resolver.rs:150`) whose
 `from_path` reads the shape from the same live file the read then draws
-from (`src/adapters/hdf5_adapter.rs:147` builds `structure.shape`, `:671`
+from (`src/adapters/hdf5_adapter.rs:173` builds `structure.shape`, `:746`
 feeds it to `read_hdf5_slice`; `src/adapters/zarr_adapter.rs:69` +
 `:159`), and metadata is served from that same fresh adapter
-(`adapter.structure_json()`, `src/server/core.rs:117`) — structure and
+(`adapter.structure_json()`, `src/server/core.rs:491`) — structure and
 data come from one file open, so no cross-source mismatch can be
 constructed. The DB `ds.structure` is never fed to the HDF5/zarr read
 path: the resolver forwards it only to the ragged-SQL branch
@@ -225,7 +225,7 @@ N/A batch (17), each with the structural reason it does not apply:
   * **#1434** — guards the `array-ref` streaming-cache update in
     `put_data_source` against non-array nodes (upstream `KeyError: 'shape'`).
     tiled-rs emits a shape-free bus `DataAppended { partition: None }`
-    uniformly across all structure families (`router.rs:5836`) and has no
+    uniformly across all structure families (`router.rs:6335`) and has no
     redis `streaming_cache` (#1192, N/A) — the bug cannot be constructed.
   * **#1429** — widens `assets.size` int32→int64 (PostgreSQL overflow on
     files >2.1 GB). tiled-rs's `assets` table has no `size` column at all
