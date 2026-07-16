@@ -463,8 +463,14 @@ pub(crate) fn to_core_data_source(
         .collect();
     core_ds::DataSource {
         structure_family,
-        structure: serde_json::from_value::<Option<crate::core::structures::AnyStructure>>(
-            ds.structure,
+        // Parse the stored structure JSON under `structure_family` authority,
+        // not `AnyStructure`'s untagged Deserialize (which mislabels a COO
+        // sparse structure carrying a data_type as Array). Errors stay lenient
+        // — a malformed row yields `None` rather than failing the whole listing,
+        // matching the prior `from_value(...).ok().flatten()` behavior.
+        structure: crate::core::structures::AnyStructure::from_family_json(
+            structure_family,
+            &ds.structure,
         )
         .ok()
         .flatten(),
@@ -478,5 +484,52 @@ pub(crate) fn to_core_data_source(
         properties: Value::Null,
         assets: core_assets,
         management,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::dtype::{BuiltinDType, Endianness, Kind};
+    use crate::core::structures::{AnyStructure, StructureFamily};
+
+    #[test]
+    fn to_core_data_source_narrows_sparse_by_family() {
+        // A stored sparse row whose structure carries a data_type would be
+        // mislabeled Array by the untagged AnyStructure parse (dropping
+        // coord_data_type + layout). to_core_data_source must narrow it under
+        // structure_family = "sparse" and preserve the non-default uint32 coord.
+        let ds = DataSource {
+            id: 7,
+            node_id: 1,
+            structure_family: "sparse".into(),
+            structure: serde_json::json!({
+                "chunks": [[3], [3]],
+                "shape": [3, 3],
+                "data_type": {"endianness": "little", "kind": "f", "itemsize": 8},
+                "coord_data_type": {"endianness": "little", "kind": "u", "itemsize": 4},
+                "layout": "COO"
+            }),
+            mimetype: "application/x-parquet;structure=sparse".into(),
+            parameters: serde_json::json!({}),
+            management: "writable".into(),
+        };
+        let core = to_core_data_source(ds, vec![]);
+        assert_eq!(core.structure_family, StructureFamily::Sparse);
+        match core.structure {
+            Some(AnyStructure::Sparse(s)) => {
+                assert_eq!(s.shape, vec![3, 3]);
+                assert_eq!(
+                    s.coord_data_type,
+                    Some(BuiltinDType::new(
+                        Endianness::Little,
+                        Kind::UnsignedInteger,
+                        4
+                    )),
+                    "include_data_sources must return a true Sparse structure"
+                );
+            }
+            other => panic!("expected Sparse, got {other:?}"),
+        }
     }
 }
