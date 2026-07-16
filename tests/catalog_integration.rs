@@ -1656,6 +1656,182 @@ async fn revisions_list_then_delete_round_trip() {
     let _ = empty_request(&app, Method::DELETE, "/api/v1/metadata/rev1").await;
 }
 
+/// A node with more revisions than one page must report the TOTAL revision
+/// count in `meta.count` and emit working `next`/`last` pagination links so a
+/// client can walk every revision one page at a time. Before upstream #1409
+/// the endpoint fed the page length as the count, so `pagination_links`
+/// derived `last_offset = 0`, never emitted a `next` link, and revisions past
+/// page 1 were unreachable. Regression for that defect (fails on old behavior).
+#[tokio::test]
+async fn revisions_pagination_walks_all_pages() {
+    let (app, _dir) = build_test_app().await;
+
+    // Create with {v:1}; three PUTs push revisions 1,2,3 (each PUT pushes the
+    // PRE-update state, as in `revisions_list_then_delete_round_trip`).
+    let (status, _) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/metadata/",
+        serde_json::json!({
+            "key": "pager",
+            "structure_family": "container",
+            "metadata": {"v": 1},
+            "specs": [],
+            "data_sources": [],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    for v in [2, 3, 4] {
+        let (status, _) = json_request(
+            &app,
+            Method::PUT,
+            "/api/v1/metadata/pager",
+            serde_json::json!({"metadata": {"v": v}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "put v={v}");
+    }
+
+    // First page (limit=1): total count is 3 (not the page length 1), one item,
+    // `next` + `last` present, `last` pointing at the final page (offset 2).
+    let (status, body) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/revisions/pager?page[offset]=0&page[limit]=1",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["meta"]["count"], 3,
+        "count is the node total, not the page length: {body}"
+    );
+    assert_eq!(body["data"].as_array().unwrap().len(), 1);
+    assert!(
+        body["links"]["next"].is_string(),
+        "next must be present when more revisions remain: {body}"
+    );
+    assert!(
+        body["links"]["last"]
+            .as_str()
+            .unwrap()
+            .contains("page[offset]=2"),
+        "last points at the final page (offset 2): {body}"
+    );
+
+    // Walk every page via the `next` links and confirm all three revisions come
+    // back in order with no overlap.
+    let mut revision_numbers = Vec::new();
+    let mut next = Some("/api/v1/revisions/pager?page[offset]=0&page[limit]=1".to_string());
+    while let Some(uri) = next {
+        let (status, body) = json_request(&app, Method::GET, &uri, serde_json::Value::Null).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        for item in body["data"].as_array().unwrap() {
+            revision_numbers.push(item["revision_number"].as_i64().unwrap());
+        }
+        next = body["links"]["next"]
+            .as_str()
+            .map(|link| link.replace("http://localhost:8000", ""));
+    }
+    assert_eq!(revision_numbers, vec![1, 2, 3]);
+}
+
+/// Boundary cases for the revisions count/pagination: exactly one full page,
+/// an empty node (zero revisions), and an offset past the end. In every case
+/// `meta.count` is the node's total and `next` is absent (no page remains).
+#[tokio::test]
+async fn revisions_pagination_boundaries() {
+    let (app, _dir) = build_test_app().await;
+
+    // (a) Exactly one page: 2 revisions, page[limit]=2 holds both → count=2,
+    //     next=None (offset+limit == count), last collapses to offset 0.
+    let (status, _) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/metadata/",
+        serde_json::json!({
+            "key": "onepage",
+            "structure_family": "container",
+            "metadata": {"v": 1},
+            "specs": [],
+            "data_sources": [],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    for v in [2, 3] {
+        let (status, _) = json_request(
+            &app,
+            Method::PUT,
+            "/api/v1/metadata/onepage",
+            serde_json::json!({"metadata": {"v": v}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    let (status, body) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/revisions/onepage?page[offset]=0&page[limit]=2",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["meta"]["count"], 2);
+    assert_eq!(body["data"].as_array().unwrap().len(), 2);
+    assert!(
+        body["links"]["next"].is_null(),
+        "no next on a single full page: {body}"
+    );
+
+    // (b) Zero revisions: a freshly created node (never PUT) has none →
+    //     count=0, empty page, next=None.
+    let (status, _) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/metadata/",
+        serde_json::json!({
+            "key": "norevs",
+            "structure_family": "container",
+            "metadata": {"v": 1},
+            "specs": [],
+            "data_sources": [],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, body) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/revisions/norevs",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["meta"]["count"], 0);
+    assert_eq!(body["data"].as_array().unwrap().len(), 0);
+    assert!(body["links"]["next"].is_null());
+
+    // (c) Offset past the end of a non-empty list: count is still the total (2),
+    //     the page is empty, next=None. Mirrors upstream
+    //     test_metadata_revisions_count_empty case (b).
+    let (status, body) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/revisions/onepage?page[offset]=10",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["meta"]["count"], 2,
+        "offset past end still reports the total: {body}"
+    );
+    assert_eq!(body["data"].as_array().unwrap().len(), 0);
+    assert!(body["links"]["next"].is_null());
+}
+
 /// exact_count_limit caps the `meta.count` returned by the search endpoint.
 /// With limit = 2 and 5 nodes registered, `meta.count` must be 2 not 5.
 /// Mirrors Python `Settings.exact_count_limit` (settings.py, default 100).
