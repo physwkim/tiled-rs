@@ -1164,13 +1164,16 @@ fn deserialize_sparse_coo(
 /// Reject a sparse write whose value column dtype differs from the node's
 /// declared `data_type`.
 ///
-/// The read path (`SparseBlocksParquetAdapter::to_sparse_data`) sizes `nnz` and
-/// labels the returned values with the *structure's* declared dtype, while the
-/// parquet stores whatever dtype was written. So a write that stored, say,
-/// float32 values into a float64-declared node would be misread on GET (wrong
-/// element size → wrong `nnz` and reinterpreted bytes). The typed client always
-/// sends the declared dtype; this guards the raw Arrow PUT entry point, turning
-/// silent corruption into a clear 422 at the write boundary.
+/// The read path labels the returned values with the *stored* parquet column
+/// dtype (`SparseBlocksParquetAdapter::to_sparse_data`), matching upstream's
+/// pandas read (`sparse_blocks_parquet.py:31,123-127`), so a stored/declared
+/// mismatch no longer corrupts a GET. This guard keeps a node's declared
+/// `data_type` truthful about what its blocks actually store for every write
+/// through our server: it rejects, at the raw Arrow PUT boundary, a write whose
+/// value dtype would leave the node's structure metadata disagreeing with its
+/// stored data. Externally-registered parquet files bypass this boundary; the
+/// read path handles their stored dtype directly. The typed client always sends
+/// the declared dtype, so it is unaffected.
 fn ensure_sparse_data_dtype(
     structure: &crate::core::structures::SparseStructure,
     data: &crate::core::adapters::SparseData,
@@ -1180,7 +1183,8 @@ fn ensure_sparse_data_dtype(
     {
         return Err(ServerError::Validation(format!(
             "sparse write: value dtype {:?} does not match the node's declared \
-             data_type {:?}; the stored values would be misread on read",
+             data_type {:?}; the node's structure metadata would then disagree \
+             with its stored data",
             data.data.dtype, declared
         )));
     }
