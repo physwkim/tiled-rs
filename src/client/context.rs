@@ -993,6 +993,30 @@ impl Context {
         handle_error(resp).await?;
         Ok(())
     }
+
+    // ---------------- Session management ----------------
+
+    /// Revoke a session by its UUID
+    /// (`DELETE /api/v1/auth/session/revoke/{session_id}`).
+    ///
+    /// Mirrors Python `Context.revoke_session` (`context.py:1193`): the caller
+    /// must be authenticated and own the session. The Rust server answers 404
+    /// (surfaced as [`ClientError::Server`] with `status == 404`) when the
+    /// session does not exist or belongs to another principal — the response is
+    /// deliberately opaque about which. Once revoked, refresh tokens for that
+    /// session stop working.
+    pub async fn revoke_session(&self, session_id: &str) -> Result<()> {
+        let url = self
+            .inner
+            .api_uri
+            .join(&format!("auth/session/revoke/{session_id}"))?;
+        let req = self.request(Method::DELETE, &url).await?;
+        let req = self.add_csrf(req).await;
+        let resp = self.send_with_auth(req).await?;
+        self.maybe_capture_csrf(&resp).await;
+        handle_error(resp).await?;
+        Ok(())
+    }
 }
 
 /// Secret + metadata returned by [`Context::create_api_key`]
