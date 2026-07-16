@@ -27,7 +27,9 @@ const PATH_SEGMENT: &AsciiSet = &CONTROLS
 
 use crate::core::data_source::{DataSource, Management};
 use crate::core::schemas::{GetDistinctResponse, PostMetadataResponse};
-use crate::core::structures::{AnyStructure, ArrayStructure, StructureFamily, TableStructure};
+use crate::core::structures::{
+    AnyStructure, ArrayStructure, RaggedStructure, StructureFamily, TableStructure,
+};
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
@@ -38,6 +40,7 @@ use crate::client::base::{BaseClient, Item};
 use crate::client::context::Context;
 use crate::client::dataframe::TableClient;
 use crate::client::error::{ClientError, Result};
+use crate::client::ragged::RaggedClient;
 use crate::client::utils::{decode_response, resolve_export_format, retry};
 
 /// Sort direction for container child ordering.
@@ -500,6 +503,63 @@ impl ContainerClient {
             .await?;
         let client = self.get(&created_key).await?.into_table()?;
         client.write(schema, batches).await?;
+        Ok(client)
+    }
+
+    /// Create a writable ragged (variable-length) array child from an explicit
+    /// `structure`, then upload its rows as a JSON list-of-lists. Mirrors Python
+    /// `Container.write_ragged` (`container.py:996`): `new(ragged,
+    /// [DataSource(structure, mimetype="application/x-ragged+sql")], ...)` then
+    /// `client.write(array)`.
+    ///
+    /// The data source pins `application/x-ragged+sql` — the server's only
+    /// ragged managed-write backend (Python `write_ragged` pins the same;
+    /// `default_creation_mimetype(Ragged)` also resolves to it) — with
+    /// `management: writable`. `access_tags` is threaded through
+    /// [`post_new_node`](Self::post_new_node).
+    ///
+    /// Deviations from Python: Python coerces the input via `make_ragged_array`,
+    /// derives partitioning with `make_ragged_chunks`, and builds the structure
+    /// with `RaggedStructure.from_array`; the Rust client has no ragged runtime,
+    /// so the caller supplies the [`RaggedStructure`] and the row data as a JSON
+    /// list-of-lists (the shape [`RaggedClient::write`] takes). This performs the
+    /// single-partition (chunk 0 / `PUT /ragged/full`) upload — Python's
+    /// non-chunked branch (`container.py:1060`); a multi-partition structure must
+    /// be filled per chunk via [`RaggedClient::write_block`].
+    ///
+    /// [`RaggedClient::write`]: crate::client::ragged::RaggedClient::write
+    /// [`RaggedClient::write_block`]: crate::client::ragged::RaggedClient::write_block
+    pub async fn write_ragged(
+        &self,
+        key: Option<&str>,
+        structure: RaggedStructure,
+        data: &serde_json::Value,
+        metadata: serde_json::Value,
+        specs: Vec<serde_json::Value>,
+        access_tags: Option<&[String]>,
+    ) -> Result<RaggedClient> {
+        let ds = DataSource {
+            structure_family: StructureFamily::Ragged,
+            structure: Some(AnyStructure::Ragged(structure)),
+            id: None,
+            mimetype: Some(crate::core::media_type::mime::RAGGED_SQL.to_string()),
+            parameters: serde_json::json!({}),
+            properties: serde_json::json!({}),
+            assets: vec![],
+            management: Management::Writable,
+        };
+        let created_key = self
+            .post_new_node(
+                key,
+                StructureFamily::Ragged,
+                metadata,
+                specs,
+                vec![ds],
+                access_tags,
+            )
+            .await?;
+        let client = self.get(&created_key).await?.into_ragged()?;
+        client.write(data, true).await?;
         Ok(client)
     }
 
