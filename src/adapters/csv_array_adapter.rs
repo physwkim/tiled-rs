@@ -4,9 +4,11 @@
 //! Corresponds to `tiled/adapters/csv.py:CSVArrayAdapter`.
 //!
 //! Schema inference: if every column is integer-typed (after Arrow's CSV
-//! inference on the first 64 rows), the array dtype is `<i8` (int64
-//! little-endian); if any column is floating-point, the array dtype is `<f8`
-//! (float64 little-endian). Mixed numeric CSVs are promoted to float64.
+//! inference on the first 64 rows) and no cell is empty, the array dtype is
+//! `<i8` (int64 little-endian); if any column is floating-point, the array dtype
+//! is `<f8` (float64 little-endian). Mixed numeric CSVs are promoted to float64.
+//! A missing value (empty cell) also promotes to float64 with NaN at the gap,
+//! matching pandas' `read_csv` (which has no typed-int-with-null).
 //!
 //! Read-only. Single chunk covering the whole array.
 
@@ -16,7 +18,7 @@ use std::io::BufReader;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use arrow::array::{Float64Array, Int64Array};
+use arrow::array::{Array, Float64Array, Int64Array};
 use arrow::compute::cast;
 use arrow::csv::ReaderBuilder;
 use arrow::datatypes::{DataType, SchemaRef};
@@ -116,8 +118,10 @@ fn read_csv_array(path: &std::path::Path) -> Result<(DynNDArray, Vec<usize>, Bui
         .infer_schema(&mut buf, Some(64))
         .map_err(|e| TiledError::Internal(format!("infer schema: {e}")))?;
 
-    // Validate and decide output dtype.
-    let use_float = decide_dtype(raw_schema.fields().iter().map(|f| f.data_type()))?;
+    // Validate column types and take the schema-level float decision (any float
+    // column ⇒ float64). Missing-value promotion is applied below, once the data
+    // is read and nulls are visible.
+    let schema_float = decide_dtype(raw_schema.fields().iter().map(|f| f.data_type()))?;
     let schema = Arc::new(raw_schema) as SchemaRef;
 
     // Read all batches.
@@ -135,6 +139,19 @@ fn read_csv_array(path: &std::path::Path) -> Result<(DynNDArray, Vec<usize>, Bui
 
     let ncols = schema.fields().len();
     let nrows: usize = batches.iter().map(|b| b.num_rows()).sum();
+
+    // Parity with pandas' `read_csv` promotion (upstream reads via
+    // dask/pandas, `csv.py:290`): an empty cell in an int-looking column makes
+    // that column float64 with NaN at the gap — pandas has no typed-int-with-null
+    // from a CSV, and dask's `assume_missing` promotes int columns that might be
+    // missing to float64. Arrow's CSV reader instead keeps the column Int64 with
+    // a null bitmap, so we reproduce the promotion here: any null anywhere forces
+    // float64 output, and the float decode writes NaN at the null slots. This
+    // guarantees the int decode path below never sees a null.
+    let has_null = batches
+        .iter()
+        .any(|b| b.columns().iter().any(|c| c.null_count() > 0));
+    let use_float = schema_float || has_null;
 
     // Handle empty file.
     if nrows == 0 || ncols == 0 {
@@ -165,7 +182,16 @@ fn read_csv_array(path: &std::path::Path) -> Result<(DynNDArray, Vec<usize>, Bui
                     .ok_or_else(|| TiledError::Internal("downcast Float64Array".into()))?;
                 for r in 0..nr {
                     let dest = ((row_offset + r) * ncols + c) * ELEM;
-                    out[dest..dest + ELEM].copy_from_slice(&arr.value(r).to_le_bytes());
+                    // A null (empty cell) decodes to NaN, matching pandas'
+                    // missing-value semantics. Arrow leaves the value buffer of a
+                    // null slot unspecified, so `arr.value(r)` there would be
+                    // garbage; the `is_null` check is what makes the read faithful.
+                    let v = if arr.is_null(r) {
+                        f64::NAN
+                    } else {
+                        arr.value(r)
+                    };
+                    out[dest..dest + ELEM].copy_from_slice(&v.to_le_bytes());
                 }
             } else {
                 let casted = cast(col, &DataType::Int64)
@@ -176,6 +202,9 @@ fn read_csv_array(path: &std::path::Path) -> Result<(DynNDArray, Vec<usize>, Bui
                     .ok_or_else(|| TiledError::Internal("downcast Int64Array".into()))?;
                 for r in 0..nr {
                     let dest = ((row_offset + r) * ncols + c) * ELEM;
+                    // `use_float` is forced true whenever any cell is null (see the
+                    // promotion above), so an integer column here is null-free and
+                    // `arr.value(r)` is always a real value.
                     out[dest..dest + ELEM].copy_from_slice(&arr.value(r).to_le_bytes());
                 }
             }
@@ -347,6 +376,100 @@ mod tests {
         write_csv(&p, "foo,bar\nbaz,qux\n");
         let err = CsvArrayAdapter::from_path(p, serde_json::Value::Null);
         assert!(err.is_err());
+    }
+
+    // ---- missing-value (empty cell) parity (Wave-18 follow-up) ---------
+
+    /// Collect a DynNDArray's f64 cells in row-major order.
+    fn f64_cells(arr: &crate::core::dtype::DynNDArray) -> Vec<f64> {
+        arr.data
+            .chunks_exact(8)
+            .map(|b| f64::from_le_bytes(b.try_into().unwrap()))
+            .collect()
+    }
+
+    // Invariant boundary — a float column with an empty cell. pandas reads the
+    // gap as NaN; Arrow keeps the slot null with an unspecified value buffer, so
+    // the decode must write NaN, not the garbage `arr.value(r)` would return.
+    #[tokio::test]
+    async fn float_column_empty_cell_becomes_nan() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("fnull.csv");
+        // col1 is float-typed (has 2.5); row 1 col1 is empty.
+        write_csv(&p, "1.0,2.5\n3.0,\n5.0,6.5\n");
+        let adapter = CsvArrayAdapter::from_path(p, serde_json::Value::Null).unwrap();
+        let arr = adapter.read(&NDSlice::empty()).await.unwrap();
+        assert_eq!(arr.dtype.kind, Kind::Float);
+        assert_eq!(arr.shape, vec![3, 2]);
+        let cells = f64_cells(&arr);
+        // row-major: [1.0, 2.5, 3.0, NaN, 5.0, 6.5]
+        assert_eq!(cells[0], 1.0);
+        assert_eq!(cells[1], 2.5);
+        assert_eq!(cells[2], 3.0);
+        assert!(
+            cells[3].is_nan(),
+            "empty float cell must be NaN, got {}",
+            cells[3]
+        );
+        assert_eq!(cells[4], 5.0);
+        assert_eq!(cells[5], 6.5);
+    }
+
+    // Invariant boundary — an int-looking column with an empty cell. Arrow infers
+    // it Int64 with a null bitmap, but pandas promotes such a column to
+    // float64+NaN (no typed-int-with-null exists from read_csv). The array must
+    // therefore come back float64 with NaN at the gap, not int64 with a garbage
+    // substitute.
+    #[tokio::test]
+    async fn int_column_empty_cell_promotes_to_float_nan() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("inull.csv");
+        // Every cell is integer-looking; row 1 col1 is empty.
+        write_csv(&p, "1,2\n3,\n5,6\n");
+        let adapter = CsvArrayAdapter::from_path(p, serde_json::Value::Null).unwrap();
+        let arr = adapter.read(&NDSlice::empty()).await.unwrap();
+        assert_eq!(
+            arr.dtype.kind,
+            Kind::Float,
+            "int-looking CSV with a missing value must promote to float64, as pandas does"
+        );
+        assert_eq!(arr.shape, vec![3, 2]);
+        let cells = f64_cells(&arr);
+        // row-major: [1, 2, 3, NaN, 5, 6]
+        assert_eq!(cells[0], 1.0);
+        assert_eq!(cells[1], 2.0);
+        assert_eq!(cells[2], 3.0);
+        assert!(
+            cells[3].is_nan(),
+            "empty int cell must decode to NaN, got {}",
+            cells[3]
+        );
+        assert_eq!(cells[4], 5.0);
+        assert_eq!(cells[5], 6.0);
+    }
+
+    // Invariant boundary — a null confined to one column still promotes the whole
+    // homogeneous array to float64 (numpy cannot hold mixed column dtypes in a
+    // 2-D builtin array; pandas' `to_dask_array` upcasts to float64). The
+    // all-integer, no-empty column must come back as exact float values.
+    #[tokio::test]
+    async fn null_in_one_column_promotes_whole_array() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("onenull.csv");
+        // col0 all-int, no empties; col1 int-looking with one empty at row 1.
+        write_csv(&p, "10,20\n30,\n50,60\n");
+        let adapter = CsvArrayAdapter::from_path(p, serde_json::Value::Null).unwrap();
+        let arr = adapter.read(&NDSlice::empty()).await.unwrap();
+        assert_eq!(arr.dtype.kind, Kind::Float);
+        let cells = f64_cells(&arr);
+        assert_eq!(cells[0], 10.0);
+        assert_eq!(cells[2], 30.0);
+        assert!(
+            cells[3].is_nan(),
+            "empty cell in col1 must be NaN, got {}",
+            cells[3]
+        );
+        assert_eq!(cells[4], 50.0);
     }
 
     #[tokio::test]
