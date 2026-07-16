@@ -1230,6 +1230,35 @@ async fn base_patch_metadata_drop_revision() {
     );
 }
 
+#[tokio::test]
+async fn base_replace_metadata_wholesale() {
+    let (base, _wd, _db) = spawn_write_server().await;
+    let client = from_uri(&base).await.unwrap();
+    let root = client.into_container().unwrap();
+
+    root.create_container("replace_node", serde_json::json!({"a": 1, "b": 2}))
+        .await
+        .expect("create");
+    let node = root.get("replace_node").await.unwrap();
+    node.base()
+        .expect("base")
+        .replace_metadata(Some(serde_json::json!({"c": 3})), None, None, false)
+        .await
+        .expect("replace_metadata");
+
+    // PUT wholesale-replaces the metadata document: "a" and "b" are gone,
+    // not merely unset, since only "c" was ever in the new document.
+    let updated = root.get("replace_node").await.unwrap();
+    let meta = updated.base().expect("base").metadata().clone();
+    assert_eq!(meta.get("a"), None, "a gone after wholesale replace");
+    assert_eq!(meta.get("b"), None, "b gone after wholesale replace");
+    assert_eq!(
+        meta.get("c"),
+        Some(&serde_json::json!(3)),
+        "c is the new document"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Scope 5: ArrayClient::export, TableClient::export
 // ---------------------------------------------------------------------------

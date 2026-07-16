@@ -256,4 +256,35 @@ impl BaseClient {
         });
         self.context.patch_json(&url, &body).await.map(|_| ())
     }
+
+    /// Replace this node's metadata, specs, and/or access_blob wholesale via
+    /// `PUT /api/v1/metadata/{path}`. Mirrors Python
+    /// `BaseClient.replace_metadata` (`base.py:836-889`).
+    ///
+    /// Unlike [`patch_metadata`](Self::patch_metadata) (a partial patch), each
+    /// of `metadata`, `specs`, `access_blob` is the *full* replacement
+    /// document. `None` leaves that field unchanged; the server treats an
+    /// explicit `Some(serde_json::Value::Null)` identically to `None` (both
+    /// mean "keep the current value") — to clear a field, pass an empty
+    /// document (`Some(json!({}))` / `Some(json!([]))`) instead.
+    /// `drop_revision` behaves as in [`patch_metadata`](Self::patch_metadata).
+    pub async fn replace_metadata(
+        &self,
+        metadata: Option<serde_json::Value>,
+        specs: Option<serde_json::Value>,
+        access_blob: Option<serde_json::Value>,
+        drop_revision: bool,
+    ) -> Result<()> {
+        let self_link = self.require_link("self")?;
+        let mut url = Url::parse(self_link)?;
+        if drop_revision {
+            url.query_pairs_mut().append_pair("drop_revision", "true");
+        }
+        let body = serde_json::json!({
+            "metadata": metadata,
+            "specs": specs,
+            "access_blob": access_blob,
+        });
+        self.context.put_json(&url, &body).await.map(|_| ())
+    }
 }
