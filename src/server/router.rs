@@ -5719,19 +5719,12 @@ fn managed_awkward_structure(
 /// (shape + chunks) drives the block layout `init_storage_sparse_parquet` lays
 /// out, so a create whose family/structure does not match is rejected here.
 ///
-/// Unlike the array/table/ragged helpers, this does not match on
-/// `AnyStructure::Sparse`: `AnyStructure` is `#[serde(untagged)]` with `Array`
-/// ordered before `Sparse`, and a COO structure (data_type + chunks + shape) is
-/// a valid `ArrayStructure`, so an incoming sparse structure deserializes as
-/// `AnyStructure::Array`. The authoritative discriminator is the sibling
-/// `structure_family` field, which lives outside the structure and so cannot
-/// steer the untagged parse. Having confirmed `structure_family == Sparse`, we
-/// re-derive the [`SparseStructure`] from the structure's raw JSON via its own
-/// lenient `from_json` (which recovers `chunks`/`shape`/`data_type` and defaults
-/// `coord_data_type`/`layout`). The array-shaped mis-parse preserves every field
-/// this path needs. (The structural cause is the untagged `AnyStructure`; a
-/// family-aware `DataSource` deserialization would fix it globally but is well
-/// out of scope for the sparse write port.)
+/// `DataSource` deserialization now narrows `structure` under `structure_family`
+/// authority ([`AnyStructure::from_family_json`](crate::core::structures::AnyStructure::from_family_json)),
+/// so a sparse create yields `AnyStructure::Sparse` directly — this matches on
+/// it like the array/table/ragged siblings. The previous re-derive-from-raw-JSON
+/// workaround existed only because the untagged parse mislabeled a COO structure
+/// (data_type + chunks + shape) as `Array`; that mislabel no longer happens.
 #[cfg(feature = "parquet")]
 fn managed_sparse_structure(
     ds: &crate::core::data_source::DataSource,
@@ -5743,19 +5736,12 @@ fn managed_sparse_structure(
             ds_family_str(ds.structure_family)
         )));
     }
-    let structure = ds.structure.as_ref().ok_or_else(|| {
-        ServerError::Validation(
+    match &ds.structure {
+        Some(crate::core::structures::AnyStructure::Sparse(s)) => Ok(s.clone()),
+        _ => Err(ServerError::Validation(
             "a managed sparse create requires a sparse structure (shape + chunks)".into(),
-        )
-    })?;
-    let raw = serde_json::to_value(structure).map_err(|e| {
-        ServerError::Internal(format!("re-serializing sparse structure failed: {e}"))
-    })?;
-    crate::core::structures::SparseStructure::from_json(&raw).map_err(|e| {
-        ServerError::Validation(format!(
-            "a managed sparse create requires a valid sparse structure (shape + chunks): {e}"
-        ))
-    })
+        )),
+    }
 }
 
 /// Validate that a managed ragged-mimetype create carries a ragged structure and
