@@ -1089,6 +1089,53 @@ async fn base_delete_removes_node() {
 }
 
 #[tokio::test]
+async fn container_distinct_metadata_values() {
+    let (base, _wd, _db) = spawn_write_server().await;
+    let client = from_uri(&base).await.unwrap();
+    let root = client.into_container().unwrap();
+
+    root.create_container("red_one", serde_json::json!({"color": "red"}))
+        .await
+        .expect("create red_one");
+    root.create_container("red_two", serde_json::json!({"color": "red"}))
+        .await
+        .expect("create red_two");
+    root.create_container("blue_one", serde_json::json!({"color": "blue"}))
+        .await
+        .expect("create blue_one");
+
+    let resp = root
+        .distinct(&["color"], true, false, true)
+        .await
+        .expect("distinct");
+
+    let color_values = resp
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get("color"))
+        .expect("color facet present");
+    let mut by_value: std::collections::HashMap<String, i64> = color_values
+        .iter()
+        .map(|v| (v.value.as_str().unwrap().to_string(), v.count.unwrap_or(0)))
+        .collect();
+    assert_eq!(by_value.remove("red"), Some(2), "two red containers");
+    assert_eq!(by_value.remove("blue"), Some(1), "one blue container");
+    assert!(by_value.is_empty(), "no other color values expected");
+
+    let families = resp
+        .structure_families
+        .as_ref()
+        .expect("structure_families facet present");
+    assert!(
+        families
+            .iter()
+            .any(|v| v.value == serde_json::json!("container")),
+        "root children are all containers"
+    );
+    assert!(resp.specs.is_none(), "specs facet not requested");
+}
+
+#[tokio::test]
 async fn base_patch_metadata_merge() {
     let (base, _wd, _db) = spawn_write_server().await;
     let client = from_uri(&base).await.unwrap();

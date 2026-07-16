@@ -26,7 +26,7 @@ const PATH_SEGMENT: &AsciiSet = &CONTROLS
     .add(b'%');
 
 use crate::core::data_source::DataSource;
-use crate::core::schemas::PostMetadataResponse;
+use crate::core::schemas::{GetDistinctResponse, PostMetadataResponse};
 use crate::core::structures::StructureFamily;
 
 use crate::client::any_client::AnyClient;
@@ -256,6 +256,52 @@ impl ContainerClient {
     pub fn search(mut self, query: crate::core::queries::Query) -> Self {
         self.queries.extend(query.encode());
         self
+    }
+
+    /// Get the unique values (and optionally counts) of `metadata_keys`,
+    /// structure families, and/or specs among this container's entries, via
+    /// `GET /api/v1/distinct/{path}`.
+    ///
+    /// Mirrors Python `Container.distinct(*metadata_keys, structure_families,
+    /// specs, counts)` (`container.py:570-606`). Honors any active search
+    /// filters ([`search`](Self::search) / [`with_filter`](Self::with_filter)),
+    /// same as Python's `**self._queries_as_params`. Errors with
+    /// [`ClientError::Server`](crate::client::error::ClientError::Server) (HTTP
+    /// 405) when the server has no catalog backing this facility.
+    ///
+    /// ```no_run
+    /// # use tiled_rs::client::ContainerClient;
+    /// # async fn run(c: ContainerClient) -> tiled_rs::client::Result<()> {
+    /// let distinct = c.distinct(&["color"], false, false, true).await?;
+    /// # Ok(()) }
+    /// ```
+    pub async fn distinct(
+        &self,
+        metadata_keys: &[&str],
+        structure_families: bool,
+        specs: bool,
+        counts: bool,
+    ) -> Result<GetDistinctResponse> {
+        let self_link = self.base.require_link("self")?;
+        let distinct_link = self_link.replacen("/metadata", "/distinct", 1);
+        let mut url = Url::parse(&distinct_link).map_err(ClientError::from)?;
+        {
+            let mut q = url.query_pairs_mut();
+            for key in metadata_keys {
+                q.append_pair("metadata", key);
+            }
+            q.append_pair("structure_families", &structure_families.to_string());
+            q.append_pair("specs", &specs.to_string());
+            q.append_pair("counts", &counts.to_string());
+            for (k, v) in &self.queries {
+                q.append_pair(k, v);
+            }
+        }
+        retry(|| async {
+            let r = self.base.context.get(&url).await?;
+            decode_response::<GetDistinctResponse>(r).await
+        })
+        .await
     }
 
     /// Create a new child node via `POST /api/v1/metadata/{parent-path}`.
