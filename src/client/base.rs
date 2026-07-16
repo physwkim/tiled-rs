@@ -347,6 +347,42 @@ impl BaseClient {
         Ok(item.attributes.data_sources)
     }
 
+    /// The formats the server can export this node as — the media types it can
+    /// serialize the node's structure family (and any of its specs) into,
+    /// sorted and de-duplicated.
+    ///
+    /// Mirrors Python `BaseClient.formats` (`base.py:503`): the union of the
+    /// server's registered formats for each of the node's spec names and for
+    /// its structure family. The format table is read from the server's About
+    /// payload (`GET /api/v1/`, fetched once and cached on the [`Context`] via
+    /// [`Context::server_info`](crate::client::Context::server_info)).
+    ///
+    /// Parity note: the Rust server keys its About `formats` map solely by
+    /// structure family (`serialization_registry.all_formats`), never by spec
+    /// name, so the per-spec lookups contribute nothing against a stock Rust
+    /// server; the loop is kept for algorithmic parity with upstream (and to
+    /// pick up spec-keyed formats should a server register any). Where upstream
+    /// indexes the structure-family entry directly (a `KeyError` if absent),
+    /// this treats an absent family key as contributing no formats rather than
+    /// erroring — every family the Rust registry serves is always present in
+    /// the map, so the softening only affects an out-of-contract server.
+    pub async fn formats(&self) -> Result<Vec<String>> {
+        let about = self.context.server_info().await?;
+        let table = &about.formats;
+        let mut formats: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for spec in self.specs() {
+            if let Some(list) = table.get(spec.name.as_str()) {
+                formats.extend(list.iter().cloned());
+            }
+        }
+        if let Some(family) = self.structure_family()
+            && let Some(list) = table.get(family.to_string().as_str())
+        {
+            formats.extend(list.iter().cloned());
+        }
+        Ok(formats.into_iter().collect())
+    }
+
     /// The node's `self` link with its first `/metadata` segment rewritten to
     /// `/asset/manifest`. Mirrors Python `asset_manifest`'s
     /// `self.item["links"]["self"].replace("/metadata", "/asset/manifest", 1)`.
