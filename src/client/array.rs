@@ -7,6 +7,7 @@
 //! `patch` to write a data block into a slice (optionally extending the shape).
 //! Higher-level reshaping is left to the caller.
 
+use crate::core::ndslice::NDSlice;
 use crate::core::structures::ArrayStructure;
 use url::Url;
 
@@ -103,6 +104,71 @@ impl ArrayClient {
         Ok(ArrayBlock {
             data: bytes,
             shape,
+            dtype: self.structure().data_type.clone(),
+        })
+    }
+
+    /// Fetch an arbitrary N-D slice of the array in a single request via
+    /// `GET /api/v1/array/full?slice=...`. Mirrors Python
+    /// `_DaskArrayClient._get_slice` (`array.py:147-193`) minus the dask
+    /// scheduling — the caller gets the raw bytes plus the shape needed to
+    /// interpret them.
+    ///
+    /// Unlike [`read_block`](Self::read_block) (one chunk by chunk-index) and
+    /// [`read`](Self::read) (every chunk, concatenated), this lets a caller
+    /// fetch an arbitrary sub-region — e.g. `NDSlice::from_numpy_str("2:5")` —
+    /// that may span multiple chunks, in one round trip. Pass
+    /// [`NDSlice::empty`] to read the whole array as a single request.
+    pub async fn read_slice(&self, slice: &NDSlice) -> Result<ArrayBlock> {
+        let exp_shape = slice
+            .shape_after_slice(self.shape())
+            .map_err(|e| ClientError::Invalid(format!("invalid slice: {e}")))?;
+
+        // A zero in the resulting shape means the slice selects no data;
+        // short-circuit rather than issuing a request the server would
+        // answer with a zero-length body anyway.
+        if exp_shape.contains(&0) {
+            return Ok(ArrayBlock {
+                data: bytes::Bytes::new(),
+                shape: exp_shape,
+                dtype: self.structure().data_type.clone(),
+            });
+        }
+
+        let link = self.base.require_link("full")?;
+        let mut url = Url::parse(link)?;
+        {
+            let mut q = url.query_pairs_mut();
+            let exp_shape_str = if exp_shape.is_empty() {
+                "scalar".to_string()
+            } else {
+                exp_shape
+                    .iter()
+                    .map(|n| n.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            };
+            q.append_pair("expected_shape", &exp_shape_str);
+            if !slice.is_empty() {
+                q.append_pair("slice", &slice.to_numpy_str());
+            }
+        }
+
+        // Cap concurrent bulk-data fetches across the whole context, mirroring
+        // Python's `with self.context.throttle()` around `_get_slice`
+        // (`array.py:181`).
+        let _permit = self.base.context.data_fetch_permit().await;
+        let bytes = retry(|| async {
+            self.base
+                .context
+                .get_bytes(&url, OCTET_STREAM_MIME_TYPE)
+                .await
+        })
+        .await?;
+
+        Ok(ArrayBlock {
+            data: bytes,
+            shape: exp_shape,
             dtype: self.structure().data_type.clone(),
         })
     }

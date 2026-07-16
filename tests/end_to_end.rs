@@ -217,6 +217,44 @@ async fn read_full_array_concatenates_blocks() {
 }
 
 #[tokio::test]
+async fn read_array_slice() {
+    use tiled_rs::core::ndslice::NDSlice;
+
+    let base = spawn_server(None).await;
+    let client = from_uri(&base).await.unwrap();
+    let root = client.into_container().unwrap();
+    let arr = root.get("some_array").await.unwrap().into_array().unwrap();
+
+    fn decode_f64s(bytes: &[u8]) -> Vec<f64> {
+        bytes
+            .chunks_exact(8)
+            .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+            .collect()
+    }
+
+    // A mid-array range slice fetches only the requested elements.
+    let slice = NDSlice::from_numpy_str("2:5").unwrap();
+    let block = arr.read_slice(&slice).await.unwrap();
+    assert_eq!(block.shape, vec![3]);
+    assert_eq!(decode_f64s(&block.data), vec![2.0, 3.0, 4.0]);
+
+    // An empty NDSlice reads the whole array in one request.
+    let block = arr.read_slice(&NDSlice::empty()).await.unwrap();
+    assert_eq!(block.shape, vec![10]);
+    assert_eq!(
+        decode_f64s(&block.data),
+        (0..10).map(|i| i as f64).collect::<Vec<_>>()
+    );
+
+    // A slice that selects nothing short-circuits without a wire round-trip
+    // (mirrors Python's `0 in exp_shape` fast path, array.py:168-173).
+    let slice = NDSlice::from_numpy_str("5:2").unwrap();
+    let block = arr.read_slice(&slice).await.unwrap();
+    assert_eq!(block.shape, vec![0]);
+    assert!(block.data.is_empty());
+}
+
+#[tokio::test]
 async fn key_not_found_returns_error() {
     let base = spawn_server(None).await;
     let client = from_uri(&base).await.unwrap();

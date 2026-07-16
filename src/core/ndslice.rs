@@ -301,6 +301,33 @@ impl NDSlice {
         Ok(NDSlice(out))
     }
 
+    /// Calculate the shape of `arr[self]` for an array of the given `shape`.
+    ///
+    /// Mirrors Python `NDSlice.shape_after_slice` (`tiled/ndslice.py:578`).
+    /// An empty slice (selects everything) returns `shape` unchanged.
+    pub fn shape_after_slice(&self, shape: &[usize]) -> Result<Vec<usize>> {
+        if self.is_empty() {
+            return Ok(shape.to_vec());
+        }
+        let expanded = expand_slice_for_shape(self, shape)?;
+        let mut out = Vec::with_capacity(shape.len());
+        for (dim, &dim_len) in expanded.iter().zip(shape.iter()) {
+            match dim {
+                // An integer index reduces dimensionality — it does not
+                // contribute a dimension to the output shape.
+                SliceDim::Index(_) => {}
+                SliceDim::Slice { start, stop, step } => {
+                    let (s, t, st) = py_slice_indices(*start, *stop, *step, dim_len)?;
+                    out.push(slice_len(s, t, st));
+                }
+                SliceDim::Ellipsis => {
+                    unreachable!("expand_slice_for_shape replaces every Ellipsis")
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Convert to JSON representation, expanding Ellipsis to fill `ndim` dimensions.
     pub fn to_json(&self, ndim: Option<usize>) -> Result<Vec<serde_json::Value>> {
         let has_ellipsis = self.0.iter().any(|d| matches!(d, SliceDim::Ellipsis));
@@ -376,11 +403,7 @@ fn compose_slc_with_idx(slc: &SliceDim, idx: isize) -> Result<isize> {
     if step == 0 {
         return Err(TiledError::InvalidSlice("slice step cannot be zero".into()));
     }
-    let length: isize = if step > 0 {
-        (stop - start + step - 1).max(0) / step
-    } else {
-        (start - stop - step - 1).max(0) / (-step)
-    };
+    let length = slice_len(start, stop, step) as isize;
     let idx = if idx < 0 { idx + length } else { idx };
     if idx < 0 || idx >= length {
         return Err(TiledError::InvalidSlice(
@@ -388,6 +411,18 @@ fn compose_slc_with_idx(slc: &SliceDim, idx: isize) -> Result<isize> {
         ));
     }
     Ok(start + step * idx)
+}
+
+/// Number of elements selected by `slice(start, stop, step)` — the length
+/// arithmetic behind Python's `slice.indices()`. `start`/`stop`/`step` must
+/// already be normalised (e.g. via [`py_slice_indices`]).
+fn slice_len(start: isize, stop: isize, step: isize) -> usize {
+    let length = if step > 0 {
+        (stop - start + step - 1).max(0) / step
+    } else {
+        (start - stop - step - 1).max(0) / (-step)
+    };
+    length as usize
 }
 
 /// Compose two SliceDim::Slice items. Mirrors upstream `_slc_with_slc`.
@@ -411,11 +446,7 @@ fn compose_slc_with_slc(slc1: &SliceDim, slc2: &SliceDim) -> Result<SliceDim> {
     if step1 == 0 {
         return Err(TiledError::InvalidSlice("slice step cannot be zero".into()));
     }
-    let length: isize = if step1 > 0 {
-        (stop1 - start1 + step1 - 1).max(0) / step1
-    } else {
-        (start1 - stop1 - step1 - 1).max(0) / (-step1)
-    };
+    let length = slice_len(start1, stop1, step1) as isize;
     // Apply slice2 to a 0..length range — this is Python's slice.indices().
     let (start2, stop2, step2) = match slc2 {
         SliceDim::Slice { start, stop, step } => {
@@ -894,6 +925,72 @@ mod tests {
         let s = NDSlice::from_numpy_str(":").unwrap();
         assert_eq!(s.0, vec![SliceDim::full()]);
         assert!(s.is_empty()); // full slice = selects everything
+    }
+
+    // ---- shape_after_slice tests ---------------------------------------
+
+    // boundary: empty slice (selects everything) → shape unchanged
+    #[test]
+    fn shape_after_slice_empty_is_identity() {
+        let s = NDSlice::empty();
+        assert_eq!(s.shape_after_slice(&[10, 20]).unwrap(), vec![10, 20]);
+    }
+
+    // boundary: plain range slice on one dim → that dim shrinks
+    #[test]
+    fn shape_after_slice_simple_range() {
+        let s = NDSlice::from_numpy_str("2:5").unwrap();
+        assert_eq!(s.shape_after_slice(&[10]).unwrap(), vec![3]);
+    }
+
+    // boundary: integer index reduces dimensionality (dim disappears)
+    #[test]
+    fn shape_after_slice_integer_index_drops_dim() {
+        let s = NDSlice::from_numpy_str("3,1:5").unwrap();
+        assert_eq!(s.shape_after_slice(&[10, 20]).unwrap(), vec![4]);
+    }
+
+    // boundary: strided slice rounds up the count correctly
+    #[test]
+    fn shape_after_slice_with_step() {
+        let s = NDSlice::from_numpy_str("0:10:3").unwrap();
+        // indices 0,3,6,9 → 4 elements
+        assert_eq!(s.shape_after_slice(&[10]).unwrap(), vec![4]);
+    }
+
+    // boundary: negative step traversing the whole axis
+    #[test]
+    fn shape_after_slice_negative_step() {
+        let s = NDSlice::from_numpy_str("::-1").unwrap();
+        assert_eq!(s.shape_after_slice(&[7]).unwrap(), vec![7]);
+    }
+
+    // boundary: ellipsis fills the remaining dims untouched
+    #[test]
+    fn shape_after_slice_ellipsis_fills_remaining() {
+        let s = NDSlice::from_numpy_str("1,...").unwrap();
+        assert_eq!(s.shape_after_slice(&[10, 20, 30]).unwrap(), vec![20, 30]);
+    }
+
+    // boundary: fewer dims than shape and no ellipsis → trailing dims pass through full
+    #[test]
+    fn shape_after_slice_fewer_dims_no_ellipsis() {
+        let s = NDSlice::from_numpy_str("2:4").unwrap();
+        assert_eq!(s.shape_after_slice(&[10, 20]).unwrap(), vec![2, 20]);
+    }
+
+    // boundary: slice that selects zero elements → 0 in the output shape
+    #[test]
+    fn shape_after_slice_empty_result() {
+        let s = NDSlice::from_numpy_str("8:5").unwrap();
+        assert_eq!(s.shape_after_slice(&[10]).unwrap(), vec![0]);
+    }
+
+    // boundary: too many non-ellipsis dims for the array's rank → error
+    #[test]
+    fn shape_after_slice_too_many_dims_errors() {
+        let s = NDSlice::from_numpy_str("1,2,3").unwrap();
+        assert!(s.shape_after_slice(&[10, 10]).is_err());
     }
 
     #[test]
