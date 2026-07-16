@@ -307,10 +307,13 @@ impl ContainerClient {
     /// Create a new child node via `POST /api/v1/metadata/{parent-path}`.
     ///
     /// Returns the key (id) assigned by the server. `data_sources` may be
-    /// empty for a pure-metadata or server-managed node.
+    /// empty for a pure-metadata or server-managed node. `key` is
+    /// `Some(name)` to request a specific name, or `None` to let the server
+    /// generate a unique one (Python parity: `Container.new(key=None)`,
+    /// `container.py:680-729`).
     pub async fn create_node(
         &self,
-        key: &str,
+        key: Option<&str>,
         structure_family: StructureFamily,
         metadata: serde_json::Value,
         specs: Vec<serde_json::Value>,
@@ -330,16 +333,21 @@ impl ContainerClient {
         Ok(created.id)
     }
 
-    /// Convenience: create an empty container child.
+    /// Convenience: create an empty container child. `key` is `Some(name)`
+    /// to request a specific name, or `None` to let the server generate a
+    /// unique one.
     pub async fn create_container(
         &self,
-        key: &str,
+        key: Option<&str>,
         metadata: serde_json::Value,
     ) -> Result<ContainerClient> {
-        self.create_node(key, StructureFamily::Container, metadata, vec![], vec![])
+        let created_key = self
+            .create_node(key, StructureFamily::Container, metadata, vec![], vec![])
             .await?;
-        // Fetch the newly-created child and return it as a ContainerClient.
-        self.get(key).await?.into_container()
+        // Fetch the newly-created child (by the server-assigned key, which
+        // echoes the caller's key when one was given) and return it as a
+        // ContainerClient.
+        self.get(&created_key).await?.into_container()
     }
 
     /// Delete every immediate child of this container (to empty it before
