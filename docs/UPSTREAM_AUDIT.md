@@ -55,6 +55,12 @@ fix problems in code we never wrote.
 | #143  | RGB TIFF support | (this batch) | Color TIFFs were silently coerced to grayscale + u16; now `[h, w, channels]` shape with native dtype (u8/u16/u32/f32/f64). |
 | #1164 | HDF5 locking parameter | (this batch) | rust-hdf5 0.2.8 added `H5File::options().locking(...)` (mirrors libhdf5's `HDF5_USE_FILE_LOCKING`); ported `Hdf5Locking::{Default,Disabled,BestEffort}` + `from_path_with_locking` constructor. Earlier audit marked N/A because 0.2.0 was lock-less. |
 | #1018 | Background-task lifecycle | a9f6df8 | `AppState::background_tasks` (`BackgroundTasks`: JoinSet registry + watch-channel cancellation) is the single owner for process-lifetime tasks; the webhook dispatcher registers with it and selects on `cancellation()` instead of a detached `tokio::spawn`. `cli::run()` calls `background_tasks.shutdown()` (signal + await, exactly once) after the HTTP listener stops accepting connections. Per-webhook delivery tasks stay detached (bounded lifetime, documented in `webhook_dispatch.rs`). |
+| #157  | vlen-string HDF5 datasets | 0be4d0e | `dtype_from_hdf5` detects the vlen-string CLASS instead of erroring; elements packed into null-padded `S<N>` fixed-width bytes (N = longest element), matching upstream's `numpy.asarray(ds[()], dtype=bytes)` coercion. #127 SWMR remains documented-unsupported (6bf3689): rust-hdf5 0.2.27 exposes no `swmr`/`libver` on `H5File`, and its `SwmrFileReader` lacks the datatype-CLASS accessor the adapter's Kind detection needs; default (`TILED_HDF5_SWMR_DEFAULT=0`) behaviour already matches upstream. |
+| #1096 | Postgres approximate length | ceb03ab | `lbound_count_children` (LIMIT-bounded), `approx_count_children` (`pg_stats.most_common_vals/freqs` × `pg_class.reltuples`), `count_children_or_approx` gate wired into the single-node metadata route via `exact_count_limit`; SQLite stays exact. Follow-up extends it to per-entry search-page counts + batches the SQLite page counts (one `GROUP BY parent_id` per page). |
+| #649  | include_data_sources on search | a30e258 | `SearchEntry.data_sources: Option<Vec<DataSource>>`; `search_page` takes the flag; SQL catalog batches the page with `list_data_sources_for_nodes` (two IN-clause queries, no N+1); `data_sources` removed from `?fields=` pruning to match upstream's flag-only gating. |
+| #774  | Zarr protocol routers (/zarr/v2 + /zarr/v3) | fa0f521 + 99360f1 | Every catalog node served as a read-only zarr store: v2 `.zgroup`/`.zarray`/`.zattrs` + dotted chunk keys, v3 `zarr.json` + `c/…` keys, N-D zero-padded boundary chunks, per-node access policy. Deliberate divergence: chunks are uncompressed (`compressor: null` / `bytes` codec) — a valid zarr subset — instead of upstream's blosc(lz4), which the in-repo blosc2 tooling cannot reproduce verifiably. Sparse densify + table-column resolution tracked as follow-ups. |
+| (core) | Auto-generated node keys | f75d760 | Omitted-key create now generates `Uuid::new_v4()` (upstream `Context.key_maker` default, catalog/adapter.py:188); client `create_node`/`create_container` take `Option<&str>`. Known gap: Rust wire uses `"key"` where upstream `PostMetadataRequest` uses `"id"` (schemas.py:462) — tracked. |
+| (core) | NotEq missing-key semantics | a866467 | `push_neq` no longer includes rows whose metadata lacks the key (`IS NULL OR` arm removed, both dialects) — matches upstream `attr != value` NULL-exclusion and our own `NotIn`. |
 
 ## Already covered (no code change)
 
@@ -81,14 +87,17 @@ fix problems in code we never wrote.
 
 | PR | Title | Reason |
 |----|-------|--------|
-| #1096 | Postgres approximate length for large containers | `pg_class.reltuples` estimate — premature without 50M+ row workload. |
 | #1314 | External-array shape race during streaming | Race between SWMR/zarr writer + cached reader metadata. Complex to fix deterministically. |
 | #1320 | Postgres `nodes` parent_id index | We have the index; production-scale planner tuning is the actual issue. |
 | #588  | btree_gin (vs plain GIN) | We have plain GIN over jsonb; btree_gin only helps hybrid btree+gin queries. |
 | #1271 | Preemptive reshape | Our HDF5 reads `ds.shape()` directly; can't diverge by design. |
-| #1378 | json-seq single-row response | Likely N/A but worth a smoke test before changing anything. |
-| #802 (zarrs write side) | Appendable Zarr — actual write impl | Trait + route landed; zarrs write integration is a separate adapter-level task. |
 | #465  | Adapters that interact with services | Large feature surface; likely many sub-PRs. |
+
+Resolved out of Deferred: #1096 (ported, see above); #1378 (confirmed
+correct — single-row json-seq framing covered by a unit + HTTP smoke
+test, b07dde3, no code change); #802 zarrs write side (implemented in
+`zarr_adapter.rs` — `write`/`write_block`/`append`/`patch` over
+`store_array_subset`/`set_shape`, with integration tests).
 
 ## N/A (Python-specific or feature not in our port)
 
@@ -139,10 +148,12 @@ Adapters") via title-and-body skim. Findings:
   #463 catalog deletion (we have it; #503 layered the empty-check).
 * **One actionable port**: #143 RGB TIFF (see Ported table). Our
   TiffAdapter was hardcoded to `[h, w]` u16 grayscale.
-* **Adapter improvements deferred**: #127 SWMR-mode HDF5 reads,
-  #157 vlen-string HDF5 datasets, #394 HDF5 inlined-contents env var,
-  #62 file→multi-node mapping. All adapter-internal work; tracked in
-  the deferred list above.
+* **Adapter improvements**: #157 vlen-string HDF5 datasets — ported
+  (0be4d0e, see Ported table). #127 SWMR-mode HDF5 reads —
+  documented-unsupported (6bf3689): rust-hdf5 exposes no `swmr`/`libver`.
+  Still deferred: #394 HDF5 inlined-contents env var (needs an HDF5
+  *container* adapter plus a server-side inlined-contents mechanism,
+  neither of which exists in this port), #62 file→multi-node mapping.
 
 The full sweep filter:
 
