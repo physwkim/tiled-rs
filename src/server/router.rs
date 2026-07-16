@@ -4510,13 +4510,14 @@ async fn create_node_core(
     generate_storage: bool,
 ) -> Result<impl IntoResponse, ServerError> {
     let path = segments.join("/");
-    // Prefer the top-level `key` (Python tiled wire format, used by cirrus),
-    // fall back to `metadata.key` for older clients, then generate one.
+    // Prefer the top-level `id` (Python tiled wire format: server/schemas.py:462
+    // `PostMetadataRequest.id`, accepts legacy `key` via serde alias), fall
+    // back to `metadata.key` for older clients, then generate one.
     // Python parity: `Context.key_maker` defaults to `str(uuid.uuid4())`
     // (tiled/catalog/adapter.py:188), applied when the client omits the key
     // (router.py:1875: `key = body.id or entry.context.key_maker()`).
     let id = req
-        .key
+        .id
         .clone()
         .or_else(|| {
             req.metadata

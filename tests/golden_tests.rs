@@ -912,6 +912,64 @@ async fn test_register_post_under_path() {
 }
 
 // ---------------------------------------------------------------------------
+// Wire-format regression: PostMetadataRequest's create-key field is named
+// `id` on the wire (Python tiled's `PostMetadataRequest.id`,
+// server/schemas.py:462), not `key`. The server must honor a top-level `id`
+// (upstream shape) and still accept a legacy top-level `key` (pre-existing
+// Rust clients) via serde alias.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_register_post_top_level_id_honored() {
+    let app = build_app();
+    let body = serde_json::json!({
+        "id": "explicit_id",
+        "structure_family": "container",
+        "metadata": {"title": "demo"},
+        "specs": [],
+        "data_sources": [],
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/register/")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 201);
+    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(parsed["id"], "explicit_id");
+}
+
+#[tokio::test]
+async fn test_register_post_legacy_top_level_key_still_honored() {
+    let app = build_app();
+    let body = serde_json::json!({
+        "key": "explicit_key",
+        "structure_family": "container",
+        "metadata": {"title": "demo"},
+        "specs": [],
+        "data_sources": [],
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/register/")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 201);
+    let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+    assert_eq!(parsed["id"], "explicit_key");
+}
+
+// ---------------------------------------------------------------------------
 // Percent-encoded slash in keys is preserved (P1 fix)
 // ---------------------------------------------------------------------------
 
