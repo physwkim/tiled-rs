@@ -28,7 +28,8 @@ const PATH_SEGMENT: &AsciiSet = &CONTROLS
 use crate::core::data_source::{DataSource, Management};
 use crate::core::schemas::{GetDistinctResponse, PostMetadataResponse};
 use crate::core::structures::{
-    AnyStructure, ArrayStructure, RaggedStructure, StructureFamily, TableStructure,
+    AnyStructure, ArrayStructure, AwkwardStructure, RaggedStructure, StructureFamily,
+    TableStructure,
 };
 
 use arrow::array::RecordBatch;
@@ -36,6 +37,7 @@ use arrow::datatypes::SchemaRef;
 
 use crate::client::any_client::AnyClient;
 use crate::client::array::ArrayClient;
+use crate::client::awkward::AwkwardClient;
 use crate::client::base::{BaseClient, Item};
 use crate::client::context::Context;
 use crate::client::dataframe::TableClient;
@@ -560,6 +562,65 @@ impl ContainerClient {
             .await?;
         let client = self.get(&created_key).await?.into_ragged()?;
         client.write(data, true).await?;
+        Ok(client)
+    }
+
+    /// Create a writable awkward-array child from an explicit `structure`, then
+    /// upload its buffer map. Mirrors Python `Container.write_awkward`
+    /// (`container.py:942`): `new(awkward, [DataSource(structure)], ...)` then
+    /// `client.write(container)`.
+    ///
+    /// The data source omits `mimetype` (Python `write_awkward` likewise builds
+    /// `DataSource(structure, structure_family=awkward)` with no mimetype,
+    /// `container.py:984`), so the server picks its awkward managed-write
+    /// backend — `default_creation_mimetype(Awkward)` →
+    /// `application/x-awkward-buffers` — with `management: writable`.
+    /// `access_tags` is threaded through [`post_new_node`](Self::post_new_node).
+    ///
+    /// Deviation from Python: Python takes an `awkward.Array`, packs it
+    /// (`awkward.to_packed`), and derives `(form, length, container)` via
+    /// `awkward.to_buffers` (`container.py:975-980`); the Rust client has no
+    /// awkward runtime, so the caller supplies the [`AwkwardStructure`] (form +
+    /// length) and the `buffers` map (`form_key → raw bytes`, the same
+    /// `node{N}-data` / `node{N}-offsets` layout `awkward.to_buffers` produces)
+    /// directly — the shape [`AwkwardClient::write`] takes. This is the same
+    /// explicit-input deviation family as [`write_array`](Self::write_array) and
+    /// [`write_ragged`](Self::write_ragged).
+    ///
+    /// [`AwkwardClient::write`]: crate::client::awkward::AwkwardClient::write
+    pub async fn write_awkward(
+        &self,
+        key: Option<&str>,
+        structure: AwkwardStructure,
+        buffers: std::collections::HashMap<String, bytes::Bytes>,
+        metadata: serde_json::Value,
+        specs: Vec<serde_json::Value>,
+        access_tags: Option<&[String]>,
+    ) -> Result<AwkwardClient> {
+        let ds = DataSource {
+            structure_family: StructureFamily::Awkward,
+            structure: Some(AnyStructure::Awkward(structure)),
+            id: None,
+            // Let the server choose the managed-write backend and its mimetype
+            // (Python `write_awkward` likewise omits it).
+            mimetype: None,
+            parameters: serde_json::json!({}),
+            properties: serde_json::json!({}),
+            assets: vec![],
+            management: Management::Writable,
+        };
+        let created_key = self
+            .post_new_node(
+                key,
+                StructureFamily::Awkward,
+                metadata,
+                specs,
+                vec![ds],
+                access_tags,
+            )
+            .await?;
+        let client = self.get(&created_key).await?.into_awkward()?;
+        client.write(buffers).await?;
         Ok(client)
     }
 

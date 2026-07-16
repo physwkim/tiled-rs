@@ -897,6 +897,63 @@ async fn write_ragged_helper_roundtrip() {
     );
 }
 
+/// `ContainerClient::write_awkward` creates a managed awkward node and uploads
+/// its buffer map in one call, threading `access_tags`; the buffers read back
+/// verbatim and the tags land as `access_blob.tags`.
+#[tokio::test]
+async fn write_awkward_helper_roundtrip() {
+    use std::collections::HashMap;
+    use tiled_rs::core::structures::AwkwardStructure;
+
+    let (base, _wd, _db) = spawn_write_server().await;
+    let root = from_uri(&base).await.unwrap().into_container().unwrap();
+
+    let structure = AwkwardStructure {
+        length: 3,
+        form: serde_json::json!({
+            "class": "NumpyArray",
+            "primitive": "float64",
+            "form_key": "node0"
+        }),
+    };
+    let mut buffers = HashMap::new();
+    buffers.insert("node0-data".to_string(), Bytes::from(vec![7u8; 24]));
+    let tags = vec!["team-a".to_string()];
+
+    let ak = root
+        .write_awkward(
+            Some("h_awk"),
+            structure,
+            buffers,
+            serde_json::json!({"note": "awk"}),
+            vec![],
+            Some(&tags),
+        )
+        .await
+        .expect("write_awkward");
+
+    // The returned client reads the buffers back unchanged.
+    let read_back = ak.read().await.expect("awkward read");
+    assert_eq!(read_back.buffers.len(), 1);
+    assert_eq!(&read_back.buffers["node0-data"][..], &[7u8; 24][..]);
+
+    // access_tags landed as access_blob.tags on the created node.
+    let fetched = root.get("h_awk").await.unwrap();
+    let blob = fetched
+        .base()
+        .expect("awkward node has a base client")
+        .item()
+        .attributes
+        .access_blob
+        .clone()
+        .expect("access_blob present on the created node");
+    assert_eq!(
+        blob,
+        serde_json::json!({"tags": ["team-a"]}),
+        "access_tags stored as access_blob.tags"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Server-level awkward managed-write: create + write + read-back over a
 // catalog node (exercises the resolver's awkward arm + the on-disk buffer
