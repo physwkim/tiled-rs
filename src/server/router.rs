@@ -437,7 +437,14 @@ pub async fn metadata(
     // a write would otherwise see stale data. Direct DB lookup keeps
     // metadata responses consistent with the latest committed write.
     let mut resource = if let Some(ref catalog) = state.catalog {
-        catalog_metadata_resource(catalog, &segments, &base_url, include_data_sources).await?
+        catalog_metadata_resource(
+            catalog,
+            &segments,
+            &base_url,
+            include_data_sources,
+            i64::try_from(state.exact_count_limit).unwrap_or(i64::MAX),
+        )
+        .await?
     } else if segments.is_empty() {
         core::construct_root_resource(state.root_tree.as_ref(), &base_url).await?
     } else {
@@ -5671,13 +5678,16 @@ async fn catalog_metadata_resource(
     segments: &[String],
     base_url: &str,
     include_data_sources: bool,
+    exact_count_limit: i64,
 ) -> Result<crate::core::schemas::Resource, ServerError> {
     use crate::core::schemas::{
         NodeAttributes, NodeStructure, Resource, SortDirection, SortingItem,
     };
     if segments.is_empty() {
+        // Root container length: exact for small containers, statistics-based
+        // approximation for large ones on Postgres (SQLite stays exact).
         let count = catalog
-            .count_children(None)
+            .count_children_or_approx(None, exact_count_limit)
             .await
             .map_err(map_catalog_err)?;
         let links = crate::core::links::links_for_node(
@@ -5730,8 +5740,10 @@ async fn catalog_metadata_resource(
     // URIs, mimetypes, and management info without a separate request.
     let (structure_value, data_sources) =
         if matches!(family, crate::core::structures::StructureFamily::Container) {
+            // Container length: exact for small containers, statistics-based
+            // approximation for large ones on Postgres (SQLite stays exact).
             let count = catalog
-                .count_children(Some(node.id))
+                .count_children_or_approx(Some(node.id), exact_count_limit)
                 .await
                 .map_err(map_catalog_err)?;
             (

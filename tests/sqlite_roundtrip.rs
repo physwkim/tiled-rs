@@ -1322,3 +1322,92 @@ async fn connect_with_pool_size_limits_connections() {
         "pool size 1: try_acquire must return None while one connection is held"
     );
 }
+
+/// `lbound_count_children` returns the exact count when within the threshold
+/// and caps at `threshold + 1` beyond it; `count_children_or_approx` on SQLite
+/// always returns the exact count (the Rust port keeps SQLite exact — only
+/// Postgres gets the statistics-based estimate); `approx_count_children` on
+/// SQLite is always `None`. Mirrors upstream `lbound_len` / `len_or_approx`
+/// (adapter.py:506, server/core.py:65) for the SQLite dialect.
+#[tokio::test]
+async fn lbound_and_approx_count_children_sqlite() {
+    let cat = Catalog::connect("sqlite::memory:").await.unwrap();
+    cat.migrate().await.unwrap();
+
+    // One parent container with five children.
+    let parent = cat
+        .create_node(
+            None,
+            vec![],
+            RegisterRequest {
+                key: "parent".into(),
+                structure_family: "container".into(),
+                metadata: json!({}),
+                specs: json!([]),
+                access_blob: json!({}),
+            },
+        )
+        .await
+        .unwrap();
+    for i in 0..5 {
+        cat.create_node(
+            Some(parent.id),
+            vec!["parent".into()],
+            RegisterRequest {
+                key: format!("child_{i}"),
+                structure_family: "array".into(),
+                metadata: json!({}),
+                specs: json!([]),
+                access_blob: json!({}),
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    // Within threshold → exact count.
+    assert_eq!(
+        cat.lbound_count_children(Some(parent.id), 10)
+            .await
+            .unwrap(),
+        5,
+        "lbound within threshold must be the exact count"
+    );
+    // Below the child count → capped at threshold + 1.
+    assert_eq!(
+        cat.lbound_count_children(Some(parent.id), 2).await.unwrap(),
+        3,
+        "lbound must cap at threshold + 1 for a large container"
+    );
+    // Exactly at the boundary → exact (5 <= 5).
+    assert_eq!(
+        cat.lbound_count_children(Some(parent.id), 5).await.unwrap(),
+        5,
+        "lbound at the threshold boundary must be exact"
+    );
+
+    // Root has exactly one child (the parent container).
+    assert_eq!(cat.lbound_count_children(None, 10).await.unwrap(), 1);
+
+    // SQLite keeps the exact COUNT regardless of the threshold.
+    assert_eq!(
+        cat.count_children_or_approx(Some(parent.id), 2)
+            .await
+            .unwrap(),
+        5,
+        "SQLite count_children_or_approx must be exact even past the threshold"
+    );
+    assert_eq!(
+        cat.count_children_or_approx(None, 2).await.unwrap(),
+        1,
+        "SQLite root count must be exact"
+    );
+
+    // SQLite has no statistics tables → no approximate estimate.
+    assert_eq!(
+        cat.approx_count_children(Some(parent.id)).await.unwrap(),
+        None,
+        "SQLite must not produce a statistics-based estimate"
+    );
+    assert_eq!(cat.approx_count_children(None).await.unwrap(), None);
+}
