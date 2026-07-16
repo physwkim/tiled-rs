@@ -253,6 +253,9 @@ reqwest = { workspace = true, features = ["cookies"] }
 # Always-on (crate-literal versions)
 argon2 = "0.5"
 rand = "0.8"
+# IEEE-754 half-precision (float16) decode for element serializers; already in
+# the tree transitively via arrow-array, declared here for direct use.
+half = "2"
 async-trait = "0.1"
 percent-encoding = "2"
 hmac = "0.12"
