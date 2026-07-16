@@ -4,6 +4,7 @@
 //! don't have to think about dialect. SQLite stores JSON as `TEXT`, Postgres
 //! as `JSONB`; both branches return the same `Node` shape after decoding.
 
+use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 
 use serde_json::Value;
@@ -552,6 +553,64 @@ impl Catalog {
                         .await?
                 };
                 Ok(n)
+            }
+        }
+    }
+
+    /// Exact child counts for several parents in one round trip: `SELECT
+    /// parent_id, COUNT(*) ... WHERE parent_id IN (...) GROUP BY parent_id`.
+    /// A `parent_id` absent from the returned map has zero children (`GROUP
+    /// BY` never emits an empty group). Empty input short-circuits to an
+    /// empty map without a query.
+    ///
+    /// This batches the search-page per-entry container count (one query
+    /// for a whole page instead of one `count_children` call per container
+    /// row — catalog #1096 follow-up). It is only ever *exact*: unlike
+    /// [`Self::count_children_or_approx`], there is no threshold-bounded
+    /// scan, so a caller that needs the Postgres large-container
+    /// approximation must call that method per parent instead — see its
+    /// docs for why the approximation cannot be batched the same way (a
+    /// page-wide `GROUP BY` would force a full scan of every container in
+    /// the page, defeating the point of the estimate).
+    pub async fn count_children_batch(&self, parent_ids: &[i64]) -> Result<HashMap<i64, i64>> {
+        if parent_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        match self.pool() {
+            DbPool::Sqlite(pool) => {
+                let placeholders = vec!["?"; parent_ids.len()].join(", ");
+                let sql = format!(
+                    "SELECT parent_id, COUNT(*) AS cnt FROM nodes \
+                     WHERE parent_id IN ({placeholders}) GROUP BY parent_id"
+                );
+                let mut query = sqlx::query(&sql);
+                for id in parent_ids {
+                    query = query.bind(id);
+                }
+                let rows = query.fetch_all(pool).await?;
+                Ok(rows
+                    .iter()
+                    .map(|r| (r.get::<i64, _>("parent_id"), r.get::<i64, _>("cnt")))
+                    .collect())
+            }
+            DbPool::Postgres(pool) => {
+                let placeholders: Vec<String> = (0..parent_ids.len())
+                    .map(|i| format!("${}", i + 1))
+                    .collect();
+                let sql = format!(
+                    "SELECT parent_id, COUNT(*) AS cnt FROM nodes \
+                     WHERE parent_id IN ({}) GROUP BY parent_id",
+                    placeholders.join(", ")
+                );
+                let mut query = sqlx::query(&sql);
+                for id in parent_ids {
+                    query = query.bind(id);
+                }
+                let rows = query.fetch_all(pool).await?;
+                Ok(rows
+                    .iter()
+                    .map(|r| (r.get::<i64, _>("parent_id"), r.get::<i64, _>("cnt")))
+                    .collect())
             }
         }
     }

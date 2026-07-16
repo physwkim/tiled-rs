@@ -607,6 +607,16 @@ pub async fn run(command: Command) -> Result<()> {
                     }
                 };
 
+            // Resolved once so both the catalog's per-entry search-page
+            // counts (`CatalogAdapter::with_exact_count_limit` below) and
+            // `AppState.exact_count_limit` (further down) apply the same
+            // threshold. Mirrors Python `Settings.exact_count_limit`
+            // (settings.py, default 100).
+            let exact_count_limit: u64 = file_config
+                .as_ref()
+                .map(|c| c.exact_count_limit)
+                .unwrap_or(config::default_exact_count_limit());
+
             let root_tree: Arc<dyn crate::core::adapters::ContainerAdapter> = if let Some(ref uri) =
                 resolved_mongo_uri
             {
@@ -634,7 +644,15 @@ pub async fn run(command: Command) -> Result<()> {
                 };
                 let resolver: Arc<dyn crate::catalog::adapter::LeafResolver> =
                     Arc::new(file_resolver);
-                Arc::new(crate::catalog::CatalogAdapter::root(cat.clone(), resolver))
+                // Per-entry search-page container counts use the same
+                // exact/approximate threshold as the metadata endpoint and
+                // the envelope `meta.count` cap (catalog #1096 follow-up).
+                Arc::new(
+                    crate::catalog::CatalogAdapter::root(cat.clone(), resolver)
+                        .with_exact_count_limit(
+                            i64::try_from(exact_count_limit).unwrap_or(i64::MAX),
+                        ),
+                )
             } else if demo {
                 tracing::info!("Starting with demo dataset");
                 Arc::new(build_demo_tree())
@@ -848,10 +866,7 @@ pub async fn run(command: Command) -> Result<()> {
                     .as_ref()
                     .map(|c| c.expose_raw_assets)
                     .unwrap_or(true),
-                exact_count_limit: file_config
-                    .as_ref()
-                    .map(|c| c.exact_count_limit)
-                    .unwrap_or(config::default_exact_count_limit()),
+                exact_count_limit,
                 background_tasks: crate::server::state::BackgroundTasks::new(),
             };
 
