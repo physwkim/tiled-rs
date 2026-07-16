@@ -498,16 +498,44 @@ fn read_sparse_parquet(path: &std::path::Path) -> Result<(Vec<Vec<i64>>, Vec<u8>
 /// The read path always emits little-endian bytes, so endianness is `Little`.
 /// The supported set matches [`extract_data_bytes`]; any other column type is a
 /// validation error (the same rejection, surfaced before the batch scan).
+///
+/// Supported — every type here round-trips through the server's COO value
+/// encoder (`dyn_ndarray_to_arrow`, router.rs), so widening the read decode to
+/// them is faithful end-to-end (upstream `pandas.read_parquet` accepts them too):
+/// Float64/32, Int64/32/16/8, UInt64/32/16/8, and any **dictionary-encoded**
+/// column (e.g. a pandas Categorical) whose value type is one of those — the
+/// dictionary decodes to its value type.
+///
+/// Deliberately rejected (upstream would read them, but our COO value encoder has
+/// no faithful fixed-width representation, and silently promoting would diverge
+/// from the stored dtype the read is meant to preserve):
+/// * `Float16` — `dyn_ndarray_to_arrow` has no 2-byte float arm; promoting to f32
+///   would change the dtype the client sees, so reject rather than promote.
+/// * `Boolean`, `Timestamp`/`Date`/`Time`, `Decimal128`/`256`, `Utf8`/`LargeUtf8`
+///   — not a round-trippable sparse COO value dtype.
 fn arrow_to_builtin_dtype(dt: &arrow::datatypes::DataType) -> Result<BuiltinDType> {
     use arrow::datatypes::DataType;
+    // A dictionary-encoded column carries its logical values in the value type;
+    // decode to that (mirrors `extract_data_bytes`, which casts before extract).
+    if let DataType::Dictionary(_, value) = dt {
+        return arrow_to_builtin_dtype(value);
+    }
     let (kind, size) = match dt {
         DataType::Float64 => (Kind::Float, 8),
         DataType::Float32 => (Kind::Float, 4),
         DataType::Int64 => (Kind::Integer, 8),
         DataType::Int32 => (Kind::Integer, 4),
+        DataType::Int16 => (Kind::Integer, 2),
+        DataType::Int8 => (Kind::Integer, 1),
+        DataType::UInt64 => (Kind::UnsignedInteger, 8),
+        DataType::UInt32 => (Kind::UnsignedInteger, 4),
+        DataType::UInt16 => (Kind::UnsignedInteger, 2),
+        DataType::UInt8 => (Kind::UnsignedInteger, 1),
         other => {
             return Err(TiledError::Validation(format!(
-                "unsupported data column type for sparse parquet: {other:?}"
+                "unsupported data column type for sparse parquet: {other:?} \
+                 (supported: float64/32, int64/32/16/8, uint64/32/16/8, and \
+                 dictionary-encoded wrappers of those)"
             )));
         }
     };
@@ -515,6 +543,11 @@ fn arrow_to_builtin_dtype(dt: &arrow::datatypes::DataType) -> Result<BuiltinDTyp
 }
 
 /// Extract little-endian bytes from an Arrow primitive value column.
+///
+/// Dictionary-encoded columns (e.g. a pandas Categorical persisted as a parquet
+/// dictionary) are decoded to their value type up front, so every branch below
+/// sees a plain primitive column. Supported widths mirror [`arrow_to_builtin_dtype`]
+/// and the server's COO value encoder (`dyn_ndarray_to_arrow`).
 ///
 /// Null handling mirrors upstream's pandas read (`sparse_blocks_parquet.py:31`,
 /// then `numpy.concatenate` at :124):
@@ -524,18 +557,40 @@ fn arrow_to_builtin_dtype(dt: &arrow::datatypes::DataType) -> Result<BuiltinDTyp
 ///   typed float buffer can hold `NaN`, so we reproduce it exactly. (Arrow leaves
 ///   a null slot's value buffer unspecified, so `arr.value(i)` on a null returns
 ///   garbage — this replacement is what makes the read faithful.)
-/// * **Integer columns** — a null is a hard error naming the block file. pandas
-///   promotes an int column with nulls to `float64`+`NaN`; our stored-int-labelled
-///   flat buffer cannot represent that, and substituting `0` would silently
-///   corrupt the data, so the read is rejected instead (a deliberate parity
-///   ceiling — see the `Finding A` commit message).
+/// * **Integer columns** (signed and unsigned, every width) — a null is a hard
+///   error naming the block file. pandas promotes an int column with nulls to
+///   `float64`+`NaN`; our stored-int-labelled flat buffer cannot represent that,
+///   and substituting `0` would silently corrupt the data, so the read is
+///   rejected instead (a deliberate parity ceiling — see the `Finding A` commit).
 fn extract_data_bytes(
     col: &Arc<dyn arrow::array::Array>,
     elem: usize,
     path: &std::path::Path,
 ) -> Result<Vec<u8>> {
-    use arrow::array::{Array, Float32Array, Float64Array, Int32Array, Int64Array};
+    use arrow::array::{
+        Array, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
+        UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    };
     use arrow::datatypes::DataType;
+
+    // Decode a dictionary-encoded value column to its value type first, so the
+    // extraction below is identical to a plain column. `arrow_to_builtin_dtype`
+    // recursed the same way, so `elem` already matches the value-type width.
+    let decoded: Arc<dyn arrow::array::Array>;
+    let col: &Arc<dyn arrow::array::Array> = match col.data_type() {
+        DataType::Dictionary(_, value_type) => {
+            decoded = arrow::compute::cast(col.as_ref(), value_type).map_err(|e| {
+                TiledError::Validation(format!(
+                    "sparse parquet value column in {} is dictionary-encoded and could \
+                     not be decoded to {value_type:?}: {e}",
+                    path.display()
+                ))
+            })?;
+            &decoded
+        }
+        _ => col,
+    };
+
     let n = col.len();
     let mut out = vec![0u8; n * elem];
     // Integer value columns cannot carry a null (see the doc comment): reject the
@@ -554,43 +609,44 @@ fn extract_data_bytes(
             }
         };
     }
+    // Signed/unsigned integer of any width: reject nulls, then copy each element
+    // as little-endian bytes.
+    macro_rules! int_bytes {
+        ($arr:ty, $native:ty) => {{
+            reject_int_nulls!();
+            const SZ: usize = std::mem::size_of::<$native>();
+            let a = col.as_any().downcast_ref::<$arr>().unwrap();
+            for i in 0..n {
+                out[i * SZ..(i + 1) * SZ].copy_from_slice(&a.value(i).to_le_bytes());
+            }
+        }};
+    }
+    // Float of any width: a null slot becomes NaN (see the doc comment).
+    macro_rules! float_bytes {
+        ($arr:ty, $native:ty) => {{
+            const SZ: usize = std::mem::size_of::<$native>();
+            let a = col.as_any().downcast_ref::<$arr>().unwrap();
+            for i in 0..n {
+                let v = if a.is_null(i) {
+                    <$native>::NAN
+                } else {
+                    a.value(i)
+                };
+                out[i * SZ..(i + 1) * SZ].copy_from_slice(&v.to_le_bytes());
+            }
+        }};
+    }
     match col.data_type() {
-        DataType::Int64 => {
-            reject_int_nulls!();
-            let arr = col.as_any().downcast_ref::<Int64Array>().unwrap();
-            for i in 0..n {
-                out[i * 8..(i + 1) * 8].copy_from_slice(&arr.value(i).to_le_bytes());
-            }
-        }
-        DataType::Float64 => {
-            let arr = col.as_any().downcast_ref::<Float64Array>().unwrap();
-            for i in 0..n {
-                let v = if arr.is_null(i) {
-                    f64::NAN
-                } else {
-                    arr.value(i)
-                };
-                out[i * 8..(i + 1) * 8].copy_from_slice(&v.to_le_bytes());
-            }
-        }
-        DataType::Float32 => {
-            let arr = col.as_any().downcast_ref::<Float32Array>().unwrap();
-            for i in 0..n {
-                let v = if arr.is_null(i) {
-                    f32::NAN
-                } else {
-                    arr.value(i)
-                };
-                out[i * 4..(i + 1) * 4].copy_from_slice(&v.to_le_bytes());
-            }
-        }
-        DataType::Int32 => {
-            reject_int_nulls!();
-            let arr = col.as_any().downcast_ref::<Int32Array>().unwrap();
-            for i in 0..n {
-                out[i * 4..(i + 1) * 4].copy_from_slice(&arr.value(i).to_le_bytes());
-            }
-        }
+        DataType::Float64 => float_bytes!(Float64Array, f64),
+        DataType::Float32 => float_bytes!(Float32Array, f32),
+        DataType::Int64 => int_bytes!(Int64Array, i64),
+        DataType::Int32 => int_bytes!(Int32Array, i32),
+        DataType::Int16 => int_bytes!(Int16Array, i16),
+        DataType::Int8 => int_bytes!(Int8Array, i8),
+        DataType::UInt64 => int_bytes!(UInt64Array, u64),
+        DataType::UInt32 => int_bytes!(UInt32Array, u32),
+        DataType::UInt16 => int_bytes!(UInt16Array, u16),
+        DataType::UInt8 => int_bytes!(UInt8Array, u8),
         other => {
             return Err(TiledError::Validation(format!(
                 "unsupported data column type: {other:?}"
@@ -1527,6 +1583,223 @@ mod tests {
         assert!(
             msg.contains("coordinate"),
             "error names the coordinate column, got: {msg}"
+        );
+    }
+
+    // ---- widened value-column coverage (Finding B) ---------------------
+
+    /// Stage a block with the given non-null value column, read it back through
+    /// both `read_block` (single) and `read` (multi-block-capable), and assert the
+    /// returned buffer carries `expected` dtype and `expected_le` bytes.
+    async fn assert_value_dtype_roundtrips(
+        name: &str,
+        value_field: arrow::datatypes::Field,
+        value_col: arrow::array::ArrayRef,
+        expected: BuiltinDType,
+        expected_le: Vec<u8>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join(format!("{name}.parquet"));
+        // Two non-zeros at global coords 0 and 1.
+        write_nullable_value_parquet(&p, vec![vec![0, 1]], value_field, value_col).await;
+
+        let adapter = SparseBlocksParquetAdapter::from_paths(
+            vec![p],
+            vec![4],
+            vec![vec![4]],
+            f64_dtype(), // declared f64; stored dtype is authoritative on read
+            None,
+            serde_json::Value::Null,
+        )
+        .unwrap();
+
+        let sb = adapter.read_block(&[0]).await.unwrap();
+        assert_eq!(sb.data.dtype, expected, "{name}: read_block dtype");
+        assert_eq!(sb.data.shape, vec![2], "{name}: read_block nnz");
+        assert_eq!(
+            sb.data.data.as_ref(),
+            expected_le.as_slice(),
+            "{name}: read_block bytes"
+        );
+
+        let sf = adapter.read(&NDSlice::empty()).await.unwrap();
+        assert_eq!(sf.data.dtype, expected, "{name}: read dtype");
+        assert_eq!(
+            sf.data.data.as_ref(),
+            expected_le.as_slice(),
+            "{name}: read bytes"
+        );
+    }
+
+    // Boundary — every widened integer value dtype round-trips through read +
+    // read_block, labelled with the stored width. These are exactly the widths
+    // the server's COO value encoder (`dyn_ndarray_to_arrow`) already handles.
+    #[tokio::test]
+    async fn read_widened_integer_value_dtypes_roundtrip() {
+        use arrow::array::{
+            ArrayRef, Int8Array, Int16Array, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+        };
+        use arrow::datatypes::{DataType, Field};
+        use std::sync::Arc;
+
+        let u = Kind::UnsignedInteger;
+        let i = Kind::Integer;
+        let le = |v: &[u8]| v.to_vec();
+
+        assert_value_dtype_roundtrips(
+            "u8",
+            Field::new("data", DataType::UInt8, false),
+            Arc::new(UInt8Array::from(vec![1u8, 200])) as ArrayRef,
+            BuiltinDType::new(Endianness::Little, u, 1),
+            le(&[1, 200]),
+        )
+        .await;
+        assert_value_dtype_roundtrips(
+            "u16",
+            Field::new("data", DataType::UInt16, false),
+            Arc::new(UInt16Array::from(vec![1u16, 40000])) as ArrayRef,
+            BuiltinDType::new(Endianness::Little, u, 2),
+            [1u16, 40000].iter().flat_map(|v| v.to_le_bytes()).collect(),
+        )
+        .await;
+        assert_value_dtype_roundtrips(
+            "u32",
+            Field::new("data", DataType::UInt32, false),
+            Arc::new(UInt32Array::from(vec![1u32, 3_000_000_000])) as ArrayRef,
+            BuiltinDType::new(Endianness::Little, u, 4),
+            [1u32, 3_000_000_000]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect(),
+        )
+        .await;
+        assert_value_dtype_roundtrips(
+            "u64",
+            Field::new("data", DataType::UInt64, false),
+            Arc::new(UInt64Array::from(vec![1u64, 10_000_000_000])) as ArrayRef,
+            BuiltinDType::new(Endianness::Little, u, 8),
+            [1u64, 10_000_000_000]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect(),
+        )
+        .await;
+        assert_value_dtype_roundtrips(
+            "i8",
+            Field::new("data", DataType::Int8, false),
+            Arc::new(Int8Array::from(vec![-1i8, 100])) as ArrayRef,
+            BuiltinDType::new(Endianness::Little, i, 1),
+            [-1i8, 100].iter().flat_map(|v| v.to_le_bytes()).collect(),
+        )
+        .await;
+        assert_value_dtype_roundtrips(
+            "i16",
+            Field::new("data", DataType::Int16, false),
+            Arc::new(Int16Array::from(vec![-1i16, 30000])) as ArrayRef,
+            BuiltinDType::new(Endianness::Little, i, 2),
+            [-1i16, 30000]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect(),
+        )
+        .await;
+    }
+
+    // A dictionary-encoded value column (e.g. a pandas Categorical) decodes to its
+    // value type. Exercised at the function level rather than via a parquet
+    // round-trip because the arrow parquet reader may normalize dictionary
+    // encoding away on read, so a round-trip would not reliably reach this branch.
+    #[test]
+    fn arrow_to_builtin_dtype_decodes_dictionary_to_value_type() {
+        use arrow::datatypes::DataType;
+        let dt = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Float64));
+        assert_eq!(super::arrow_to_builtin_dtype(&dt).unwrap(), f64_dtype());
+    }
+
+    #[test]
+    fn extract_data_bytes_decodes_dictionary_wrapped_primitive() {
+        use arrow::array::{Array, ArrayRef, DictionaryArray, Float64Array, Int32Array};
+        use arrow::datatypes::Int32Type;
+        use std::sync::Arc;
+
+        // Dictionary<Int32, Float64>: keys [0,1,0] over values [1.5, 2.5].
+        let keys = Int32Array::from(vec![0, 1, 0]);
+        let values = Arc::new(Float64Array::from(vec![1.5, 2.5])) as ArrayRef;
+        let dict = DictionaryArray::<Int32Type>::try_new(keys, values).unwrap();
+        let col: Arc<dyn Array> = Arc::new(dict);
+
+        let bytes =
+            super::extract_data_bytes(&col, 8, std::path::Path::new("dict.parquet")).unwrap();
+        let vals: Vec<f64> = bytes
+            .chunks_exact(8)
+            .map(|b| f64::from_le_bytes(b.try_into().unwrap()))
+            .collect();
+        assert_eq!(
+            vals,
+            vec![1.5, 2.5, 1.5],
+            "dictionary decodes to its values"
+        );
+    }
+
+    // Deliberate parity ceilings: types upstream `pandas.read_parquet` accepts but
+    // our COO value encoder cannot faithfully round-trip, so the read rejects them
+    // (422) rather than silently promote (which would diverge from the stored
+    // dtype). See `arrow_to_builtin_dtype`'s doc for the per-type reason.
+    #[test]
+    fn arrow_to_builtin_dtype_rejects_unrepresentable_types() {
+        use arrow::datatypes::{DataType, TimeUnit};
+        for dt in [
+            DataType::Float16,
+            DataType::Boolean,
+            DataType::Utf8,
+            DataType::LargeUtf8,
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            DataType::Date32,
+            DataType::Decimal128(38, 10),
+        ] {
+            assert!(
+                super::arrow_to_builtin_dtype(&dt).is_err(),
+                "{dt:?} must be a deliberate rejection, not silently accepted"
+            );
+        }
+    }
+
+    // End-to-end: a boolean value column in an actual parquet file is rejected on
+    // read (not promoted), demonstrating the 422 reaches the read boundary.
+    #[tokio::test]
+    async fn read_rejects_boolean_value_column() {
+        use arrow::array::BooleanArray;
+        use arrow::datatypes::{DataType, Field};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("boolval.parquet");
+        write_nullable_value_parquet(
+            &p,
+            vec![vec![0, 1]],
+            Field::new("data", DataType::Boolean, false),
+            Arc::new(BooleanArray::from(vec![true, false])),
+        )
+        .await;
+
+        let adapter = SparseBlocksParquetAdapter::from_paths(
+            vec![p],
+            vec![4],
+            vec![vec![4]],
+            f64_dtype(),
+            None,
+            serde_json::Value::Null,
+        )
+        .unwrap();
+
+        let err = adapter.read_block(&[0]).await;
+        assert!(
+            err.is_err(),
+            "boolean value column must be rejected on read, not promoted"
+        );
+        assert!(
+            err.unwrap_err().to_string().contains("Boolean"),
+            "rejection names the offending arrow type"
         );
     }
 }
