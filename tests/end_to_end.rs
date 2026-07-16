@@ -882,6 +882,156 @@ async fn table_write_full_roundtrip() {
     assert_eq!(x_col.values(), &[1, 2, 3]);
 }
 
+// ---------------------------------------------------------------------------
+// High-level container write helpers: ContainerClient::write_array / write_table
+// ---------------------------------------------------------------------------
+
+/// `ContainerClient::write_array` creates a managed array node and uploads the
+/// buffer in one call; the data reads back verbatim.
+#[tokio::test]
+async fn write_array_helper_roundtrip() {
+    use tiled_rs::core::dtype::{BuiltinDType, DType, Endianness, Kind};
+    use tiled_rs::core::structures::ArrayStructure;
+
+    let (base, _wd, _db) = spawn_write_server().await;
+    let root = from_uri(&base).await.unwrap().into_container().unwrap();
+
+    let structure = ArrayStructure {
+        data_type: DType::Builtin(BuiltinDType::new(Endianness::Little, Kind::Float, 8)),
+        chunks: vec![vec![4]],
+        shape: vec![4],
+        dims: None,
+        resizable: Default::default(),
+    };
+    let values = [1.5f64, 2.5, 3.5, 4.5];
+    let payload: bytes::Bytes = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+
+    let arr = root
+        .write_array(
+            Some("h_arr"),
+            structure,
+            payload,
+            serde_json::json!({"note": "hi"}),
+            vec![],
+            None,
+        )
+        .await
+        .expect("write_array");
+
+    // The returned client reads the data back.
+    let blocks = arr.read().await.expect("read");
+    assert_eq!(blocks.len(), 1);
+    let got: Vec<f64> = blocks[0]
+        .data
+        .chunks_exact(8)
+        .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    assert_eq!(got, values.to_vec(), "round-trip data mismatch");
+
+    // A fresh fetch also sees the node with its metadata.
+    let refetched = root.get("h_arr").await.unwrap().into_array().unwrap();
+    assert_eq!(refetched.shape(), &[4]);
+}
+
+/// `ContainerClient::write_table` derives the structure from the Arrow schema,
+/// creates a managed table node, and uploads the batch in one call.
+#[tokio::test]
+async fn write_table_helper_roundtrip() {
+    use arrow::array::Int64Array;
+    use arrow::array::StringArray;
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    let (base, _wd, _db) = spawn_write_server().await;
+    let root = from_uri(&base).await.unwrap().into_container().unwrap();
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("x", DataType::Int64, false),
+        Field::new("y", DataType::Utf8, false),
+    ]));
+    let batch = arrow::array::RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![1i64, 2, 3])),
+            Arc::new(StringArray::from(vec!["a", "b", "c"])),
+        ],
+    )
+    .unwrap();
+
+    let tbl = root
+        .write_table(
+            Some("h_tbl"),
+            &schema,
+            &[batch],
+            serde_json::json!({}),
+            vec![],
+            None,
+        )
+        .await
+        .expect("write_table");
+
+    // Columns come from the schema field names.
+    assert_eq!(tbl.columns(), &["x".to_string(), "y".to_string()]);
+
+    // The data reads back.
+    let partitions = tbl.read(None).await.expect("read table");
+    assert_eq!(partitions.len(), 1);
+    let read_batch = &partitions[0].batches[0];
+    let x_col = read_batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(x_col.values(), &[1, 2, 3]);
+}
+
+/// `access_tags` on a write helper is sent as `access_blob: {"tags": [...]}`
+/// and stored on the node (verified by reading the access_blob back).
+#[tokio::test]
+async fn write_array_helper_access_tags_roundtrip() {
+    use tiled_rs::core::dtype::{BuiltinDType, DType, Endianness, Kind};
+    use tiled_rs::core::structures::ArrayStructure;
+
+    let (base, _wd, _db) = spawn_write_server().await;
+    let root = from_uri(&base).await.unwrap().into_container().unwrap();
+
+    let structure = ArrayStructure {
+        data_type: DType::Builtin(BuiltinDType::new(Endianness::Little, Kind::Float, 8)),
+        chunks: vec![vec![2]],
+        shape: vec![2],
+        dims: None,
+        resizable: Default::default(),
+    };
+    let payload: bytes::Bytes = [1.0f64, 2.0].iter().flat_map(|v| v.to_le_bytes()).collect();
+    let tags = vec!["team-a".to_string(), "team-b".to_string()];
+
+    root.write_array(
+        Some("tagged"),
+        structure,
+        payload,
+        serde_json::json!({}),
+        vec![],
+        Some(&tags),
+    )
+    .await
+    .expect("write_array with access_tags");
+
+    // Fetch fresh and confirm the tags landed in access_blob.
+    let fetched = root.get("tagged").await.unwrap();
+    let blob = fetched
+        .base()
+        .expect("array node has a base client")
+        .item()
+        .attributes
+        .access_blob
+        .clone()
+        .expect("access_blob present on the created node");
+    assert_eq!(
+        blob,
+        serde_json::json!({"tags": ["team-a", "team-b"]}),
+        "access_tags stored as access_blob.tags"
+    );
+}
+
 #[tokio::test]
 async fn table_write_partition_and_append_roundtrip() {
     use arrow::array::Int64Array;

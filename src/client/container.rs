@@ -25,13 +25,18 @@ const PATH_SEGMENT: &AsciiSet = &CONTROLS
     .add(b'/')
     .add(b'%');
 
-use crate::core::data_source::DataSource;
+use crate::core::data_source::{DataSource, Management};
 use crate::core::schemas::{GetDistinctResponse, PostMetadataResponse};
-use crate::core::structures::StructureFamily;
+use crate::core::structures::{AnyStructure, ArrayStructure, StructureFamily, TableStructure};
+
+use arrow::array::RecordBatch;
+use arrow::datatypes::SchemaRef;
 
 use crate::client::any_client::AnyClient;
+use crate::client::array::ArrayClient;
 use crate::client::base::{BaseClient, Item};
 use crate::client::context::Context;
+use crate::client::dataframe::TableClient;
 use crate::client::error::{ClientError, Result};
 use crate::client::utils::{decode_response, resolve_export_format, retry};
 
@@ -319,18 +324,47 @@ impl ContainerClient {
         specs: Vec<serde_json::Value>,
         data_sources: Vec<DataSource>,
     ) -> Result<String> {
+        self.post_new_node(key, structure_family, metadata, specs, data_sources, None)
+            .await
+    }
+
+    /// The single `POST /api/v1/metadata/{parent}` builder behind
+    /// [`create_node`](Self::create_node) and the `write_*` helpers, mirroring
+    /// Python `Container.new` (`container.py:680`).
+    ///
+    /// `access_tags` maps to the wire `access_blob` field: `Some(tags)` sends
+    /// `access_blob: {"tags": [...]}` (Python `new`: `access_blob = {"tags":
+    /// access_tags}`, `container.py:704`), which the Rust server accepts on
+    /// create (`PostMetadataRequest.access_blob`, `schemas.rs:309`; threaded
+    /// through `init_node` at `router.rs:4586`). `None` omits the field
+    /// entirely so the server assigns the default creator-owned blob
+    /// (`creator_access_blob`, `router.rs:4588`) — deviating from Python, which
+    /// always sends `access_blob` (`{}` when no tags); against the Rust server
+    /// omission is what preserves the existing creator-ownership default.
+    async fn post_new_node(
+        &self,
+        key: Option<&str>,
+        structure_family: StructureFamily,
+        metadata: serde_json::Value,
+        specs: Vec<serde_json::Value>,
+        data_sources: Vec<DataSource>,
+        access_tags: Option<&[String]>,
+    ) -> Result<String> {
         let self_link = self.base.require_link("self")?;
         let url = Url::parse(self_link)?;
         // Wire field is `id`, matching Python tiled's `PostMetadataRequest.id`
         // (tiled/server/schemas.py:462) — a real Python tiled server ignores
         // a top-level `key` field.
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "id": key,
             "structure_family": structure_family,
             "metadata": metadata,
             "specs": specs,
             "data_sources": data_sources,
         });
+        if let Some(tags) = access_tags {
+            body["access_blob"] = serde_json::json!({ "tags": tags });
+        }
         let resp = self.base.context.post_json(&url, &body).await?;
         let created = decode_response::<PostMetadataResponse>(resp).await?;
         Ok(created.id)
@@ -351,6 +385,122 @@ impl ContainerClient {
         // echoes the caller's key when one was given) and return it as a
         // ContainerClient.
         self.get(&created_key).await?.into_container()
+    }
+
+    /// Create a writable array child from an explicit `structure`, then upload
+    /// its C-order element buffer. Mirrors Python `Container.write_array`
+    /// (`container.py:842`): `new(array, [DataSource(structure)], ...)` then
+    /// `client.write(array)`.
+    ///
+    /// Deviation from Python: Python derives shape/dtype/chunks from a numpy /
+    /// dask array; the Rust client has no array runtime, so the caller supplies
+    /// the [`ArrayStructure`] and the raw `data` buffer directly (the same
+    /// split as [`ArrayClient::write`], which takes `nelem * element_size`
+    /// C-order bytes). Single-chunk upload only — chunked `write_block` fan-out
+    /// (Python `container.py:919-937`) is left to the caller.
+    ///
+    /// The data source is `management: writable` with no pinned `mimetype`, so
+    /// the server picks its managed-write backend for arrays (zarr, else npy —
+    /// `default_creation_mimetype`, `router.rs`). `access_tags` is threaded
+    /// through [`post_new_node`](Self::post_new_node).
+    ///
+    /// [`ArrayClient::write`]: crate::client::array::ArrayClient::write
+    pub async fn write_array(
+        &self,
+        key: Option<&str>,
+        structure: ArrayStructure,
+        data: bytes::Bytes,
+        metadata: serde_json::Value,
+        specs: Vec<serde_json::Value>,
+        access_tags: Option<&[String]>,
+    ) -> Result<ArrayClient> {
+        let ds = DataSource {
+            structure_family: StructureFamily::Array,
+            structure: Some(AnyStructure::Array(structure)),
+            id: None,
+            // Let the server choose the managed-write backend and its mimetype
+            // (Python `write_array` likewise omits it).
+            mimetype: None,
+            parameters: serde_json::json!({}),
+            properties: serde_json::json!({}),
+            assets: vec![],
+            management: Management::Writable,
+        };
+        let created_key = self
+            .post_new_node(
+                key,
+                StructureFamily::Array,
+                metadata,
+                specs,
+                vec![ds],
+                access_tags,
+            )
+            .await?;
+        let client = self.get(&created_key).await?.into_array()?;
+        client.write(data).await?;
+        Ok(client)
+    }
+
+    /// Create a writable table child whose columns come from `schema`, then
+    /// upload `batches`. Mirrors Python `Container.write_table`
+    /// (`container.py:1212`): `new(table, [DataSource(structure)], ...)` then
+    /// `client.write(data)`.
+    ///
+    /// The [`TableStructure`] is derived from `schema` — one partition, columns
+    /// taken from the field names — matching Python `TableStructure.from_schema`
+    /// with `npartitions=1`. `arrow_schema` is left empty: the Rust server
+    /// validates a write against the structure's `columns` and the written IPC
+    /// stream (see [`TableClient::write`]), so the encoded schema is not needed
+    /// at create time (existing round-trip tests create tables the same way).
+    ///
+    /// The data source is `management: writable` with no pinned `mimetype`, so
+    /// the server picks its managed-write backend for tables (parquet, else
+    /// csv). `access_tags` is threaded through
+    /// [`post_new_node`](Self::post_new_node).
+    ///
+    /// Python's deprecated `write_dataframe` alias (`container.py:1286`) is not
+    /// ported; use this method.
+    ///
+    /// [`TableClient::write`]: crate::client::dataframe::TableClient::write
+    pub async fn write_table(
+        &self,
+        key: Option<&str>,
+        schema: &SchemaRef,
+        batches: &[RecordBatch],
+        metadata: serde_json::Value,
+        specs: Vec<serde_json::Value>,
+        access_tags: Option<&[String]>,
+    ) -> Result<TableClient> {
+        let columns: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
+        let structure = TableStructure {
+            arrow_schema: String::new(),
+            npartitions: 1,
+            columns,
+            resizable: Default::default(),
+        };
+        let ds = DataSource {
+            structure_family: StructureFamily::Table,
+            structure: Some(AnyStructure::Table(structure)),
+            id: None,
+            mimetype: None,
+            parameters: serde_json::json!({}),
+            properties: serde_json::json!({}),
+            assets: vec![],
+            management: Management::Writable,
+        };
+        let created_key = self
+            .post_new_node(
+                key,
+                StructureFamily::Table,
+                metadata,
+                specs,
+                vec![ds],
+                access_tags,
+            )
+            .await?;
+        let client = self.get(&created_key).await?.into_table()?;
+        client.write(schema, batches).await?;
+        Ok(client)
     }
 
     /// Delete every immediate child of this container (to empty it before
