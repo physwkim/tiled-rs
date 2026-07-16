@@ -427,7 +427,7 @@ fn coord_dyn_to_i64_vec(arr: &DynNDArray) -> Result<Vec<i64>> {
 /// Parquet layout: columns `[coord_0, coord_1, ..., data]` — all columns
 /// except the last are coordinate columns; the last column is values.
 fn read_sparse_parquet(path: &std::path::Path) -> Result<(Vec<Vec<i64>>, Vec<u8>, BuiltinDType)> {
-    use arrow::array::Int64Array;
+    use arrow::array::{Array, Int64Array};
 
     let file = std::fs::File::open(path)
         .map_err(|e| TiledError::Internal(format!("open {}: {e}", path.display())))?;
@@ -467,13 +467,27 @@ fn read_sparse_parquet(path: &std::path::Path) -> Result<(Vec<Vec<i64>>, Vec<u8>
                     col.data_type()
                 ))
             })?;
+            // A COO coordinate is an array index; it cannot be null. Upstream
+            // would promote a null-bearing int coord column to float64+NaN via
+            // pandas (`sparse_blocks_parquet.py:30`), which is not a valid index
+            // either. Reject rather than let `arr.value(i)` substitute a garbage
+            // index for the null (the coord analogue of the integer-value null
+            // rejection in `extract_data_bytes`).
+            if arr.null_count() > 0 {
+                return Err(TiledError::Validation(format!(
+                    "sparse parquet coordinate column {d} in {} has {} null(s); a COO \
+                     coordinate index cannot be null",
+                    path.display(),
+                    arr.null_count()
+                )));
+            }
             for i in 0..nr {
                 dim_buf.push(arr.value(i));
             }
         }
         // Data column — extract as raw little-endian bytes.
         let data_col = batch.column(ndim);
-        data_bytes.extend_from_slice(&extract_data_bytes(data_col, elem)?);
+        data_bytes.extend_from_slice(&extract_data_bytes(data_col, elem, path)?);
     }
 
     Ok((per_dim, data_bytes, value_dtype))
@@ -500,14 +514,49 @@ fn arrow_to_builtin_dtype(dt: &arrow::datatypes::DataType) -> Result<BuiltinDTyp
     Ok(BuiltinDType::new(Endianness::Little, kind, size))
 }
 
-/// Extract little-endian bytes from an Arrow primitive column.
-fn extract_data_bytes(col: &Arc<dyn arrow::array::Array>, elem: usize) -> Result<Vec<u8>> {
-    use arrow::array::{Float32Array, Float64Array, Int32Array, Int64Array};
+/// Extract little-endian bytes from an Arrow primitive value column.
+///
+/// Null handling mirrors upstream's pandas read (`sparse_blocks_parquet.py:31`,
+/// then `numpy.concatenate` at :124):
+///
+/// * **Float columns** — a null decodes to `NaN`. pandas reads a nullable float
+///   parquet column into a numpy float array with `NaN` at the null slots, and a
+///   typed float buffer can hold `NaN`, so we reproduce it exactly. (Arrow leaves
+///   a null slot's value buffer unspecified, so `arr.value(i)` on a null returns
+///   garbage — this replacement is what makes the read faithful.)
+/// * **Integer columns** — a null is a hard error naming the block file. pandas
+///   promotes an int column with nulls to `float64`+`NaN`; our stored-int-labelled
+///   flat buffer cannot represent that, and substituting `0` would silently
+///   corrupt the data, so the read is rejected instead (a deliberate parity
+///   ceiling — see the `Finding A` commit message).
+fn extract_data_bytes(
+    col: &Arc<dyn arrow::array::Array>,
+    elem: usize,
+    path: &std::path::Path,
+) -> Result<Vec<u8>> {
+    use arrow::array::{Array, Float32Array, Float64Array, Int32Array, Int64Array};
     use arrow::datatypes::DataType;
     let n = col.len();
     let mut out = vec![0u8; n * elem];
+    // Integer value columns cannot carry a null (see the doc comment): reject the
+    // block rather than emit a substitute value.
+    macro_rules! reject_int_nulls {
+        () => {
+            if col.null_count() > 0 {
+                return Err(TiledError::Validation(format!(
+                    "sparse parquet value column in {} has {} null(s) in an integer \
+                     column; upstream promotes int+null to float64+NaN, which a typed \
+                     integer buffer cannot represent — re-register the node with a \
+                     float value dtype",
+                    path.display(),
+                    col.null_count()
+                )));
+            }
+        };
+    }
     match col.data_type() {
         DataType::Int64 => {
+            reject_int_nulls!();
             let arr = col.as_any().downcast_ref::<Int64Array>().unwrap();
             for i in 0..n {
                 out[i * 8..(i + 1) * 8].copy_from_slice(&arr.value(i).to_le_bytes());
@@ -516,16 +565,27 @@ fn extract_data_bytes(col: &Arc<dyn arrow::array::Array>, elem: usize) -> Result
         DataType::Float64 => {
             let arr = col.as_any().downcast_ref::<Float64Array>().unwrap();
             for i in 0..n {
-                out[i * 8..(i + 1) * 8].copy_from_slice(&arr.value(i).to_le_bytes());
+                let v = if arr.is_null(i) {
+                    f64::NAN
+                } else {
+                    arr.value(i)
+                };
+                out[i * 8..(i + 1) * 8].copy_from_slice(&v.to_le_bytes());
             }
         }
         DataType::Float32 => {
             let arr = col.as_any().downcast_ref::<Float32Array>().unwrap();
             for i in 0..n {
-                out[i * 4..(i + 1) * 4].copy_from_slice(&arr.value(i).to_le_bytes());
+                let v = if arr.is_null(i) {
+                    f32::NAN
+                } else {
+                    arr.value(i)
+                };
+                out[i * 4..(i + 1) * 4].copy_from_slice(&v.to_le_bytes());
             }
         }
         DataType::Int32 => {
+            reject_int_nulls!();
             let arr = col.as_any().downcast_ref::<Int32Array>().unwrap();
             for i in 0..n {
                 out[i * 4..(i + 1) * 4].copy_from_slice(&arr.value(i).to_le_bytes());
@@ -1279,6 +1339,194 @@ mod tests {
                 .to_string()
                 .contains("disagree on stored value dtype"),
             "the error names the cross-block dtype disagreement"
+        );
+    }
+
+    // ---- null value-column handling (Finding A) ------------------------
+
+    /// Write a parquet file from fully-formed arrow fields + columns. Stages the
+    /// shapes an external (non-tiled) writer can produce — including nullable
+    /// columns, which our production encoder never writes.
+    async fn write_raw_parquet(
+        path: &Path,
+        fields: Vec<arrow::datatypes::Field>,
+        columns: Vec<arrow::array::ArrayRef>,
+    ) {
+        use arrow::datatypes::Schema;
+        use arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::new(fields));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), columns).unwrap();
+        let file = std::fs::File::create(path).unwrap();
+        let mut writer = super::ArrowWriter::try_new(file, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+
+    /// Stage a block with non-nullable Int64 coord columns plus a caller-supplied
+    /// value column (typically **nullable**, `nullable` set on the value field so
+    /// parquet records definition levels and the nulls survive the round-trip).
+    async fn write_nullable_value_parquet(
+        path: &Path,
+        coords: Vec<Vec<i64>>,
+        value_field: arrow::datatypes::Field,
+        value_col: arrow::array::ArrayRef,
+    ) {
+        use arrow::array::{ArrayRef, Int64Array};
+        use arrow::datatypes::{DataType, Field};
+        use std::sync::Arc;
+
+        let mut fields: Vec<Field> = Vec::with_capacity(coords.len() + 1);
+        let mut columns: Vec<ArrayRef> = Vec::with_capacity(coords.len() + 1);
+        for (d, c) in coords.iter().enumerate() {
+            fields.push(Field::new(format!("dim{d}"), DataType::Int64, false));
+            columns.push(Arc::new(Int64Array::from(c.clone())) as ArrayRef);
+        }
+        fields.push(value_field);
+        columns.push(value_col);
+        write_raw_parquet(path, fields, columns).await;
+    }
+
+    // Invariant boundary — float value column with a null. Upstream reads it
+    // with pandas (`sparse_blocks_parquet.py:31`) → numpy float array with NaN
+    // at the null slot, never 0.0. A typed f64 buffer can hold NaN, so we must
+    // decode the null to NaN, not silently zero it.
+    #[tokio::test]
+    async fn read_block_float_column_nulls_become_nan() {
+        use arrow::array::Float64Array;
+        use arrow::datatypes::{DataType, Field};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("fnull.parquet");
+        write_nullable_value_parquet(
+            &p,
+            vec![vec![0, 1, 2]],
+            Field::new("data", DataType::Float64, true),
+            Arc::new(Float64Array::from(vec![Some(1.5), None, Some(2.5)])),
+        )
+        .await;
+
+        let adapter = SparseBlocksParquetAdapter::from_paths(
+            vec![p],
+            vec![4],
+            vec![vec![4]],
+            f64_dtype(),
+            None,
+            serde_json::Value::Null,
+        )
+        .unwrap();
+
+        let sd = adapter.read_block(&[0]).await.unwrap();
+        let vals = read_f64_col(&sd.data);
+        assert_eq!(vals.len(), 3, "nnz counts every stored row, null included");
+        assert_eq!(vals[0], 1.5);
+        assert!(
+            vals[1].is_nan(),
+            "null float slot must decode to NaN, got {}",
+            vals[1]
+        );
+        assert_eq!(vals[2], 2.5);
+    }
+
+    // Invariant boundary — integer value column with a null. Upstream pandas
+    // promotes an int column with nulls to float64+NaN, a dtype our stored-int
+    // flat buffer cannot represent. Silent zeros are unacceptable, so the read
+    // must error and name the offending block file.
+    #[tokio::test]
+    async fn read_block_int_column_nulls_are_rejected() {
+        use arrow::array::Int64Array;
+        use arrow::datatypes::{DataType, Field};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("inull.parquet");
+        write_nullable_value_parquet(
+            &p,
+            vec![vec![0, 1, 2]],
+            Field::new("data", DataType::Int64, true),
+            Arc::new(Int64Array::from(vec![Some(10), None, Some(30)])),
+        )
+        .await;
+
+        let adapter = SparseBlocksParquetAdapter::from_paths(
+            vec![p],
+            vec![4],
+            vec![vec![4]],
+            i64_dtype(),
+            None,
+            serde_json::Value::Null,
+        )
+        .unwrap();
+
+        let err = adapter.read_block(&[0]).await;
+        assert!(
+            err.is_err(),
+            "int value column with nulls must be rejected, not silently zeroed"
+        );
+        let msg = err.unwrap_err().to_string();
+        assert!(
+            msg.contains("inull.parquet"),
+            "error names the offending block file, got: {msg}"
+        );
+        assert!(
+            msg.contains("null"),
+            "error explains the null cause, got: {msg}"
+        );
+    }
+
+    // Invariant boundary — a null in a *coordinate* column (family audit: the
+    // coord read path shares `extract_data_bytes`'s null-bitmap blindness). A COO
+    // coordinate is an array index and cannot be null, so the read must reject
+    // the block naming the file, not push a garbage index for the null slot.
+    #[tokio::test]
+    async fn read_block_null_coordinate_is_rejected() {
+        use arrow::array::{ArrayRef, Float64Array, Int64Array};
+        use arrow::datatypes::{DataType, Field};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("cnull.parquet");
+        // Nullable Int64 coord column with a null at row 1; the value column is
+        // valid so only the coordinate check can fire.
+        let fields = vec![
+            Field::new("dim0", DataType::Int64, true),
+            Field::new("data", DataType::Float64, false),
+        ];
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(Int64Array::from(vec![Some(0), None, Some(2)])),
+            Arc::new(Float64Array::from(vec![1.0, 2.0, 3.0])),
+        ];
+        write_raw_parquet(&p, fields, columns).await;
+
+        let adapter = SparseBlocksParquetAdapter::from_paths(
+            vec![p],
+            vec![4],
+            vec![vec![4]],
+            f64_dtype(),
+            None,
+            serde_json::Value::Null,
+        )
+        .unwrap();
+
+        let err = adapter.read_block(&[0]).await;
+        assert!(
+            err.is_err(),
+            "null coordinate index must be rejected, not silently zeroed"
+        );
+        let msg = err.unwrap_err().to_string();
+        assert!(
+            msg.contains("cnull.parquet"),
+            "error names the offending block file, got: {msg}"
+        );
+        assert!(
+            msg.contains("null"),
+            "error explains the null cause, got: {msg}"
+        );
+        assert!(
+            msg.contains("coordinate"),
+            "error names the coordinate column, got: {msg}"
         );
     }
 }
