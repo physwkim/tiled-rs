@@ -19,6 +19,7 @@
 //! # Ok(()) }
 //! ```
 
+pub mod admin;
 pub mod any_client;
 pub mod array;
 pub mod auth;
@@ -42,6 +43,7 @@ pub mod stream;
 pub mod utils;
 pub mod xarray_client;
 
+pub use admin::{Admin, AdminIdentity, PrincipalView};
 pub use any_client::AnyClient;
 pub use array::{ArrayBlock, ArrayClient};
 pub use auth::{
