@@ -85,6 +85,11 @@ fix problems in code we never wrote.
 | #1364 / #1343 / #1326 / #1351 / #1339 / #1218 / #287 / #262 | various gaps | initial-port gap commits (`d48e5f4`, `ec00c22`). |
 | #564  | confirmation_message on Authenticators | `ProviderInfo.confirmation_message` already passed through to SPA. |
 | #1196 / #1197 | Subscription Executor | tokio runtime + bus already covers it. |
+| #1391 | Allow empty `sort=` param | `parse_sort` drops truly-empty items (`router.rs:523-525`), test `empty_param_yields_no_sorting` (`:6105`); the `Vec<(String,String)>` parser never had pydantic's strict regex, so the 422 never existed here. |
+| #1381 | EntraAuthenticator: code-flow secret, `scp`-absent scopes, human username | `external_oidc.rs`: `client_secret` + code flow (`:121`, `:476`); `translate_scp` grants the union of all mapped scopes when `scp` is absent/empty (`:1008-1013`); `derive_entra_identity` derives a human-readable username (`:872`). |
+| #1382 | Downstream-OBO token storage | `exchange_code_flow` stores `entra_access_token`/`entra_refresh_token` in the session `state` claim (`external_oidc.rs:819`, `:968-980`) — the OBO-carrier substrate from #465. |
+| #1383 | Readable-username priority + `extra_scopes` for OBO `aud` | Username from nameID/preferred_username/upn/email (`derive_entra_identity`, `external_oidc.rs:872`); `extra_scopes` appended to the token-POST `scope` so the returned `access_token` carries the resource `aud` (`:515`, doc `:126-137`). |
+| #1385 | Union token scopes with real role scopes (incl. admin) | `token_scopes ∪ role_scopes` with role from the principal's *actual* role — `for_role` maps `admin`→full (`scopes.rs:159`), unioned at `app.rs:572-576`; refresh re-derives from the current role (`auth_router.rs:156`). External-session tracking + `access_token`-in-Principal are consequences of tiled-rs minting its own OIDC session (see #1384 note), N/A. |
 
 ## Deferred (substantive port, tracked)
 
@@ -93,6 +98,8 @@ fix problems in code we never wrote.
 | #1320 | Postgres `nodes` parent_id index | We have the index; production-scale planner tuning is the actual issue. |
 | #588  | btree_gin (vs plain GIN) | We have plain GIN over jsonb; btree_gin only helps hybrid btree+gin queries. |
 | #1271 | Preemptive reshape | Our HDF5 reads `ds.shape()` directly; can't diverge by design. |
+| #1409 | Metadata-revision pagination (`revisions_count`) | `GET /revisions` reports `meta.count = revisions.len()` — the *page* length, not the total (`router.rs:5444`). `pagination_links` then computes `last_offset = ((count-1)/limit)*limit = 0` (`core/links.rs:127`) and emits no `next`/`last`, so a client can never page past the first 100 revisions (upstream issue #1389). Deterministic `ORDER BY revision` is already present (`node.rs:1089`/`:1115`); the only gap is the total count — upstream returns it via `revisions_with_count` (server/core.py:340). Bounded fix: add a `count_revisions(node_id)` catalog query and feed it to `meta.count` + the links. |
+| #1415 | HDF5 non-string object-dtype placeholder | vlen-string object datasets are ported (#157, `0be4d0e` → fixed-width `S<N>`), but other object dtypes (vlen arrays, HDF5 object references) fall through to `dtype_from_hdf5` (`hdf5_adapter.rs:161`), which errors. Upstream now serves an empty `S0` placeholder of the same shape instead of raising (hdf5.py, #1415). Low value — these dtypes are rare and h5py-only. |
 
 Resolved out of Deferred: #1096 (ported, see above); #1378 (confirmed
 correct — single-row json-seq framing covered by a unit + HTTP smoke
@@ -179,6 +186,64 @@ behaviour lives outside this port:
 If you find a Python PR that you think belongs in "Ported" or "Deferred",
 open it and check the file list — most of the alembic/dask/pydantic
 churn was infrastructure, not behaviour change.
+
+## Sweep: PR #1381 – #1435 (wave-6, above the #1378 high-water mark)
+
+Prior batches account through **#1378** (the Ported / Already-covered tables
+top out at #1374; #1378 is resolved-out-of-Deferred above). This batch swept
+every merged upstream PR numbered above #1378 — 24 PRs, #1381 through #1435
+(upstream local checkout HEAD `da03df0f` = the #1434 merge; #1435 is a
+GitHub-only pixi change). Classification: **5 already covered**, **2 deferred /
+actionable**, **17 N/A**.
+
+* **Already covered (5)** — rows in the Already-covered table: #1381, #1382,
+  #1383, #1385 (the Entra/OIDC + role-scope follow-ups to #1364 / #1178 / #465
+  were already folded into `external_oidc.rs` / `auth_router.rs` / `app.rs`)
+  and #1391 (empty `sort=`).
+* **Deferred / actionable (2)** — rows in the Deferred table: **#1409**
+  (metadata-revision total-count pagination — a real defect: multi-page
+  revision listings are uncapped-count and un-pageable) and **#1415** (HDF5
+  non-string object-dtype placeholder — low value).
+
+N/A batch (17), each with the structural reason it does not apply:
+
+* **Python client — separate Rust client with its own APIs (7):** #1400
+  (retries + progress bar), #1395 (httpx connection cap), #1406 (no-retry on
+  unsupported protocol), #1408 (client raises on non-JSON-object metadata
+  update), #1411 (skip re-auth in `from_context`), #1418 (whoami auth-link
+  check), #1386 (`TILED_API_KEY` CLI auth).
+* **Python tooling / frontend (4):** #1435 (pixi ARM64 + `ragged` dep), #1392
+  (WebUI catalog pagination / table UX — our SPA is a separate, link-based
+  paradigm), #1397 (sphinx-click CLI-docs compat), #1396 (client logger +
+  server `logging_config.py` cleanup — Python logging config).
+* **Structurally absent in this port (6):**
+  * **#1434** — guards the `array-ref` streaming-cache update in
+    `put_data_source` against non-array nodes (upstream `KeyError: 'shape'`).
+    tiled-rs emits a shape-free bus `DataAppended { partition: None }`
+    uniformly across all structure families (`router.rs:5836`) and has no
+    redis `streaming_cache` (#1192, N/A) — the bug cannot be constructed.
+  * **#1429** — widens `assets.size` int32→int64 (PostgreSQL overflow on
+    files >2.1 GB). tiled-rs's `assets` table has no `size` column at all
+    (`migrations/{sqlite,postgres}/0001_initial.sql`), so the overflow can't
+    occur.
+  * **#1424** — strips `Asset.size` from responses for pre-v0.2.13
+    `python-tiled` clients whose dataclass lacks the field. tiled-rs carries
+    no `size` field to strip, and the target is the Python client's dataclass
+    strictness.
+  * **#1384** — provides the OAuth2 `scope` to the IdP token endpoint on
+    refresh (Entra refresh follow-up to #1381). tiled-rs's refresh always
+    re-mints via its own `/auth/refresh` and never re-calls the IdP token
+    endpoint (deliberate divergence, `router.rs:281-284`), so there is no IdP
+    refresh call to attach scopes to.
+  * **#1402** — deterministic row ordering / `order_by_args` / `primary_key`
+    for the *writable* SQL storage adapter (`_partition_id` / `_dataset_id`
+    INSERT machinery, `tiled/adapters/sql.py`). tiled-rs carries no such
+    write-side SQL adapter (#1010 / #998, N/A); its ragged-SQL path is a
+    read-only `sqlite://` resolver.
+  * **#1394** — internal `NDSlice` helper methods (`chunk_indices`,
+    `block_for_slice`, `build_nested_grid`) consumed only by the Python ragged
+    adapter's `read()`→`read_block()` slice decomposition; no wire/behaviour
+    change, and tiled-rs resolves slices in its own read path.
 
 ## Older-PR sweep (PR #1 - #465)
 
