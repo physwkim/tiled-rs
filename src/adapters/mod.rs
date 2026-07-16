@@ -1,5 +1,6 @@
 pub mod array_adapter;
 pub mod awkward_adapter;
+pub mod awkward_buffers_adapter;
 pub mod coo_adapter;
 pub mod map_adapter;
 pub mod npy_adapter;
@@ -34,6 +35,7 @@ pub mod zarr_adapter;
 
 pub use array_adapter::ArrayAdapter;
 pub use awkward_adapter::AwkwardAdapter;
+pub use awkward_buffers_adapter::{AwkwardBuffersAdapter, init_storage_awkward};
 pub use coo_adapter::CooAdapter;
 pub use map_adapter::MapAdapter;
 pub use npy_adapter::{NpyAdapter, init_storage_npy, npy_bytes};
