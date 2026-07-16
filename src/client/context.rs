@@ -923,6 +923,112 @@ impl Context {
             .join(link.trim_start_matches('/'))
             .map_err(ClientError::from)
     }
+
+    // ---------------- API-key management ----------------
+
+    /// A "who am I" for API keys: metadata about the key that authenticated
+    /// the current request (`GET /api/v1/auth/apikey`).
+    ///
+    /// Mirrors Python `Context.which_api_key` (`context.py:825`). The server
+    /// returns 401 (surfaced as [`ClientError::AuthRequired`]) when the request
+    /// was not authenticated with an API key.
+    pub async fn which_api_key(&self) -> Result<ApiKeyInfo> {
+        let url = self.inner.api_uri.join("auth/apikey")?;
+        let req = self.request(Method::GET, &url).await?.header(
+            reqwest::header::ACCEPT,
+            crate::client::utils::JSON_MIME_TYPE,
+        );
+        let resp = self.send_with_auth(req).await?;
+        self.maybe_capture_csrf(&resp).await;
+        let resp = handle_error(resp).await?;
+        decode_response::<ApiKeyInfo>(resp).await
+    }
+
+    /// Generate a new API key (`POST /api/v1/auth/apikeys`).
+    ///
+    /// Mirrors Python `Context.create_api_key` (`context.py:840`). The Rust
+    /// server takes the lifetime as an integer number of seconds
+    /// (`expires_in_seconds`) rather than Python's `expires_in` duration
+    /// string, and has no `access_tags` field. `scopes = None` grants the key
+    /// the caller's own scopes; a non-`None` list must be a subset of them.
+    /// The returned [`ApiKeyCreated::secret`] is shown exactly once.
+    pub async fn create_api_key(
+        &self,
+        scopes: Option<Vec<String>>,
+        expires_in_seconds: Option<i64>,
+        note: Option<String>,
+    ) -> Result<ApiKeyCreated> {
+        let url = self.inner.api_uri.join("auth/apikeys")?;
+        let body = serde_json::json!({
+            "scopes": scopes,
+            "expires_in_seconds": expires_in_seconds,
+            "note": note,
+        });
+        let req = self.request(Method::POST, &url).await?.json(&body);
+        let req = self.add_csrf(req).await;
+        let resp = self.send_with_auth(req).await?;
+        self.maybe_capture_csrf(&resp).await;
+        let resp = handle_error(resp).await?;
+        decode_response::<ApiKeyCreated>(resp).await
+    }
+
+    /// Revoke an API key by its first eight characters
+    /// (`DELETE /api/v1/auth/apikeys/{first_eight}`).
+    ///
+    /// Mirrors Python `Context.revoke_api_key` (`context.py:889`): the key must
+    /// belong to the currently-authenticated principal (or the caller must hold
+    /// admin scopes). The Rust server takes `first_eight` as a path segment
+    /// rather than Python's query parameter. As in Python, any characters past
+    /// the first eight are truncated.
+    pub async fn revoke_api_key(&self, first_eight: &str) -> Result<()> {
+        let first_eight = first_eight.get(..8).unwrap_or(first_eight);
+        let url = self
+            .inner
+            .api_uri
+            .join(&format!("auth/apikeys/{first_eight}"))?;
+        let req = self.request(Method::DELETE, &url).await?;
+        let req = self.add_csrf(req).await;
+        let resp = self.send_with_auth(req).await?;
+        self.maybe_capture_csrf(&resp).await;
+        handle_error(resp).await?;
+        Ok(())
+    }
+}
+
+/// Secret + metadata returned by [`Context::create_api_key`]
+/// (`POST /api/v1/auth/apikeys`). The `secret` is the full API key, returned
+/// only once at creation time.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ApiKeyCreated {
+    /// The full API key material (shown only at creation).
+    pub secret: String,
+    /// First eight characters of the key, used to identify it for revocation.
+    pub first_eight: String,
+    /// Scopes granted to the key.
+    pub scopes: Vec<String>,
+    /// Expiration instant, or `None` if the key never expires.
+    pub expiration_time: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Metadata about an existing API key returned by [`Context::which_api_key`]
+/// (`GET /api/v1/auth/apikey`). No secret is included — the key material is
+/// never returned after creation.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ApiKeyInfo {
+    /// Server-side row id of the key.
+    pub id: i64,
+    /// First eight characters of the key.
+    pub first_eight: String,
+    /// Human-facing description supplied at creation, if any.
+    pub note: Option<String>,
+    /// Scopes granted to the key.
+    pub scopes: Vec<String>,
+    /// Expiration instant, or `None` if the key never expires.
+    pub expiration_time: Option<chrono::DateTime<chrono::Utc>>,
+    /// When the key was created.
+    pub time_created: chrono::DateTime<chrono::Utc>,
+    /// Most recent time the key was used, if ever.
+    pub latest_activity: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Optional inputs for `Context::from_uri_with_options`.
