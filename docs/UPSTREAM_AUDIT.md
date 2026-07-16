@@ -90,7 +90,6 @@ fix problems in code we never wrote.
 | #1320 | Postgres `nodes` parent_id index | We have the index; production-scale planner tuning is the actual issue. |
 | #588  | btree_gin (vs plain GIN) | We have plain GIN over jsonb; btree_gin only helps hybrid btree+gin queries. |
 | #1271 | Preemptive reshape | Our HDF5 reads `ds.shape()` directly; can't diverge by design. |
-| #465  | Adapters that interact with services | Large feature surface; likely many sub-PRs. |
 
 Resolved out of Deferred: #1096 (ported, see above); #1378 (confirmed
 correct — single-row json-seq framing covered by a unit + HTTP smoke
@@ -116,6 +115,41 @@ constructed. The DB `ds.structure` is never fed to the HDF5/zarr read
 path (only the ragged-SQL branch forwards it, `file_resolver.rs:178`).
 Same structural reason as #1271 below: our external-array reads take
 `ds.shape()`/`array.shape()` directly and can't diverge by design.
+
+#465 "Support Adapters that Interact with Services" (merged upstream
+`7e72ee24`; current form in `tiled/server/protocols.py`,
+`dependencies.py:68`, `authentication.py:237`/`:857`,
+`authn_database/orm.py:223`) splits into two halves; neither remains a
+deferred port:
+
+* **Transport substrate — already covered.** #465 added a `Session.state`
+  JSON column and embedded it as a JWT `state` claim so per-session
+  secrets survive to the read path. This port already carries that
+  substrate, built for the Entra on-behalf-of flow (#1364): migration
+  `0006_add_session_state` (`src/auth/migrations/{sqlite,postgres}/`)
+  adds `sessions.state`, `AccessTokenClaims.state`
+  (`src/auth/jwt.rs:40`) embeds it verbatim, and `create_session`
+  stores + round-trips it through refresh (`src/auth/session.rs:41`).
+* **Adapter-consumption half — N/A (architectural).** The feature's
+  point is a config-loaded custom adapter exposing
+  `with_session_state(state)`, which upstream reaches by duck typing:
+  `get_entry` does `hasattr(entry, "with_session_state")`
+  (`dependencies.py:68`) on a Python `Adapter` class named by config
+  `object_path`. This port has no such surface: `AnyAdapter` is a
+  **closed enum** of six concrete categories (`src/core/adapters.rs:582`)
+  and leaf adapters come from a fixed `match mimetype` dispatch over
+  built-in file formats (`src/server/file_resolver.rs:244`) — there is
+  no runtime custom/plugin adapter loader (`from_config` exists only for
+  *authenticators*, not adapters/trees), so no duck-typed `entry` on
+  which to call `with_session_state`. The `Authenticator` trait returns
+  a `Subject` (`src/auth/authenticator.rs:38`), not a state dict, and
+  nothing on the read path consumes the `state` claim to bind an
+  adapter. Wiring a `with_session_state` hook now would be dead code:
+  there is **no Rust service adapter to consume it** (the stored state
+  exists only as an OBO token carrier). Providing the plugin/extension
+  system that would give it a consumer is a large, unbounded
+  architectural change, not a bounded port — revisit only if/when a
+  concrete Rust service-backed adapter lands.
 
 ## N/A (Python-specific or feature not in our port)
 
