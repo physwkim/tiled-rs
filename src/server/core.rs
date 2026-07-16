@@ -236,17 +236,41 @@ fn arrow_string_column_to_numpy(
     Ok((bytes::Bytes::from(out), dtype, nrows))
 }
 
-/// Map an Arrow numeric/boolean [`arrow::datatypes::DataType`] to the numpy
-/// [`BuiltinDType`] a column-array view exposes. One-byte types use numpy's
-/// "not applicable" byte-order marker (`|i1`, `|u1`, `|b1`); multi-byte numerics
-/// are little-endian (the byte order [`arrow_array_to_le_bytes`] emits). A
-/// non-numeric column (string, temporal, nested) is rejected — the array routes
-/// cannot serve it.
+/// Map an Arrow numeric/boolean/temporal [`arrow::datatypes::DataType`] to the
+/// numpy [`BuiltinDType`] a column-array view exposes. One-byte types use
+/// numpy's "not applicable" byte-order marker (`|i1`, `|u1`, `|b1`); multi-byte
+/// numerics are little-endian (the byte order [`arrow_array_to_le_bytes`]
+/// emits).
+///
+/// Temporal columns become numpy `datetime64` (`<M8[unit]`), an 8-byte little-
+/// endian int64 tick count whose unit is carried in `dt_units`: `Timestamp`
+/// keeps its Arrow unit (`[s]`/`[ms]`/`[us]`/`[ns]`), `Date32` is `[D]`, and
+/// `Date64` is `[ms]`. A `Timestamp`'s timezone is dropped — numpy `datetime64`
+/// is tz-naive, so the ticks are the raw UTC ticks upstream also serves after
+/// `numpy.array(series.values)` on a tz-aware column (the tz is not surfaced in
+/// metadata). A non-numeric, non-temporal column (nested, decimal, …) is
+/// rejected — the array routes cannot serve it. Strings are handled earlier in
+/// [`arrow_column_to_numpy`] and never reach here.
 fn arrow_datatype_to_builtin(
     dt: &arrow::datatypes::DataType,
     column: &str,
 ) -> Result<BuiltinDType, ServerError> {
-    use arrow::datatypes::DataType;
+    use arrow::datatypes::{DataType, TimeUnit};
+
+    // datetime64 unit token for a temporal `<M8[unit]` dtype.
+    let time_unit = |u: &TimeUnit| match u {
+        TimeUnit::Second => "[s]",
+        TimeUnit::Millisecond => "[ms]",
+        TimeUnit::Microsecond => "[us]",
+        TimeUnit::Nanosecond => "[ns]",
+    };
+    let datetime64 = |units: &str| BuiltinDType {
+        endianness: Endianness::Little,
+        kind: Kind::Datetime,
+        itemsize: 8,
+        dt_units: Some(units.to_string()),
+    };
+
     let (kind, size, endian) = match dt {
         DataType::Int8 => (Kind::Integer, 1, Endianness::NotApplicable),
         DataType::Int16 => (Kind::Integer, 2, Endianness::Little),
@@ -259,6 +283,10 @@ fn arrow_datatype_to_builtin(
         DataType::Float32 => (Kind::Float, 4, Endianness::Little),
         DataType::Float64 => (Kind::Float, 8, Endianness::Little),
         DataType::Boolean => (Kind::Boolean, 1, Endianness::NotApplicable),
+        // datetime64: 8-byte int64 ticks, unit carried in `dt_units`.
+        DataType::Timestamp(unit, _tz) => return Ok(datetime64(time_unit(unit))),
+        DataType::Date32 => return Ok(datetime64("[D]")),
+        DataType::Date64 => return Ok(datetime64("[ms]")),
         other => {
             return Err(ServerError::WrongType(format!(
                 "table column '{column}' has type {other:?}, which cannot be served as an array"
@@ -278,10 +306,12 @@ fn arrow_array_to_le_bytes(
     column: &str,
 ) -> Result<Vec<u8>, ServerError> {
     use arrow::array::{
-        Array, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
-        Int64Array, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+        Array, BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array, Int8Array,
+        Int16Array, Int32Array, Int64Array, TimestampMicrosecondArray, TimestampMillisecondArray,
+        TimestampNanosecondArray, TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array,
+        UInt64Array,
     };
-    use arrow::datatypes::DataType;
+    use arrow::datatypes::{DataType, TimeUnit};
 
     let n = array.len();
     let downcast_err = |ty: &str| -> ServerError {
@@ -323,6 +353,27 @@ fn arrow_array_to_le_bytes(
             out
         }};
     }
+    // datetime64: 8-byte little-endian int64 ticks, Arrow null → `i64::MIN`
+    // (numpy `NaT`, the sentinel `datetime64` uses for a missing value). `$widen`
+    // lifts a narrower native tick (`Date32`'s i32 days) to i64.
+    macro_rules! datetimes {
+        ($arr:ty, $ty_name:literal, $widen:expr) => {{
+            let a = array
+                .as_any()
+                .downcast_ref::<$arr>()
+                .ok_or_else(|| downcast_err($ty_name))?;
+            let mut out = Vec::with_capacity(n * 8);
+            for i in 0..n {
+                let v: i64 = if a.is_null(i) {
+                    i64::MIN
+                } else {
+                    $widen(a.value(i))
+                };
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            out
+        }};
+    }
 
     let bytes = match array.data_type() {
         DataType::Int8 => ints!(Int8Array, i8, "Int8Array"),
@@ -346,6 +397,31 @@ fn arrow_array_to_le_bytes(
                 .map(|i| u8::from(!a.is_null(i) && a.value(i)))
                 .collect()
         }
+        // datetime64 ticks (int64). Timestamp/Date64 are already i64; Date32 is
+        // i32 days widened to i64. The dtype's unit (from
+        // `arrow_datatype_to_builtin`) tells the client how to read these ticks.
+        DataType::Timestamp(unit, _tz) => match unit {
+            TimeUnit::Second => datetimes!(TimestampSecondArray, "TimestampSecondArray", |v| v),
+            TimeUnit::Millisecond => {
+                datetimes!(
+                    TimestampMillisecondArray,
+                    "TimestampMillisecondArray",
+                    |v| v
+                )
+            }
+            TimeUnit::Microsecond => {
+                datetimes!(
+                    TimestampMicrosecondArray,
+                    "TimestampMicrosecondArray",
+                    |v| v
+                )
+            }
+            TimeUnit::Nanosecond => {
+                datetimes!(TimestampNanosecondArray, "TimestampNanosecondArray", |v| v)
+            }
+        },
+        DataType::Date32 => datetimes!(Date32Array, "Date32Array", |v: i32| v as i64),
+        DataType::Date64 => datetimes!(Date64Array, "Date64Array", |v| v),
         other => {
             return Err(ServerError::WrongType(format!(
                 "table column '{column}' has type {other:?}, which cannot be served as an array"
@@ -559,8 +635,11 @@ fn resource_from_entry(entry: SearchEntry, child_path: &str, base_url: &str) -> 
 mod table_column_tests {
     use std::sync::Arc;
 
-    use arrow::array::{BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray};
-    use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+    use arrow::array::{
+        BooleanArray, Date32Array, Date64Array, Float64Array, Int64Array, RecordBatch, StringArray,
+        TimestampMicrosecondArray, TimestampMillisecondArray,
+    };
+    use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
     use indexmap::IndexMap;
 
     use super::*;
@@ -855,6 +934,119 @@ mod table_column_tests {
         assert_eq!(nrows, 0);
         assert!(data.is_empty());
         assert_eq!(dtype.to_numpy_str(), "<U0");
+    }
+
+    #[test]
+    fn datatype_to_builtin_maps_temporal_to_datetime64() {
+        let ny = Some("America/New_York".into());
+        let cases: &[(DataType, &str)] = &[
+            (DataType::Timestamp(TimeUnit::Second, None), "<M8[s]"),
+            (DataType::Timestamp(TimeUnit::Millisecond, None), "<M8[ms]"),
+            // A timezone is dropped: numpy `datetime64` is tz-naive.
+            (DataType::Timestamp(TimeUnit::Microsecond, ny), "<M8[us]"),
+            (DataType::Timestamp(TimeUnit::Nanosecond, None), "<M8[ns]"),
+            (DataType::Date32, "<M8[D]"),
+            (DataType::Date64, "<M8[ms]"),
+        ];
+        for (dt, expected) in cases {
+            let got = arrow_datatype_to_builtin(dt, "t").unwrap();
+            assert_eq!(got.to_numpy_str(), *expected, "{dt:?}");
+            assert_eq!(got.element_size(), 8, "datetime64 is always 8 bytes");
+        }
+    }
+
+    /// Two-partition timestamp table (`ts: Timestamp(ms)`, nullable), the null in
+    /// partition 0 and a value in partition 1, so ticks exercise the concat and
+    /// the `NaT` sentinel.
+    fn timestamp_table() -> InMemTable {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            true,
+        )]));
+        let b0 = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(TimestampMillisecondArray::from(vec![
+                Some(1000),
+                None,
+            ]))],
+        )
+        .unwrap();
+        let b1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(TimestampMillisecondArray::from(vec![Some(3000)]))],
+        )
+        .unwrap();
+        InMemTable::new(schema, vec![b0, b1])
+    }
+
+    #[tokio::test]
+    async fn column_timestamp_ms_null_is_nat() {
+        let table = timestamp_table();
+        let projected = table.read(Some(&["ts".to_string()])).await.unwrap();
+        let (data, dtype, nrows) = arrow_column_to_numpy(&projected, "ts").unwrap();
+        assert_eq!(nrows, 3);
+        assert_eq!(dtype.to_numpy_str(), "<M8[ms]");
+        // Null → i64::MIN (numpy `NaT`).
+        assert_eq!(i64s(&data), vec![1000, i64::MIN, 3000]);
+    }
+
+    #[tokio::test]
+    async fn column_tz_aware_timestamp_serves_naive_utc_ticks() {
+        // Arrow stores a tz-aware timestamp as UTC ticks + a tz annotation.
+        // Dropping the tz yields those same ticks under a tz-naive `<M8[us]`.
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Microsecond, Some("America/New_York".into())),
+            false,
+        )]));
+        let arr = TimestampMicrosecondArray::from(vec![1_000_000, 2_000_000])
+            .with_timezone("America/New_York");
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(arr)]).unwrap();
+        let table = InMemTable::new(schema, vec![batch]);
+        let projected = table.read(Some(&["ts".to_string()])).await.unwrap();
+        let (data, dtype, nrows) = arrow_column_to_numpy(&projected, "ts").unwrap();
+        assert_eq!(nrows, 2);
+        // tz dropped: unit is [us], no tz surfaced.
+        assert_eq!(dtype.to_numpy_str(), "<M8[us]");
+        assert_eq!(dtype.dt_units.as_deref(), Some("[us]"));
+        assert_eq!(i64s(&data), vec![1_000_000, 2_000_000]);
+    }
+
+    #[tokio::test]
+    async fn column_date32_is_day_ticks() {
+        let schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("d", DataType::Date32, true)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Date32Array::from(vec![Some(10), None, Some(20)]))],
+        )
+        .unwrap();
+        let table = InMemTable::new(schema, vec![batch]);
+        let projected = table.read(Some(&["d".to_string()])).await.unwrap();
+        let (data, dtype, nrows) = arrow_column_to_numpy(&projected, "d").unwrap();
+        assert_eq!(nrows, 3);
+        // Date32 → day-unit datetime64; i32 days widened to i64, null → NaT.
+        assert_eq!(dtype.to_numpy_str(), "<M8[D]");
+        assert_eq!(i64s(&data), vec![10, i64::MIN, 20]);
+    }
+
+    #[tokio::test]
+    async fn column_date64_is_ms_ticks() {
+        let schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("d", DataType::Date64, false)]));
+        // 86_400_000 ms = 1 day.
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Date64Array::from(vec![0, 86_400_000]))],
+        )
+        .unwrap();
+        let table = InMemTable::new(schema, vec![batch]);
+        let projected = table.read(Some(&["d".to_string()])).await.unwrap();
+        let (data, dtype, nrows) = arrow_column_to_numpy(&projected, "d").unwrap();
+        assert_eq!(nrows, 2);
+        assert_eq!(dtype.to_numpy_str(), "<M8[ms]");
+        assert_eq!(i64s(&data), vec![0, 86_400_000]);
     }
 
     fn root_with_table() -> Arc<dyn ContainerAdapter> {
