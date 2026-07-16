@@ -2,7 +2,10 @@
 //!
 //! Corresponds to `tiled/server/core.py` — `construct_resource`, `construct_entries_response`.
 
-use crate::core::adapters::{AnyAdapter, ContainerAdapter, SearchEntry};
+use std::sync::Arc;
+
+use crate::core::adapters::{AnyAdapter, ContainerAdapter, SearchEntry, TableAdapterRead};
+use crate::core::dtype::{ArrowTable, BuiltinDType, Endianness, Kind};
 use crate::core::links;
 use crate::core::schemas::{
     ContainerMeta, NodeAttributes, NodeStructure, Resource, Response, SortDirection, SortingItem,
@@ -41,6 +44,16 @@ pub async fn walk_tree(
     for j in 1..=last {
         let parent = match current {
             AnyAdapter::Container(c) => c,
+            // Final hop into a table addresses one of its columns as a
+            // synthesized array node. Upstream `TableAdapter.get(column)` returns
+            // `ArrayAdapter.from_array(self.read([column])[column].values)`
+            // (adapters/table.py:143-146, arrow.py:95-98), so a table is
+            // descendable by column name even though it is a leaf, not a
+            // container. Only the FINAL segment may name a column — a column is
+            // an array leaf, so a path continuing past it cannot resolve.
+            AnyAdapter::Table(t) if j == last => {
+                return table_column_as_array(&t, &segments[j]).await;
+            }
             _ => {
                 return Err(ServerError::NotFound(format!(
                     "'{}' is not a container, cannot descend further",
@@ -55,6 +68,198 @@ pub async fn walk_tree(
     }
 
     Ok(current)
+}
+
+/// Synthesize an array-adapter view over a single `column` of a `table` node.
+///
+/// Parity with upstream `TableAdapter.__getitem__` / `.get`
+/// (adapters/table.py:137-146, arrow.py:95-98): a table column is addressable as
+/// a child *array* node, materialized as
+/// `ArrayAdapter.from_array(self.read([column])[column].values)`. The column's
+/// dtype comes from the table's Arrow schema and its shape is `[nrows]`; a name
+/// absent from the schema's `columns` is a 404 (upstream `get` returns `None`).
+///
+/// The whole column is read and materialized eagerly here — exactly as upstream
+/// `__getitem__` reads `self.read([column])` to build the `ArrayAdapter` — so the
+/// data routes (`/array/full`, `/array/block`, `/zarr/…`) slice an in-memory
+/// array with no further reads.
+async fn table_column_as_array(
+    table: &Arc<dyn TableAdapterRead>,
+    column: &str,
+) -> Result<AnyAdapter, ServerError> {
+    // Absent column → 404, before any read (upstream `get` → None). Uses the
+    // same "Key not found" message as a missing container child so both walk
+    // failures surface identically.
+    if !table.structure().columns.iter().any(|c| c == column) {
+        return Err(ServerError::NotFound(format!("Key not found: {column}")));
+    }
+    // Read only the requested column (a one-column projection), then materialize
+    // it as numpy little-endian bytes + dtype — upstream's
+    // `self.read([column])[column].values`.
+    let fields = [column.to_string()];
+    let projected = table.read(Some(&fields)).await.map_err(ServerError::from)?;
+    let (data, dtype, nrows) = arrow_column_to_numpy(&projected, column)?;
+    let adapter = crate::adapters::ArrayAdapter::from_array(
+        data,
+        dtype,
+        vec![nrows],
+        // A single-partition column reads as one chunk covering every row
+        // (upstream's numpy-backed `ArrayAdapter.from_array` chunks a
+        // sub-128-MiB 1-D column as a single chunk).
+        vec![vec![nrows]],
+        // A synthesized column view carries no user metadata / specs, matching
+        // upstream `ArrayAdapter.from_array(array)` (neither is passed there).
+        serde_json::json!({}),
+        vec![],
+    );
+    Ok(AnyAdapter::Array(Arc::new(adapter)))
+}
+
+/// Convert a single-column [`ArrowTable`] (already projected to one column) into
+/// a numpy little-endian byte buffer, its [`BuiltinDType`], and the row count.
+///
+/// The dtype comes from the Arrow schema field (so it is known even for a
+/// zero-row column); the bytes are the column concatenated across all
+/// partitions/batches in C order.
+fn arrow_column_to_numpy(
+    table: &ArrowTable,
+    column: &str,
+) -> Result<(bytes::Bytes, BuiltinDType, usize), ServerError> {
+    use arrow::array::Array;
+
+    let field = table.schema.field(0);
+    let dtype = arrow_datatype_to_builtin(field.data_type(), column)?;
+
+    let arrays: Vec<&dyn Array> = table.batches.iter().map(|b| b.column(0).as_ref()).collect();
+    let nrows: usize = arrays.iter().map(|a| a.len()).sum();
+    if nrows == 0 {
+        return Ok((bytes::Bytes::new(), dtype, 0));
+    }
+    // One contiguous column across partitions (upstream concatenates partitions
+    // before exposing the column via `read`).
+    let col = arrow::compute::concat(&arrays)
+        .map_err(|e| ServerError::Internal(format!("concat column '{column}': {e}")))?;
+    let bytes = arrow_array_to_le_bytes(col.as_ref(), column)?;
+    Ok((bytes::Bytes::from(bytes), dtype, nrows))
+}
+
+/// Map an Arrow numeric/boolean [`arrow::datatypes::DataType`] to the numpy
+/// [`BuiltinDType`] a column-array view exposes. One-byte types use numpy's
+/// "not applicable" byte-order marker (`|i1`, `|u1`, `|b1`); multi-byte numerics
+/// are little-endian (the byte order [`arrow_array_to_le_bytes`] emits). A
+/// non-numeric column (string, temporal, nested) is rejected — the array routes
+/// cannot serve it.
+fn arrow_datatype_to_builtin(
+    dt: &arrow::datatypes::DataType,
+    column: &str,
+) -> Result<BuiltinDType, ServerError> {
+    use arrow::datatypes::DataType;
+    let (kind, size, endian) = match dt {
+        DataType::Int8 => (Kind::Integer, 1, Endianness::NotApplicable),
+        DataType::Int16 => (Kind::Integer, 2, Endianness::Little),
+        DataType::Int32 => (Kind::Integer, 4, Endianness::Little),
+        DataType::Int64 => (Kind::Integer, 8, Endianness::Little),
+        DataType::UInt8 => (Kind::UnsignedInteger, 1, Endianness::NotApplicable),
+        DataType::UInt16 => (Kind::UnsignedInteger, 2, Endianness::Little),
+        DataType::UInt32 => (Kind::UnsignedInteger, 4, Endianness::Little),
+        DataType::UInt64 => (Kind::UnsignedInteger, 8, Endianness::Little),
+        DataType::Float32 => (Kind::Float, 4, Endianness::Little),
+        DataType::Float64 => (Kind::Float, 8, Endianness::Little),
+        DataType::Boolean => (Kind::Boolean, 1, Endianness::NotApplicable),
+        other => {
+            return Err(ServerError::WrongType(format!(
+                "table column '{column}' has type {other:?}, which cannot be served as an array"
+            )));
+        }
+    };
+    Ok(BuiltinDType::new(endian, kind, size))
+}
+
+/// Serialize an Arrow numeric/boolean array to numpy C-order little-endian
+/// bytes. Mirrors `hdf5_common::write_table_column`'s per-type handling: integer
+/// values are copied from the underlying values buffer; float nulls become NaN
+/// (matching the JSON and HDF5 serializers); boolean stores as u8 (0/1),
+/// null → 0.
+fn arrow_array_to_le_bytes(
+    array: &dyn arrow::array::Array,
+    column: &str,
+) -> Result<Vec<u8>, ServerError> {
+    use arrow::array::{
+        Array, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
+        Int64Array, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    };
+    use arrow::datatypes::DataType;
+
+    let n = array.len();
+    let downcast_err = |ty: &str| -> ServerError {
+        ServerError::Internal(format!("column '{column}': downcast to {ty} failed"))
+    };
+
+    // Integer: copy the underlying values buffer verbatim (null slots carry
+    // their buffer value, as in hdf5_common — pandas promotes genuinely
+    // null-bearing integer columns to float before they reach here).
+    macro_rules! ints {
+        ($arr:ty, $native:ty, $ty_name:literal) => {{
+            let a = array
+                .as_any()
+                .downcast_ref::<$arr>()
+                .ok_or_else(|| downcast_err($ty_name))?;
+            let mut out = Vec::with_capacity(n * std::mem::size_of::<$native>());
+            for &v in a.values().iter() {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            out
+        }};
+    }
+    // Float: map each slot, turning Arrow nulls into NaN.
+    macro_rules! floats {
+        ($arr:ty, $native:ty, $ty_name:literal) => {{
+            let a = array
+                .as_any()
+                .downcast_ref::<$arr>()
+                .ok_or_else(|| downcast_err($ty_name))?;
+            let mut out = Vec::with_capacity(n * std::mem::size_of::<$native>());
+            for i in 0..n {
+                let v = if a.is_null(i) {
+                    <$native>::NAN
+                } else {
+                    a.value(i)
+                };
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            out
+        }};
+    }
+
+    let bytes = match array.data_type() {
+        DataType::Int8 => ints!(Int8Array, i8, "Int8Array"),
+        DataType::Int16 => ints!(Int16Array, i16, "Int16Array"),
+        DataType::Int32 => ints!(Int32Array, i32, "Int32Array"),
+        DataType::Int64 => ints!(Int64Array, i64, "Int64Array"),
+        DataType::UInt8 => ints!(UInt8Array, u8, "UInt8Array"),
+        DataType::UInt16 => ints!(UInt16Array, u16, "UInt16Array"),
+        DataType::UInt32 => ints!(UInt32Array, u32, "UInt32Array"),
+        DataType::UInt64 => ints!(UInt64Array, u64, "UInt64Array"),
+        DataType::Float32 => floats!(Float32Array, f32, "Float32Array"),
+        DataType::Float64 => floats!(Float64Array, f64, "Float64Array"),
+        DataType::Boolean => {
+            let a = array
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .ok_or_else(|| downcast_err("BooleanArray"))?;
+            // Booleans are bit-packed in Arrow, so they cannot be copied like a
+            // values buffer; expand to one u8 per element (null → 0).
+            (0..n)
+                .map(|i| u8::from(!a.is_null(i) && a.value(i)))
+                .collect()
+        }
+        other => {
+            return Err(ServerError::WrongType(format!(
+                "table column '{column}' has type {other:?}, which cannot be served as an array"
+            )));
+        }
+    };
+    Ok(bytes)
 }
 
 /// Compute ancestors list from a segment list.
@@ -254,5 +459,290 @@ fn resource_from_entry(entry: SearchEntry, child_path: &str, base_url: &str) -> 
             data_sources: entry.data_sources,
         },
         links: links::links_for_node(family, base_url, child_path),
+    }
+}
+
+#[cfg(test)]
+mod table_column_tests {
+    use std::sync::Arc;
+
+    use arrow::array::{BooleanArray, Float64Array, Int64Array, RecordBatch};
+    use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+    use indexmap::IndexMap;
+
+    use super::*;
+    use crate::adapters::MapAdapter;
+    use crate::core::adapters::{BaseAdapter, BoxFuture};
+    use crate::core::dtype::ArrowTable;
+    use crate::core::error::Result as CoreResult;
+    use crate::core::ndslice::NDSlice;
+    use crate::core::structures::{Spec, TableStructure};
+
+    /// A minimal in-memory table adapter over a fixed [`ArrowTable`], enough to
+    /// exercise the synthesized column-array hop. `read` honors a one-column
+    /// projection exactly like the real file-backed table adapters.
+    struct InMemTable {
+        schema: SchemaRef,
+        batches: Vec<RecordBatch>,
+        structure: TableStructure,
+        metadata: serde_json::Value,
+        specs: Vec<Spec>,
+    }
+
+    impl InMemTable {
+        fn new(schema: SchemaRef, batches: Vec<RecordBatch>) -> Self {
+            let columns: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
+            let structure = TableStructure {
+                arrow_schema: TableStructure::encode_arrow_schema_bytes(&[]),
+                npartitions: batches.len().max(1),
+                columns,
+                resizable: Default::default(),
+            };
+            Self {
+                schema,
+                batches,
+                structure,
+                metadata: serde_json::json!({}),
+                specs: vec![],
+            }
+        }
+
+        fn project(&self, fields: Option<&[String]>) -> CoreResult<ArrowTable> {
+            let Some(cols) = fields else {
+                return Ok(ArrowTable::new(self.batches.clone(), self.schema.clone()));
+            };
+            let indices: Vec<usize> = cols
+                .iter()
+                .map(|name| {
+                    self.schema
+                        .fields()
+                        .iter()
+                        .position(|f| f.name() == name)
+                        .ok_or_else(|| {
+                            crate::core::error::TiledError::Validation(format!(
+                                "unknown column: {name}"
+                            ))
+                        })
+                })
+                .collect::<CoreResult<Vec<_>>>()?;
+            let projected_schema = Arc::new(self.schema.project(&indices).unwrap());
+            let batches = self
+                .batches
+                .iter()
+                .map(|b| b.project(&indices).unwrap())
+                .collect();
+            Ok(ArrowTable::new(batches, projected_schema))
+        }
+    }
+
+    impl BaseAdapter for InMemTable {
+        fn structure_family(&self) -> StructureFamily {
+            StructureFamily::Table
+        }
+        fn metadata(&self) -> &serde_json::Value {
+            &self.metadata
+        }
+        fn specs(&self) -> &[Spec] {
+            &self.specs
+        }
+    }
+
+    impl TableAdapterRead for InMemTable {
+        fn structure(&self) -> &TableStructure {
+            &self.structure
+        }
+        fn read<'a>(
+            &'a self,
+            fields: Option<&'a [String]>,
+        ) -> BoxFuture<'a, CoreResult<ArrowTable>> {
+            Box::pin(async move { self.project(fields) })
+        }
+        fn read_partition<'a>(
+            &'a self,
+            partition: usize,
+            fields: Option<&'a [String]>,
+        ) -> BoxFuture<'a, CoreResult<ArrowTable>> {
+            Box::pin(async move {
+                let b = self
+                    .batches
+                    .get(partition)
+                    .ok_or_else(|| {
+                        crate::core::error::TiledError::Validation("partition out of range".into())
+                    })?
+                    .clone();
+                let one = InMemTable {
+                    schema: self.schema.clone(),
+                    batches: vec![b],
+                    structure: self.structure.clone(),
+                    metadata: self.metadata.clone(),
+                    specs: self.specs.clone(),
+                };
+                one.project(fields)
+            })
+        }
+    }
+
+    /// Table with columns `x: Int64`, `y: Float64` (with a null), `flag: Boolean`,
+    /// split across two partitions (rows [1,2] then [3]) so column reads exercise
+    /// the cross-partition concat.
+    fn three_col_table() -> InMemTable {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("x", DataType::Int64, false),
+            Field::new("y", DataType::Float64, true),
+            Field::new("flag", DataType::Boolean, false),
+        ]));
+        let b0 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(Float64Array::from(vec![Some(1.5), None])),
+                Arc::new(BooleanArray::from(vec![true, false])),
+            ],
+        )
+        .unwrap();
+        let b1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![3])),
+                Arc::new(Float64Array::from(vec![3.5])),
+                Arc::new(BooleanArray::from(vec![true])),
+            ],
+        )
+        .unwrap();
+        InMemTable::new(schema, vec![b0, b1])
+    }
+
+    fn f64s(bytes: &[u8]) -> Vec<f64> {
+        bytes
+            .chunks_exact(8)
+            .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+            .collect()
+    }
+    fn i64s(bytes: &[u8]) -> Vec<i64> {
+        bytes
+            .chunks_exact(8)
+            .map(|c| i64::from_le_bytes(c.try_into().unwrap()))
+            .collect()
+    }
+
+    #[test]
+    fn datatype_to_builtin_covers_numeric_and_bool() {
+        let i64 = arrow_datatype_to_builtin(&DataType::Int64, "x").unwrap();
+        assert_eq!(i64.to_numpy_str(), "<i8");
+        let f64 = arrow_datatype_to_builtin(&DataType::Float64, "y").unwrap();
+        assert_eq!(f64.to_numpy_str(), "<f8");
+        let u8 = arrow_datatype_to_builtin(&DataType::UInt8, "u").unwrap();
+        assert_eq!(u8.to_numpy_str(), "|u1");
+        let b = arrow_datatype_to_builtin(&DataType::Boolean, "flag").unwrap();
+        assert_eq!(b.to_numpy_str(), "|b1");
+        // A non-numeric column is rejected (WrongType → 404).
+        let err = arrow_datatype_to_builtin(&DataType::Utf8, "s").unwrap_err();
+        assert!(matches!(err, ServerError::WrongType(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn column_int_concatenates_partitions() {
+        let table = three_col_table();
+        let projected = table.read(Some(&["x".to_string()])).await.unwrap();
+        let (data, dtype, nrows) = arrow_column_to_numpy(&projected, "x").unwrap();
+        assert_eq!(nrows, 3);
+        assert_eq!(dtype.to_numpy_str(), "<i8");
+        assert_eq!(i64s(&data), vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn column_float_null_becomes_nan() {
+        let table = three_col_table();
+        let projected = table.read(Some(&["y".to_string()])).await.unwrap();
+        let (data, dtype, nrows) = arrow_column_to_numpy(&projected, "y").unwrap();
+        assert_eq!(nrows, 3);
+        assert_eq!(dtype.to_numpy_str(), "<f8");
+        let vals = f64s(&data);
+        assert_eq!(vals[0], 1.5);
+        assert!(vals[1].is_nan(), "null slot → NaN");
+        assert_eq!(vals[2], 3.5);
+    }
+
+    #[tokio::test]
+    async fn column_bool_expands_to_u8() {
+        let table = three_col_table();
+        let projected = table.read(Some(&["flag".to_string()])).await.unwrap();
+        let (data, dtype, nrows) = arrow_column_to_numpy(&projected, "flag").unwrap();
+        assert_eq!(nrows, 3);
+        assert_eq!(dtype.to_numpy_str(), "|b1");
+        assert_eq!(data.as_ref(), &[1u8, 0, 1]);
+    }
+
+    #[tokio::test]
+    async fn column_empty_table_zero_rows() {
+        let schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
+        let table = InMemTable::new(schema, vec![]);
+        let projected = table.read(Some(&["x".to_string()])).await.unwrap();
+        let (data, dtype, nrows) = arrow_column_to_numpy(&projected, "x").unwrap();
+        assert_eq!(nrows, 0);
+        assert!(data.is_empty());
+        // dtype still comes from the schema field even with no rows.
+        assert_eq!(dtype.to_numpy_str(), "<i8");
+    }
+
+    fn root_with_table() -> Arc<dyn ContainerAdapter> {
+        let mut mapping = IndexMap::new();
+        mapping.insert(
+            "tbl".to_string(),
+            AnyAdapter::Table(Arc::new(three_col_table())),
+        );
+        Arc::new(MapAdapter::new(mapping, serde_json::json!({}), vec![])) as _
+    }
+
+    #[tokio::test]
+    async fn walk_table_column_yields_array_view() {
+        let root = root_with_table();
+        let seg = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+
+        // [tbl, y] resolves to a synthesized array node.
+        let node = walk_tree(root.as_ref(), &seg(&["tbl", "y"])).await.unwrap();
+        assert_eq!(node.structure_family(), StructureFamily::Array);
+        let arr = node.as_array_arc().expect("column resolves to an array");
+        assert_eq!(arr.structure().shape, vec![3]);
+        assert_eq!(arr.structure().chunks, vec![vec![3]]);
+        assert_eq!(arr.structure().data_type.element_size(), 8);
+        // Its full read returns the column values (null → NaN).
+        let data = arr.read(&NDSlice::empty()).await.unwrap();
+        let vals = f64s(&data.data);
+        assert_eq!(vals[0], 1.5);
+        assert!(vals[1].is_nan());
+        assert_eq!(vals[2], 3.5);
+    }
+
+    #[tokio::test]
+    async fn walk_table_missing_column_is_404() {
+        let root = root_with_table();
+        let seg = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let err = walk_tree(root.as_ref(), &seg(&["tbl", "nope"]))
+            .await
+            .err()
+            .expect("missing column must error");
+        assert!(matches!(err, ServerError::NotFound(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn walk_bare_table_is_still_a_table() {
+        let root = root_with_table();
+        let seg = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let node = walk_tree(root.as_ref(), &seg(&["tbl"])).await.unwrap();
+        assert_eq!(node.structure_family(), StructureFamily::Table);
+    }
+
+    #[tokio::test]
+    async fn walk_past_column_cannot_descend() {
+        // A column is an array leaf: [tbl, y, extra] must not resolve.
+        let root = root_with_table();
+        let seg = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let err = walk_tree(root.as_ref(), &seg(&["tbl", "y", "extra"]))
+            .await
+            .err()
+            .expect("descending past a column must error");
+        assert!(matches!(err, ServerError::NotFound(_)), "{err:?}");
     }
 }
