@@ -138,6 +138,15 @@ impl Hdf5Adapter {
         if matches!(datatype, rust_hdf5::DatatypeMessage::VarLenString { .. }) {
             return Self::from_vlen_string_dataset(path, dataset, &ds, metadata, locking);
         }
+        // h5py also uses numpy's object dtype for variable-length *sequences*
+        // (vlen arrays) and HDF5 object references. These can't be read as a
+        // numpy array, so upstream serves an empty placeholder of the same shape
+        // and dtype `S0` (`numpy.empty(ds.shape, dtype="S0")`, hdf5.py:204-235).
+        // Detect the vlen-sequence CLASS here and materialise the placeholder,
+        // rather than letting `dtype_from_hdf5` error. (#1415)
+        if matches!(datatype, rust_hdf5::DatatypeMessage::VarLenSequence { .. }) {
+            return Self::from_object_placeholder_dataset(path, dataset, &ds, metadata, locking);
+        }
 
         // Upstream tiled #944 covers scalar (`shape=()`) and
         // shape-with-zero datasets. We surface zero-rank as a 1-element
@@ -239,6 +248,66 @@ impl Hdf5Adapter {
 
         let dtype = BuiltinDType::new(Endianness::NotApplicable, Kind::String, width);
         let materialized = DynNDArray::new(Bytes::from(buf), dtype.clone(), shape.clone());
+        let chunks: Vec<Vec<usize>> = shape.iter().map(|d| vec![*d]).collect();
+        let structure = ArrayStructure {
+            data_type: DType::Builtin(dtype.clone()),
+            chunks,
+            shape,
+            dims: None,
+            resizable: Default::default(),
+        };
+        Ok(Self {
+            path,
+            dataset: dataset.to_string(),
+            dtype,
+            structure,
+            metadata,
+            specs: vec![Spec::new("hdf5")],
+            scalar_promoted,
+            locking,
+            materialized: Some(materialized),
+        })
+    }
+
+    /// Build an adapter for a non-string object-dtype dataset (#1415).
+    ///
+    /// h5py exposes variable-length sequences (vlen arrays) and HDF5 object
+    /// references through numpy's object dtype `O`. Unlike vlen strings (#157),
+    /// these can't be coerced to a real bytes array, so upstream serves an empty
+    /// placeholder of the same shape and dtype `S0`
+    /// (`numpy.empty(ds.shape, dtype="S0")`, hdf5.py:204-235). We mirror that: an
+    /// `S0` (zero-width bytes) structure over the dataset's shape, materialised
+    /// with an empty buffer (itemsize 0 × any count = 0 bytes), so reads slice to
+    /// zero bytes via the same in-memory path as vlen strings and never touch the
+    /// global-heap vlen storage.
+    fn from_object_placeholder_dataset(
+        path: PathBuf,
+        dataset: &str,
+        ds: &rust_hdf5::H5Dataset,
+        metadata: serde_json::Value,
+        locking: Hdf5Locking,
+    ) -> Result<Self> {
+        tracing::warn!(
+            target: "tiled.adapters.hdf5",
+            "dataset {dataset} has a non-string object dtype (h5py vlen array or \
+             object reference), a Python-only feature not supported by HDF5 in \
+             general; serving an empty S0 placeholder of the same shape"
+        );
+
+        // Same zero-rank promotion as the numeric and vlen-string paths.
+        let raw_shape: Vec<usize> = ds.shape();
+        let scalar_promoted = raw_shape.is_empty();
+        let shape = if scalar_promoted {
+            vec![1usize]
+        } else {
+            raw_shape
+        };
+
+        // `S0`: fixed-width bytes of width 0, byte-order-agnostic (numpy `|S0`).
+        let dtype = BuiltinDType::new(Endianness::NotApplicable, Kind::String, 0);
+        // Empty buffer: itemsize 0 means every element is zero bytes, so the whole
+        // array is zero bytes regardless of shape. Reads slice this in memory.
+        let materialized = DynNDArray::new(Bytes::new(), dtype.clone(), shape.clone());
         let chunks: Vec<Vec<usize>> = shape.iter().map(|d| vec![*d]).collect();
         let structure = ArrayStructure {
             data_type: DType::Builtin(dtype.clone()),
@@ -993,6 +1062,111 @@ mod vlen_string {
         let full = adapter.read_block(&[0], &NDSlice::empty()).await.unwrap();
         assert_eq!(full.shape, vec![3]);
         assert_eq!(&full.data[..], b"a\0\0bb\0ccc");
+        assert!(adapter.read_block(&[1], &NDSlice::empty()).await.is_err());
+    }
+}
+
+#[cfg(test)]
+mod object_placeholder {
+    //! Non-string object-dtype datasets (#1415).
+    //!
+    //! h5py exposes variable-length *sequences* (vlen arrays) and HDF5 object
+    //! references through numpy's object dtype `O`. Only vlen strings can be
+    //! coerced to a real bytes array (#157); for any other object dtype upstream
+    //! serves an empty placeholder of the same shape and dtype `S0`
+    //! (`numpy.empty(ds.shape, dtype="S0")`, hdf5.py:204-235). Before this
+    //! support the adapter errored in `dtype_from_hdf5` ("datatype
+    //! VarLenSequence ... not supported"). These tests assert the placeholder:
+    //! a `Kind::String` structure of width 0, the dataset's shape preserved, and
+    //! reads that yield zero bytes.
+    //!
+    //! The only non-string object dtype rust-hdf5 can represent (and construct)
+    //! is `VarLenSequence` — a vlen byte array. HDF5 object references (class 7)
+    //! have no `DatatypeMessage` variant, so they are unreachable from this port
+    //! and untestable here.
+    use std::path::PathBuf;
+
+    use super::*;
+
+    /// Write a 1-D variable-length *bytes* (vlen sequence) dataset — numpy
+    /// object dtype `O`, HDF5 class 9 vlen-sequence — and return the file.
+    fn write_vlen_bytes(name: &str, items: &[&[u8]]) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vlen_bytes.h5");
+        let file = rust_hdf5::H5File::create(&path).unwrap();
+        file.write_vlen_bytes(name, items).unwrap();
+        file.close().unwrap();
+        (dir, path)
+    }
+
+    /// Sanity: the fixture really does reach the non-string object-dtype path —
+    /// its stored datatype CLASS is `VarLenSequence`, not `VarLenString`.
+    #[test]
+    fn fixture_datatype_is_vlen_sequence() {
+        let (_dir, path) = write_vlen_bytes("v", &[b"a", b"bb", b"ccc"]);
+        let file = rust_hdf5::H5File::open(&path).unwrap();
+        let ds = file.dataset("v").unwrap();
+        let dt = ds.datatype().unwrap();
+        assert!(
+            matches!(dt, rust_hdf5::DatatypeMessage::VarLenSequence { .. }),
+            "expected VarLenSequence, got {dt:?}"
+        );
+        assert!(
+            !matches!(dt, rust_hdf5::DatatypeMessage::VarLenString { .. }),
+            "must not be a vlen string (that path is #157)"
+        );
+    }
+
+    /// The structure reports `S0` (byte-order-agnostic, numpy `|S0`) and the
+    /// dataset's shape — an empty placeholder, no error.
+    #[test]
+    fn reports_s0_and_preserves_shape() {
+        let (_dir, path) = write_vlen_bytes("v", &[b"a", b"bb", b"ccc"]);
+        let adapter = Hdf5Adapter::from_path(path, "v", serde_json::json!({})).unwrap();
+        let st = adapter.structure();
+        assert_eq!(st.shape, vec![3]);
+        match &st.data_type {
+            DType::Builtin(b) => {
+                assert_eq!(b.kind, Kind::String);
+                assert_eq!(b.itemsize, 0);
+                assert_eq!(b.endianness, Endianness::NotApplicable);
+                assert_eq!(b.to_numpy_str(), "|S0");
+            }
+            other => panic!("expected builtin dtype, got {other:?}"),
+        }
+    }
+
+    /// A full read yields zero bytes (itemsize 0 × any count), shape preserved.
+    #[tokio::test]
+    async fn full_read_is_empty_bytes() {
+        let (_dir, path) = write_vlen_bytes("v", &[b"a", b"bb", b"ccc"]);
+        let adapter = Hdf5Adapter::from_path(path, "v", serde_json::json!({})).unwrap();
+        let arr = adapter.read(&NDSlice::empty()).await.unwrap();
+        assert_eq!(arr.shape, vec![3]);
+        assert_eq!(&arr.data[..], b"");
+    }
+
+    /// A range slice preserves the placeholder: out-shape follows the slice,
+    /// bytes stay empty.
+    #[tokio::test]
+    async fn range_slice_stays_empty() {
+        let (_dir, path) = write_vlen_bytes("v", &[b"a", b"bb", b"ccc"]);
+        let adapter = Hdf5Adapter::from_path(path, "v", serde_json::json!({})).unwrap();
+        let slice = NDSlice::from_numpy_str("0:2").unwrap();
+        let arr = adapter.read(&slice).await.unwrap();
+        assert_eq!(arr.shape, vec![2]);
+        assert_eq!(&arr.data[..], b"");
+    }
+
+    /// `read_block` accepts the single chunk `[0]` (empty, shape preserved) and
+    /// rejects any other block index, like the numeric and vlen-string paths.
+    #[tokio::test]
+    async fn read_block_single_chunk_only() {
+        let (_dir, path) = write_vlen_bytes("v", &[b"a", b"bb", b"ccc"]);
+        let adapter = Hdf5Adapter::from_path(path, "v", serde_json::json!({})).unwrap();
+        let full = adapter.read_block(&[0], &NDSlice::empty()).await.unwrap();
+        assert_eq!(full.shape, vec![3]);
+        assert_eq!(&full.data[..], b"");
         assert!(adapter.read_block(&[1], &NDSlice::empty()).await.is_err());
     }
 }
