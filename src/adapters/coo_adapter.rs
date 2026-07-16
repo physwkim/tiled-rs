@@ -1020,4 +1020,17 @@ mod tests {
         .unwrap_err();
         assert!(err.to_string().contains("out of range"));
     }
+
+    // The in-memory COO adapter is read-only: the `SparseAdapterRead::as_writable`
+    // hook returns `None`, so the write route answers 405 rather than mutating an
+    // adapter that has no backing store. Only the managed parquet-backed sparse
+    // adapter overrides this hook.
+    #[test]
+    fn coo_adapter_is_not_writable() {
+        let adapter = make_3x3_adapter();
+        assert!(
+            SparseAdapterRead::as_writable(&adapter).is_none(),
+            "the in-memory CooAdapter must report itself read-only"
+        );
+    }
 }

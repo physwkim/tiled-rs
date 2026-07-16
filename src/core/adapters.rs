@@ -266,6 +266,42 @@ pub trait SparseAdapterRead: BaseAdapter {
     fn read<'a>(&'a self, slice: &'a NDSlice) -> BoxFuture<'a, Result<SparseData>>;
 
     fn read_block<'a>(&'a self, block: &'a [usize]) -> BoxFuture<'a, Result<SparseData>>;
+
+    /// The write face of this adapter, or `None` if it is read-only.
+    ///
+    /// The in-memory `CooAdapter` and any externally-registered sparse node are
+    /// read-only; only a managed parquet-backed sparse node under the server's
+    /// writable storage returns `Some`. Mirrors [`AwkwardAdapterRead::as_writable`]
+    /// and [`ArrayAdapterRead::as_writable`], so a read-only sparse node answers
+    /// 405 rather than the write route silently not existing.
+    fn as_writable(&self) -> Option<&dyn SparseAdapterWrite> {
+        None
+    }
+}
+
+/// Write face for sparse (COO) adapters backed by writable storage.
+///
+/// The Rust analog of Python's `SparseBlocksParquetAdapter.write` /
+/// `write_block` (`tiled/adapters/sparse_blocks_parquet.py:91-109`), which
+/// persist a COO DataFrame to per-block parquet files. `write` and `write_block`
+/// are kept distinct — as on the array/table side — so "full" never silently
+/// means "block 0": `write` overwrites the whole (single-block) array,
+/// `write_block` targets one addressed block of a chunked array.
+pub trait SparseAdapterWrite: SparseAdapterRead {
+    /// Overwrite the whole sparse array with `data`. `PUT /array/full` routes
+    /// here. Upstream `SparseBlocksParquetAdapter.write` supports only the
+    /// single-block case (`NotImplementedError` for >1 block,
+    /// `sparse_blocks_parquet.py:106-107`); adapters mirror that guard.
+    ///
+    /// `data.coords` are in the array's global coordinate frame; for a
+    /// single-block array that frame equals the block-local one.
+    fn write<'a>(&'a self, data: SparseData) -> BoxFuture<'a, Result<()>>;
+
+    /// Overwrite a single block. `PUT /array/block` routes here. `data.coords`
+    /// are in the *block-local* frame (the reference frame of that chunk),
+    /// matching upstream `write_block` (`sparse_blocks_parquet.py:91-103`).
+    fn write_block<'a>(&'a self, data: SparseData, block: &'a [usize])
+    -> BoxFuture<'a, Result<()>>;
 }
 
 // ---------------------------------------------------------------------------
