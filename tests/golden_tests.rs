@@ -1662,6 +1662,57 @@ async fn test_table_full_endpoint() {
 }
 
 // ---------------------------------------------------------------------------
+// #1378: `application/json-seq` single-row table response over HTTP.
+// Unit coverage for the serializer itself lives in
+// `src/serialization/table.rs` (`json_seq_table_single_row_has_no_newline_framing`);
+// this is the end-to-end smoke test through the actual `/table/full` route.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "csv-adapter")]
+#[tokio::test]
+async fn table_full_json_seq_single_row_has_no_newline_framing() {
+    use std::io::Write;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.csv");
+    let mut f = std::fs::File::create(&path).unwrap();
+    writeln!(f, "x,y").unwrap();
+    writeln!(f, "1,10").unwrap();
+    f.flush().unwrap();
+    let app = build_table_app(path, 300_000_000);
+
+    let (status, headers, body) = get_with_headers(
+        &app,
+        "/api/v1/table/full/some_table?format=application/json-seq",
+        &[],
+    )
+    .await;
+    assert_eq!(status, 200);
+    let ct = headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        ct.contains("json-seq"),
+        "?format=application/json-seq must negotiate json-seq; got {ct}"
+    );
+
+    let text = std::str::from_utf8(&body).expect("json-seq body must be valid utf-8");
+    assert_eq!(
+        text, "{\"x\":1,\"y\":10}",
+        "single-row json-seq must be exactly one JSON object, no newline framing"
+    );
+    assert_eq!(
+        text.matches('\n').count(),
+        0,
+        "single-row json-seq must contain no newline, got {text:?}"
+    );
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(text).expect("single-row body must parse as one JSON object");
+    assert_eq!(parsed, serde_json::json!({"x": 1, "y": 10}));
+}
+
+// ---------------------------------------------------------------------------
 // `?filename=` → `Content-Disposition: attachment; filename="..."` on data
 // export routes (Python `construct_data_response`, core.py:436-437).
 // ---------------------------------------------------------------------------

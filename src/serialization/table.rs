@@ -487,6 +487,43 @@ mod tests {
         assert!(out.is_empty(), "empty table must yield empty json-seq body");
     }
 
+    /// #1378: a single-row table is the boundary the `row > 0` newline guard
+    /// exists for — it must emit exactly one JSON object with NO leading or
+    /// trailing newline (not the empty-table case, and not a two-row case that
+    /// would mask an off-by-one in the guard). Mirrors Python's `n == 1` path
+    /// through `json_sequence` (table.py: first row has no leading newline,
+    /// loop over `range(1, n)` never runs).
+    #[test]
+    fn json_seq_table_single_row_has_no_newline_framing() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("b", DataType::Int64, false),
+            Field::new("a", DataType::Float64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1])),
+                Arc::new(Float64Array::from(vec![4.0])),
+            ],
+        )
+        .unwrap();
+        let out = json_seq_serializer()(&ipc_bytes(&batch), &serde_json::Value::Null).unwrap();
+        let text = String::from_utf8(out.to_vec()).unwrap();
+        assert_eq!(
+            text, "{\"b\":1,\"a\":4.0}",
+            "single row must be exactly one JSON object, no newline framing"
+        );
+        assert!(
+            !text.starts_with('\n') && !text.ends_with('\n'),
+            "single row must carry no leading/trailing newline, got {text:?}"
+        );
+        assert_eq!(
+            text.matches('\n').count(),
+            0,
+            "single row must contain no newline at all, got {text:?}"
+        );
+    }
+
     /// A genuinely non-JSON-native Arrow column type (binary) is a hard error
     /// (→ HTTP 500), never silently dropped or mis-encoded — matching orjson's
     /// failure on a bytes column rather than emitting garbage.
