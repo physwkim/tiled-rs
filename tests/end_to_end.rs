@@ -489,7 +489,7 @@ async fn array_write_full_roundtrip() {
         management: Management::Writable,
     };
     root.create_node(
-        "w_arr",
+        Some("w_arr"),
         StructureFamily::Array,
         serde_json::json!({}),
         vec![],
@@ -552,7 +552,7 @@ async fn array_write_block_roundtrip() {
         management: Management::Writable,
     };
     root.create_node(
-        "wb_arr",
+        Some("wb_arr"),
         StructureFamily::Array,
         serde_json::json!({}),
         vec![],
@@ -625,7 +625,7 @@ async fn array_patch_slice_write_and_extend_roundtrip() {
         management: Management::Writable,
     };
     root.create_node(
-        "z_arr",
+        Some("z_arr"),
         StructureFamily::Array,
         serde_json::json!({}),
         vec![],
@@ -734,7 +734,7 @@ async fn ragged_write_full_read_and_patch_roundtrip() {
     // One chunk of 2 rows; 4 leaf elements total ([1,2,3] + [4]).
     let ds = ragged_int64_ds(2, vec![2], 4);
     root.create_node(
-        "rag",
+        Some("rag"),
         StructureFamily::Ragged,
         serde_json::json!({}),
         vec![],
@@ -785,7 +785,7 @@ async fn ragged_write_block_roundtrip() {
     // Two chunks: chunk 0 has 2 rows, chunk 1 has 1 row; 6 leaf elements total.
     let ds = ragged_int64_ds(3, vec![2, 1], 6);
     root.create_node(
-        "rag_blocks",
+        Some("rag_blocks"),
         StructureFamily::Ragged,
         serde_json::json!({}),
         vec![],
@@ -844,7 +844,7 @@ async fn table_write_full_roundtrip() {
         management: Management::Writable,
     };
     root.create_node(
-        "w_tbl",
+        Some("w_tbl"),
         StructureFamily::Table,
         serde_json::json!({}),
         vec![],
@@ -913,7 +913,7 @@ async fn table_write_partition_and_append_roundtrip() {
         management: Management::Writable,
     };
     root.create_node(
-        "w_part",
+        Some("w_part"),
         StructureFamily::Table,
         serde_json::json!({}),
         vec![],
@@ -1034,7 +1034,7 @@ async fn container_create_and_delete_contents() {
 
     // Create a sub-container.
     let sub = root
-        .create_container("sub", serde_json::json!({"created_by": "test"}))
+        .create_container(Some("sub"), serde_json::json!({"created_by": "test"}))
         .await
         .expect("create_container");
     assert_eq!(
@@ -1043,10 +1043,10 @@ async fn container_create_and_delete_contents() {
     );
 
     // Create two grandchildren inside it.
-    sub.create_container("a", serde_json::json!({}))
+    sub.create_container(Some("a"), serde_json::json!({}))
         .await
         .expect("create grandchild a");
-    sub.create_container("b", serde_json::json!({}))
+    sub.create_container(Some("b"), serde_json::json!({}))
         .await
         .expect("create grandchild b");
 
@@ -1062,6 +1062,75 @@ async fn container_create_and_delete_contents() {
     );
 }
 
+/// Omitting `key` (`None`) lets the server generate one (Python parity:
+/// `Container.new(key=None)` → `entry.context.key_maker()`, a `uuid.uuid4()`
+/// string). The client must read the generated key back from the response
+/// and use it to fetch the node it just created.
+#[tokio::test]
+async fn container_create_container_with_generated_key() {
+    let (base, _wd, _db) = spawn_write_server().await;
+    let client = from_uri(&base).await.unwrap();
+    let root = client.into_container().unwrap();
+
+    let child = root
+        .create_container(None, serde_json::json!({"auto": true}))
+        .await
+        .expect("create_container with generated key");
+    let generated_key = child.base().id().to_string();
+
+    assert!(!generated_key.is_empty(), "server must assign a key");
+    uuid::Uuid::parse_str(&generated_key)
+        .expect("generated key must be a uuid4 string, matching Python's key_maker");
+
+    // Roundtrip: fetch by the generated key and confirm it is the same node.
+    let fetched = root
+        .get(&generated_key)
+        .await
+        .expect("fetch by generated key")
+        .into_container()
+        .expect("generated child is a container");
+    assert_eq!(
+        fetched.base().metadata().get("auto"),
+        Some(&serde_json::json!(true))
+    );
+
+    let keys = root.keys().await.unwrap();
+    assert!(
+        keys.contains(&generated_key),
+        "generated key must appear in parent listing"
+    );
+}
+
+/// Two anonymous creates under the same parent must not collide: each gets
+/// its own server-generated key and both children persist independently.
+#[tokio::test]
+async fn container_two_anonymous_creates_do_not_collide() {
+    let (base, _wd, _db) = spawn_write_server().await;
+    let client = from_uri(&base).await.unwrap();
+    let root = client.into_container().unwrap();
+
+    let first = root
+        .create_container(None, serde_json::json!({"which": "first"}))
+        .await
+        .expect("create first anonymous container");
+    let second = root
+        .create_container(None, serde_json::json!({"which": "second"}))
+        .await
+        .expect("create second anonymous container");
+
+    let first_key = first.base().id().to_string();
+    let second_key = second.base().id().to_string();
+    assert_ne!(
+        first_key, second_key,
+        "two anonymous creates must not collide on the same key"
+    );
+
+    let keys = root.keys().await.unwrap();
+    assert!(keys.contains(&first_key));
+    assert!(keys.contains(&second_key));
+    assert_eq!(keys.len(), 2, "both anonymous children must persist");
+}
+
 // ---------------------------------------------------------------------------
 // Scope 4: BaseClient::delete, BaseClient::patch_metadata
 // ---------------------------------------------------------------------------
@@ -1072,7 +1141,7 @@ async fn base_delete_removes_node() {
     let client = from_uri(&base).await.unwrap();
     let root = client.into_container().unwrap();
 
-    root.create_container("to_delete", serde_json::json!({}))
+    root.create_container(Some("to_delete"), serde_json::json!({}))
         .await
         .expect("create");
     let keys_before = root.keys().await.unwrap();
@@ -1096,13 +1165,13 @@ async fn container_distinct_metadata_values() {
     let client = from_uri(&base).await.unwrap();
     let root = client.into_container().unwrap();
 
-    root.create_container("red_one", serde_json::json!({"color": "red"}))
+    root.create_container(Some("red_one"), serde_json::json!({"color": "red"}))
         .await
         .expect("create red_one");
-    root.create_container("red_two", serde_json::json!({"color": "red"}))
+    root.create_container(Some("red_two"), serde_json::json!({"color": "red"}))
         .await
         .expect("create red_two");
-    root.create_container("blue_one", serde_json::json!({"color": "blue"}))
+    root.create_container(Some("blue_one"), serde_json::json!({"color": "blue"}))
         .await
         .expect("create blue_one");
 
@@ -1143,7 +1212,7 @@ async fn base_patch_metadata_merge() {
     let client = from_uri(&base).await.unwrap();
     let root = client.into_container().unwrap();
 
-    root.create_container("to_patch", serde_json::json!({"a": 1, "b": 2}))
+    root.create_container(Some("to_patch"), serde_json::json!({"a": 1, "b": 2}))
         .await
         .expect("create");
     let node = root.get("to_patch").await.unwrap();
@@ -1176,7 +1245,7 @@ async fn base_patch_metadata_json_patch_mode() {
     let client = from_uri(&base).await.unwrap();
     let root = client.into_container().unwrap();
 
-    root.create_container("jp_node", serde_json::json!({"a": 1, "b": 2}))
+    root.create_container(Some("jp_node"), serde_json::json!({"a": 1, "b": 2}))
         .await
         .expect("create");
     let node = root.get("jp_node").await.unwrap();
@@ -1207,7 +1276,7 @@ async fn base_patch_metadata_drop_revision() {
     let client = from_uri(&base).await.unwrap();
     let root = client.into_container().unwrap();
 
-    root.create_container("dr_node", serde_json::json!({"a": 1}))
+    root.create_container(Some("dr_node"), serde_json::json!({"a": 1}))
         .await
         .expect("create");
     let node = root.get("dr_node").await.unwrap();
@@ -1238,7 +1307,7 @@ async fn base_replace_metadata_wholesale() {
     let client = from_uri(&base).await.unwrap();
     let root = client.into_container().unwrap();
 
-    root.create_container("replace_node", serde_json::json!({"a": 1, "b": 2}))
+    root.create_container(Some("replace_node"), serde_json::json!({"a": 1, "b": 2}))
         .await
         .expect("create");
     let node = root.get("replace_node").await.unwrap();
@@ -1293,7 +1362,7 @@ async fn array_export_to_file() {
         management: Management::Writable,
     };
     root.create_node(
-        "exp_arr",
+        Some("exp_arr"),
         StructureFamily::Array,
         serde_json::json!({}),
         vec![],
@@ -1344,7 +1413,7 @@ async fn table_export_to_file() {
         management: Management::Writable,
     };
     root.create_node(
-        "exp_tbl",
+        Some("exp_tbl"),
         StructureFamily::Table,
         serde_json::json!({}),
         vec![],

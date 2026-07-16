@@ -4501,7 +4501,10 @@ async fn create_node_core(
 ) -> Result<impl IntoResponse, ServerError> {
     let path = segments.join("/");
     // Prefer the top-level `key` (Python tiled wire format, used by cirrus),
-    // fall back to `metadata.key` for older clients, then synthesise.
+    // fall back to `metadata.key` for older clients, then generate one.
+    // Python parity: `Context.key_maker` defaults to `str(uuid.uuid4())`
+    // (tiled/catalog/adapter.py:188), applied when the client omits the key
+    // (router.py:1875: `key = body.id or entry.context.key_maker()`).
     let id = req
         .key
         .clone()
@@ -4511,10 +4514,7 @@ async fn create_node_core(
                 .and_then(|v| v.as_str())
                 .map(String::from)
         })
-        .unwrap_or_else(|| {
-            let (nanos, counter) = synthetic_seed();
-            format!("{:?}-{nanos:x}-{counter:x}", req.structure_family)
-        });
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
     let structure_family = match req.structure_family {
         crate::core::structures::StructureFamily::Container => "container",
@@ -6070,21 +6070,6 @@ fn parse_structure_family(
     s.parse().map_err(|e: crate::core::TiledError| {
         ServerError::Validation(format!("unknown structure_family in DB: {s} ({e})"))
     })
-}
-
-/// Distinct (wall-clock, counter) seed used to synthesise IDs when the
-/// caller didn't supply a `key`. The two values are kept separate (not
-/// XORed) so concurrent POSTs in the same nanosecond can't collide via
-/// any combination of (nanos, counter) values.
-fn synthetic_seed() -> (u64, u64) {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    (nanos, COUNTER.fetch_add(1, Ordering::Relaxed))
 }
 
 #[cfg(test)]
