@@ -7,9 +7,12 @@
 //! - the parsed structure (`ArrayStructure`, `TableStructure`, ...),
 //! - per-family helpers like `metadata`, `specs`, `uri`.
 
+use std::path::{Path, PathBuf};
+
 use serde::Deserialize;
 use url::Url;
 
+use crate::core::data_source::{Asset, DataSource};
 use crate::core::schemas::{NodeAttributes, Resource};
 use crate::core::structures::{
     ArrayStructure, AwkwardStructure, ContainerStructure, RaggedStructure, SparseStructure, Spec,
@@ -18,7 +21,7 @@ use crate::core::structures::{
 
 use crate::client::context::Context;
 use crate::client::error::{ClientError, Result};
-use crate::client::utils::retry;
+use crate::client::utils::{OCTET_STREAM_MIME_TYPE, decode_response, retry};
 
 /// Content-type discriminator sent in the `PATCH /metadata` body — mirrors
 /// Python's `base.py:741-757` where the body `content-type` field selects
@@ -304,6 +307,252 @@ impl BaseClient {
         let link = self_link.replacen("/metadata", "/revisions", 1);
         Ok(MetadataRevisions::new(self.context.clone(), link))
     }
+
+    /// The node's data sources, as attached when this client was constructed
+    /// with `include_data_sources=true`.
+    ///
+    /// Returns [`ClientError::Invalid`] (rather than treating the node as
+    /// having no data sources) when the flag was not set: the asset accessors
+    /// below need the assets' database ids, which only ride along when the flag
+    /// is requested. This deliberately does *not* re-fetch — upstream
+    /// `raw_export` calls `self.include_data_sources().data_sources()`, lazily
+    /// refetching, which is a separate capability (audit gap #8) not
+    /// implemented here; construct the client with the flag instead (e.g.
+    /// `from_uri_with_options(uri, opts, true)`).
+    fn data_sources(&self) -> Result<&[DataSource]> {
+        self.item.attributes.data_sources.as_deref().ok_or_else(|| {
+            ClientError::Invalid(
+                "data sources are unavailable on this client; construct it with \
+                     include_data_sources=true (e.g. from_uri_with_options(uri, opts, true)) \
+                     so the backing asset ids are known"
+                    .into(),
+            )
+        })
+    }
+
+    /// The node's `self` link with its first `/metadata` segment rewritten to
+    /// `/asset/manifest`. Mirrors Python `asset_manifest`'s
+    /// `self.item["links"]["self"].replace("/metadata", "/asset/manifest", 1)`.
+    fn asset_manifest_link(&self) -> Result<String> {
+        Ok(self
+            .require_link("self")?
+            .replacen("/metadata", "/asset/manifest", 1))
+    }
+
+    /// The node's `self` link with its first `/metadata` segment rewritten to
+    /// `/asset/bytes`. Mirrors Python `raw_export`'s
+    /// `self.item["links"]["self"].replace("/metadata", "/asset/bytes", 1)`.
+    fn asset_bytes_link(&self) -> Result<String> {
+        Ok(self
+            .require_link("self")?
+            .replacen("/metadata", "/asset/bytes", 1))
+    }
+
+    /// GET `{manifest link}?id={asset id}` and return its `manifest` list — the
+    /// forward-slash paths of the directory asset's files, relative to the
+    /// asset directory. The asset must be a directory and carry an id.
+    async fn fetch_manifest(&self, manifest_link: &str, asset: &Asset) -> Result<Vec<String>> {
+        let id = require_asset_id(asset)?;
+        let mut url = Url::parse(manifest_link)?;
+        url.query_pairs_mut().append_pair("id", &id.to_string());
+        // The manifest endpoint answers with a bare `{"manifest": [...]}` body
+        // (axum `Json`), not the standard `{data, error, ...}` envelope, so it
+        // is decoded straight into `ManifestBody` rather than via `get_json`.
+        let body: ManifestBody =
+            retry(|| async { decode_response(self.context.get(&url).await?).await }).await?;
+        Ok(body.manifest)
+    }
+
+    /// GET the raw bytes of one asset (optionally one file within a directory
+    /// asset via `relative_path`) from `{bytes link}?id={asset id}`.
+    async fn fetch_asset_bytes(
+        &self,
+        bytes_link: &str,
+        asset: &Asset,
+        relative_path: Option<&str>,
+    ) -> Result<bytes::Bytes> {
+        let id = require_asset_id(asset)?;
+        let mut url = Url::parse(bytes_link)?;
+        {
+            let mut q = url.query_pairs_mut();
+            q.append_pair("id", &id.to_string());
+            if let Some(rel) = relative_path {
+                q.append_pair("relative_path", rel);
+            }
+        }
+        // The endpoint streams `application/octet-stream`; it never applies the
+        // blosc2 content-encoding to a raw asset, so `get_bytes` returns the
+        // file verbatim.
+        retry(|| async { self.context.get_bytes(&url, OCTET_STREAM_MIME_TYPE).await }).await
+    }
+
+    /// Build a manifest of the relative paths backing each of this node's
+    /// assets.
+    ///
+    /// Mirrors Python `BaseClient.asset_manifest` (`base.py:342`): for every
+    /// asset of every data source, an asset backed by a single file maps to
+    /// `None` (no manifest) and an asset backed by a directory maps to the
+    /// server's `/asset/manifest` listing (the forward-slash paths of its files
+    /// relative to the asset directory). Upstream returns a `dict` keyed on
+    /// asset id; the idiomatic equivalent here is an ordered [`AssetEntry`] per
+    /// asset, preserving data-source and asset order.
+    ///
+    /// Requires the client to carry its data sources (see
+    /// [`data_sources`](Self::data_sources)).
+    pub async fn asset_manifest(&self) -> Result<Vec<AssetEntry>> {
+        let manifest_link = self.asset_manifest_link()?;
+        let mut out = Vec::new();
+        for ds in self.data_sources()? {
+            for asset in &ds.assets {
+                let relative_paths = if asset.is_directory {
+                    Some(self.fetch_manifest(&manifest_link, asset).await?)
+                } else {
+                    None
+                };
+                out.push(AssetEntry {
+                    asset_id: asset.id,
+                    relative_paths,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    /// Download the raw assets backing this node into `dest_dir`, returning the
+    /// paths written (in download order).
+    ///
+    /// Mirrors Python `BaseClient.raw_export` (`base.py:380`): it refuses a node
+    /// backed by more than one data source
+    /// (["Export of multiple data sources not yet supported"]), and for the
+    /// single data source writes each asset — a single-file asset as one file,
+    /// a directory asset as its manifest walk, each file fetched with its
+    /// `relative_path` and written preserving the relative layout. When the data
+    /// source has exactly one asset the files land directly under `dest_dir`;
+    /// when it has several, each asset is namespaced under `dest_dir/{asset id}`
+    /// (matching upstream's `Path(destination, str(asset.id))`).
+    ///
+    /// A single-file asset's on-disk name is the basename of its `file://`
+    /// `data_uri`, which is exactly the `Content-Disposition` attachment
+    /// filename the server sends (upstream writes to that header via
+    /// `ATTACHMENT_FILENAME_PLACEHOLDER`; deriving it locally avoids a
+    /// dependency on response headers, which [`Context::get_bytes`] discards).
+    ///
+    /// Deviation from upstream: downloads run sequentially — the `max_workers`
+    /// parallelism is not reproduced (parity does not depend on it, and no
+    /// progress callback is invented). Requires the client to carry its data
+    /// sources (see [`data_sources`](Self::data_sources)).
+    pub async fn raw_export(&self, dest_dir: &Path) -> Result<Vec<PathBuf>> {
+        let data_sources = self.data_sources()?;
+        // Upstream guard (base.py:435): a node backed by anything other than
+        // exactly one data source is refused (0 or >1 both hit this).
+        if data_sources.len() != 1 {
+            return Err(ClientError::Invalid(
+                "Export of multiple data sources not yet supported".into(),
+            ));
+        }
+        let manifest_link = self.asset_manifest_link()?;
+        let bytes_link = self.asset_bytes_link()?;
+        let mut written = Vec::new();
+        for ds in data_sources {
+            // Single asset → files land directly in `dest_dir`; several assets →
+            // namespace each by its id (base.py:444-451).
+            let namespace_by_id = ds.assets.len() != 1;
+            for asset in &ds.assets {
+                let base = if namespace_by_id {
+                    dest_dir.join(require_asset_id(asset)?.to_string())
+                } else {
+                    dest_dir.to_path_buf()
+                };
+                if asset.is_directory {
+                    for rel in self.fetch_manifest(&manifest_link, asset).await? {
+                        let bytes = self
+                            .fetch_asset_bytes(&bytes_link, asset, Some(&rel))
+                            .await?;
+                        let target = base.join(&rel);
+                        write_asset_file(&target, &bytes).await?;
+                        written.push(target);
+                    }
+                } else {
+                    let bytes = self.fetch_asset_bytes(&bytes_link, asset, None).await?;
+                    let target = base.join(single_file_name(asset)?);
+                    write_asset_file(&target, &bytes).await?;
+                    written.push(target);
+                }
+            }
+        }
+        Ok(written)
+    }
+}
+
+/// One asset's contribution to a node's raw-download manifest, as produced by
+/// [`BaseClient::asset_manifest`].
+///
+/// Mirrors one key/value pair of Python `asset_manifest`'s dict (`base.py:342`),
+/// which is keyed on asset id.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AssetEntry {
+    /// The asset's database id (`Asset.id`) — the `?id=` query parameter used
+    /// to download it. Always populated when the node was fetched with
+    /// `include_data_sources=true`.
+    pub asset_id: Option<i64>,
+    /// `None` for an asset backed by a single file (no manifest); `Some(paths)`
+    /// for an asset backed by a directory, where each entry is a forward-slash
+    /// path relative to the asset directory (the server's `/asset/manifest`
+    /// listing) usable directly as a `relative_path` download argument.
+    pub relative_paths: Option<Vec<String>>,
+}
+
+/// Wire shape of the `/asset/manifest` response body: a bare
+/// `{"manifest": [relative paths]}` object (not the `{data, ...}` envelope).
+#[derive(Debug, Deserialize)]
+struct ManifestBody {
+    #[serde(default)]
+    manifest: Vec<String>,
+}
+
+/// An asset's database id, or [`ClientError::Invalid`] when it is absent (the
+/// node was not fetched with `include_data_sources=true`, so the server never
+/// assigned one) — every asset download needs it as the `?id=` parameter.
+fn require_asset_id(asset: &Asset) -> Result<i64> {
+    asset.id.ok_or_else(|| {
+        ClientError::Invalid(format!(
+            "asset backed by '{}' has no id; fetch the node with \
+             include_data_sources=true so the server assigns one",
+            asset.data_uri
+        ))
+    })
+}
+
+/// The on-disk filename for a single-file asset: the basename of its `file://`
+/// `data_uri`. This reproduces the server's `Content-Disposition` attachment
+/// filename (`get_asset_bytes` sets it from the same basename).
+fn single_file_name(asset: &Asset) -> Result<String> {
+    crate::core::file_uri::file_uri_to_path(&asset.data_uri)
+        .as_deref()
+        .and_then(Path::file_name)
+        .and_then(|n| n.to_str())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            ClientError::Invalid(format!(
+                "cannot derive a filename from asset data_uri '{}'",
+                asset.data_uri
+            ))
+        })
+}
+
+/// Write `bytes` to `target`, creating parent directories first so a directory
+/// asset's nested layout is reproduced. Filesystem errors surface as
+/// [`ClientError::Invalid`] with the offending path (the client has no
+/// dedicated I/O error variant).
+async fn write_asset_file(target: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = target.parent() {
+        tokio::fs::create_dir_all(parent).await.map_err(|e| {
+            ClientError::Invalid(format!("creating directory '{}': {e}", parent.display()))
+        })?;
+    }
+    tokio::fs::write(target, bytes)
+        .await
+        .map_err(|e| ClientError::Invalid(format!("writing file '{}': {e}", target.display())))
 }
 
 /// One historical version of a node's metadata, as served by a single item of
@@ -524,5 +773,44 @@ mod tests {
         assert_eq!(rev.metadata, serde_json::Value::Null);
         assert!(rev.specs.is_empty());
         assert_eq!(rev.time_updated, "");
+    }
+
+    fn asset(data_uri: &str, id: Option<i64>) -> Asset {
+        Asset {
+            data_uri: data_uri.into(),
+            is_directory: false,
+            parameter: None,
+            num: None,
+            id,
+        }
+    }
+
+    #[test]
+    fn require_asset_id_errors_when_absent() {
+        // A missing asset id (node not fetched with include_data_sources) can't
+        // build the `?id=` download query → Invalid, not a panic or silent skip.
+        let err = require_asset_id(&asset("file:///d/x.h5", None)).unwrap_err();
+        assert!(matches!(err, ClientError::Invalid(_)));
+        // A present id passes straight through.
+        assert_eq!(
+            require_asset_id(&asset("file:///d/x.h5", Some(7))).unwrap(),
+            7
+        );
+    }
+
+    #[test]
+    fn single_file_name_is_data_uri_basename() {
+        // Matches the server's Content-Disposition attachment filename, which is
+        // the basename of the asset's file:// path.
+        assert_eq!(
+            single_file_name(&asset("file:///data/scan001.h5", Some(1))).unwrap(),
+            "scan001.h5"
+        );
+    }
+
+    #[test]
+    fn single_file_name_rejects_non_file_uri() {
+        let err = single_file_name(&asset("s3://bucket/obj", Some(1))).unwrap_err();
+        assert!(matches!(err, ClientError::Invalid(_)));
     }
 }
