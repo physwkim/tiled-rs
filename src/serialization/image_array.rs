@@ -94,24 +94,22 @@ fn encode_image(
         }
     };
 
-    // Convert pixel buffer to u8 grayscale (single channel) regardless of
-    // input dtype. Floats are clipped to [0, 1] and scaled; ints are
-    // shifted/clamped into u8 range.
-    let pixels = match (kind, itemsize) {
-        ("u", 1) => data.to_vec(),
-        ("u", 2) => downscale_u16(data, big_endian),
-        ("u", 4) => downscale_u32(data, big_endian),
-        ("i", 1) => data
-            .iter()
-            .map(|&b| b as i8 as i32 + 128)
-            .map(|v| v as u8)
-            .collect(),
-        ("i", 2) => downscale_i16(data, big_endian),
-        ("f", 2) => normalize_f16(data, big_endian),
-        ("f", 4) => normalize_f32(data, big_endian),
-        ("f", 8) => normalize_f64(data, big_endian),
-        ("b", _) => data.iter().map(|&b| if b != 0 { 255 } else { 0 }).collect(),
-        _ => data.to_vec(),
+    // Convert the pixel buffer to u8 grayscale. Mirrors upstream
+    // `save_to_buffer_PIL` (array.py:76), which widens EVERY numeric dtype to
+    // float32 (`array.astype(numpy.float32)`) before scaling: a single uniform
+    // "decode element → f32 → normalize" path serves u/i/f at any width and
+    // complex (real part), so no integer width can fall through to a raw-byte
+    // reinterpretation. Non-renderable kinds (U/S/M/m/…) are a loud error,
+    // matching upstream where `.astype(numpy.float32)` raises and `serialize_html`
+    // then falls back to CSV (array.py:143-153).
+    let pixels: Vec<u8> = if kind == "b" {
+        // Booleans map directly to 0/255. Upstream `astype(float32)` yields the
+        // {0.0, 1.0} two-level array, which percentile-scales to the same two
+        // extremes; the direct mapping is equivalent and clearer.
+        data.iter().map(|&b| if b != 0 { 255 } else { 0 }).collect()
+    } else {
+        let values = decode_numeric_to_f32(data, kind, itemsize, big_endian)?;
+        normalize_floats(&values)
     };
 
     // Truncate / pad to expected size so a malformed buffer doesn't crash.
@@ -155,96 +153,89 @@ fn encode_image(
     Ok(Bytes::from(out.into_inner()))
 }
 
-fn downscale_u16(data: &[u8], big_endian: bool) -> Vec<u8> {
-    data.chunks_exact(2)
-        .map(|c| {
-            let arr = [c[0], c[1]];
-            let v = if big_endian {
-                u16::from_be_bytes(arr)
-            } else {
-                u16::from_le_bytes(arr)
-            };
-            (v >> 8) as u8
-        })
-        .collect()
-}
+/// Decode a numeric array buffer into `f32` values for image normalization,
+/// mirroring upstream `save_to_buffer_PIL`'s `array.astype(numpy.float32)`
+/// (array.py:76): every numeric dtype is widened to float32 before scaling, so
+/// integer widths that once fell through to a raw-byte reinterpretation now
+/// render correctly. `kind` is a numpy kind char; `big_endian` selects each
+/// element's byte order.
+///
+/// Renderable kinds: unsigned int (`u`, 1/2/4/8), signed int (`i`, 1/2/4/8),
+/// float (`f`, 2/4/8), and complex (`c`, 8/16 → real part only, matching numpy's
+/// `astype(float32)`, which discards the imaginary part with a ComplexWarning).
+/// Any other kind/width is a hard error so the caller answers 406/500 and the
+/// Array HTML path falls back to CSV, rather than emitting a garbage image.
+fn decode_numeric_to_f32(
+    data: &[u8],
+    kind: &str,
+    itemsize: usize,
+    big_endian: bool,
+) -> Result<Vec<f32>, crate::serialization::registry::SerializeError> {
+    if itemsize == 0 {
+        return Err("itemsize must be > 0 to render an image".into());
+    }
 
-fn downscale_u32(data: &[u8], big_endian: bool) -> Vec<u8> {
-    data.chunks_exact(4)
-        .map(|c| {
-            let arr = [c[0], c[1], c[2], c[3]];
-            let v = if big_endian {
-                u32::from_be_bytes(arr)
-            } else {
-                u32::from_le_bytes(arr)
-            };
-            (v >> 24) as u8
-        })
-        .collect()
-}
+    // Read `N`-byte little-endian elements (reversing each element's bytes when
+    // the source is big-endian) and map each to f32 via `conv`.
+    fn map_le<const N: usize>(
+        data: &[u8],
+        big_endian: bool,
+        conv: impl Fn([u8; N]) -> f32,
+    ) -> Vec<f32> {
+        data.chunks_exact(N)
+            .map(|c| {
+                let mut b: [u8; N] = c.try_into().expect("chunks_exact(N) yields N bytes");
+                if big_endian {
+                    b.reverse();
+                }
+                conv(b)
+            })
+            .collect()
+    }
 
-fn downscale_i16(data: &[u8], big_endian: bool) -> Vec<u8> {
-    data.chunks_exact(2)
-        .map(|c| {
-            let arr = [c[0], c[1]];
-            let v = if big_endian {
-                i16::from_be_bytes(arr)
-            } else {
-                i16::from_le_bytes(arr)
-            };
-            (v.saturating_add(i16::MIN.unsigned_abs() as i16) as i32 / 257) as u8
-        })
-        .collect()
-}
-
-/// Decode numpy half-precision (float16) pixels, widening each to f32
-/// (lossless) before the shared [`normalize_floats`] scaling — mirroring
-/// upstream's `astype(numpy.float32)` (array.py:76) rather than reinterpreting
-/// the raw 2-byte pattern as u8 pixels.
-fn normalize_f16(data: &[u8], big_endian: bool) -> Vec<u8> {
-    let values: Vec<f32> = data
-        .chunks_exact(2)
-        .map(|c| {
-            let bits = if big_endian {
-                u16::from_be_bytes([c[0], c[1]])
-            } else {
-                u16::from_le_bytes([c[0], c[1]])
-            };
-            half::f16::from_bits(bits).to_f32()
-        })
-        .collect();
-    normalize_floats(&values)
-}
-
-fn normalize_f32(data: &[u8], big_endian: bool) -> Vec<u8> {
-    let values: Vec<f32> = data
-        .chunks_exact(4)
-        .map(|c| {
-            let arr = [c[0], c[1], c[2], c[3]];
-            if big_endian {
-                f32::from_be_bytes(arr)
-            } else {
-                f32::from_le_bytes(arr)
-            }
-        })
-        .collect();
-    normalize_floats(&values)
-}
-
-fn normalize_f64(data: &[u8], big_endian: bool) -> Vec<u8> {
-    let values: Vec<f32> = data
-        .chunks_exact(8)
-        .map(|c| {
-            let arr = [c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]];
-            let v = if big_endian {
-                f64::from_be_bytes(arr)
-            } else {
-                f64::from_le_bytes(arr)
-            };
-            v as f32
-        })
-        .collect();
-    normalize_floats(&values)
+    let values: Vec<f32> = match (kind, itemsize) {
+        ("u", 1) => data.iter().map(|&b| b as f32).collect(),
+        ("u", 2) => map_le::<2>(data, big_endian, |b| u16::from_le_bytes(b) as f32),
+        ("u", 4) => map_le::<4>(data, big_endian, |b| u32::from_le_bytes(b) as f32),
+        ("u", 8) => map_le::<8>(data, big_endian, |b| u64::from_le_bytes(b) as f32),
+        ("i", 1) => data.iter().map(|&b| b as i8 as f32).collect(),
+        ("i", 2) => map_le::<2>(data, big_endian, |b| i16::from_le_bytes(b) as f32),
+        ("i", 4) => map_le::<4>(data, big_endian, |b| i32::from_le_bytes(b) as f32),
+        ("i", 8) => map_le::<8>(data, big_endian, |b| i64::from_le_bytes(b) as f32),
+        ("f", 2) => map_le::<2>(data, big_endian, |b| {
+            half::f16::from_bits(u16::from_le_bytes(b)).to_f32()
+        }),
+        ("f", 4) => map_le::<4>(data, big_endian, f32::from_le_bytes),
+        ("f", 8) => map_le::<8>(data, big_endian, |b| f64::from_le_bytes(b) as f32),
+        // Complex: numpy `astype(float32)` keeps the real component (the first
+        // half of each element's bytes; re/im are interleaved) and discards the
+        // imaginary part. Reverse only the real half for big-endian sources —
+        // reversing the whole element would swap re and im.
+        ("c", 8) => data
+            .chunks_exact(8)
+            .map(|c| {
+                let mut re: [u8; 4] = c[..4].try_into().expect("4 bytes");
+                if big_endian {
+                    re.reverse();
+                }
+                f32::from_le_bytes(re)
+            })
+            .collect(),
+        ("c", 16) => data
+            .chunks_exact(16)
+            .map(|c| {
+                let mut re: [u8; 8] = c[..8].try_into().expect("8 bytes");
+                if big_endian {
+                    re.reverse();
+                }
+                f64::from_le_bytes(re) as f32
+            })
+            .collect(),
+        _ => {
+            return Err(format!("cannot render dtype {kind}{itemsize} as image").into());
+        }
+    };
+    Ok(values)
 }
 
 fn normalize_floats(values: &[f32]) -> Vec<u8> {
@@ -287,25 +278,43 @@ pub(crate) fn encode_array_png(
 mod tests {
     use super::*;
 
-    /// Finding 3: a big-endian decode must read the true value, not a
-    /// byte-swapped one. 0x1234's high byte (the downscaled pixel) is 0x12.
+    /// Finding 3 (updated for the unified decoder): a big-endian decode must read
+    /// the true value, not a byte-swapped one. 0x1234 decodes to 4660.0 as both
+    /// LE (bytes 34,12) and BE (bytes 12,34); reading the BE buffer as LE would
+    /// instead yield 0x3412 = 13330.0.
     #[test]
-    fn downscale_u16_honors_byteorder() {
+    fn decode_u16_honors_byteorder() {
         let le = [0x34u8, 0x12]; // little-endian 0x1234
         let be = [0x12u8, 0x34]; // big-endian 0x1234
-        assert_eq!(downscale_u16(&le, false), vec![0x12]);
-        assert_eq!(downscale_u16(&be, true), vec![0x12]);
-        // Ignoring byte order (the bug) reads the BE buffer as 0x3412 → 0x34.
-        assert_eq!(downscale_u16(&be, false), vec![0x34]);
+        assert_eq!(
+            decode_numeric_to_f32(&le, "u", 2, false).unwrap(),
+            vec![4660.0]
+        );
+        assert_eq!(
+            decode_numeric_to_f32(&be, "u", 2, true).unwrap(),
+            vec![4660.0]
+        );
+        // Ignoring byte order (the bug) reads the BE buffer as 0x3412 = 13330.
+        assert_eq!(
+            decode_numeric_to_f32(&be, "u", 2, false).unwrap(),
+            vec![13330.0]
+        );
     }
 
+    /// The unified numeric decoder honors source byte order for f32.
     #[test]
-    fn normalize_f32_honors_byteorder() {
-        let vals = [0.0f32, 1.0];
+    fn decode_f32_honors_byteorder() {
+        let vals = [0.0f32, 1.5];
         let le: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
         let be: Vec<u8> = vals.iter().flat_map(|v| v.to_be_bytes()).collect();
-        assert_eq!(normalize_f32(&le, false), vec![0, 255]);
-        assert_eq!(normalize_f32(&be, true), vec![0, 255]);
+        assert_eq!(
+            decode_numeric_to_f32(&le, "f", 4, false).unwrap(),
+            vec![0.0, 1.5]
+        );
+        assert_eq!(
+            decode_numeric_to_f32(&be, "f", 4, true).unwrap(),
+            vec![0.0, 1.5]
+        );
     }
 
     /// End-to-end: a big-endian image and its little-endian twin encode to
@@ -352,10 +361,10 @@ mod tests {
         );
     }
 
-    /// `normalize_f16` widens each half to f32 and scales like `normalize_f32`,
-    /// honoring source byte order (mirrors `normalize_f32_honors_byteorder`).
+    /// The unified numeric decoder widens each float16 to f32 and honors source
+    /// byte order (mirrors `decode_f32_honors_byteorder`).
     #[test]
-    fn normalize_f16_honors_byteorder() {
+    fn decode_f16_honors_byteorder() {
         let vals = [0.0f32, 1.0];
         let le: Vec<u8> = vals
             .iter()
@@ -365,7 +374,122 @@ mod tests {
             .iter()
             .flat_map(|v| half::f16::from_f32(*v).to_bits().to_be_bytes())
             .collect();
-        assert_eq!(normalize_f16(&le, false), vec![0, 255]);
-        assert_eq!(normalize_f16(&be, true), vec![0, 255]);
+        assert_eq!(
+            decode_numeric_to_f32(&le, "f", 2, false).unwrap(),
+            vec![0.0, 1.0]
+        );
+        assert_eq!(
+            decode_numeric_to_f32(&be, "f", 2, true).unwrap(),
+            vec![0.0, 1.0]
+        );
+    }
+
+    /// FAILING-TEST-FIRST (numpy's default integer dtype): a 2-D int64 array must
+    /// render the same image as its float32-widened twin — mirroring upstream
+    /// `save_to_buffer_PIL` (`array.astype(numpy.float32)`, array.py:76). Before
+    /// the fix, `("i", 8)` fell to the `_ => data.to_vec()` catch-all and produced
+    /// a truncated raw-byte garbage image (200 OK, wrong pixels).
+    #[test]
+    fn encode_image_int64_matches_f32_widening() {
+        let vals = [0i64, 25, 50, 100];
+        let i64_bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let f32_bytes: Vec<u8> = vals
+            .iter()
+            .flat_map(|&v| (v as f32).to_le_bytes())
+            .collect();
+        let meta_i =
+            serde_json::json!({"itemsize": 8, "kind": "i", "byteorder": "<", "shape": [2, 2]});
+        let meta_f =
+            serde_json::json!({"itemsize": 4, "kind": "f", "byteorder": "<", "shape": [2, 2]});
+        let png_i = encode_image(&i64_bytes, &meta_i, ImageFormat::Png).unwrap();
+        let png_f = encode_image(&f32_bytes, &meta_f, ImageFormat::Png).unwrap();
+        assert_eq!(
+            png_i, png_f,
+            "int64 image must render as its f32 widening, not raw-byte garbage"
+        );
+    }
+
+    /// int32 (`("i", 4)`) — also unhandled before the fix — must render as its
+    /// f32-widened twin.
+    #[test]
+    fn encode_image_int32_matches_f32_widening() {
+        let vals = [0i32, 25, 50, 100];
+        let i32_bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let f32_bytes: Vec<u8> = vals
+            .iter()
+            .flat_map(|&v| (v as f32).to_le_bytes())
+            .collect();
+        let meta_i =
+            serde_json::json!({"itemsize": 4, "kind": "i", "byteorder": "<", "shape": [2, 2]});
+        let meta_f =
+            serde_json::json!({"itemsize": 4, "kind": "f", "byteorder": "<", "shape": [2, 2]});
+        let png_i = encode_image(&i32_bytes, &meta_i, ImageFormat::Png).unwrap();
+        let png_f = encode_image(&f32_bytes, &meta_f, ImageFormat::Png).unwrap();
+        assert_eq!(png_i, png_f, "int32 image must render as its f32 widening");
+    }
+
+    /// uint64 (`("u", 8)`) — also unhandled before the fix — must render as its
+    /// f32-widened twin.
+    #[test]
+    fn encode_image_uint64_matches_f32_widening() {
+        let vals = [0u64, 25, 50, 100];
+        let u64_bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let f32_bytes: Vec<u8> = vals
+            .iter()
+            .flat_map(|&v| (v as f32).to_le_bytes())
+            .collect();
+        let meta_u =
+            serde_json::json!({"itemsize": 8, "kind": "u", "byteorder": "<", "shape": [2, 2]});
+        let meta_f =
+            serde_json::json!({"itemsize": 4, "kind": "f", "byteorder": "<", "shape": [2, 2]});
+        let png_u = encode_image(&u64_bytes, &meta_u, ImageFormat::Png).unwrap();
+        let png_f = encode_image(&f32_bytes, &meta_f, ImageFormat::Png).unwrap();
+        assert_eq!(png_u, png_f, "uint64 image must render as its f32 widening");
+    }
+
+    /// Complex arrays render as an image of the REAL part — matching numpy's
+    /// `astype(numpy.float32)` (array.py:76), which discards the imaginary part
+    /// (ComplexWarning) and keeps the real component. A complex64 array must
+    /// render identically to an f32 image of just its real values, regardless of
+    /// the imaginary parts.
+    #[test]
+    fn encode_image_complex64_renders_real_part() {
+        // complex64: [re: f32, im: f32] per element. Vary imag to prove it's dropped.
+        let re = [0.0f32, 25.0, 50.0, 100.0];
+        let im = [9.0f32, -3.0, 7.0, 1.0];
+        let c_bytes: Vec<u8> = re
+            .iter()
+            .zip(im.iter())
+            .flat_map(|(r, i)| r.to_le_bytes().into_iter().chain(i.to_le_bytes()))
+            .collect();
+        let f_bytes: Vec<u8> = re.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let meta_c =
+            serde_json::json!({"itemsize": 8, "kind": "c", "byteorder": "<", "shape": [2, 2]});
+        let meta_f =
+            serde_json::json!({"itemsize": 4, "kind": "f", "byteorder": "<", "shape": [2, 2]});
+        let png_c = encode_image(&c_bytes, &meta_c, ImageFormat::Png).unwrap();
+        let png_f = encode_image(&f_bytes, &meta_f, ImageFormat::Png).unwrap();
+        assert_eq!(
+            png_c, png_f,
+            "complex image must render the real part only (numpy astype drops imaginary)"
+        );
+    }
+
+    /// A non-renderable dtype (fixed-width unicode `U`) is now a loud error, not a
+    /// garbage image — so the Array HTML serializer falls back to CSV, matching
+    /// upstream where `array.astype(numpy.float32)` raises for such dtypes and
+    /// `serialize_html` catches it (array.py:143-153).
+    #[test]
+    fn encode_image_rejects_non_renderable_dtype() {
+        // <U2: 2 code points × 4 bytes = one element.
+        let data = vec![0u8; 8];
+        let meta =
+            serde_json::json!({"itemsize": 8, "kind": "U", "byteorder": "<", "shape": [1, 1]});
+        let err = encode_image(&data, &meta, ImageFormat::Png)
+            .expect_err("non-renderable dtype must error, not emit a garbage image");
+        assert!(
+            err.to_string().contains("cannot render dtype U8"),
+            "error must name the unsupported dtype: {err}"
+        );
     }
 }
