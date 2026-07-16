@@ -576,6 +576,20 @@ impl Context {
         Ok(resp)
     }
 
+    /// PUT a JSON body, e.g. a wholesale metadata replacement
+    /// (`PUT /api/v1/metadata/{path}`).
+    pub async fn put_json(&self, url: &Url, body: &serde_json::Value) -> Result<Response> {
+        let req = self.request(Method::PUT, url).await?.json(body);
+        let req = self.add_csrf(req).await;
+        let resp = self.send_with_auth(req).await?;
+        self.maybe_capture_csrf(&resp).await;
+        let resp = handle_error(resp).await?;
+        if let Some(cache) = self.cache() {
+            cache.invalidate(url).await?;
+        }
+        Ok(resp)
+    }
+
     /// PUT or PATCH a raw-bytes body; shared by array/table write paths. When
     /// `content_type` is `Some`, it is set as the `Content-Type` header (the
     /// ragged write paths send `application/zip`); array/table writes leave it
