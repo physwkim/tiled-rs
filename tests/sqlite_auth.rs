@@ -331,8 +331,8 @@ async fn pending_session_user_code_lookup_is_normalized() {
         .unwrap();
     let dashed_lower = format!(
         "{}-{}",
-        &init.user_code[..4].to_lowercase(),
-        &init.user_code[4..].to_lowercase()
+        init.user_code[..4].to_lowercase(),
+        init.user_code[4..].to_lowercase()
     );
     let rec = db
         .lookup_valid_pending_session_by_user_code(&dashed_lower)
