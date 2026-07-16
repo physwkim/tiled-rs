@@ -2580,3 +2580,96 @@ async fn sparse_put_array_block_arrow_roundtrips() {
         "block-local writes must reassemble with chunk-origin offsets on read"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Scope: client sparse write (ContainerClient::write_sparse,
+// SparseClient::write/write_block, AnyClient::into_sparse)
+//
+// The full client → server → parquet → client loop, driven entirely through the
+// typed client (no hand-rolled Arrow body). Exercises the encode side of the
+// COO wire that commit 4's server deserializer consumes.
+// ---------------------------------------------------------------------------
+
+/// `ContainerClient::write_sparse` creates a managed single-block sparse node
+/// and uploads its non-zeros; the returned `SparseClient` reads them back.
+#[tokio::test]
+async fn container_write_sparse_roundtrips() {
+    use tiled_rs::core::dtype::{BuiltinDType, DType, Endianness, Kind};
+    use tiled_rs::core::structures::SparseStructure;
+
+    let (base, _wd, _db) = spawn_write_server().await;
+    let root = from_uri(&base).await.unwrap().into_container().unwrap();
+
+    // Single-chunk 3×3 COO: (0,1)=1.5, (2,0)=3.7.
+    let structure = SparseStructure {
+        chunks: vec![vec![3], vec![3]],
+        shape: vec![3, 3],
+        data_type: Some(DType::Builtin(BuiltinDType::new(
+            Endianness::Little,
+            Kind::Float,
+            8,
+        ))),
+        ..Default::default()
+    };
+    let sc = root
+        .write_sparse(
+            Some("sp_client"),
+            structure,
+            (&[vec![0, 2], vec![1, 0]], &[1.5, 3.7]),
+            serde_json::json!({"note": "coo"}),
+            vec![],
+            None,
+        )
+        .await
+        .expect("write_sparse");
+
+    let block = sc.read().await.expect("read back through returned client");
+    assert_eq!(block.shape, vec![3, 3]);
+    let mut got: Vec<((i64, i64), f64)> = (0..block.data.len())
+        .map(|i| ((block.coords[0][i], block.coords[1][i]), block.data[i]))
+        .collect();
+    got.sort_by_key(|a| a.0);
+    assert_eq!(got, vec![((0, 1), 1.5), ((2, 0), 3.7)]);
+
+    // The coordinate-count guard rejects a structure/coords dimensionality
+    // mismatch before any request goes out.
+    let err = sc.write(&[vec![0, 1]], &[1.0, 2.0]).await;
+    assert!(
+        matches!(err, Err(tiled_rs::client::ClientError::Invalid(_))),
+        "1 coord column for a 2-D array must be a client-side Invalid error, got {err:?}"
+    );
+}
+
+/// `SparseClient::write_block` fills a multi-block node one block at a time
+/// (via `AnyClient::into_sparse`); `read` reassembles the global frame.
+#[tokio::test]
+async fn sparse_client_write_block_roundtrips() {
+    let (base, _wd, _db) = spawn_write_server().await;
+    // 4×2, two blocks along axis 0.
+    let root =
+        create_managed_sparse(&base, "sp_cli_blk", vec![4, 2], vec![vec![2, 2], vec![2]]).await;
+
+    let sc = root
+        .get("sp_cli_blk")
+        .await
+        .unwrap()
+        .into_sparse()
+        .expect("into_sparse");
+
+    // Block [0,0]: local (0,1)=5.0 -> global (0,1).
+    sc.write_block(&[0, 0], &[vec![0], vec![1]], &[5.0])
+        .await
+        .expect("write_block 0,0");
+    // Block [1,0]: local (1,0)=9.0 -> global (3,0).
+    sc.write_block(&[1, 0], &[vec![1], vec![0]], &[9.0])
+        .await
+        .expect("write_block 1,0");
+
+    let block = sc.read().await.expect("read back");
+    assert_eq!(block.shape, vec![4, 2]);
+    let mut got: Vec<((i64, i64), f64)> = (0..block.data.len())
+        .map(|i| ((block.coords[0][i], block.coords[1][i]), block.data[i]))
+        .collect();
+    got.sort_by_key(|a| a.0);
+    assert_eq!(got, vec![((0, 1), 5.0), ((3, 0), 9.0)]);
+}

@@ -28,8 +28,8 @@ const PATH_SEGMENT: &AsciiSet = &CONTROLS
 use crate::core::data_source::{DataSource, Management};
 use crate::core::schemas::{GetDistinctResponse, PostMetadataResponse};
 use crate::core::structures::{
-    AnyStructure, ArrayStructure, AwkwardStructure, RaggedStructure, StructureFamily,
-    TableStructure,
+    AnyStructure, ArrayStructure, AwkwardStructure, RaggedStructure, SparseStructure,
+    StructureFamily, TableStructure,
 };
 
 use arrow::array::RecordBatch;
@@ -43,6 +43,7 @@ use crate::client::context::Context;
 use crate::client::dataframe::TableClient;
 use crate::client::error::{ClientError, Result};
 use crate::client::ragged::RaggedClient;
+use crate::client::sparse::SparseClient;
 use crate::client::utils::{decode_response, resolve_export_format, retry};
 
 /// Sort direction for container child ordering.
@@ -621,6 +622,64 @@ impl ContainerClient {
             .await?;
         let client = self.get(&created_key).await?.into_awkward()?;
         client.write(buffers).await?;
+        Ok(client)
+    }
+
+    /// Create a writable sparse (COO) array child from an explicit `structure`,
+    /// then upload its non-zeros as one block. Mirrors Python
+    /// `Container.write_sparse` (`container.py:1068`): `new(sparse,
+    /// [DataSource(structure)], ...)` then `client.write(coords, data)`.
+    ///
+    /// The data source is `management: writable` with **no** pinned `mimetype`,
+    /// so the server picks its sparse managed-write backend
+    /// (`default_creation_mimetype(Sparse)` → `application/x-parquet;structure=sparse`);
+    /// Python's `write_sparse` likewise omits the mimetype. `access_tags` is
+    /// threaded through [`post_new_node`](Self::post_new_node).
+    ///
+    /// Like [`write_array`](Self::write_array) this performs the whole-array
+    /// (single-chunk / `PUT /array/full`) upload, so `structure` should be a
+    /// single-chunk COO structure; a multi-block structure must be filled per
+    /// block via [`SparseClient::write_block`]. `coo` is the `(coords, data)`
+    /// payload: `coords[i]` holds the non-zero indices along axis `i`, and every
+    /// `coords[i]` and `data` must be equal length. (The two arrays travel as one
+    /// argument — the COO is a single logical payload — keeping the arity in step
+    /// with the array/table/ragged siblings.)
+    ///
+    /// [`SparseClient::write_block`]: crate::client::sparse::SparseClient::write_block
+    pub async fn write_sparse(
+        &self,
+        key: Option<&str>,
+        structure: SparseStructure,
+        coo: (&[Vec<i64>], &[f64]),
+        metadata: serde_json::Value,
+        specs: Vec<serde_json::Value>,
+        access_tags: Option<&[String]>,
+    ) -> Result<SparseClient> {
+        let (coords, data) = coo;
+        let ds = DataSource {
+            structure_family: StructureFamily::Sparse,
+            structure: Some(AnyStructure::Sparse(structure)),
+            id: None,
+            // Let the server choose the sparse managed-write backend and its
+            // mimetype (Python `write_sparse` likewise omits it).
+            mimetype: None,
+            parameters: serde_json::json!({}),
+            properties: serde_json::json!({}),
+            assets: vec![],
+            management: Management::Writable,
+        };
+        let created_key = self
+            .post_new_node(
+                key,
+                StructureFamily::Sparse,
+                metadata,
+                specs,
+                vec![ds],
+                access_tags,
+            )
+            .await?;
+        let client = self.get(&created_key).await?.into_sparse()?;
+        client.write(coords, data).await?;
         Ok(client)
     }
 

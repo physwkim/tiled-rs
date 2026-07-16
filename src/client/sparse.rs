@@ -122,6 +122,115 @@ impl SparseClient {
         let shape = self.structure().shape.clone();
         decode_coo_arrow(bytes, shape)
     }
+
+    /// Write the **whole** sparse array as one COO block.
+    ///
+    /// Builds the `dim0`…`dim{ndim-1}` + `data` table Python's
+    /// `client/sparse.py::write` (client/sparse.py:107) serializes —
+    /// `DataFrame({f"dim{i}": coords[i], "data": data})` → `serialize_arrow` —
+    /// encodes it as Arrow IPC, and PUTs it to `links["full"]`
+    /// (`PUT /api/v1/array/full`). `coords[i]` holds the non-zero indices along
+    /// axis `i`; every `coords[i]` and `data` must be the same length.
+    ///
+    /// Like [`read`](Self::read)/[`read_block`](Self::read_block), no throttle
+    /// semaphore is held: the sparse family does not participate in the data
+    /// fetch throttle (Python throttles only array and dataframe transfers).
+    pub async fn write(&self, coords: &[Vec<i64>], data: &[f64]) -> Result<()> {
+        let ndim = self.structure().shape.len();
+        if coords.len() != ndim {
+            return Err(ClientError::Invalid(format!(
+                "sparse write: got {} coordinate column(s) but the array is {ndim}-dimensional",
+                coords.len()
+            )));
+        }
+        let body = encode_coo_arrow(coords, data)?;
+        let url = Url::parse(self.base.require_link("full")?)?;
+        retry(|| async {
+            self.base
+                .context
+                .put_bytes_typed(&url, body.clone(), ARROW_FILE_MIME_TYPE)
+                .await
+                .map(|_| ())
+        })
+        .await
+    }
+
+    /// Write one block's **block-local** COO. `block` is the per-axis chunk
+    /// index; `coords[i]` are the indices within that chunk (the server shifts
+    /// them by the chunk origin on read). Mirrors `client/sparse.py::write_block`
+    /// — same DataFrame → Arrow IPC body — to `links["block"]`
+    /// (`PUT /api/v1/array/block?block=…`).
+    pub async fn write_block(
+        &self,
+        block: &[usize],
+        coords: &[Vec<i64>],
+        data: &[f64],
+    ) -> Result<()> {
+        let ndim = self.structure().shape.len();
+        if coords.len() != ndim {
+            return Err(ClientError::Invalid(format!(
+                "sparse write_block: got {} coordinate column(s) but the array is \
+                 {ndim}-dimensional",
+                coords.len()
+            )));
+        }
+        let body = encode_coo_arrow(coords, data)?;
+        let mut url = Url::parse(self.base.require_link("block")?)?;
+        let block_str = block
+            .iter()
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        url.query_pairs_mut().append_pair("block", &block_str);
+        retry(|| async {
+            self.base
+                .context
+                .put_bytes_typed(&url, body.clone(), ARROW_FILE_MIME_TYPE)
+                .await
+                .map(|_| ())
+        })
+        .await
+    }
+}
+
+/// Encode a COO table — columns `dim0`…`dim{ndim-1}` (Int64) plus `data`
+/// (Float64) — as an Arrow IPC file. The inverse of [`decode_coo_arrow`], and
+/// the wire body the sparse write routes deserialize; matches Python
+/// `client/sparse.py`'s `serialize_arrow(DataFrame({...}))`.
+fn encode_coo_arrow(coords: &[Vec<i64>], data: &[f64]) -> Result<bytes::Bytes> {
+    use arrow::array::ArrayRef;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::ipc::writer::FileWriter;
+    use arrow::record_batch::RecordBatch;
+    use std::sync::Arc;
+
+    let mut fields: Vec<Field> = Vec::with_capacity(coords.len() + 1);
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(coords.len() + 1);
+    for (i, c) in coords.iter().enumerate() {
+        fields.push(Field::new(format!("dim{i}"), DataType::Int64, false));
+        columns.push(Arc::new(Int64Array::from(c.clone())) as ArrayRef);
+    }
+    fields.push(Field::new("data", DataType::Float64, false));
+    columns.push(Arc::new(Float64Array::from(data.to_vec())) as ArrayRef);
+
+    let schema = Arc::new(Schema::new(fields));
+    // `try_new` enforces equal column lengths, surfacing a ragged
+    // coords/data caller error as a clean client error.
+    let batch = RecordBatch::try_new(Arc::clone(&schema), columns)
+        .map_err(|e| ClientError::Invalid(format!("sparse write: {e}")))?;
+
+    let mut buf = Vec::new();
+    {
+        let mut writer = FileWriter::try_new(&mut buf, &schema)
+            .map_err(|e| ClientError::Invalid(format!("sparse write: Arrow IPC init: {e}")))?;
+        writer
+            .write(&batch)
+            .map_err(|e| ClientError::Invalid(format!("sparse write: Arrow IPC write: {e}")))?;
+        writer
+            .finish()
+            .map_err(|e| ClientError::Invalid(format!("sparse write: Arrow IPC finish: {e}")))?;
+    }
+    Ok(bytes::Bytes::from(buf))
 }
 
 /// Decode an Arrow IPC file containing a COO sparse table.
@@ -349,5 +458,27 @@ mod tests {
         assert!(block.coords[0].is_empty());
         assert!(block.coords[1].is_empty());
         assert!(block.data.is_empty());
+    }
+
+    /// `encode_coo_arrow` is the inverse of `decode_coo_arrow`: an encoded COO
+    /// frame decodes back to the same coords and data.
+    #[test]
+    fn encode_then_decode_coo_roundtrips() {
+        let coords = vec![vec![0i64, 2], vec![1i64, 0]];
+        let data = vec![1.5f64, 3.7];
+        let body = encode_coo_arrow(&coords, &data).unwrap();
+        let block = decode_coo_arrow(body, vec![3, 3]).unwrap();
+        assert_eq!(block.coords, coords);
+        assert_eq!(block.data, data);
+        assert_eq!(block.shape, vec![3, 3]);
+    }
+
+    /// Ragged coords/data lengths surface as a client-side `Invalid` error from
+    /// the Arrow builder rather than an opaque panic.
+    #[test]
+    fn encode_rejects_length_mismatch() {
+        // dim0 has 2 entries but data has 1.
+        let err = encode_coo_arrow(&[vec![0i64, 1]], &[5.0]);
+        assert!(matches!(err, Err(ClientError::Invalid(_))), "got {err:?}");
     }
 }
