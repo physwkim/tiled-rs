@@ -325,11 +325,11 @@ pub fn build_app(state: AppState) -> Router {
 
     let guarded = api
         .merge(private_auth)
-        // ETag/If-None-Match for JSON responses. Layered INSIDE auth (auth is
+        // ETag/If-None-Match for GET responses. Layered INSIDE auth (auth is
         // applied after, so it wraps this): the ETag layer only ever sees
         // responses from authorized handlers, never the 401 auth short-circuits.
         .layer(axum::middleware::from_fn(
-            crate::server::etag::etag_json_responses,
+            crate::server::etag::etag_get_responses,
         ))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),

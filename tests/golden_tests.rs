@@ -1778,6 +1778,79 @@ async fn test_container_full_filename_sets_content_disposition() {
 }
 
 // ---------------------------------------------------------------------------
+// ETag / If-None-Match on data-export responses (previously JSON-only; see
+// `src/server/etag.rs`).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_array_full_emits_etag_and_honours_if_none_match() {
+    let app = build_app();
+
+    // First GET → 200 with a strong (quoted) ETag.
+    let (status, headers, body1) =
+        get_with_headers(&app, "/api/v1/array/full/some_array", &[]).await;
+    assert_eq!(status, 200);
+    let etag = headers
+        .get("etag")
+        .expect("data-export response carries an ETag")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        etag.starts_with('"') && etag.ends_with('"'),
+        "strong quoted ETag, got {etag}"
+    );
+
+    // Matching If-None-Match → 304, empty body, ETag retained.
+    let (status, headers, body) = get_with_headers(
+        &app,
+        "/api/v1/array/full/some_array",
+        &[("if-none-match", &etag)],
+    )
+    .await;
+    assert_eq!(status, 304);
+    assert_eq!(
+        headers.get("etag").and_then(|v| v.to_str().ok()),
+        Some(etag.as_str()),
+        "304 retains the ETag validator"
+    );
+    assert!(
+        body.is_empty(),
+        "304 carries no body, got {} bytes",
+        body.len()
+    );
+
+    // Stale validator → full 200 response again, identical body.
+    let (status, _, body2) = get_with_headers(
+        &app,
+        "/api/v1/array/full/some_array",
+        &[("if-none-match", "\"stale\"")],
+    )
+    .await;
+    assert_eq!(status, 200, "non-matching validator → 200");
+    assert_eq!(body2, body1, "200 body is unchanged across requests");
+}
+
+#[tokio::test]
+async fn range_request_206_response_has_no_etag() {
+    // `serve_with_range` has already sliced the body by the time the ETag
+    // layer sees it (see src/server/etag.rs module docs) — a 206 must not
+    // carry an ETag computed over the wrong (partial) representation.
+    let app = build_app();
+    let (status, headers, _) = get_with_headers(
+        &app,
+        "/api/v1/array/full/some_array",
+        &[("range", "bytes=0-7")],
+    )
+    .await;
+    assert_eq!(status, 206);
+    assert!(
+        headers.get("etag").is_none(),
+        "206 Partial Content must not carry an ETag"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // GET/PUT /api/v1/node/full/{path} — deprecated family-agnostic alias
 // (Python router.py:1477 GET / 2162 PUT). Dispatches to the same core as
 // `/table/full` or `/container/full` depending on the target node's
