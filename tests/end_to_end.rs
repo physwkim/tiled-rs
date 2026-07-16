@@ -2408,3 +2408,175 @@ async fn sparse_managed_create_resolves_and_reads_back() {
         "read-back COO must match what was written to the resolved managed node"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Scope: PUT /array/full + /array/block sparse arms (Arrow COO deserializer)
+//
+// The sparse write face is reachable over HTTP: the array PUT routes accept a
+// sparse leaf, deserialize the Arrow IPC COO body (dim0…dim{ndim-1} + data)
+// through `deserialize_sparse_coo`, and persist it to the per-block parquet
+// files. These tests drive a raw Arrow IPC PUT (no client write yet — that is
+// the next layer) and read the frame back through the existing GET/serve path.
+// ---------------------------------------------------------------------------
+
+/// Encode a COO table — columns `dim0`…`dim{ndim-1}` (Int64) plus `data`
+/// (Float64) — as an Arrow IPC *file*, the wire body Python `client/sparse.py`
+/// produces (client/sparse.py:107) and the server's sparse PUT arm consumes.
+fn encode_coo_arrow(coords: Vec<Vec<i64>>, data: Vec<f64>) -> Vec<u8> {
+    use arrow::array::{ArrayRef, Float64Array, Int64Array};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+
+    let mut fields: Vec<Field> = Vec::with_capacity(coords.len() + 1);
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(coords.len() + 1);
+    for (i, c) in coords.iter().enumerate() {
+        fields.push(Field::new(format!("dim{i}"), DataType::Int64, false));
+        columns.push(Arc::new(Int64Array::from(c.clone())) as ArrayRef);
+    }
+    fields.push(Field::new("data", DataType::Float64, false));
+    columns.push(Arc::new(Float64Array::from(data)) as ArrayRef);
+
+    let schema = Arc::new(Schema::new(fields));
+    let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
+    let mut buf = Vec::new();
+    {
+        let mut writer = arrow::ipc::writer::FileWriter::try_new(&mut buf, &schema).unwrap();
+        writer.write(&batch).unwrap();
+        writer.finish().unwrap();
+    }
+    buf
+}
+
+/// Create a managed (writable) sparse f64 node with the given shape/chunk grid
+/// and return the root container for follow-up reads.
+async fn create_managed_sparse(
+    base: &str,
+    name: &str,
+    shape: Vec<usize>,
+    chunks: Vec<Vec<usize>>,
+) -> tiled_rs::client::ContainerClient {
+    use tiled_rs::core::data_source::{DataSource, Management};
+    use tiled_rs::core::dtype::{BuiltinDType, DType, Endianness, Kind};
+    use tiled_rs::core::structures::{AnyStructure, SparseStructure, StructureFamily};
+
+    let root = from_uri(base).await.unwrap().into_container().unwrap();
+    let structure = SparseStructure {
+        chunks,
+        shape,
+        data_type: Some(DType::Builtin(BuiltinDType::new(
+            Endianness::Little,
+            Kind::Float,
+            8,
+        ))),
+        ..Default::default()
+    };
+    let ds = DataSource {
+        structure_family: StructureFamily::Sparse,
+        structure: Some(AnyStructure::Sparse(structure)),
+        id: None,
+        mimetype: None,
+        parameters: serde_json::json!({}),
+        properties: serde_json::json!({}),
+        assets: vec![],
+        management: Management::Writable,
+    };
+    root.create_node(
+        Some(name),
+        StructureFamily::Sparse,
+        serde_json::json!({}),
+        vec![],
+        vec![ds],
+    )
+    .await
+    .expect("create sparse node");
+    root
+}
+
+const ARROW_FILE_CT: &str = "application/vnd.apache.arrow.file";
+
+/// PUT /array/full on a single-block sparse node: an Arrow IPC COO body is
+/// deserialized, written to the block parquet, and read back identically.
+#[tokio::test]
+async fn sparse_put_array_full_arrow_roundtrips() {
+    let (base, _wd, _db) = spawn_write_server().await;
+    let root = create_managed_sparse(&base, "sp_full", vec![3, 3], vec![vec![3], vec![3]]).await;
+
+    // Whole 3×3 array as one COO block: (0,1)=1.5, (2,0)=3.7.
+    let body = encode_coo_arrow(vec![vec![0, 2], vec![1, 0]], vec![1.5, 3.7]);
+    let resp = reqwest::Client::new()
+        .put(format!("{base}/api/v1/array/full/sp_full"))
+        .header("Content-Type", ARROW_FILE_CT)
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "PUT /array/full sparse arm must accept COO"
+    );
+
+    // GET reads the parquet back through the sparse serve path.
+    let node = root.get("sp_full").await.unwrap();
+    let sc = node
+        .as_sparse()
+        .expect("sp_full resolves to a sparse client");
+    let block = sc.read().await.expect("read sparse COO");
+    assert_eq!(block.shape, vec![3, 3]);
+    let mut got: Vec<((i64, i64), f64)> = (0..block.data.len())
+        .map(|i| ((block.coords[0][i], block.coords[1][i]), block.data[i]))
+        .collect();
+    got.sort_by_key(|a| a.0);
+    assert_eq!(
+        got,
+        vec![((0, 1), 1.5), ((2, 0), 3.7)],
+        "PUT-then-GET COO must round-trip through the Arrow deserializer"
+    );
+}
+
+/// PUT /array/block on a multi-block sparse node: each block's local COO is
+/// written independently; GET /array/full reassembles the global frame with the
+/// block-origin coordinate offsets applied.
+#[tokio::test]
+async fn sparse_put_array_block_arrow_roundtrips() {
+    let (base, _wd, _db) = spawn_write_server().await;
+    // 4×2, two blocks along axis 0: block [0,0] covers rows 0..2, [1,0] rows 2..4.
+    let root = create_managed_sparse(&base, "sp_blk", vec![4, 2], vec![vec![2, 2], vec![2]]).await;
+
+    let client = reqwest::Client::new();
+    // Block [0,0]: local (0,1)=5.0 -> global (0,1).
+    let r0 = client
+        .put(format!("{base}/api/v1/array/block/sp_blk?block=0,0"))
+        .header("Content-Type", ARROW_FILE_CT)
+        .body(encode_coo_arrow(vec![vec![0], vec![1]], vec![5.0]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r0.status(), 200, "PUT block 0,0");
+    // Block [1,0]: local (1,0)=9.0 -> global (1+2, 0) = (3,0).
+    let r1 = client
+        .put(format!("{base}/api/v1/array/block/sp_blk?block=1,0"))
+        .header("Content-Type", ARROW_FILE_CT)
+        .body(encode_coo_arrow(vec![vec![1], vec![0]], vec![9.0]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r1.status(), 200, "PUT block 1,0");
+
+    // GET full reassembles both blocks into one global COO frame.
+    let node = root.get("sp_blk").await.unwrap();
+    let sc = node
+        .as_sparse()
+        .expect("sp_blk resolves to a sparse client");
+    let block = sc.read().await.expect("read sparse COO");
+    assert_eq!(block.shape, vec![4, 2]);
+    let mut got: Vec<((i64, i64), f64)> = (0..block.data.len())
+        .map(|i| ((block.coords[0][i], block.coords[1][i]), block.data[i]))
+        .collect();
+    got.sort_by_key(|a| a.0);
+    assert_eq!(
+        got,
+        vec![((0, 1), 5.0), ((3, 0), 9.0)],
+        "block-local writes must reassemble with chunk-origin offsets on read"
+    );
+}
