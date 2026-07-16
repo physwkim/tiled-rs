@@ -303,11 +303,40 @@ async fn auth_succeeds_with_correct_api_key() {
 
 #[tokio::test]
 async fn server_info_about_payload() {
+    use std::collections::BTreeSet;
+    use tiled_rs::core::structures::StructureFamily;
+
     let base = spawn_server(None).await;
     let (ctx, _) = tiled_rs::client::Context::from_uri(&base).unwrap();
     let about = ctx.server_info().await.unwrap();
     assert_eq!(about.api_version, 0);
     assert!(!about.library_version.is_empty());
+
+    // Server-contract regression (client gap #9 follow-up): the About `formats`
+    // map must carry *every* family the server can serialize, including
+    // `ragged` — it dropped out when the family list was hand-maintained in two
+    // places. Tie the expectation to the server's own registry so it tracks the
+    // contract, not a hardcoded list.
+    let registry = tiled_rs::serialization::default_registry();
+    let expected_ragged: BTreeSet<String> = registry
+        .media_types(StructureFamily::Ragged)
+        .into_iter()
+        .collect();
+    assert!(
+        !expected_ragged.is_empty(),
+        "the default registry serves ragged formats — this regression must not be vacuous"
+    );
+    let about_ragged: BTreeSet<String> = about
+        .formats
+        .get("ragged")
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    assert_eq!(
+        about_ragged, expected_ragged,
+        "About `formats` must carry `ragged` with the server's registered ragged media types"
+    );
 }
 
 #[tokio::test]

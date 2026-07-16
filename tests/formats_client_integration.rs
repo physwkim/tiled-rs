@@ -16,7 +16,7 @@ use std::sync::Arc;
 use indexmap::IndexMap;
 use tokio::net::TcpListener;
 
-use tiled_rs::adapters::{ArrayAdapter, MapAdapter};
+use tiled_rs::adapters::{ArrayAdapter, MapAdapter, RaggedAdapter};
 use tiled_rs::core::adapters::{AnyAdapter, ContainerAdapter};
 use tiled_rs::core::queries::Query;
 use tiled_rs::core::structures::Spec;
@@ -36,14 +36,22 @@ fn expected_formats(family: &str) -> Vec<String> {
     v
 }
 
-/// Root container carrying a spec and a single plain array child `plain`. The
-/// root's spec exercises `formats`' per-spec lookup, which is inert against a
-/// stock Rust server (its About `formats` map has no spec-name keys).
+/// Root container carrying a spec and two children: a plain array `plain` and a
+/// ragged node `ragged`. The root's spec exercises `formats`' per-spec lookup,
+/// which is inert against a stock Rust server (its About `formats` map has no
+/// spec-name keys); the ragged child covers the family that previously dropped
+/// out of the server's About `formats` map.
 fn build_root() -> Arc<dyn ContainerAdapter> {
     let data: Vec<f64> = (0..4).map(|i| i as f64).collect();
     let arr = ArrayAdapter::from_f64_1d(&data, serde_json::json!({}));
+    let ragged = RaggedAdapter::from_rows_f64(
+        vec![vec![1.0, 2.0, 3.0], vec![4.0], vec![5.0, 6.0]],
+        serde_json::json!({}),
+        vec![],
+    );
     let mut mapping = IndexMap::new();
     mapping.insert("plain".to_string(), AnyAdapter::Array(Arc::new(arr)));
+    mapping.insert("ragged".to_string(), AnyAdapter::Ragged(Arc::new(ragged)));
     Arc::new(MapAdapter::new(
         mapping,
         serde_json::json!({"description": "formats test catalog"}),
@@ -149,5 +157,40 @@ async fn formats_container_node_ignores_unknown_specs() {
     assert_eq!(
         formats, expected,
         "container formats match the server registry; the unknown spec adds nothing"
+    );
+}
+
+#[tokio::test]
+async fn formats_ragged_node_is_non_empty() {
+    // Regression for the server-side follow-up: a ragged node's formats() is
+    // non-empty. Before the `all_formats()` family list included `ragged`, the
+    // server's About map had no `ragged` key and this returned `[]`. It must now
+    // match the server's registered ragged media types.
+    let base = spawn_server(build_root()).await;
+    let expected = expected_formats("ragged");
+    assert!(
+        !expected.is_empty(),
+        "the default registry serves at least one ragged format"
+    );
+
+    let root = tiled_rs::client::from_uri(&base)
+        .await
+        .unwrap()
+        .into_container()
+        .unwrap();
+    let node = root.get("ragged").await.unwrap();
+    let formats = node
+        .base()
+        .unwrap()
+        .formats()
+        .await
+        .expect("ragged node formats");
+    assert!(
+        !formats.is_empty(),
+        "a ragged node must report at least one exportable format"
+    );
+    assert_eq!(
+        formats, expected,
+        "ragged formats match the server registry (regression: ragged was dropped from the map)"
     );
 }
