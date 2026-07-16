@@ -176,26 +176,52 @@ impl DatasetClient {
 
     async fn fetch_wide_arrow(&self, variables: &[String]) -> Result<HashMap<String, Variable>> {
         let link = self.inner.base().require_link("full")?;
-        let mut url = Url::parse(link)?;
-        url.query_pairs_mut()
-            .append_pair("format", ARROW_FILE_MIME_TYPE);
-        for v in variables {
-            url.query_pairs_mut().append_pair("field", v);
-        }
-        if url.as_str().len() > URL_CHARACTER_LIMIT {
-            // Bail out so the caller falls back to per-array reads. The
-            // server supports POST with a JSON field list as an alternative;
-            // wiring that up in this client is a future change.
-            return Err(ClientError::Invalid(format!(
-                "wide-table URL exceeds {URL_CHARACTER_LIMIT} chars; falling back to per-array reads"
-            )));
-        }
-        let bytes = self
-            .inner
-            .base()
-            .context()
-            .get_bytes(&url, ARROW_FILE_MIME_TYPE)
-            .await?;
+
+        // Estimate the GET URL length the way upstream does (`xarray.py:176-182`):
+        // the base link plus one `&field=<name>` per variable. Past
+        // `URL_CHARACTER_LIMIT` the field list moves into a POST JSON body
+        // (upstream `_fetch_variables__post`, `xarray.py:206`); otherwise it stays
+        // as repeated `field=` query params (`_fetch_variables__get`,
+        // `xarray.py:193`). Mirrors the table wide-column fallback in
+        // `dataframe.rs::read_partition`. Both forms hit `/container/full/{path}`
+        // (GET vs POST) and come back as Arrow IPC.
+        const EXTRA_CHARS_PER_ITEM: usize = "&field=".len();
+        let projected_len = link.len()
+            + variables
+                .iter()
+                .map(|v| EXTRA_CHARS_PER_ITEM + v.len())
+                .sum::<usize>();
+
+        let bytes = if projected_len > URL_CHARACTER_LIMIT {
+            // POST: `format` stays a query param; the field list becomes the JSON
+            // body (parity with the server's `post_container_full`).
+            let mut url = Url::parse(link)?;
+            url.query_pairs_mut()
+                .append_pair("format", ARROW_FILE_MIME_TYPE);
+            let body = serde_json::Value::Array(
+                variables
+                    .iter()
+                    .map(|v| serde_json::Value::String(v.clone()))
+                    .collect(),
+            );
+            self.inner
+                .base()
+                .context()
+                .post_bytes(&url, ARROW_FILE_MIME_TYPE, &body)
+                .await?
+        } else {
+            let mut url = Url::parse(link)?;
+            url.query_pairs_mut()
+                .append_pair("format", ARROW_FILE_MIME_TYPE);
+            for v in variables {
+                url.query_pairs_mut().append_pair("field", v);
+            }
+            self.inner
+                .base()
+                .context()
+                .get_bytes(&url, ARROW_FILE_MIME_TYPE)
+                .await?
+        };
 
         // Decode arrow file into per-column Variables.
         use arrow::ipc::reader::FileReader;
