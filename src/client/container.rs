@@ -266,7 +266,7 @@ impl ContainerClient {
     /// specs, counts)` (`container.py:570-606`). Honors any active search
     /// filters ([`search`](Self::search) / [`with_filter`](Self::with_filter)),
     /// same as Python's `**self._queries_as_params`. Errors with
-    /// [`ClientError::Server`](crate::client::error::ClientError::Server) (HTTP
+    /// [`ClientError::Server`] (HTTP
     /// 405) when the server has no catalog backing this facility.
     ///
     /// ```no_run

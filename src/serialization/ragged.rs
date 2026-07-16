@@ -454,7 +454,7 @@ fn zip_buffers_body(
 // ---------------------------------------------------------------------------
 
 /// Reconstruct a JSON list-of-lists from ZIP bytes produced by
-/// [`to_zipped_buffers`].
+/// `to_zipped_buffers`.
 ///
 /// Mirrors `tiled/serialization/ragged.py:114-128` (`from_zipped_buffers`).
 pub fn from_zipped_buffers(data: &[u8]) -> Result<serde_json::Value, SerializeError> {
@@ -467,7 +467,7 @@ pub fn from_zipped_buffers(data: &[u8]) -> Result<serde_json::Value, SerializeEr
 ///
 /// The `application/zip` deserialize direction used by the write path: the
 /// server stores these buffers per chunk. Inverse of the packing in
-/// [`to_zipped_buffers`]; the front half of [`from_zipped_buffers`] factored
+/// `to_zipped_buffers`; the front half of [`from_zipped_buffers`] factored
 /// out so the adapter can keep the buffers instead of materializing rows.
 pub fn zip_to_buffers(
     data: &[u8],

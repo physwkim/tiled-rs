@@ -7,7 +7,8 @@
 //! writes **each column as its own 1-D dataset** named after the column, the
 //! same rule the array-leaf and single-table exporters use.
 //!
-//! Unlike the flat array/table serializers, this cannot be a [`SerializerFn`]:
+//! Unlike the flat array/table serializers, this cannot be a
+//! [`crate::serialization::registry::SerializerFn`]:
 //! the byte-in/byte-out signature has no access to the adapter tree, so the
 //! actual walk + per-leaf read lives in the server router (`container_full`),
 //! exactly as the `application/zip` deep-export does. This module provides
@@ -25,7 +26,7 @@
 //! null, a mixed-kind or `null`-bearing array, or a ragged (non-rectangular)
 //! nested array — fails the whole export, the same fail-fast contract as Python's
 //! `except TypeError: raise SerializationError`. See
-//! [`crate::serialization::hdf5_common::write_file_attrs`].
+//! `crate::serialization::hdf5_common::write_file_attrs`.
 //!
 //! Remaining parity gaps (UNFIXED, library-bound): sparse/awkward leaves are
 //! skipped — Python's `walk` has no defined dataset shape for them either — and

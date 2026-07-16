@@ -246,7 +246,7 @@ impl AppState {
         self.resolve_base_url_with_peer(headers, None)
     }
 
-    /// Like [`resolve_base_url`] but lets the caller pass the connecting
+    /// Like [`Self::resolve_base_url`] but lets the caller pass the connecting
     /// peer's IP — used so X-Forwarded-Host is honoured only when the
     /// peer is listed in `forwarded_allow_ips`.
     pub fn resolve_base_url_with_peer(

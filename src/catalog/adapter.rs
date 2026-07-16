@@ -90,7 +90,7 @@ impl CatalogAdapter {
     /// [`ContainerAdapter::search_page`], so a container's per-entry count
     /// uses the same exact/approximate cutoff as the metadata endpoint and
     /// the envelope `meta.count` cap. Consuming builder; call on the root
-    /// adapter before use — [`Self::child_container`] carries the value to
+    /// adapter before use — `Self::child_container` carries the value to
     /// every descendant.
     pub fn with_exact_count_limit(mut self, limit: i64) -> Self {
         self.exact_count_limit = limit;

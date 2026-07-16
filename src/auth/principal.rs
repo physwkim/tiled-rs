@@ -135,7 +135,7 @@ impl AuthDb {
     }
 
     /// Create a standalone service principal with the given role. Unlike
-    /// [`ensure_principal`], this creates no Identity row: the principal is
+    /// [`Self::ensure_principal`], this creates no Identity row: the principal is
     /// accessed only via API keys, not via login. Mirrors Python's
     /// `create_service` in `authn_database/core.py`.
     pub async fn create_service_principal(&self, role: &str) -> Result<Principal> {

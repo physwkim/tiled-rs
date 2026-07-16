@@ -76,7 +76,7 @@ impl ArrayAdapter {
         Self::from_f64_2d_checked(data, rows, cols, metadata).expect("rows*cols == data.len()")
     }
 
-    /// Like [`from_f64_2d`] but returns `Err` on shape mismatch instead of
+    /// Like [`Self::from_f64_2d`] but returns `Err` on shape mismatch instead of
     /// panicking.
     pub fn from_f64_2d_checked(
         data: &[f64],

@@ -21,7 +21,7 @@ use crate::core::adapters::{AnyAdapter, BoxFuture};
 ///
 /// Reads are **deny-by-default**, matching Python tiled
 /// (`catalog/adapter.py` refuses to serve an asset outside the readable
-/// storage area): a [`Restricted`](ReadScope::Restricted) resolver serves a
+/// storage area): a `Restricted` resolver serves a
 /// `file:` path only when its canonicalised location lives under one of the
 /// configured directories, and an empty directory list serves nothing — so
 /// a registered `file:///etc/passwd` is refused unless an operator has
@@ -138,7 +138,7 @@ fn is_writable_path(writable_storage: &[PathBuf], path: &Path) -> bool {
 
 impl Default for FileLeafResolver {
     /// The default is the safe deny-all: an empty
-    /// [`Restricted`](ReadScope::Restricted) scope that serves no files until
+    /// `Restricted` scope that serves no files until
     /// directories are configured. Routes through
     /// [`new`](FileLeafResolver::new) so the empty-list warning fires.
     fn default() -> Self {

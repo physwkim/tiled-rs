@@ -12,7 +12,7 @@
 //! at-rest column type differs.
 //!
 //! This is the first SQL-backed *managed* storage in the Rust port (the
-//! file-backed [`crate::adapters::file_resolver`] path rejects `sqlite://`). The store
+//! file-backed [`crate::server::file_resolver`] path rejects `sqlite://`). The store
 //! owns only the chunk table; the [`crate::adapters::ragged_sql_adapter::RaggedSqlStore`]
 //! the higher layers wrap it with read/write/patch live above it (L3).
 
