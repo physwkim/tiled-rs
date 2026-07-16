@@ -1669,6 +1669,130 @@ async fn test_table_full_endpoint() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// GET/PUT /api/v1/node/full/{path} — deprecated family-agnostic alias
+// (Python router.py:1477 GET / 2162 PUT). Dispatches to the same core as
+// `/table/full` or `/container/full` depending on the target node's
+// structure family; kept for old-client back-compat.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "csv-adapter")]
+#[tokio::test]
+async fn test_node_full_dispatches_to_table() {
+    use std::io::Write;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.csv");
+    let mut f = std::fs::File::create(&path).unwrap();
+    writeln!(f, "x,y").unwrap();
+    writeln!(f, "1,10").unwrap();
+    writeln!(f, "2,20").unwrap();
+    f.flush().unwrap();
+    let app = build_table_app(path, 300_000_000);
+
+    // Full read: /node/full must return the exact same Arrow IPC bytes as
+    // the non-deprecated /table/full route it dispatches to.
+    let (node_status, node_headers, node_body) =
+        get_with_headers(&app, "/api/v1/node/full/some_table", &[]).await;
+    let (table_status, table_headers, table_body) =
+        get_with_headers(&app, "/api/v1/table/full/some_table", &[]).await;
+    assert_eq!(node_status, 200);
+    assert_eq!(node_status, table_status);
+    assert_eq!(
+        node_headers.get("content-type"),
+        table_headers.get("content-type")
+    );
+    assert_eq!(node_body, table_body);
+    let (cols, rows) = decode_arrow(&node_body);
+    assert_eq!(cols, vec!["x", "y"]);
+    assert_eq!(rows, 2);
+
+    // Python's node_full query key is `field` (not `column`); table_full
+    // already treats `field` as a `column` alias, so it must flow through
+    // node_full's forwarded query params unchanged.
+    let (status, _, body) =
+        get_with_headers(&app, "/api/v1/node/full/some_table?field=y", &[]).await;
+    assert_eq!(status, 200);
+    let (cols, _) = decode_arrow(&body);
+    assert_eq!(
+        cols,
+        vec!["y"],
+        "?field=y projects to column y via node_full"
+    );
+}
+
+#[tokio::test]
+async fn test_node_full_dispatches_to_container() {
+    let app = build_app();
+
+    let (node_status, node_headers, node_body) =
+        get_with_headers(&app, "/api/v1/node/full/?format=json", &[]).await;
+    let (container_status, container_headers, container_body) =
+        get_with_headers(&app, "/api/v1/container/full/?format=json", &[]).await;
+    assert_eq!(node_status, 200);
+    assert_eq!(node_status, container_status);
+    assert_eq!(
+        node_headers.get("content-type"),
+        container_headers.get("content-type")
+    );
+    assert_eq!(node_body, container_body);
+
+    // Non-root path through node_full too.
+    let (node_status, _, node_body) =
+        get_with_headers(&app, "/api/v1/node/full/subgroup?format=json", &[]).await;
+    let (container_status, _, container_body) =
+        get_with_headers(&app, "/api/v1/container/full/subgroup?format=json", &[]).await;
+    assert_eq!(node_status, 200);
+    assert_eq!(node_status, container_status);
+    assert_eq!(node_body, container_body);
+}
+
+/// A node that is neither a table nor a container (e.g. a plain array) must
+/// 404 through node_full, matching Python's `WrongTypeForRoute` → 404
+/// (router.py:393-394) rather than a 500 or a silent misdispatch.
+#[tokio::test]
+async fn test_node_full_wrong_type_404() {
+    let app = build_app();
+    let (status, _, _) = get_with_headers(&app, "/api/v1/node/full/some_array", &[]).await;
+    assert_eq!(status, 404);
+}
+
+/// PUT /node/full/{path} must resolve to the identical handler as
+/// PUT /table/full/{path} (Python decorates the single `put_node_full`
+/// function with both paths, router.py:2161-2162) — same status, same body,
+/// on an equivalent non-writable node.
+#[cfg(feature = "csv-adapter")]
+#[tokio::test]
+async fn test_node_full_put_matches_table_full_put() {
+    use std::io::Write;
+    let mk_app = || {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.csv");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "x").unwrap();
+        writeln!(f, "1").unwrap();
+        f.flush().unwrap();
+        build_table_app(path, 300_000_000)
+    };
+    let put = |app: axum::Router, uri: &'static str| async move {
+        let req = Request::builder()
+            .method("PUT")
+            .uri(uri)
+            .header("content-type", "application/vnd.apache.arrow.file")
+            .body(Body::from(Vec::<u8>::new()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, body)
+    };
+    let (node_status, node_body) = put(mk_app(), "/api/v1/node/full/some_table").await;
+    let (table_status, table_body) = put(mk_app(), "/api/v1/table/full/some_table").await;
+    assert_eq!(node_status, table_status);
+    assert_eq!(node_body, table_body);
+}
+
 /// Finding 1 (table side): `?format=png` resolves `.png` → `image/png`, which
 /// the table family cannot serialize. Must be HTTP 406, not 200 with raw Arrow
 /// IPC bytes mislabeled as `image/png`.

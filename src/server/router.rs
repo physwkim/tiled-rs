@@ -3846,6 +3846,116 @@ pub async fn table_full_post(
 }
 
 // ---------------------------------------------------------------------------
+// GET /api/v1/node/full/{*path} — deprecated family-agnostic alias
+// ---------------------------------------------------------------------------
+//
+// Mirrors upstream `node_full` (router.py:1477-1559, `deprecated=True` since
+// tiled commit c7edd9d "Deprecate /node/full/{path} routes", Nov 2023).
+// Upstream keeps serving it for old-client back-compat; this dispatches to
+// the already-implemented `table_full`/`container_full` core by resolving
+// the target node's structure family and delegating, the same
+// call-the-real-handler-with-a-rewritten-URI pattern `table_full_post` uses
+// above. `field=` (Python's query key on this route) reaches `table_full`
+// unchanged — it already treats `field` as a `column` alias (see
+// `table_full`'s "Collect column projection" comment); `container_full` has
+// no field-based child filtering in this port either, so the container
+// branch has the same scope as Python's non-deprecated `/container/full`.
+/// Root-path variant (`GET /api/v1/node/full/`, no trailing segments). Axum's
+/// `{*path}` wildcard does not match a zero-segment path — `container_full`
+/// needs the identical split (`container_full_root` + `container_full`), so
+/// `node_full` gets one too.
+pub async fn node_full_root(
+    state: State<AppState>,
+    base_url: BaseUrl,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    auth: crate::server::AuthContext,
+) -> Result<axum::response::Response, ServerError> {
+    node_full(
+        state,
+        OriginalUri("/api/v1/node/full/".parse().expect("static URI")),
+        base_url,
+        Query(params),
+        headers,
+        auth,
+    )
+    .await
+}
+
+pub async fn node_full(
+    state: State<AppState>,
+    OriginalUri(uri): OriginalUri,
+    base_url: BaseUrl,
+    Query(params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    auth: crate::server::AuthContext,
+) -> Result<axum::response::Response, ServerError> {
+    let segments = segments_from_uri(&uri, "/api/v1/node/full/");
+    let family = if segments.is_empty() {
+        // The root is always a container (Python: entry.structure_family is
+        // never checked for the empty path here since get_entry would have
+        // already resolved the root tree adapter).
+        crate::core::structures::StructureFamily::Container
+    } else {
+        core::walk_tree(state.0.root_tree.as_ref(), &segments)
+            .await?
+            .structure_family()
+    };
+    let path = segments.join("/");
+    match family {
+        crate::core::structures::StructureFamily::Table => {
+            let uri: axum::http::Uri = format!("/api/v1/table/full/{path}")
+                .parse()
+                .map_err(|e| ServerError::Internal(format!("rebuild URI: {e}")))?;
+            let query: Vec<(String, String)> = params.into_iter().collect();
+            table_full(state, OriginalUri(uri), Query(query), headers, auth)
+                .await
+                .map(IntoResponse::into_response)
+        }
+        crate::core::structures::StructureFamily::Container => {
+            let uri: axum::http::Uri = format!("/api/v1/container/full/{path}")
+                .parse()
+                .map_err(|e| ServerError::Internal(format!("rebuild URI: {e}")))?;
+            container_full(
+                state,
+                OriginalUri(uri),
+                base_url,
+                Query(params),
+                headers,
+                auth,
+            )
+            .await
+            .map(IntoResponse::into_response)
+        }
+        other => Err(ServerError::WrongType(format!(
+            "'{path}' is a {other:?}, not a table or container"
+        ))),
+    }
+}
+
+/// `PUT /api/v1/node/full/{*path}` — deprecated alias of `PUT /table/full`
+/// (Python decorates the single `put_node_full` function with both paths,
+/// router.py:2161-2162 — there is no container-write branch upstream either,
+/// since containers have no whole-node write). `table_full_put` extracts its
+/// path segments by locating the literal `/api/v1/table/full/` substring in
+/// the request URI (`segments_from_uri`), so it cannot be mounted directly on
+/// this route — the URI must be rewritten first, same as the GET dispatcher
+/// above.
+pub async fn node_full_put(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+    auth: crate::server::AuthContext,
+    body: bytes::Bytes,
+) -> Result<impl IntoResponse, ServerError> {
+    let segments = segments_from_uri(&uri, "/api/v1/node/full/");
+    let path = segments.join("/");
+    let rewritten: axum::http::Uri = format!("/api/v1/table/full/{path}")
+        .parse()
+        .map_err(|e| ServerError::Internal(format!("rebuild URI: {e}")))?;
+    table_full_put(State(state), OriginalUri(rewritten), auth, body).await
+}
+
+// ---------------------------------------------------------------------------
 // PUT /api/v1/table/full/{*path} — overwrite a writable table's data
 // ---------------------------------------------------------------------------
 //
