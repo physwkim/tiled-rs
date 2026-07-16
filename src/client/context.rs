@@ -658,14 +658,14 @@ impl Context {
         Ok(resp)
     }
 
-    async fn add_csrf(&self, req: RequestBuilder) -> RequestBuilder {
+    pub(crate) async fn add_csrf(&self, req: RequestBuilder) -> RequestBuilder {
         match self.csrf_token().await {
             Some(t) => req.header("x-csrf", t),
             None => req,
         }
     }
 
-    async fn maybe_capture_csrf(&self, resp: &Response) {
+    pub(crate) async fn maybe_capture_csrf(&self, resp: &Response) {
         // `cookie_store(true)` makes the Client persist cookies for the next
         // request automatically. We additionally snapshot `tiled_csrf` here
         // so we can echo it as the `x-csrf` header on POST/PATCH/DELETE
@@ -1016,6 +1016,21 @@ impl Context {
         self.maybe_capture_csrf(&resp).await;
         handle_error(resp).await?;
         Ok(())
+    }
+
+    // ---------------- Administrative accessor ----------------
+
+    /// Accessor for administrative requests — principal management and
+    /// per-principal API-key management.
+    ///
+    /// Mirrors upstream `Context.admin` (`context.py:331`), which groups the
+    /// admin-only endpoints under a sub-object. The returned
+    /// [`Admin`](crate::client::admin::Admin) borrows this context; each call
+    /// still requires the caller to hold the relevant
+    /// admin scope server-side (`read:principals`, `write:principals`,
+    /// `admin:apikeys`).
+    pub fn admin(&self) -> crate::client::admin::Admin<'_> {
+        crate::client::admin::Admin::new(self)
     }
 }
 
