@@ -877,13 +877,32 @@ mod tests {
             .collect()
     }
 
+    /// A unique, deliberately non-canonicalized per-test directory under the OS
+    /// temp dir. `std::env::temp_dir()` + process id + the caller-supplied test
+    /// name keeps concurrent tests from colliding without needing `Date`/random
+    /// (both unavailable in some sandboxes). Not canonicalized on purpose: on
+    /// Windows `canonicalize` yields a `\\?\` verbatim path, while the `dir_uri`
+    /// `init_storage` returns round-trips through `file_uri_to_path` to a
+    /// normalized non-verbatim path, so a path-equality assert against a
+    /// canonicalized root spuriously fails. Same helper shape as the
+    /// awkward-buffers adapter tests, which pass CI on all three platforms.
+    fn tmpdir(name: &str) -> PathBuf {
+        let mut d = std::env::temp_dir();
+        d.push(format!(
+            "tiled_sparse_blocksparquet_{}_{name}",
+            std::process::id()
+        ));
+        d
+    }
+
     // init_storage lays out one `data_uris` asset per block, numbered in C-order,
     // with no parquet files created yet (upstream leaves each block file to the
     // first write).
     #[test]
     fn init_storage_registers_one_asset_per_block() {
-        let root = tempfile::tempdir().unwrap();
-        let root = root.path().canonicalize().unwrap();
+        let root = tmpdir("init_registers");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
         // 1D shape 8 split into two chunks of 4 → two blocks.
         let structure = SparseStructure {
             chunks: vec![vec![4, 4]],
@@ -913,8 +932,9 @@ mod tests {
     // through disk (init_storage → from_paths → into_writable → write → read).
     #[tokio::test]
     async fn write_full_then_read_roundtrips_on_disk() {
-        let root = tempfile::tempdir().unwrap();
-        let root = root.path().canonicalize().unwrap();
+        let root = tmpdir("write_full_read");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
         // Single-chunk 3×3 (chunks = one chunk per dim) → one block.
         let structure = SparseStructure {
             chunks: vec![vec![3], vec![3]],
@@ -955,8 +975,9 @@ mod tests {
     // `SparseBlocksParquetAdapter.write` raises NotImplementedError for >1 block.
     #[tokio::test]
     async fn write_full_on_multi_block_node_is_rejected() {
-        let root = tempfile::tempdir().unwrap();
-        let root = root.path().canonicalize().unwrap();
+        let root = tmpdir("write_full_multiblock_reject");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
         let structure = SparseStructure {
             chunks: vec![vec![4, 4]],
             shape: vec![8],
@@ -992,8 +1013,9 @@ mod tests {
     // reading reassembles the global frame by adding chunk offsets.
     #[tokio::test]
     async fn write_block_then_read_reassembles_global_frame() {
-        let root = tempfile::tempdir().unwrap();
-        let root = root.path().canonicalize().unwrap();
+        let root = tmpdir("write_block_reassemble");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
         let structure = SparseStructure {
             chunks: vec![vec![4, 4]],
             shape: vec![8],
@@ -1037,8 +1059,9 @@ mod tests {
     // error, not a panic.
     #[tokio::test]
     async fn write_block_unknown_index_is_error() {
-        let root = tempfile::tempdir().unwrap();
-        let root = root.path().canonicalize().unwrap();
+        let root = tmpdir("write_block_unknown");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
         let structure = SparseStructure {
             chunks: vec![vec![4]],
             shape: vec![4],
