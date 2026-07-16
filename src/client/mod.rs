@@ -49,7 +49,9 @@ pub use auth::{
     device_code_grant, password_grant, prompt_for_credentials, token_directory_for_server,
 };
 pub use awkward::{AwkwardBuffers, AwkwardClient};
-pub use base::{BaseClient, Item, JSON_PATCH_MIME, MERGE_PATCH_MIME, ParsedStructure};
+pub use base::{
+    BaseClient, Item, JSON_PATCH_MIME, MERGE_PATCH_MIME, ParsedStructure, PatchContentType,
+};
 pub use cache::{CacheControl, CacheEntry, HttpCache};
 pub use composite::{CompositeClient, CompositePart};
 pub use constructors::{from_context, from_uri, from_uri_with_options};

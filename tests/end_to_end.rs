@@ -1148,7 +1148,13 @@ async fn base_patch_metadata_merge() {
     // Merge-patch: add "c", leave "a" alone, remove "b" with null.
     node.base()
         .expect("base")
-        .patch_metadata(serde_json::json!({"b": null, "c": 3}), None)
+        .patch_metadata(
+            Some(serde_json::json!({"b": null, "c": 3})),
+            None,
+            None,
+            tiled_rs::client::PatchContentType::MergePatch,
+            false,
+        )
         .await
         .expect("patch_metadata");
 
@@ -1158,6 +1164,70 @@ async fn base_patch_metadata_merge() {
     assert_eq!(meta.get("a"), Some(&serde_json::json!(1)), "a unchanged");
     assert_eq!(meta.get("b"), None, "b removed by null");
     assert_eq!(meta.get("c"), Some(&serde_json::json!(3)), "c added");
+}
+
+#[tokio::test]
+async fn base_patch_metadata_json_patch_mode() {
+    use tiled_rs::client::PatchContentType;
+
+    let (base, _wd, _db) = spawn_write_server().await;
+    let client = from_uri(&base).await.unwrap();
+    let root = client.into_container().unwrap();
+
+    root.create_container("jp_node", serde_json::json!({"a": 1, "b": 2}))
+        .await
+        .expect("create");
+    let node = root.get("jp_node").await.unwrap();
+    // RFC 6902 ops: replace "a", remove "b", add "c".
+    let ops = serde_json::json!([
+        {"op": "replace", "path": "/a", "value": 10},
+        {"op": "remove", "path": "/b"},
+        {"op": "add", "path": "/c", "value": 3},
+    ]);
+    node.base()
+        .expect("base")
+        .patch_metadata(Some(ops), None, None, PatchContentType::JsonPatch, false)
+        .await
+        .expect("patch_metadata");
+
+    let updated = root.get("jp_node").await.unwrap();
+    let meta = updated.base().expect("base").metadata().clone();
+    assert_eq!(meta.get("a"), Some(&serde_json::json!(10)), "a replaced");
+    assert_eq!(meta.get("b"), None, "b removed");
+    assert_eq!(meta.get("c"), Some(&serde_json::json!(3)), "c added");
+}
+
+#[tokio::test]
+async fn base_patch_metadata_drop_revision() {
+    use tiled_rs::client::PatchContentType;
+
+    let (base, _wd, _db) = spawn_write_server().await;
+    let client = from_uri(&base).await.unwrap();
+    let root = client.into_container().unwrap();
+
+    root.create_container("dr_node", serde_json::json!({"a": 1}))
+        .await
+        .expect("create");
+    let node = root.get("dr_node").await.unwrap();
+    node.base()
+        .expect("base")
+        .patch_metadata(
+            Some(serde_json::json!({"a": 2})),
+            None,
+            None,
+            PatchContentType::MergePatch,
+            true, // drop_revision: discard the pre-patch version instead of recording it.
+        )
+        .await
+        .expect("patch_metadata with drop_revision");
+
+    let updated = root.get("dr_node").await.unwrap();
+    let meta = updated.base().expect("base").metadata().clone();
+    assert_eq!(
+        meta.get("a"),
+        Some(&serde_json::json!(2)),
+        "patch still applied"
+    );
 }
 
 // ---------------------------------------------------------------------------
