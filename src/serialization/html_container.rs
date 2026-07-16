@@ -3,7 +3,7 @@
 //! Renders a list of children as `<a href>` entries so an operator can
 //! navigate through `/api/v1/metadata/...` in a regular browser when
 //! debugging. Input is the JSON-encoded entries response (the same
-//! Vec<Resource> the search endpoint emits).
+//! `Vec<Resource>` the search endpoint emits).
 
 use bytes::Bytes;
 
