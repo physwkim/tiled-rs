@@ -230,7 +230,7 @@ pub fn build_app(state: AppState) -> Router {
         .route("/api/v1/container/full/", get(router::container_full_root))
         .route(
             "/api/v1/container/full/{*path}",
-            get(router::container_full),
+            get(router::container_full).post(router::post_container_full),
         )
         .route("/api/v1/array/full", post(router::array_full_post))
         .route("/api/v1/container/full", post(router::container_full_post))

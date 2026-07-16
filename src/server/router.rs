@@ -1925,6 +1925,288 @@ pub async fn container_full_post(
     .map(IntoResponse::into_response)
 }
 
+/// `POST /api/v1/container/full/{path}` — the xarray wide-table fallback. When a
+/// dataset's variable list is long enough that repeated `field=` query params
+/// would overflow the GET URI, the client moves the field list into a JSON-array
+/// body (`tiled/client/xarray.py:206`, `json=variables`) and the server reads it
+/// from there. Mirrors upstream `post_container_full` (router.py:1390, `field:
+/// List[str] = Body(None)`) and the sibling `post_table_partition` above:
+/// `format`/`filename` stay query params, the path stays in the URI, an absent or
+/// empty body means "all children". Only the arrow representation is served here
+/// (the sole reason to POST to this route); a non-arrow POST falls through to the
+/// shared GET logic via `container_full`.
+pub async fn post_container_full(
+    state: State<AppState>,
+    OriginalUri(uri): OriginalUri,
+    BaseUrl(base_url): BaseUrl,
+    Query(params): Query<Vec<(String, String)>>,
+    headers: HeaderMap,
+    auth: crate::server::AuthContext,
+    fields: Option<Json<Vec<String>>>,
+) -> Result<axum::response::Response, ServerError> {
+    auth.require(crate::auth::Scope::ReadData)?;
+    let segments = segments_from_uri(&uri, "/api/v1/container/full/");
+    let format_param = params
+        .iter()
+        .find(|(k, _)| k == "format")
+        .map(|(_, v)| v.clone());
+    let filename_param = params
+        .iter()
+        .find(|(k, _)| k == "filename")
+        .map(|(_, v)| v.clone());
+    let accept = headers
+        .get("accept")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    if wants_arrow(format_param.as_deref(), accept) {
+        // H2: per-node policy check (parity with the GET path's resolve_entry).
+        if !segments.is_empty() {
+            let _ = resolve_entry(
+                &state,
+                auth.clone(),
+                &segments,
+                crate::auth::Scope::ReadData,
+            )
+            .await?;
+        }
+        let fields = fields.map(|Json(f)| f).filter(|f| !f.is_empty());
+        return serve_container_arrow(&state, &segments, fields, filename_param, &headers).await;
+    }
+
+    // Non-arrow POST: delegate to the shared GET logic. The body (field list) is
+    // only meaningful for the arrow projection, so it is not forwarded.
+    let mut query: HashMap<String, String> = HashMap::new();
+    if let Some(f) = format_param {
+        query.insert("format".to_string(), f);
+    }
+    if let Some(name) = filename_param {
+        query.insert("filename".to_string(), name);
+    }
+    container_full(
+        state,
+        OriginalUri(uri),
+        BaseUrl(base_url),
+        Query(query),
+        headers,
+        auth,
+    )
+    .await
+    .map(IntoResponse::into_response)
+}
+
+/// Whether the caller requested the Apache Arrow representation, honouring the
+/// same `?format=` hard priority as [`crate::serialization::negotiate_media_type`]:
+/// a `format` param settles it (the client sends the full MIME type), otherwise
+/// the `Accept` header is consulted.
+fn wants_arrow(format_param: Option<&str>, accept: &str) -> bool {
+    if let Some(fmt) = format_param {
+        return matches!(fmt, "arrow" | "feather" | "ipc")
+            || fmt == crate::core::media_type::mime::ARROW_FILE;
+    }
+    accept.split(',').any(|part| {
+        part.split(';').next().map(str::trim) == Some(crate::core::media_type::mime::ARROW_FILE)
+    })
+}
+
+/// Collect the values of one or more repeated query keys off a raw URI, in order.
+/// `Query<HashMap>` collapses repeated keys, so the arrow column projection
+/// (`?field=a&field=b`) must be read from the query string directly. Returns
+/// `None` when no such key is present (→ "all children").
+fn repeated_query_values(uri: &axum::http::Uri, keys: &[&str]) -> Option<Vec<String>> {
+    let query = uri.query()?;
+    let vals: Vec<String> = url::form_urlencoded::parse(query.as_bytes())
+        .filter(|(k, _)| keys.contains(&k.as_ref()))
+        .map(|(_, v)| v.into_owned())
+        .collect();
+    (!vals.is_empty()).then_some(vals)
+}
+
+/// Serialize an `xarray_dataset` container's array children as a single Arrow IPC
+/// FILE — one column per variable. This mirrors upstream `serialize_dataset_arrow`
+/// (serialization/xarray.py:68 → `as_dataset(node).to_dataframe()`), adapted to run
+/// inline because the Rust serialization registry is keyed on `StructureFamily`,
+/// not on the `xarray_dataset` spec upstream dispatches on. `fields` is the column
+/// projection (a subset of child keys in request order, upstream
+/// `MapAdapter.read(fields=…)`, mapping.py:280); `None` reads every child.
+async fn serve_container_arrow(
+    state: &AppState,
+    segments: &[String],
+    fields: Option<Vec<String>>,
+    filename: Option<String>,
+    headers: &HeaderMap,
+) -> Result<axum::response::Response, ServerError> {
+    let walked;
+    let container: &dyn ContainerAdapter = if segments.is_empty() {
+        state.root_tree.as_ref()
+    } else {
+        walked = core::walk_tree(state.root_tree.as_ref(), segments).await?;
+        walked.as_container().ok_or_else(|| {
+            ServerError::WrongType(format!("'{}' is not a container", segments.join("/")))
+        })?
+    };
+
+    // Parity gate: only an `xarray_dataset` container has an arrow serializer
+    // upstream. A plain container → 406, exactly as the family-keyed
+    // `negotiate_media_type` answers for every other unsupported format.
+    if !container.specs().iter().any(|s| s.name == "xarray_dataset") {
+        return Err(unsupported_media_type(
+            crate::core::structures::StructureFamily::Container,
+            crate::core::media_type::mime::ARROW_FILE,
+            &state.serialization_registry,
+        ));
+    }
+
+    let keys: Vec<String> = match fields {
+        Some(f) => f,
+        None => container.keys().await?,
+    };
+
+    let slice = crate::core::ndslice::NDSlice::empty();
+    let mut columns: Vec<(String, crate::core::dtype::DynNDArray)> = Vec::with_capacity(keys.len());
+    let mut cumulative = 0usize;
+    for key in keys {
+        let child = container
+            .get(&key)
+            .await?
+            .ok_or_else(|| ServerError::NotFound(format!("no child named '{key}'")))?;
+        let arr = child.as_array().ok_or_else(|| {
+            ServerError::WrongType(format!(
+                "child '{key}' is not an array; xarray wide-table export requires array variables"
+            ))
+        })?;
+        // Parity with `as_dataset`: every variable must be a coord or data var.
+        if !arr
+            .specs()
+            .iter()
+            .any(|s| s.name == "xarray_coord" || s.name == "xarray_data_var")
+        {
+            return Err(ServerError::Validation(format!(
+                "child '{key}' lacks an 'xarray_coord'/'xarray_data_var' spec; not an xarray dataset variable"
+            )));
+        }
+        let data = arr.read(&slice).await.map_err(ServerError::from)?;
+        cumulative += data.data.len();
+        check_response_size(
+            cumulative,
+            state.response_bytesize_limit,
+            "Select a subset of the data to request a smaller chunk.",
+        )?;
+        columns.push((key, data));
+    }
+
+    // Column packing + IPC encode is CPU-bound → run off the async executor.
+    let ipc = tokio::task::spawn_blocking(move || build_container_arrow_ipc(columns))
+        .await
+        .map_err(|e| ServerError::Internal(format!("arrow build task failed: {e}")))??;
+
+    Ok(serve_with_range(
+        headers,
+        crate::core::media_type::mime::ARROW_FILE,
+        bytes::Bytes::from(ipc),
+        filename.as_deref(),
+    ))
+}
+
+/// Pack `(name, array)` columns into one Arrow IPC FILE record batch. Each array
+/// is flattened to its element sequence and becomes one primitive column; the
+/// supported dtypes mirror the client's wide-table decoder
+/// (`xarray_client.rs::arrow_dtype_to_tiled_dtype`): f64/f32/i64/i32/u64/u32.
+/// Columns must share length (the wide-table invariant) — `RecordBatch::try_new`
+/// enforces it and a mismatch surfaces as 422, which the client treats as a
+/// signal to fall back to per-array reads.
+fn build_container_arrow_ipc(
+    columns: Vec<(String, crate::core::dtype::DynNDArray)>,
+) -> Result<Vec<u8>, ServerError> {
+    use arrow::datatypes::Schema;
+
+    let mut fields = Vec::with_capacity(columns.len());
+    let mut arrays = Vec::with_capacity(columns.len());
+    for (name, arr) in &columns {
+        let (field, values) = arrow_column_from_ndarray(name, arr)?;
+        fields.push(field);
+        arrays.push(values);
+    }
+    let schema = Arc::new(Schema::new(fields));
+    let batch = arrow::record_batch::RecordBatch::try_new(schema.clone(), arrays).map_err(|e| {
+        ServerError::Validation(format!(
+            "cannot assemble wide-table arrow batch (columns must share length): {e}"
+        ))
+    })?;
+
+    let mut ipc = Vec::new();
+    {
+        let mut writer = arrow::ipc::writer::FileWriter::try_new(&mut ipc, &schema)
+            .map_err(|e| ServerError::Internal(format!("arrow ipc: {e}")))?;
+        writer
+            .write(&batch)
+            .map_err(|e| ServerError::Internal(format!("arrow ipc: {e}")))?;
+        writer
+            .finish()
+            .map_err(|e| ServerError::Internal(format!("arrow ipc: {e}")))?;
+    }
+    Ok(ipc)
+}
+
+/// Convert one flattened [`DynNDArray`] into an Arrow field + primitive column,
+/// honouring the array's declared endianness. Unsupported dtypes → 406 (the
+/// client only decodes the six primitive types below).
+fn arrow_column_from_ndarray(
+    name: &str,
+    arr: &crate::core::dtype::DynNDArray,
+) -> Result<(arrow::datatypes::Field, arrow::array::ArrayRef), ServerError> {
+    use crate::core::dtype::{Endianness, Kind};
+    use arrow::array::{
+        ArrayRef, Float32Array, Float64Array, Int32Array, Int64Array, UInt32Array, UInt64Array,
+    };
+    use arrow::datatypes::{DataType, Field};
+
+    let n = arr.len();
+    let itemsize = arr.dtype.itemsize;
+    let expected = n.saturating_mul(itemsize);
+    if arr.data.len() != expected {
+        return Err(ServerError::Internal(format!(
+            "variable '{name}': {} bytes but shape {:?} implies {n} elements of {itemsize}B",
+            arr.data.len(),
+            arr.shape
+        )));
+    }
+    let big = matches!(arr.dtype.endianness, Endianness::Big);
+    let bytes = &arr.data;
+
+    macro_rules! decode {
+        ($t:ty, $sz:literal, $ArrowArr:ty) => {{
+            let mut v: Vec<$t> = Vec::with_capacity(n);
+            for chunk in bytes.chunks_exact($sz) {
+                let a: [u8; $sz] = chunk
+                    .try_into()
+                    .expect("chunks_exact yields fixed-size chunks");
+                v.push(if big {
+                    <$t>::from_be_bytes(a)
+                } else {
+                    <$t>::from_le_bytes(a)
+                });
+            }
+            Arc::new(<$ArrowArr>::from(v)) as ArrayRef
+        }};
+    }
+
+    let (dt, values): (DataType, ArrayRef) = match (arr.dtype.kind, itemsize) {
+        (Kind::Float, 8) => (DataType::Float64, decode!(f64, 8, Float64Array)),
+        (Kind::Float, 4) => (DataType::Float32, decode!(f32, 4, Float32Array)),
+        (Kind::Integer, 8) => (DataType::Int64, decode!(i64, 8, Int64Array)),
+        (Kind::Integer, 4) => (DataType::Int32, decode!(i32, 4, Int32Array)),
+        (Kind::UnsignedInteger, 8) => (DataType::UInt64, decode!(u64, 8, UInt64Array)),
+        (Kind::UnsignedInteger, 4) => (DataType::UInt32, decode!(u32, 4, UInt32Array)),
+        (kind, sz) => {
+            return Err(ServerError::NotAcceptable(format!(
+                "xarray wide-table arrow export does not support dtype (kind={kind:?}, itemsize={sz}) for variable '{name}'"
+            )));
+        }
+    };
+    Ok((Field::new(name, dt, false), values))
+}
+
 // ---------------------------------------------------------------------------
 // GET /api/v1/container/full/{*path} — export entire container
 // ---------------------------------------------------------------------------
@@ -1986,6 +2268,22 @@ pub async fn container_full(
         .unwrap_or("");
     let format_str = params.get("format").map(|s| s.to_string());
     let filename_str = params.get("filename").map(|s| s.to_string());
+
+    // Wide-table arrow export. Upstream registers the Container→arrow serializer
+    // under the `xarray_dataset` *spec* (serialization/xarray.py:68); the Rust
+    // serialization registry keys on `StructureFamily` only, so a spec-keyed
+    // serializer is unrepresentable and `negotiate_media_type` below (family-
+    // keyed) would answer 406. Intercept the arrow request here and mirror the
+    // serializer's logic inline in `serve_container_arrow`, which still 406s for
+    // a non-`xarray_dataset` container — exactly what negotiation would do. The
+    // repeated `field`/`column` query keys are the column projection (upstream
+    // `field` query param, router.py:1352); `Query<HashMap>` collapses repeated
+    // keys, so read them straight off the raw URI.
+    if wants_arrow(format_str.as_deref(), accept) {
+        let fields = repeated_query_values(&uri, &["field", "column"]);
+        return serve_container_arrow(&state, &segments, fields, filename_str, &headers).await;
+    }
+
     // Resolve effective media type once: format param beats Accept header. An
     // explicit but unserviceable format/Accept resolves to `None` → HTTP 406,
     // consistent with the array/table/sparse handlers (no silent HTML fallback).
