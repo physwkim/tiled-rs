@@ -812,6 +812,62 @@ async fn ragged_write_block_roundtrip() {
     );
 }
 
+/// `ContainerClient::write_ragged` creates a managed ragged node and uploads the
+/// rows in one call; the list-of-lists reads back verbatim, and `access_tags`
+/// is stored via the shared create builder.
+#[tokio::test]
+async fn write_ragged_helper_roundtrip() {
+    use tiled_rs::core::dtype::{BuiltinDType, DType};
+    use tiled_rs::core::structures::RaggedStructure;
+
+    let (base, _wd, _db) = spawn_write_server().await;
+    let root = from_uri(&base).await.unwrap().into_container().unwrap();
+
+    // Two rows ([1,2,3] + [4]), 4 leaf elements, one chunk of 2 rows.
+    let structure = RaggedStructure {
+        data_type: DType::Builtin(BuiltinDType::new(Endianness::Little, Kind::Integer, 8)),
+        shape: vec![Some(2), None],
+        size: 4,
+        chunks: vec![Some(vec![2]), None],
+        dims: None,
+        resizable: Default::default(),
+    };
+    let data = serde_json::json!([[1, 2, 3], [4]]);
+    let tags = vec!["team-r".to_string()];
+
+    let rag = root
+        .write_ragged(
+            Some("h_rag"),
+            structure,
+            &data,
+            serde_json::json!({"note": "hi"}),
+            vec![],
+            Some(&tags),
+        )
+        .await
+        .expect("write_ragged");
+
+    // The returned client reads the rows back unchanged.
+    let read_back = rag.read().await.expect("ragged read");
+    assert_eq!(read_back, data, "ragged round-trip mismatch");
+
+    // access_tags landed as access_blob.tags on the created node.
+    let fetched = root.get("h_rag").await.unwrap();
+    let blob = fetched
+        .base()
+        .expect("ragged node has a base client")
+        .item()
+        .attributes
+        .access_blob
+        .clone()
+        .expect("access_blob present on the created node");
+    assert_eq!(
+        blob,
+        serde_json::json!({"tags": ["team-r"]}),
+        "access_tags stored as access_blob.tags"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Scope 2: TableClient::write
 // ---------------------------------------------------------------------------
