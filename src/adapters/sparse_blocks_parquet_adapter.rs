@@ -118,13 +118,6 @@ impl SparseBlocksParquetAdapter {
         self
     }
 
-    fn data_dtype(&self) -> BuiltinDType {
-        match &self.structure.data_type {
-            Some(DType::Builtin(b)) => b.clone(),
-            _ => unreachable!("data_type always Builtin"),
-        }
-    }
-
     fn coord_dtype(&self) -> BuiltinDType {
         self.structure
             .coord_data_type
@@ -140,7 +133,7 @@ impl SparseBlocksParquetAdapter {
             .collect()
     }
 
-    fn read_block_file(&self, block: &[usize]) -> Result<(Vec<Vec<i64>>, Vec<u8>)> {
+    fn read_block_file(&self, block: &[usize]) -> Result<(Vec<Vec<i64>>, Vec<u8>, BuiltinDType)> {
         let path = self
             .blocks
             .get(block)
@@ -148,10 +141,27 @@ impl SparseBlocksParquetAdapter {
         read_sparse_parquet(path)
     }
 
-    fn to_sparse_data(&self, coords: Vec<Vec<i64>>, data_bytes: Vec<u8>) -> SparseData {
-        let dtype = self.data_dtype();
+    /// Wrap per-dimension coordinate arrays and a values buffer as [`SparseData`],
+    /// labelling the values with the dtype **actually stored** in the parquet
+    /// file (`data_dtype`, read from the value column) rather than the node's
+    /// declared `structure.data_type`. Upstream reads each block with pandas and
+    /// returns `df["data"].values` verbatim (`sparse_blocks_parquet.py:31`), then
+    /// builds `sparse.COO(data=numpy.concatenate(all_data), ...)`
+    /// (`sparse_blocks_parquet.py:123-127`) — it never consults
+    /// `structure.data_type` for the values, so the stored column dtype is
+    /// authoritative. `nnz` is sized by the stored element width, so a stored
+    /// dtype narrower or wider than the declared one still yields the correct
+    /// non-zero count (declared/stored can diverge only for externally-registered
+    /// files; our own writes are pinned equal at the PUT boundary by
+    /// `ensure_sparse_data_dtype`).
+    fn to_sparse_data(
+        &self,
+        coords: Vec<Vec<i64>>,
+        data_bytes: Vec<u8>,
+        data_dtype: BuiltinDType,
+    ) -> SparseData {
         let coord_dtype = self.coord_dtype();
-        let elem = dtype.element_size();
+        let elem = data_dtype.element_size();
         let nnz = data_bytes.len().checked_div(elem).unwrap_or(0);
         let coord_arrays: Vec<DynNDArray> = coords
             .iter()
@@ -160,7 +170,7 @@ impl SparseBlocksParquetAdapter {
                 DynNDArray::new(Bytes::from(bytes), coord_dtype.clone(), vec![nnz])
             })
             .collect();
-        let data = DynNDArray::new(Bytes::from(data_bytes), dtype, vec![nnz]);
+        let data = DynNDArray::new(Bytes::from(data_bytes), data_dtype, vec![nnz]);
         SparseData {
             coords: coord_arrays,
             data,
@@ -190,9 +200,25 @@ impl SparseAdapterRead for SparseBlocksParquetAdapter {
             let ndim = self.structure.shape.len();
             let mut all_coords: Vec<Vec<i64>> = vec![Vec::new(); ndim];
             let mut all_data: Vec<u8> = Vec::new();
+            let mut value_dtype: Option<BuiltinDType> = None;
 
             for index in self.blocks.keys() {
-                let (local_coords, data_bytes) = self.read_block_file(index)?;
+                let (local_coords, data_bytes, block_dtype) = self.read_block_file(index)?;
+                // Every block of one node must share a stored value dtype so the
+                // concatenated buffer has a single interpretation. Upstream's
+                // `numpy.concatenate` would promote differing dtypes; a flat byte
+                // buffer cannot, so a genuine cross-block divergence is rejected
+                // rather than mis-sizing the assembled buffer.
+                if let Some(seen) = &value_dtype {
+                    if *seen != block_dtype {
+                        return Err(TiledError::Validation(format!(
+                            "sparse blocks disagree on stored value dtype ({seen:?} vs \
+                             {block_dtype:?}); cannot assemble one COO buffer"
+                        )));
+                    }
+                } else {
+                    value_dtype = Some(block_dtype);
+                }
                 let offsets = self.block_offsets(index);
                 for (d, (dest, src)) in all_coords.iter_mut().zip(local_coords.iter()).enumerate() {
                     let off = offsets[d];
@@ -201,16 +227,20 @@ impl SparseAdapterRead for SparseBlocksParquetAdapter {
                 all_data.extend_from_slice(&data_bytes);
             }
 
-            let sd = self.to_sparse_data(all_coords, all_data);
+            // `blocks` is non-empty by construction (`from_paths` requires one
+            // path per grid cell, and the block grid always has >= 1 cell), so
+            // the loop always sets `value_dtype`.
+            let data_dtype = value_dtype.expect("blocks is non-empty by constructor invariant");
+            let sd = self.to_sparse_data(all_coords, all_data, data_dtype);
             // Apply slice by filtering non-zero entries that fall within the slice.
-            apply_sparse_slice(sd, slice, &self.structure.shape, self.data_dtype())
+            apply_sparse_slice(sd, slice, &self.structure.shape)
         })
     }
 
     fn read_block<'a>(&'a self, block: &'a [usize]) -> BoxFuture<'a, Result<SparseData>> {
         Box::pin(async move {
-            let (coords, data_bytes) = self.read_block_file(block)?;
-            Ok(self.to_sparse_data(coords, data_bytes))
+            let (coords, data_bytes, data_dtype) = self.read_block_file(block)?;
+            Ok(self.to_sparse_data(coords, data_bytes, data_dtype))
         })
     }
 
@@ -386,13 +416,17 @@ fn coord_dyn_to_i64_vec(arr: &DynNDArray) -> Result<Vec<i64>> {
 
 /// Read a sparse block parquet file.
 ///
-/// Returns `(coords, data_bytes)` where `coords[d]` is the list of
-/// block-local integer coordinates for dimension `d` and `data_bytes`
-/// is the raw non-zero value buffer.
+/// Returns `(coords, data_bytes, value_dtype)` where `coords[d]` is the list of
+/// block-local integer coordinates for dimension `d`, `data_bytes` is the raw
+/// non-zero value buffer, and `value_dtype` is the dtype of the **stored** value
+/// column. The stored dtype — not the node's declared `data_type` — is what the
+/// returned values are labelled with, matching upstream's pandas read
+/// (`sparse_blocks_parquet.py:31,123-127`); see
+/// [`SparseBlocksParquetAdapter::to_sparse_data`].
 ///
 /// Parquet layout: columns `[coord_0, coord_1, ..., data]` — all columns
 /// except the last are coordinate columns; the last column is values.
-fn read_sparse_parquet(path: &std::path::Path) -> Result<(Vec<Vec<i64>>, Vec<u8>)> {
+fn read_sparse_parquet(path: &std::path::Path) -> Result<(Vec<Vec<i64>>, Vec<u8>, BuiltinDType)> {
     use arrow::array::Int64Array;
 
     let file = std::fs::File::open(path)
@@ -414,8 +448,12 @@ fn read_sparse_parquet(path: &std::path::Path) -> Result<(Vec<Vec<i64>>, Vec<u8>
 
     let mut per_dim: Vec<Vec<i64>> = vec![Vec::new(); ndim];
     let mut data_bytes: Vec<u8> = Vec::new();
-    let data_dtype = schema.field(ndim).data_type().clone();
-    let elem = arrow_elem_size(&data_dtype)?;
+    // The stored value-column dtype is authoritative on read (upstream reads it
+    // via pandas, `sparse_blocks_parquet.py:31`), independent of the node's
+    // declared `data_type`. Reject an unsupported column type up front, before
+    // the batch scan.
+    let value_dtype = arrow_to_builtin_dtype(schema.field(ndim).data_type())?;
+    let elem = value_dtype.element_size();
 
     for batch in reader {
         let batch = batch.map_err(|e| TiledError::Internal(format!("parquet batch: {e}")))?;
@@ -438,21 +476,28 @@ fn read_sparse_parquet(path: &std::path::Path) -> Result<(Vec<Vec<i64>>, Vec<u8>
         data_bytes.extend_from_slice(&extract_data_bytes(data_col, elem)?);
     }
 
-    Ok((per_dim, data_bytes))
+    Ok((per_dim, data_bytes, value_dtype))
 }
 
-/// Return the element size (bytes) for an Arrow DataType.
-fn arrow_elem_size(dt: &arrow::datatypes::DataType) -> Result<usize> {
+/// Map a supported Arrow value-column `DataType` to the [`BuiltinDType`] that
+/// describes the little-endian bytes [`extract_data_bytes`] produces for it.
+/// The read path always emits little-endian bytes, so endianness is `Little`.
+/// The supported set matches [`extract_data_bytes`]; any other column type is a
+/// validation error (the same rejection, surfaced before the batch scan).
+fn arrow_to_builtin_dtype(dt: &arrow::datatypes::DataType) -> Result<BuiltinDType> {
     use arrow::datatypes::DataType;
-    match dt {
-        DataType::Int8 | DataType::UInt8 => Ok(1),
-        DataType::Int16 | DataType::UInt16 => Ok(2),
-        DataType::Float32 | DataType::Int32 | DataType::UInt32 => Ok(4),
-        DataType::Float64 | DataType::Int64 | DataType::UInt64 => Ok(8),
-        other => Err(TiledError::Validation(format!(
-            "unsupported data column type for sparse parquet: {other:?}"
-        ))),
-    }
+    let (kind, size) = match dt {
+        DataType::Float64 => (Kind::Float, 8),
+        DataType::Float32 => (Kind::Float, 4),
+        DataType::Int64 => (Kind::Integer, 8),
+        DataType::Int32 => (Kind::Integer, 4),
+        other => {
+            return Err(TiledError::Validation(format!(
+                "unsupported data column type for sparse parquet: {other:?}"
+            )));
+        }
+    };
+    Ok(BuiltinDType::new(Endianness::Little, kind, size))
 }
 
 /// Extract little-endian bytes from an Arrow primitive column.
@@ -501,12 +546,7 @@ fn extract_data_bytes(col: &Arc<dyn arrow::array::Array>, elem: usize) -> Result
 /// For non-trivial slices this is a linear scan — acceptable given that
 /// sparse data is typically sparse. For the empty/ellipsis slice, returns
 /// the data unchanged without scanning.
-fn apply_sparse_slice(
-    sd: SparseData,
-    slice: &NDSlice,
-    shape: &[usize],
-    _dtype: BuiltinDType,
-) -> Result<SparseData> {
+fn apply_sparse_slice(sd: SparseData, slice: &NDSlice, shape: &[usize]) -> Result<SparseData> {
     if slice.is_empty() {
         return Ok(sd);
     }
@@ -1087,5 +1127,158 @@ mod tests {
             .write_block(sparse_data(vec![vec![0]], vec![1.0]), &[3])
             .await;
         assert!(err.is_err(), "unknown block index must error");
+    }
+
+    // ---- stored-vs-declared value dtype (Wave-17) -----------------------
+
+    fn f32_dtype() -> BuiltinDType {
+        BuiltinDType::new(Endianness::Little, Kind::Float, 4)
+    }
+
+    fn read_f32_col(arr: &DynNDArray) -> Vec<f32> {
+        arr.data
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .collect()
+    }
+
+    /// Build a [`SparseData`] whose value column is f32 (one int64 coord column
+    /// per dimension). Used to stage an "externally-registered" block whose
+    /// stored dtype differs from a node's declared dtype.
+    fn sparse_data_f32(coords: Vec<Vec<i64>>, data: Vec<f32>) -> SparseData {
+        let nnz = data.len();
+        let coord_dyn: Vec<DynNDArray> = coords
+            .into_iter()
+            .map(|c| {
+                let bytes: Vec<u8> = c.iter().flat_map(|v| v.to_le_bytes()).collect();
+                DynNDArray::new(Bytes::from(bytes), i64_dtype(), vec![nnz])
+            })
+            .collect();
+        let data_bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let data_dyn = DynNDArray::new(Bytes::from(data_bytes), f32_dtype(), vec![nnz]);
+        SparseData {
+            coords: coord_dyn,
+            data: data_dyn,
+        }
+    }
+
+    // Invariant boundary — stored == declared: the returned buffer carries the
+    // stored (== declared here) f64 dtype and the correct nnz.
+    #[tokio::test]
+    async fn read_block_reports_stored_dtype_when_stored_eq_declared() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("eq.parquet");
+        // Stored f64 via the production encoder.
+        write_sparse_parquet(&p, vec![vec![0, 2]], vec![1.5, 2.5]).await;
+
+        let adapter = SparseBlocksParquetAdapter::from_paths(
+            vec![p],
+            vec![4],
+            vec![vec![4]],
+            f64_dtype(), // declared f64 == stored f64
+            None,
+            serde_json::Value::Null,
+        )
+        .unwrap();
+
+        let sd = adapter.read_block(&[0]).await.unwrap();
+        assert_eq!(sd.data.dtype, f64_dtype());
+        assert_eq!(sd.data.shape, vec![2]);
+        assert_eq!(sd.coords[0].shape, vec![2]);
+        assert_eq!(read_f64_col(&sd.data), vec![1.5, 2.5]);
+    }
+
+    // Invariant boundary — stored != declared (externally-registered file): the
+    // parquet stores f32 values but the node is declared f64. Upstream reads the
+    // stored dtype via pandas (sparse_blocks_parquet.py:31,123-127), so the
+    // returned buffer must carry the stored f32 — correct nnz, correct values —
+    // not the declared f64 (which would halve nnz and reinterpret the bytes).
+    #[tokio::test]
+    async fn read_block_uses_stored_dtype_when_stored_ne_declared() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("ne.parquet");
+        // Stage a stored-f32 block through the production encoder.
+        write_sparse_block_parquet(&p, sparse_data_f32(vec![vec![0, 2]], vec![1.5, 2.5]))
+            .await
+            .unwrap();
+
+        let adapter = SparseBlocksParquetAdapter::from_paths(
+            vec![p],
+            vec![4],
+            vec![vec![4]],
+            f64_dtype(), // declared f64, but stored is f32
+            None,
+            serde_json::Value::Null,
+        )
+        .unwrap();
+
+        let sd = adapter.read_block(&[0]).await.unwrap();
+        // Stored f32 wins over declared f64.
+        assert_eq!(sd.data.dtype, f32_dtype());
+        // nnz sized by the stored 4-byte width: 2 non-zeros, not 1.
+        assert_eq!(sd.data.shape, vec![2]);
+        assert_eq!(sd.coords[0].shape, vec![2]);
+        assert_eq!(read_f32_col(&sd.data), vec![1.5f32, 2.5]);
+    }
+
+    // Invariant boundary — the same stored/declared mismatch exercised through
+    // the multi-block-capable `read()` path (single block here).
+    #[tokio::test]
+    async fn read_uses_stored_dtype_when_stored_ne_declared() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("ne_full.parquet");
+        write_sparse_block_parquet(&p, sparse_data_f32(vec![vec![1]], vec![7.5]))
+            .await
+            .unwrap();
+
+        let adapter = SparseBlocksParquetAdapter::from_paths(
+            vec![p],
+            vec![4],
+            vec![vec![4]],
+            f64_dtype(),
+            None,
+            serde_json::Value::Null,
+        )
+        .unwrap();
+
+        let sd = adapter.read(&NDSlice::empty()).await.unwrap();
+        assert_eq!(sd.data.dtype, f32_dtype());
+        assert_eq!(sd.data.shape, vec![1]);
+        assert_eq!(read_f32_col(&sd.data), vec![7.5f32]);
+    }
+
+    // Invariant boundary — one COO buffer, one dtype: two externally-registered
+    // blocks that disagree on stored value dtype (f32 vs f64) cannot be assembled
+    // into a single byte buffer, so `read()` errors rather than mis-sizing it.
+    // (Upstream numpy.concatenate would promote; a flat byte buffer cannot.)
+    #[tokio::test]
+    async fn read_rejects_cross_block_value_dtype_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let p0 = dir.path().join("mix-0.parquet");
+        let p1 = dir.path().join("mix-1.parquet");
+        // Block 0 stored f32, block 1 stored f64.
+        write_sparse_block_parquet(&p0, sparse_data_f32(vec![vec![1]], vec![1.0]))
+            .await
+            .unwrap();
+        write_sparse_parquet(&p1, vec![vec![2]], vec![2.0]).await;
+
+        let adapter = SparseBlocksParquetAdapter::from_paths(
+            vec![p0, p1],
+            vec![8],
+            vec![vec![4, 4]],
+            f64_dtype(),
+            None,
+            serde_json::Value::Null,
+        )
+        .unwrap();
+
+        let err = adapter.read(&NDSlice::empty()).await;
+        assert!(err.is_err(), "cross-block dtype disagreement must error");
+        assert!(
+            err.unwrap_err()
+                .to_string()
+                .contains("disagree on stored value dtype"),
+            "the error names the cross-block dtype disagreement"
+        );
     }
 }
