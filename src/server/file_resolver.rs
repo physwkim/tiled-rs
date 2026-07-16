@@ -207,6 +207,10 @@ impl LeafResolver for FileLeafResolver {
             let mimetype = ds.mimetype.clone();
             let parameters = ds.parameters.clone();
             let metadata = node.metadata.clone();
+            // Awkward is a `file://` directory asset like zarr, so it resolves
+            // through the same path — but its structure (form + length) is not
+            // stored on disk, so it travels from the catalog data_source here.
+            let structure = ds.structure.clone();
             // The allow-list check (`canonicalize`) and adapter construction
             // (`from_path` reads the data file's header) are blocking
             // filesystem work — offload to the blocking pool so the async
@@ -214,7 +218,7 @@ impl LeafResolver for FileLeafResolver {
             tokio::task::spawn_blocking(move || {
                 check_allowed(&scope, &path)?;
                 let writable = is_writable_path(&writable_storage, &path);
-                build_leaf_adapter(&mimetype, path, &parameters, metadata, writable)
+                build_leaf_adapter(&mimetype, path, &parameters, structure, metadata, writable)
             })
             .await
             .map_err(|e| CatalogError::Validation(format!("leaf resolve task failed: {e}")))?
@@ -235,6 +239,11 @@ fn build_leaf_adapter(
         allow(unused_variables)
     )]
     parameters: &serde_json::Value,
+    // Only the awkward arm reads this: its form + length are not stored on disk
+    // (the buffer directory holds only raw buffers), so the structure travels
+    // from the catalog data_source as raw JSON. Every other arm derives its
+    // structure from the file it opens.
+    structure: serde_json::Value,
     metadata: serde_json::Value,
     // Whether the resolver decided this backing file is under writable storage.
     // Only adapters that implement a writer act on it; the rest are read-only
@@ -388,6 +397,23 @@ fn build_leaf_adapter(
                     "netcdf support not built in".into(),
                 ));
             }
+        }
+        "application/x-awkward-buffers" => {
+            // A directory of raw buffer files (one per form key). The form +
+            // length are not on disk, so they come from the catalog structure
+            // JSON (persisted verbatim at create time).
+            let awk =
+                crate::core::structures::AwkwardStructure::from_json(&structure).map_err(|e| {
+                    CatalogError::Validation(format!(
+                        "awkward node data_source has no valid awkward structure: {e}"
+                    ))
+                })?;
+            let mut adapter =
+                crate::adapters::AwkwardBuffersAdapter::from_path(path, awk, metadata);
+            if writable {
+                adapter = adapter.into_writable();
+            }
+            AnyAdapter::Awkward(Arc::new(adapter))
         }
         other => {
             return Err(CatalogError::Validation(format!(

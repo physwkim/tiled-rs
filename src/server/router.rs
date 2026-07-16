@@ -4785,6 +4785,10 @@ fn default_creation_mimetype(
         // Ragged nodes have one managed-write backend: SQL-backed storage.
         #[cfg(feature = "sql-adapter")]
         SF::Ragged => Ok(crate::core::media_type::mime::RAGGED_SQL),
+        // Awkward nodes have one managed-write backend: a directory of buffer
+        // files. Upstream `DEFAULT_CREATION_MIMETYPE[awkward]`
+        // (tiled/catalog/adapter.py:120) → `AWKWARD_BUFFERS_MIMETYPE`.
+        SF::Awkward => Ok(crate::core::media_type::mime::AWKWARD_BUFFERS),
         other => Err(ServerError::UnsupportedMediaType(format!(
             "no managed-write backend for {} nodes in this build \
              (array: application/x-zarr or application/x-npy; \
@@ -4937,12 +4941,47 @@ async fn managed_init_storage(
                 ))
             }
         }
+        crate::core::media_type::mime::AWKWARD_BUFFERS => {
+            // Validate the create carries an awkward structure (fast-fail before
+            // touching disk); the structure itself is persisted verbatim in the
+            // catalog data_source — the buffer directory holds only raw buffers,
+            // so `init_storage_awkward` needs no structure (upstream
+            // `AwkwardBuffersAdapter.init_storage`, awkward.py:120-138).
+            let _structure = managed_awkward_structure(ds, &mimetype)?;
+            let (_data_uri, assets) =
+                crate::adapters::init_storage_awkward(writable_root, &path_parts)
+                    .map_err(ServerError::from)?;
+            Ok((mimetype, to_asset_specs(assets), parameters))
+        }
         other => Err(ServerError::UnsupportedMediaType(format!(
             "managed writes are not supported for mimetype {other} in this build \
              (supported: application/x-zarr, application/x-npy for array nodes; \
              application/x-parquet, text/csv for table nodes; \
-             application/x-ragged+sql for ragged nodes)"
+             application/x-ragged+sql for ragged nodes; \
+             application/x-awkward-buffers for awkward nodes)"
         ))),
+    }
+}
+
+/// Validate that a managed awkward-mimetype create carries an awkward structure
+/// and return it. The awkward analog of [`managed_array_structure`]. The
+/// structure is not needed to lay out storage (the buffer directory starts
+/// empty), only to reject a create whose family/structure does not match.
+fn managed_awkward_structure(
+    ds: &crate::core::data_source::DataSource,
+    mimetype: &str,
+) -> Result<crate::core::structures::AwkwardStructure, ServerError> {
+    if ds.structure_family != crate::core::structures::StructureFamily::Awkward {
+        return Err(ServerError::UnsupportedMediaType(format!(
+            "mimetype {mimetype} is only valid for awkward nodes, not {}",
+            ds_family_str(ds.structure_family)
+        )));
+    }
+    match &ds.structure {
+        Some(crate::core::structures::AnyStructure::Awkward(a)) => Ok(a.clone()),
+        _ => Err(ServerError::Validation(
+            "a managed awkward create requires an awkward structure (form + length)".into(),
+        )),
     }
 }
 
