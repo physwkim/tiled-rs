@@ -308,26 +308,43 @@ impl BaseClient {
         Ok(MetadataRevisions::new(self.context.clone(), link))
     }
 
-    /// The node's data sources, as attached when this client was constructed
-    /// with `include_data_sources=true`.
+    /// The node's data sources — its storage backends and their assets —
+    /// lazily fetching them when this client was not constructed with
+    /// `include_data_sources=true`.
     ///
-    /// Returns [`ClientError::Invalid`] (rather than treating the node as
-    /// having no data sources) when the flag was not set: the asset accessors
-    /// below need the assets' database ids, which only ride along when the flag
-    /// is requested. This deliberately does *not* re-fetch — upstream
-    /// `raw_export` calls `self.include_data_sources().data_sources()`, lazily
-    /// refetching, which is a separate capability (audit gap #8) not
-    /// implemented here; construct the client with the flag instead (e.g.
-    /// `from_uri_with_options(uri, opts, true)`).
-    fn data_sources(&self) -> Result<&[DataSource]> {
-        self.item.attributes.data_sources.as_deref().ok_or_else(|| {
-            ClientError::Invalid(
-                "data sources are unavailable on this client; construct it with \
-                     include_data_sources=true (e.g. from_uri_with_options(uri, opts, true)) \
-                     so the backing asset ids are known"
-                    .into(),
-            )
+    /// Mirrors Python `BaseClient.data_sources` (`base.py:299`) composed with
+    /// `include_data_sources` (`base.py:307`): when the flag was set at
+    /// construction the already-attached sources are returned with no extra
+    /// round-trip; otherwise the node's own `self` URI is re-fetched with
+    /// `?include_data_sources=true` (upstream's `refresh`, `base.py:207`) so the
+    /// server attaches the sources and their asset database ids, rather than
+    /// erroring. The re-fetch lands on a throwaway item and does *not* mutate
+    /// `self`, matching upstream, whose `include_data_sources()` refreshes a
+    /// `new_variation`, not the original client.
+    ///
+    /// Returns `Ok(None)` when the node reports no `data_sources` attribute even
+    /// after the fetch (upstream returns `None` for a missing attribute).
+    pub async fn data_sources(&self) -> Result<Option<Vec<DataSource>>> {
+        if self.include_data_sources {
+            return Ok(self.item.attributes.data_sources.clone());
+        }
+        // Lazily enable: re-fetch this node's own `self` URI with the flag set
+        // and read the sources off the returned item. Preserving any existing
+        // query on the link and appending the flag mirrors upstream `refresh`,
+        // which merges `include_data_sources` into `parse_qs(self.uri)`.
+        let self_link = self.require_link("self")?;
+        let mut url = Url::parse(self_link)?;
+        url.query_pairs_mut()
+            .append_pair("include_data_sources", "true");
+        let item = retry(|| async {
+            let resp = self.context.get(&url).await?;
+            let envelope: ResourceEnvelope = decode_response(resp).await?;
+            envelope
+                .data
+                .ok_or_else(|| ClientError::Invalid("metadata response missing data".into()))
         })
+        .await?;
+        Ok(item.attributes.data_sources)
     }
 
     /// The node's `self` link with its first `/metadata` segment rewritten to
@@ -397,12 +414,16 @@ impl BaseClient {
     /// asset id; the idiomatic equivalent here is an ordered [`AssetEntry`] per
     /// asset, preserving data-source and asset order.
     ///
-    /// Requires the client to carry its data sources (see
-    /// [`data_sources`](Self::data_sources)).
+    /// The data sources are resolved through
+    /// [`data_sources`](Self::data_sources), which lazily fetches them (with
+    /// their asset ids) when this client was not built with
+    /// `include_data_sources=true`; a node reporting no data sources yields an
+    /// empty manifest.
     pub async fn asset_manifest(&self) -> Result<Vec<AssetEntry>> {
+        let data_sources = self.data_sources().await?.unwrap_or_default();
         let manifest_link = self.asset_manifest_link()?;
         let mut out = Vec::new();
-        for ds in self.data_sources()? {
+        for ds in &data_sources {
             for asset in &ds.assets {
                 let relative_paths = if asset.is_directory {
                     Some(self.fetch_manifest(&manifest_link, asset).await?)
@@ -439,10 +460,12 @@ impl BaseClient {
     ///
     /// Deviation from upstream: downloads run sequentially — the `max_workers`
     /// parallelism is not reproduced (parity does not depend on it, and no
-    /// progress callback is invented). Requires the client to carry its data
-    /// sources (see [`data_sources`](Self::data_sources)).
+    /// progress callback is invented). The data sources are resolved through
+    /// [`data_sources`](Self::data_sources), which lazily fetches them (with
+    /// their asset ids) when this client was not built with
+    /// `include_data_sources=true`.
     pub async fn raw_export(&self, dest_dir: &Path) -> Result<Vec<PathBuf>> {
-        let data_sources = self.data_sources()?;
+        let data_sources = self.data_sources().await?.unwrap_or_default();
         // Upstream guard (base.py:435): a node backed by anything other than
         // exactly one data source is refused (0 or >1 both hit this).
         if data_sources.len() != 1 {
@@ -453,7 +476,7 @@ impl BaseClient {
         let manifest_link = self.asset_manifest_link()?;
         let bytes_link = self.asset_bytes_link()?;
         let mut written = Vec::new();
-        for ds in data_sources {
+        for ds in &data_sources {
             // Single asset → files land directly in `dest_dir`; several assets →
             // namespace each by its id (base.py:444-451).
             let namespace_by_id = ds.assets.len() != 1;
@@ -508,6 +531,15 @@ pub struct AssetEntry {
 struct ManifestBody {
     #[serde(default)]
     manifest: Vec<String>,
+}
+
+/// Wire shape of a `/metadata/.../{path}` response envelope — its `data` field
+/// is the node [`Item`]. Decoded by [`BaseClient::data_sources`] when lazily
+/// re-fetching the node with `include_data_sources=true`. Mirrors the private
+/// envelope the constructors and container client decode for the same GET.
+#[derive(Debug, Deserialize)]
+struct ResourceEnvelope {
+    data: Option<Item>,
 }
 
 /// An asset's database id, or [`ClientError::Invalid`] when it is absent (the

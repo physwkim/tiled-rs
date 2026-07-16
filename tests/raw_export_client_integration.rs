@@ -277,14 +277,17 @@ async fn raw_export_refuses_multiple_data_sources() {
 }
 
 #[tokio::test]
-async fn asset_accessors_error_without_include_data_sources() {
-    // A client built without include_data_sources carries no data sources, so
-    // the backing asset ids are unavailable — asset_manifest and raw_export must
-    // refuse rather than silently treat the node as asset-less.
+async fn asset_accessors_lazily_fetch_without_include_data_sources() {
+    // Client gap #8: a client built WITHOUT include_data_sources no longer
+    // errors on the asset accessors — `data_sources()` lazily re-fetches the
+    // node's own URI with `?include_data_sources=true` (upstream base.py:299 +
+    // :307), so the backing asset ids arrive and the accessors succeed, matching
+    // upstream's `self.include_data_sources().data_sources()`.
     let (base, cat, _db) = spawn_catalog_server().await;
     let filedir = tempfile::tempdir().unwrap();
-    let file = filedir.path().join("data.bin");
-    std::fs::write(&file, b"x").unwrap();
+    let file = filedir.path().join("scan.h5");
+    let payload = b"lazy-asset-bytes";
+    std::fs::write(&file, payload).unwrap();
     add_asset(&cat, "frame", &file_uri(&file), false).await;
 
     // Plain from_uri → include_data_sources defaults to false.
@@ -292,16 +295,102 @@ async fn asset_accessors_error_without_include_data_sources() {
     let node = root.get("frame").await.unwrap();
     let base_client = node.base().unwrap();
 
-    let manifest_err = base_client.asset_manifest().await.unwrap_err();
+    // asset_manifest succeeds via the lazy re-fetch: one single-file asset,
+    // carrying a server-assigned id, mapping to no directory manifest.
+    let manifest = base_client
+        .asset_manifest()
+        .await
+        .expect("asset_manifest must lazily fetch data sources");
+    assert_eq!(manifest.len(), 1);
     assert!(
-        matches!(&manifest_err, ClientError::Invalid(m) if m.contains("include_data_sources")),
-        "asset_manifest without data sources must point at include_data_sources, got {manifest_err:?}"
+        manifest[0].asset_id.is_some(),
+        "the lazily-fetched asset must carry its server-assigned id"
+    );
+    assert_eq!(manifest[0].relative_paths, None);
+
+    // raw_export likewise succeeds and writes the file's bytes.
+    let dest = tempfile::tempdir().unwrap();
+    let written = base_client
+        .raw_export(dest.path())
+        .await
+        .expect("raw_export must lazily fetch data sources");
+    let expected = dest.path().join("scan.h5");
+    assert_eq!(written, vec![expected.clone()]);
+    assert_eq!(std::fs::read(&expected).unwrap(), payload);
+}
+
+#[tokio::test]
+async fn data_sources_lazily_populates_asset_ids_and_matches_eager() {
+    // Client gap #8, the accessor itself: `BaseClient::data_sources()` returns
+    // the node's data sources with populated asset ids whether or not the client
+    // was built with include_data_sources — lazily re-fetching when it was not.
+    let (base, cat, _db) = spawn_catalog_server().await;
+    let filedir = tempfile::tempdir().unwrap();
+    let file = filedir.path().join("data.bin");
+    std::fs::write(&file, b"x").unwrap();
+    add_asset(&cat, "frame", &file_uri(&file), false).await;
+
+    // Eager client (flag set at construction): sources are already attached.
+    let eager = node_base(&base, "frame").await;
+    let eager_sources = eager
+        .data_sources()
+        .await
+        .expect("eager data_sources")
+        .expect("node has data sources");
+    assert_eq!(eager_sources.len(), 1);
+    assert_eq!(eager_sources[0].assets.len(), 1);
+    let eager_id = eager_sources[0].assets[0]
+        .id
+        .expect("eager asset carries an id");
+
+    // Lazy client (flag absent): data_sources() must re-fetch and surface the
+    // same source, with the same server-assigned asset id.
+    let root = from_uri(&base).await.unwrap().into_container().unwrap();
+    let lazy = root.get("frame").await.unwrap().base().unwrap().clone();
+    let lazy_sources = lazy
+        .data_sources()
+        .await
+        .expect("lazy data_sources must re-fetch, not error")
+        .expect("re-fetched node has data sources");
+    assert_eq!(lazy_sources.len(), 1);
+    assert_eq!(lazy_sources[0].assets.len(), 1);
+    assert_eq!(
+        lazy_sources[0].assets[0].id,
+        Some(eager_id),
+        "the lazily-fetched asset id must match the eager fetch"
+    );
+}
+
+#[tokio::test]
+async fn data_sources_none_for_node_without_sources() {
+    // A container node carries no data sources; data_sources() returns Ok(None)
+    // (upstream returns None for a missing `data_sources` attribute), both eager
+    // and lazy — never an error.
+    let (base, _cat, _db) = spawn_catalog_server().await;
+
+    // The root container itself has no data sources. Lazy path (from_uri).
+    let root_lazy = from_uri(&base).await.unwrap();
+    let lazy_base = root_lazy.base().unwrap();
+    assert_eq!(
+        lazy_base
+            .data_sources()
+            .await
+            .expect("lazy root data_sources"),
+        None,
+        "a container node reports no data sources (lazy)"
     );
 
-    let dest = tempfile::tempdir().unwrap();
-    let export_err = base_client.raw_export(dest.path()).await.unwrap_err();
-    assert!(
-        matches!(&export_err, ClientError::Invalid(m) if m.contains("include_data_sources")),
-        "raw_export without data sources must point at include_data_sources, got {export_err:?}"
+    // Eager path (flag set): same answer, no re-fetch.
+    let root_eager = from_uri_with_options(&base, ContextOptions::default(), true)
+        .await
+        .unwrap();
+    let eager_base = root_eager.base().unwrap();
+    assert_eq!(
+        eager_base
+            .data_sources()
+            .await
+            .expect("eager root data_sources"),
+        None,
+        "a container node reports no data sources (eager)"
     );
 }
