@@ -87,7 +87,6 @@ fix problems in code we never wrote.
 
 | PR | Title | Reason |
 |----|-------|--------|
-| #1314 | External-array shape race during streaming | Race between SWMR/zarr writer + cached reader metadata. Complex to fix deterministically. |
 | #1320 | Postgres `nodes` parent_id index | We have the index; production-scale planner tuning is the actual issue. |
 | #588  | btree_gin (vs plain GIN) | We have plain GIN over jsonb; btree_gin only helps hybrid btree+gin queries. |
 | #1271 | Preemptive reshape | Our HDF5 reads `ds.shape()` directly; can't diverge by design. |
@@ -97,7 +96,26 @@ Resolved out of Deferred: #1096 (ported, see above); #1378 (confirmed
 correct — single-row json-seq framing covered by a unit + HTTP smoke
 test, b07dde3, no code change); #802 zarrs write side (implemented in
 `zarr_adapter.rs` — `write`/`write_block`/`append`/`patch` over
-`store_array_subset`/`set_shape`, with integration tests).
+`store_array_subset`/`set_shape`, with integration tests); #1314
+(reclassified **N/A — structurally absent**, no code change). #1314 is
+an *open upstream issue* (not a merged PR; upstream HEAD `da03df0f`) with
+no fix to port: its 500 is `force_reshape(self._array,
+self._structure.shape)` (`tiled/adapters/array.py`, commit `92c890d4`
+"#1271") reconciling a DB-cached `structure.shape` against a live
+external file a SWMR/zarr writer is growing — any element-count mismatch
+raises `ValueError` (`tiled/adapters/utils.py`, same commit). This port
+has no such reconciliation: every read resolves a *fresh* leaf adapter
+(`FileLeafResolver::resolve`, `src/server/file_resolver.rs:214`) whose
+`from_path` reads the shape from the same live file the read then draws
+from (`src/adapters/hdf5_adapter.rs:147` builds `structure.shape`, `:671`
+feeds it to `read_hdf5_slice`; `src/adapters/zarr_adapter.rs:69` +
+`:159`), and metadata is served from that same fresh adapter
+(`adapter.structure_json()`, `src/server/core.rs:117`) — structure and
+data come from one file open, so no cross-source mismatch can be
+constructed. The DB `ds.structure` is never fed to the HDF5/zarr read
+path (only the ragged-SQL branch forwards it, `file_resolver.rs:178`).
+Same structural reason as #1271 below: our external-array reads take
+`ds.shape()`/`array.shape()` directly and can't diverge by design.
 
 ## N/A (Python-specific or feature not in our port)
 
