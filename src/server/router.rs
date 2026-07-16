@@ -1090,6 +1090,184 @@ fn dyn_ndarray_to_arrow(
     }
 }
 
+/// Deserialize an Arrow IPC file carrying a COO sparse table into a `SparseData`
+/// — the inverse of [`build_sparse_response`]'s encode, and the server side of
+/// Python `client/sparse.py::write`/`write_block` (client/sparse.py:107), which
+/// builds a DataFrame of columns `dim0`…`dim{ndim-1}` (integer indices) plus
+/// `data` (the non-zero values) and PUTs it as Arrow IPC. Coordinate columns are
+/// normalized to int64-LE — the on-disk parquet coord type
+/// (serialization/sparse_blocks_parquet.py:26) the write face reads back via
+/// `coord_dyn_to_i64_vec` — while the `data` column keeps its native width
+/// (Float64/Float32/Int64/Int32, the set the sparse parquet writer supports).
+fn deserialize_sparse_coo(
+    body: &[u8],
+    ndim: usize,
+) -> Result<crate::core::adapters::SparseData, ServerError> {
+    use crate::core::dtype::{BuiltinDType, DynNDArray, Endianness, Kind};
+
+    let cursor = std::io::Cursor::new(body.to_vec());
+    let reader = arrow::ipc::reader::FileReader::try_new(cursor, None).map_err(|e| {
+        ServerError::Validation(format!(
+            "sparse write: body is not a valid Arrow IPC file: {e}"
+        ))
+    })?;
+
+    // One growing i64 index vector per axis, plus the value column's raw
+    // little-endian bytes and its (batch-invariant) dtype.
+    let mut coord_i64: Vec<Vec<i64>> = (0..ndim).map(|_| Vec::new()).collect();
+    let mut data_bytes: Vec<u8> = Vec::new();
+    let mut data_dtype: Option<BuiltinDType> = None;
+
+    for batch_result in reader {
+        let batch = batch_result.map_err(|e| {
+            ServerError::Validation(format!("sparse write: Arrow batch decode error: {e}"))
+        })?;
+        for (i, buf) in coord_i64.iter_mut().enumerate() {
+            let name = format!("dim{i}");
+            let col = batch.column_by_name(&name).ok_or_else(|| {
+                ServerError::Validation(format!("sparse write: missing column '{name}'"))
+            })?;
+            buf.extend(sparse_coord_col_to_i64(col.as_ref(), &name)?);
+        }
+        let data_col = batch
+            .column_by_name("data")
+            .ok_or_else(|| ServerError::Validation("sparse write: missing column 'data'".into()))?;
+        let (dtype, mut bytes) = sparse_data_col_to_le_bytes(data_col.as_ref())?;
+        match &data_dtype {
+            Some(prev) if *prev != dtype => {
+                return Err(ServerError::Validation(
+                    "sparse write: 'data' column dtype changed between Arrow batches".into(),
+                ));
+            }
+            _ => data_dtype = Some(dtype),
+        }
+        data_bytes.append(&mut bytes);
+    }
+
+    let data_dtype = data_dtype.ok_or_else(|| {
+        ServerError::Validation("sparse write: Arrow IPC body has no record batches".into())
+    })?;
+    let nnz = data_bytes.len() / data_dtype.element_size();
+
+    let i64_dtype = BuiltinDType::new(Endianness::Little, Kind::Integer, 8);
+    let coords: Vec<DynNDArray> = coord_i64
+        .into_iter()
+        .map(|c| {
+            let bytes: Vec<u8> = c.iter().flat_map(|v| v.to_le_bytes()).collect();
+            DynNDArray::new(bytes::Bytes::from(bytes), i64_dtype.clone(), vec![nnz])
+        })
+        .collect();
+    let data = DynNDArray::new(bytes::Bytes::from(data_bytes), data_dtype, vec![nnz]);
+    Ok(crate::core::adapters::SparseData { coords, data })
+}
+
+/// Reject a sparse write whose value column dtype differs from the node's
+/// declared `data_type`.
+///
+/// The read path (`SparseBlocksParquetAdapter::to_sparse_data`) sizes `nnz` and
+/// labels the returned values with the *structure's* declared dtype, while the
+/// parquet stores whatever dtype was written. So a write that stored, say,
+/// float32 values into a float64-declared node would be misread on GET (wrong
+/// element size → wrong `nnz` and reinterpreted bytes). The typed client always
+/// sends the declared dtype; this guards the raw Arrow PUT entry point, turning
+/// silent corruption into a clear 422 at the write boundary.
+fn ensure_sparse_data_dtype(
+    structure: &crate::core::structures::SparseStructure,
+    data: &crate::core::adapters::SparseData,
+) -> Result<(), ServerError> {
+    if let Some(crate::core::dtype::DType::Builtin(declared)) = &structure.data_type
+        && *declared != data.data.dtype
+    {
+        return Err(ServerError::Validation(format!(
+            "sparse write: value dtype {:?} does not match the node's declared \
+             data_type {:?}; the stored values would be misread on read",
+            data.data.dtype, declared
+        )));
+    }
+    Ok(())
+}
+
+/// Read a COO coordinate column (any integer width) as `i64`, the on-disk coord
+/// type. Mirrors the client-side `col_to_i64` so a GET→PUT round-trip of the
+/// same table is lossless.
+fn sparse_coord_col_to_i64(
+    col: &dyn arrow::array::Array,
+    name: &str,
+) -> Result<Vec<i64>, ServerError> {
+    use arrow::array::{
+        Int8Array, Int16Array, Int32Array, Int64Array, UInt8Array, UInt16Array, UInt32Array,
+        UInt64Array,
+    };
+    use arrow::datatypes::DataType;
+    macro_rules! ints {
+        ($arr:ty) => {
+            col.as_any()
+                .downcast_ref::<$arr>()
+                .unwrap()
+                .values()
+                .iter()
+                .map(|&v| v as i64)
+                .collect()
+        };
+    }
+    let out: Vec<i64> = match col.data_type() {
+        DataType::Int64 => col
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .values()
+            .to_vec(),
+        DataType::Int32 => ints!(Int32Array),
+        DataType::Int16 => ints!(Int16Array),
+        DataType::Int8 => ints!(Int8Array),
+        DataType::UInt64 => ints!(UInt64Array),
+        DataType::UInt32 => ints!(UInt32Array),
+        DataType::UInt16 => ints!(UInt16Array),
+        DataType::UInt8 => ints!(UInt8Array),
+        other => {
+            return Err(ServerError::Validation(format!(
+                "sparse write: column '{name}' has non-integer type {other:?} for COO coordinates"
+            )));
+        }
+    };
+    Ok(out)
+}
+
+/// Read the COO `data` column as raw little-endian element bytes, preserving its
+/// native dtype. Restricted to the value dtypes the sparse parquet writer stores
+/// (Float64/Float32/Int64/Int32) so a rejected type fails here at the boundary
+/// rather than deep in the encoder.
+fn sparse_data_col_to_le_bytes(
+    col: &dyn arrow::array::Array,
+) -> Result<(crate::core::dtype::BuiltinDType, Vec<u8>), ServerError> {
+    use crate::core::dtype::{BuiltinDType, Endianness, Kind};
+    use arrow::array::{Float32Array, Float64Array, Int32Array, Int64Array};
+    use arrow::datatypes::DataType;
+    macro_rules! le {
+        ($arr:ty, $kind:expr, $size:expr) => {{
+            let bytes: Vec<u8> = col
+                .as_any()
+                .downcast_ref::<$arr>()
+                .unwrap()
+                .values()
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
+            Ok((BuiltinDType::new(Endianness::Little, $kind, $size), bytes))
+        }};
+    }
+    match col.data_type() {
+        DataType::Float64 => le!(Float64Array, Kind::Float, 8),
+        DataType::Float32 => le!(Float32Array, Kind::Float, 4),
+        DataType::Int64 => le!(Int64Array, Kind::Integer, 8),
+        DataType::Int32 => le!(Int32Array, Kind::Integer, 4),
+        other => Err(ServerError::Validation(format!(
+            "sparse write: 'data' column has unsupported type {other:?} \
+             (supported: float64, float32, int64, int32)"
+        ))),
+    }
+}
+
 // Shared by the sparse branches of `array_block` and `array_full`: encode a
 // `SparseData` (COO coordinates + values) as a table with columns
 // `dim0..dim{ndim-1}` and `data`, then route it through the serialization
@@ -1681,6 +1859,33 @@ pub async fn array_full_put(
     .await?;
 
     let adapter = core::walk_tree(state.root_tree.as_ref(), &segments).await?;
+
+    // Sparse (COO) leaf: the PUT body is an Arrow IPC COO table, not a dense
+    // C-order buffer, so it deserializes through `deserialize_sparse_coo` and
+    // writes through the sparse write face. Mirrors upstream `put_array_full`
+    // accepting both array and sparse families (router.py:2018): dense reuse of
+    // the array path below would misread the Arrow bytes as a raw element buffer.
+    if let Some(sparse) = adapter.as_sparse_arc() {
+        let writable = sparse.as_writable().ok_or_else(|| {
+            ServerError::MethodNotAllowed(
+                "this sparse node is not writable; only internally-managed sparse \
+                 arrays under the server's writable storage accept writes"
+                    .into(),
+            )
+        })?;
+        let ndim = sparse.structure().shape.len();
+        let data = deserialize_sparse_coo(&body, ndim)?;
+        ensure_sparse_data_dtype(sparse.structure(), &data)?;
+        writable.write(data).await.map_err(ServerError::from)?;
+
+        let path = segments.join("/");
+        state.streaming_bus.publish(
+            &path,
+            crate::server::streaming::UpdateKind::DataAppended { partition: None },
+        );
+        return Ok(Json(serde_json::json!({ "ok": true })));
+    }
+
     let array_adapter: Arc<dyn crate::core::adapters::ArrayAdapterRead> =
         adapter.as_array_arc().ok_or_else(|| {
             ServerError::WrongType(format!("'{}' is not an array", segments.join("/")))
@@ -1726,6 +1931,38 @@ pub async fn array_full_put(
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
+/// Parse the `?block=i,j,…` query parameter into one chunk index per axis.
+/// Empty defaults to the origin chunk `[0,…]`. Shared by the array and sparse
+/// PUT-block handlers: `?block=` addresses exactly one chunk (a single index per
+/// axis, no ranges), so the arity must equal the node's dimensionality.
+fn parse_block_param(
+    params: &HashMap<String, String>,
+    ndim: usize,
+) -> Result<Vec<usize>, ServerError> {
+    let block_str = params.get("block").map(|s| s.as_str()).unwrap_or("");
+    let block: Vec<usize> = if block_str.is_empty() {
+        vec![0usize; ndim]
+    } else {
+        block_str
+            .split(',')
+            .map(|s| {
+                s.trim().parse::<usize>().map_err(|_| {
+                    ServerError::Validation(format!(
+                        "block index must be a non-negative integer, got '{s}'"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    if block.len() != ndim {
+        return Err(ServerError::Validation(format!(
+            "block has {} indices but the array is {ndim}-dimensional",
+            block.len()
+        )));
+    }
+    Ok(block)
+}
+
 // ---------------------------------------------------------------------------
 // PUT /api/v1/array/block/{*path} — overwrite a single chunk
 // ---------------------------------------------------------------------------
@@ -1753,6 +1990,36 @@ pub async fn array_block_put(
     .await?;
 
     let adapter = core::walk_tree(state.root_tree.as_ref(), &segments).await?;
+
+    // Sparse (COO) leaf: one block's non-zeros arrive as an Arrow IPC COO table,
+    // not a dense chunk buffer. Deserialize and route to the sparse write face's
+    // `write_block`. Mirrors upstream `put_array_block` accepting {array, sparse}
+    // (router.py); the dense chunk-shape / body-length checks below do not apply
+    // to a variable-`nnz` COO block.
+    if let Some(sparse) = adapter.as_sparse_arc() {
+        let writable = sparse.as_writable().ok_or_else(|| {
+            ServerError::MethodNotAllowed(
+                "this sparse node is not writable; only internally-managed sparse \
+                 arrays under the server's writable storage accept writes"
+                    .into(),
+            )
+        })?;
+        let block = parse_block_param(&params, sparse.structure().shape.len())?;
+        let data = deserialize_sparse_coo(&body, block.len())?;
+        ensure_sparse_data_dtype(sparse.structure(), &data)?;
+        writable
+            .write_block(data, &block)
+            .await
+            .map_err(ServerError::from)?;
+
+        let path = segments.join("/");
+        state.streaming_bus.publish(
+            &path,
+            crate::server::streaming::UpdateKind::DataAppended { partition: None },
+        );
+        return Ok(Json(serde_json::json!({ "ok": true })));
+    }
+
     let array_adapter: Arc<dyn crate::core::adapters::ArrayAdapterRead> =
         adapter.as_array_arc().ok_or_else(|| {
             ServerError::WrongType(format!("'{}' is not an array", segments.join("/")))
@@ -1778,27 +2045,7 @@ pub async fn array_block_put(
 
     // `?block=` is one index per axis (no ranges: a write targets exactly one
     // chunk). Empty defaults to the origin chunk.
-    let block_str = params.get("block").map(|s| s.as_str()).unwrap_or("");
-    let block: Vec<usize> = if block_str.is_empty() {
-        vec![0usize; ndim]
-    } else {
-        block_str
-            .split(',')
-            .map(|s| {
-                s.trim().parse::<usize>().map_err(|_| {
-                    ServerError::Validation(format!(
-                        "block index must be a non-negative integer, got '{s}'"
-                    ))
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?
-    };
-    if block.len() != ndim {
-        return Err(ServerError::Validation(format!(
-            "block has {} indices but the array is {ndim}-dimensional",
-            block.len()
-        )));
-    }
+    let block = parse_block_param(&params, ndim)?;
 
     // The addressed chunk's shape comes from the structure's chunk grid; the
     // body must hold exactly that many elements.
@@ -7037,5 +7284,127 @@ mod sparse_response_tests {
             vec![1],
         );
         assert!(dyn_ndarray_to_arrow(&weird).is_err());
+    }
+
+    /// Encode named columns as an Arrow IPC file — the inverse of what
+    /// `deserialize_sparse_coo` reads.
+    fn build_coo_ipc(columns: Vec<(&str, arrow::array::ArrayRef)>) -> Vec<u8> {
+        use arrow::datatypes::{Field, Schema};
+        let fields: Vec<Field> = columns
+            .iter()
+            .map(|(n, c)| Field::new(*n, c.data_type().clone(), false))
+            .collect();
+        let schema = Arc::new(Schema::new(fields));
+        let arrays: Vec<arrow::array::ArrayRef> = columns.into_iter().map(|(_, c)| c).collect();
+        let batch = arrow::array::RecordBatch::try_new(Arc::clone(&schema), arrays).unwrap();
+        let mut buf = Vec::new();
+        {
+            let mut w = arrow::ipc::writer::FileWriter::try_new(&mut buf, &schema).unwrap();
+            w.write(&batch).unwrap();
+            w.finish().unwrap();
+        }
+        buf
+    }
+
+    fn decode_i64(arr: &DynNDArray) -> Vec<i64> {
+        arr.data
+            .chunks_exact(8)
+            .map(|b| i64::from_le_bytes(b.try_into().unwrap()))
+            .collect()
+    }
+
+    fn decode_f64(arr: &DynNDArray) -> Vec<f64> {
+        arr.data
+            .chunks_exact(8)
+            .map(|b| f64::from_le_bytes(b.try_into().unwrap()))
+            .collect()
+    }
+
+    /// COO round-trip: `dim{i}` columns of mixed integer width normalize to
+    /// int64-LE, the `data` column keeps its float64 dtype, and every value
+    /// survives.
+    #[test]
+    fn deserialize_sparse_coo_roundtrips_and_normalizes_coords() {
+        use arrow::array::{Float64Array, Int32Array, Int64Array};
+        // dim0 as Int64, dim1 as narrow Int32 — both must land as int64-LE.
+        let body = build_coo_ipc(vec![
+            ("dim0", Arc::new(Int64Array::from(vec![0i64, 2])) as _),
+            ("dim1", Arc::new(Int32Array::from(vec![1i32, 0])) as _),
+            ("data", Arc::new(Float64Array::from(vec![1.5f64, 3.7])) as _),
+        ]);
+        let sd = deserialize_sparse_coo(&body, 2).unwrap();
+        assert_eq!(sd.coords.len(), 2);
+        for c in &sd.coords {
+            assert_eq!(c.dtype.kind, Kind::Integer);
+            assert_eq!(c.dtype.element_size(), 8);
+        }
+        assert_eq!(decode_i64(&sd.coords[0]), vec![0, 2]);
+        assert_eq!(decode_i64(&sd.coords[1]), vec![1, 0]);
+        assert_eq!(sd.data.dtype.kind, Kind::Float);
+        assert_eq!(sd.data.dtype.element_size(), 8);
+        assert_eq!(decode_f64(&sd.data), vec![1.5, 3.7]);
+    }
+
+    /// A `data` column dtype outside the sparse parquet writer's set
+    /// (float64/float32/int64/int32) is rejected at the deserialize boundary.
+    #[test]
+    fn deserialize_sparse_coo_rejects_unsupported_data_dtype() {
+        use arrow::array::{Int64Array, UInt64Array};
+        let body = build_coo_ipc(vec![
+            ("dim0", Arc::new(Int64Array::from(vec![0i64])) as _),
+            ("data", Arc::new(UInt64Array::from(vec![5u64])) as _),
+        ]);
+        assert!(deserialize_sparse_coo(&body, 1).is_err());
+    }
+
+    /// A body missing a required `dim{i}` column for the node's dimensionality
+    /// is a client error, not a panic.
+    #[test]
+    fn deserialize_sparse_coo_rejects_missing_dim_column() {
+        use arrow::array::{Float64Array, Int64Array};
+        // ndim=2 but only dim0 present.
+        let body = build_coo_ipc(vec![
+            ("dim0", Arc::new(Int64Array::from(vec![0i64])) as _),
+            ("data", Arc::new(Float64Array::from(vec![1.5f64])) as _),
+        ]);
+        assert!(deserialize_sparse_coo(&body, 2).is_err());
+    }
+
+    /// A value dtype that differs from the node's declared `data_type` is
+    /// rejected — the read path would otherwise mis-size and reinterpret the
+    /// stored bytes. A matching dtype passes.
+    #[test]
+    fn ensure_sparse_data_dtype_rejects_mismatch_accepts_match() {
+        use crate::core::adapters::SparseData;
+        use crate::core::dtype::DType;
+        use crate::core::structures::SparseStructure;
+
+        let f64_dtype = BuiltinDType::new(Endianness::Little, Kind::Float, 8);
+        let f32_dtype = BuiltinDType::new(Endianness::Little, Kind::Float, 4);
+        let structure = SparseStructure {
+            chunks: vec![vec![1]],
+            shape: vec![1],
+            data_type: Some(DType::Builtin(f64_dtype.clone())),
+            ..Default::default()
+        };
+        let mk = |dt: BuiltinDType, bytes: Vec<u8>| SparseData {
+            coords: vec![DynNDArray::new(
+                bytes::Bytes::from(0i64.to_le_bytes().to_vec()),
+                BuiltinDType::new(Endianness::Little, Kind::Integer, 8),
+                vec![1],
+            )],
+            data: DynNDArray::new(bytes::Bytes::from(bytes), dt, vec![1]),
+        };
+        assert!(
+            ensure_sparse_data_dtype(
+                &structure,
+                &mk(f64_dtype.clone(), 1.5f64.to_le_bytes().to_vec())
+            )
+            .is_ok()
+        );
+        assert!(
+            ensure_sparse_data_dtype(&structure, &mk(f32_dtype, 1.5f32.to_le_bytes().to_vec()))
+                .is_err()
+        );
     }
 }
