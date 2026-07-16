@@ -114,7 +114,7 @@ impl Context {
         Self::from_uri_with_options(uri, ContextOptions::default())
     }
 
-    /// Like [`from_uri`] but accepts options.
+    /// Like [`Self::from_uri`] but accepts options.
     pub fn from_uri_with_options(
         uri: &str,
         options: ContextOptions,

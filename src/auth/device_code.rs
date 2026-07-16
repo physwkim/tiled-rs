@@ -263,7 +263,7 @@ fn random_user_code(len: usize) -> String {
 /// Format a canonical `user_code` for display by inserting a single dash at
 /// the midpoint (e.g. `ABCDEFGH-JKMNPQRS`). Purely cosmetic — the dash and
 /// case are stripped again at the approval boundary by
-/// [`normalize_user_code`]. The code is ASCII, so midpoint byte-slicing is
+/// `normalize_user_code`. The code is ASCII, so midpoint byte-slicing is
 /// safe.
 pub fn format_user_code(code: &str) -> String {
     let mid = code.len() / 2;

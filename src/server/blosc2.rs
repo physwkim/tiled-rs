@@ -47,7 +47,7 @@ pub(crate) fn compress(src: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
-/// Decompress a blosc2 chunk produced by [`compress`] (or Python's
+/// Decompress a blosc2 chunk produced by `compress` (or Python's
 /// `blosc2.compress()`).  Returns an error string on failure.
 pub fn decompress(src: &[u8]) -> Result<Vec<u8>, String> {
     let (nbytes, _, _) =

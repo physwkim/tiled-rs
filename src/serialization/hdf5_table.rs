@@ -18,7 +18,7 @@
 //! h5py cannot store (nested object, null, mixed-kind or `null`-bearing array, or
 //! a ragged nested array) fails the export, the same fail-fast as Python's
 //! `except TypeError: raise SerializationError` (see
-//! [`crate::serialization::hdf5_common::write_file_attrs`]). Output is a
+//! `crate::serialization::hdf5_common::write_file_attrs`). Output is a
 //! self-contained `.h5` file; like [`crate::serialization::hdf5_array`], `rust-hdf5` only writes
 //! through a file path, so we round-trip through a temp file.
 //!

@@ -624,7 +624,7 @@ impl ExternalOidcValidator {
 
     /// Exchange an authorization code obtained via the IdP-brokered **device**
     /// flow for tokens, validate the id_token (no nonce — see
-    /// [`Self::validate_id_token`]), and return the principal identity plus OBO
+    /// `Self::validate_id_token`), and return the principal identity plus OBO
     /// session state. Mirrors Python `OIDCAuthenticator.authenticate`
     /// (authenticators.py:222) as used by the device-code submit route.
     ///

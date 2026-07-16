@@ -207,7 +207,7 @@ impl ScopeSet {
 
     /// Set intersection used as the scope cap/subset primitive. Because no
     /// operand can be a bare `{Admin}` (canonicalized to full on
-    /// construction), this literal intersection agrees with [`contains`].
+    /// construction), this literal intersection agrees with [`Self::contains`].
     pub fn intersect(&self, other: &Self) -> Self {
         Self(self.0.intersection(&other.0).copied().collect())
     }
