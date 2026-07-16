@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 
-use arrow::array::{BooleanArray, Float64Array, Int64Array, RecordBatch};
+use arrow::array::{BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::writer::FileWriter;
 use axum::body::Body;
@@ -58,11 +58,19 @@ fn build_app() -> (axum::Router, tempfile::TempDir) {
     write_partition(&p1, vec![3], vec![Some(3.5)], vec![true]);
 
     let table = ArrowIpcAdapter::from_paths(vec![p0, p1], serde_json::json!({})).unwrap();
-    let mut mapping = IndexMap::new();
-    mapping.insert("some_table".to_string(), AnyAdapter::Table(Arc::new(table)));
-    let root: Arc<dyn ContainerAdapter> =
-        Arc::new(MapAdapter::new(mapping, serde_json::json!({}), vec![]));
+    let root = single_table_root("some_table", AnyAdapter::Table(Arc::new(table)));
+    (app_for_root(root), dir)
+}
 
+/// Wrap one table under a `MapAdapter` root keyed by `name`.
+fn single_table_root(name: &str, table: AnyAdapter) -> Arc<dyn ContainerAdapter> {
+    let mut mapping = IndexMap::new();
+    mapping.insert(name.to_string(), table);
+    Arc::new(MapAdapter::new(mapping, serde_json::json!({}), vec![]))
+}
+
+/// Build the HTTP app over a given root tree (all AppState knobs at defaults).
+fn app_for_root(root: Arc<dyn ContainerAdapter>) -> axum::Router {
     let registry = Arc::new(tiled_rs::serialization::default_registry());
     let state = tiled_rs::server::AppState {
         root_tree: root,
@@ -95,7 +103,48 @@ fn build_app() -> (axum::Router, tempfile::TempDir) {
         exact_count_limit: u64::MAX,
         background_tasks: tiled_rs::server::state::BackgroundTasks::new(),
     };
-    (tiled_rs::server::build_app(state), dir)
+    tiled_rs::server::build_app(state)
+}
+
+/// Write one Arrow IPC file holding a single nullable Utf8 column `name`.
+fn write_string_partition(path: &std::path::Path, names: Vec<Option<&str>>) {
+    let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, true)]));
+    let batch =
+        RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(names))]).unwrap();
+    let f = std::fs::File::create(path).unwrap();
+    let mut w = FileWriter::try_new(f, &schema).unwrap();
+    w.write(&batch).unwrap();
+    w.finish().unwrap();
+}
+
+/// App whose root holds a two-partition table `str_table` with one nullable
+/// string column `name`: rows `["al", null]` then `["charlie"]`. The longest
+/// value ("charlie", 7 chars) lives in the SECOND partition, and the null
+/// renders as the literal "None".
+fn build_string_app() -> (axum::Router, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let p0 = dir.path().join("s0.arrow");
+    let p1 = dir.path().join("s1.arrow");
+    write_string_partition(&p0, vec![Some("al"), None]);
+    write_string_partition(&p1, vec![Some("charlie")]);
+
+    let table = ArrowIpcAdapter::from_paths(vec![p0, p1], serde_json::json!({})).unwrap();
+    let root = single_table_root("str_table", AnyAdapter::Table(Arc::new(table)));
+    (app_for_root(root), dir)
+}
+
+/// Decode a fixed-width UTF-32-LE `<U` buffer into per-row Strings.
+fn utf32_rows(bytes: &[u8], itemsize: usize) -> Vec<String> {
+    bytes
+        .chunks_exact(itemsize)
+        .map(|cell| {
+            cell.chunks_exact(4)
+                .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                .take_while(|&cp| cp != 0)
+                .filter_map(char::from_u32)
+                .collect::<String>()
+        })
+        .collect()
 }
 
 async fn get(app: &axum::Router, uri: &str) -> (StatusCode, Vec<u8>) {
@@ -297,4 +346,88 @@ async fn zarr_v3_missing_column_is_404() {
     let (app, _dir) = build_app();
     let (status, _) = get(&app, "/zarr/v3/some_table/nope/zarr.json").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// ---------------------------------------------------------------------------
+// string columns (Utf8 → fixed-width UTF-32-LE `<U{n}`)
+//
+// Parity: upstream coerces an object/string column to a numpy `<U` array via
+// `numpy.array([str(x) for x in array])` (adapters/array.py:73-78; null → the
+// literal "None"). The fixed width is the longest value over the WHOLE
+// concatenated column, so here "charlie" (7 chars) in the second partition sets
+// `<U7` (itemsize 28), even though partition 0's longest is only 2 chars.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn metadata_of_string_column_is_fixed_width_unicode() {
+    let (app, _dir) = build_string_app();
+
+    let (status, body) = get_json(&app, "/api/v1/metadata/str_table/name").await;
+    assert_eq!(status, StatusCode::OK);
+    let attrs = &body["data"]["attributes"];
+    assert_eq!(attrs["structure_family"], "array");
+    let structure = &attrs["structure"];
+    assert_eq!(structure["shape"], serde_json::json!([3]), "3 rows");
+    // `<U7`: unicode kind, itemsize = 4 * longest-char-count (7) = 28 bytes.
+    assert_eq!(structure["data_type"]["kind"], "U");
+    assert_eq!(
+        structure["data_type"]["itemsize"], 28,
+        "width is the longest value over ALL partitions (charlie=7 → 28)"
+    );
+}
+
+#[tokio::test]
+async fn array_full_of_string_column_octet_stream_roundtrip() {
+    let (app, _dir) = build_string_app();
+
+    let (status, body) = get(&app, "/api/v1/array/full/str_table/name").await;
+    assert_eq!(status, StatusCode::OK);
+    // 3 rows × 28 bytes (7 code points × 4) = 84 bytes.
+    assert_eq!(body.len(), 84, "3 rows × <U7 itemsize 28");
+    assert_eq!(
+        utf32_rows(&body, 28),
+        vec!["al".to_string(), "None".to_string(), "charlie".to_string()],
+        "null renders as the literal \"None\" (array.py:78)"
+    );
+}
+
+#[tokio::test]
+async fn csv_of_string_column_renders_cell_text() {
+    let (app, _dir) = build_string_app();
+
+    let (status, body) = get(&app, "/api/v1/array/full/str_table/name?format=text/csv").await;
+    assert_eq!(status, StatusCode::OK);
+    // 1-D array → one cell per line, no trailing newline; null → "None".
+    assert_eq!(String::from_utf8(body).unwrap(), "al\nNone\ncharlie");
+}
+
+#[tokio::test]
+async fn zarr_v2_string_column_zarray_and_chunk() {
+    let (app, _dir) = build_string_app();
+
+    // The column resolves to a zarr v2 array whose dtype is the numpy `<U7`.
+    let (status, doc) = get_json(&app, "/zarr/v2/str_table/name/.zarray").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(doc["zarr_format"], 2);
+    assert_eq!(doc["dtype"], "<U7");
+    assert_eq!(doc["shape"], serde_json::json!([3]));
+    assert_eq!(doc["chunks"], serde_json::json!([3]));
+
+    // Its chunk bytes decode back to the padded string cells.
+    let (status, chunk) = get(&app, "/zarr/v2/str_table/name/0").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(chunk.len(), 84);
+    assert_eq!(
+        utf32_rows(&chunk, 28),
+        vec!["al".to_string(), "None".to_string(), "charlie".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn zarr_v3_string_column_is_422() {
+    // Parity ceiling: zarr v3 has no fixed-width unicode data type, so upstream
+    // (and this port) reject a string column with 422 rather than inventing one.
+    let (app, _dir) = build_string_app();
+    let (status, _) = get(&app, "/zarr/v3/str_table/name/zarr.json").await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
 }

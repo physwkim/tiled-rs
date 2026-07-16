@@ -118,20 +118,34 @@ async fn table_column_as_array(
 /// Convert a single-column [`ArrowTable`] (already projected to one column) into
 /// a numpy little-endian byte buffer, its [`BuiltinDType`], and the row count.
 ///
-/// The dtype comes from the Arrow schema field (so it is known even for a
-/// zero-row column); the bytes are the column concatenated across all
-/// partitions/batches in C order.
+/// For fixed-width types (numeric, boolean, temporal) the dtype comes from the
+/// Arrow schema field, so it is known even for a zero-row column; the bytes are
+/// the column concatenated across all partitions/batches in C order.
+///
+/// **Schema-only invariant is relaxed for strings.** A string column becomes
+/// numpy fixed-width unicode `<U{n}`, and `n` is the longest value's char count
+/// over the *concatenated* column — data the schema alone does not carry. So a
+/// string column is concatenated first and its dtype derived from the data (see
+/// [`arrow_string_column_to_numpy`]), unlike every other type here whose dtype
+/// is fixed by the schema field.
 fn arrow_column_to_numpy(
     table: &ArrowTable,
     column: &str,
 ) -> Result<(bytes::Bytes, BuiltinDType, usize), ServerError> {
     use arrow::array::Array;
+    use arrow::datatypes::DataType;
 
     let field = table.schema.field(0);
-    let dtype = arrow_datatype_to_builtin(field.data_type(), column)?;
-
     let arrays: Vec<&dyn Array> = table.batches.iter().map(|b| b.column(0).as_ref()).collect();
     let nrows: usize = arrays.iter().map(|a| a.len()).sum();
+
+    // Strings size their `<U{n}` dtype from the data, so branch before the
+    // schema-based dtype derivation and concat inside the string path.
+    if matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8) {
+        return arrow_string_column_to_numpy(&arrays, nrows, column);
+    }
+
+    let dtype = arrow_datatype_to_builtin(field.data_type(), column)?;
     if nrows == 0 {
         return Ok((bytes::Bytes::new(), dtype, 0));
     }
@@ -141,6 +155,85 @@ fn arrow_column_to_numpy(
         .map_err(|e| ServerError::Internal(format!("concat column '{column}': {e}")))?;
     let bytes = arrow_array_to_le_bytes(col.as_ref(), column)?;
     Ok((bytes::Bytes::from(bytes), dtype, nrows))
+}
+
+/// Materialize a string column as numpy fixed-width unicode `<U{n}` bytes.
+///
+/// Parity with upstream `ArrayAdapter.from_array` on a pandas object/string
+/// column: `numpy.array([str(x) for x in array])` (adapters/array.py:73-78),
+/// which yields a `<U{n}` array whose width `n` is the longest value's char
+/// count. numpy stores unicode as UCS4/UTF-32, so each element occupies `4 * n`
+/// bytes; each code point is emitted little-endian and rows shorter than `n` are
+/// right-padded with U+0000. A null renders as the literal string `"None"` —
+/// Python's `str(None)` (adapters/array.py:78) — not a masked or empty slot. An
+/// empty column has width 0 (`<U0`, an empty buffer).
+fn arrow_string_column_to_numpy(
+    arrays: &[&dyn arrow::array::Array],
+    nrows: usize,
+    column: &str,
+) -> Result<(bytes::Bytes, BuiltinDType, usize), ServerError> {
+    use arrow::array::{Array, LargeStringArray, StringArray};
+    use arrow::datatypes::DataType;
+
+    let downcast_err = |ty: &str| -> ServerError {
+        ServerError::Internal(format!("column '{column}': downcast to {ty} failed"))
+    };
+
+    // One `String` per row, nulls rendered as "None" (upstream `str(None)`).
+    let mut values: Vec<String> = Vec::with_capacity(nrows);
+    for arr in arrays {
+        match arr.data_type() {
+            DataType::Utf8 => {
+                let a = arr
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| downcast_err("StringArray"))?;
+                for i in 0..a.len() {
+                    values.push(if a.is_null(i) {
+                        "None".to_string()
+                    } else {
+                        a.value(i).to_string()
+                    });
+                }
+            }
+            DataType::LargeUtf8 => {
+                let a = arr
+                    .as_any()
+                    .downcast_ref::<LargeStringArray>()
+                    .ok_or_else(|| downcast_err("LargeStringArray"))?;
+                for i in 0..a.len() {
+                    values.push(if a.is_null(i) {
+                        "None".to_string()
+                    } else {
+                        a.value(i).to_string()
+                    });
+                }
+            }
+            other => {
+                return Err(ServerError::Internal(format!(
+                    "column '{column}': string path reached non-string type {other:?}"
+                )));
+            }
+        }
+    }
+
+    // Width = longest value's char count; numpy stores 4 bytes/char (UCS4).
+    let max_chars = values.iter().map(|s| s.chars().count()).max().unwrap_or(0);
+    let itemsize = max_chars * 4;
+    let mut out = Vec::with_capacity(nrows * itemsize);
+    for s in &values {
+        let mut chars = 0usize;
+        for ch in s.chars() {
+            out.extend_from_slice(&(ch as u32).to_le_bytes());
+            chars += 1;
+        }
+        // Right-pad the fixed-width cell with U+0000.
+        for _ in chars..max_chars {
+            out.extend_from_slice(&0u32.to_le_bytes());
+        }
+    }
+    let dtype = BuiltinDType::new(Endianness::Little, Kind::Unicode, itemsize);
+    Ok((bytes::Bytes::from(out), dtype, nrows))
 }
 
 /// Map an Arrow numeric/boolean [`arrow::datatypes::DataType`] to the numpy
@@ -466,7 +559,7 @@ fn resource_from_entry(entry: SearchEntry, child_path: &str, base_url: &str) -> 
 mod table_column_tests {
     use std::sync::Arc;
 
-    use arrow::array::{BooleanArray, Float64Array, Int64Array, RecordBatch};
+    use arrow::array::{BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray};
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use indexmap::IndexMap;
 
@@ -684,6 +777,84 @@ mod table_column_tests {
         assert!(data.is_empty());
         // dtype still comes from the schema field even with no rows.
         assert_eq!(dtype.to_numpy_str(), "<i8");
+    }
+
+    /// Decode a fixed-width UTF-32-LE `<U` buffer into per-row Strings, trimming
+    /// the trailing U+0000 pad numpy writes for values shorter than the width.
+    fn utf32_rows(bytes: &[u8], itemsize: usize) -> Vec<String> {
+        if itemsize == 0 {
+            return vec![];
+        }
+        bytes
+            .chunks_exact(itemsize)
+            .map(|cell| {
+                cell.chunks_exact(4)
+                    .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+                    .take_while(|&cp| cp != 0)
+                    .filter_map(char::from_u32)
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    /// Two-partition string table: `s` (non-null) whose longest value lives in
+    /// the SECOND partition, and `sn` (nullable) carrying one null.
+    fn string_table() -> InMemTable {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("s", DataType::Utf8, false),
+            Field::new("sn", DataType::Utf8, true),
+        ]));
+        let b0 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["a", "bb"])),
+                Arc::new(StringArray::from(vec![Some("x"), None])),
+            ],
+        )
+        .unwrap();
+        let b1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["cccc"])),
+                Arc::new(StringArray::from(vec![Some("y")])),
+            ],
+        )
+        .unwrap();
+        InMemTable::new(schema, vec![b0, b1])
+    }
+
+    #[tokio::test]
+    async fn column_string_is_fixed_width_unicode_over_all_partitions() {
+        let table = string_table();
+        let projected = table.read(Some(&["s".to_string()])).await.unwrap();
+        let (data, dtype, nrows) = arrow_column_to_numpy(&projected, "s").unwrap();
+        assert_eq!(nrows, 3);
+        // Width = longest value ("cccc", in partition 2) = 4 chars → `<U4`.
+        assert_eq!(dtype.to_numpy_str(), "<U4");
+        assert_eq!(dtype.element_size(), 16);
+        assert_eq!(utf32_rows(&data, 16), vec!["a", "bb", "cccc"]);
+    }
+
+    #[tokio::test]
+    async fn column_null_string_renders_as_none_literal() {
+        let table = string_table();
+        let projected = table.read(Some(&["sn".to_string()])).await.unwrap();
+        let (data, dtype, nrows) = arrow_column_to_numpy(&projected, "sn").unwrap();
+        assert_eq!(nrows, 3);
+        // The null becomes "None" (4 chars), the longest value → `<U4`.
+        assert_eq!(dtype.to_numpy_str(), "<U4");
+        assert_eq!(utf32_rows(&data, 16), vec!["x", "None", "y"]);
+    }
+
+    #[tokio::test]
+    async fn column_empty_string_is_u0() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8, false)]));
+        let table = InMemTable::new(schema, vec![]);
+        let projected = table.read(Some(&["s".to_string()])).await.unwrap();
+        let (data, dtype, nrows) = arrow_column_to_numpy(&projected, "s").unwrap();
+        assert_eq!(nrows, 0);
+        assert!(data.is_empty());
+        assert_eq!(dtype.to_numpy_str(), "<U0");
     }
 
     fn root_with_table() -> Arc<dyn ContainerAdapter> {
