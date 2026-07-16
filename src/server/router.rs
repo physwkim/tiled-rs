@@ -378,8 +378,14 @@ fn apply_select_metadata(
 /// every other section is set to `None` and dropped by `skip_serializing_if`.
 /// `ancestors` is always kept (an id-only `fields=""` resource still carries it,
 /// core.py:248). Recognized names: `metadata`, `structure_family`, `structure`,
-/// `specs`, `sorting`, `access_blob`, `data_sources`. `count` and the empty
-/// value (`none`) request no attribute section; unknown names are ignored.
+/// `specs`, `sorting`, `access_blob`. `count` and the empty value (`none`)
+/// request no attribute section; unknown names are ignored.
+///
+/// `data_sources` is deliberately NOT pruned here: upstream sets it from the
+/// `include_data_sources` flag alone (core.py:483), independent of `fields`, so
+/// a `fields=metadata&include_data_sources=true` request keeps its data sources.
+/// It is `None` unless that flag was set, so leaving it untouched is a no-op for
+/// every request that did not ask for it.
 ///
 /// The caller MUST invoke this only when the client actually sent `fields` —
 /// an absent `fields` means "full entry" (the FastAPI default selects every
@@ -403,9 +409,6 @@ fn prune_entry_fields(attrs: &mut crate::core::schemas::NodeAttributes, requeste
     }
     if !want("access_blob") {
         attrs.access_blob = None;
-    }
-    if !want("data_sources") {
-        attrs.data_sources = None;
     }
 }
 
@@ -572,6 +575,12 @@ pub async fn search(
     let omit_links = params
         .iter()
         .any(|(k, v)| k == "omit_links" && matches!(v.as_str(), "true" | "True" | "1"));
+    // ?include_data_sources=true attaches each entry's `data_sources` list (with
+    // assets) to the response, mirroring the single-node metadata route (Python
+    // router.py:324 / core.py:483). Off ⇒ the field is omitted per entry.
+    let include_data_sources = params
+        .iter()
+        .any(|(k, v)| k == "include_data_sources" && matches!(v.as_str(), "true" | "True" | "1"));
     // ?fields= projection (Python `EntryFields`). ABSENT → full entry (FastAPI
     // defaults `fields` to every EntryFields, router.py:458), so we do not prune.
     // PRESENT → each entry keeps only the requested attribute sections. The Rust
@@ -654,6 +663,7 @@ pub async fn search(
         &queries,
         &sorting,
         state.exact_count_limit,
+        include_data_sources,
     )
     .await?;
     // `select_metadata` only applies within `metadata in fields` (core.py:479-485):
@@ -5010,52 +5020,6 @@ fn map_catalog_err(e: crate::catalog::CatalogError) -> ServerError {
     }
 }
 
-/// Convert a catalog ORM DataSource row (+ its asset rows) into the
-/// `crate::core::data_source::DataSource` wire type used in API responses.
-fn catalog_ds_to_core_ds(
-    ds: crate::catalog::orm::DataSource,
-    assets: Vec<crate::catalog::orm::Asset>,
-) -> crate::core::data_source::DataSource {
-    let management = serde_json::from_value(serde_json::Value::String(ds.management.clone()))
-        .unwrap_or(crate::core::data_source::Management::Writable);
-    let structure_family = ds
-        .structure_family
-        .parse::<crate::core::structures::StructureFamily>()
-        .unwrap_or(crate::core::structures::StructureFamily::Container);
-    let core_assets = assets
-        .into_iter()
-        .map(|a| crate::core::data_source::Asset {
-            data_uri: a.data_uri,
-            is_directory: a.is_directory,
-            parameter: if a.parameter.is_empty() {
-                None
-            } else {
-                Some(a.parameter)
-            },
-            num: a.num.map(|n| n as usize),
-            id: Some(a.id),
-        })
-        .collect();
-    crate::core::data_source::DataSource {
-        structure_family,
-        structure: serde_json::from_value::<Option<crate::core::structures::AnyStructure>>(
-            ds.structure,
-        )
-        .ok()
-        .flatten(),
-        id: Some(ds.id),
-        mimetype: if ds.mimetype.is_empty() {
-            None
-        } else {
-            Some(ds.mimetype)
-        },
-        parameters: ds.parameters,
-        properties: serde_json::Value::Null,
-        assets: core_assets,
-        management,
-    }
-}
-
 // ---------------------------------------------------------------------------
 // PATCH /api/v1/metadata/{*path} — update metadata + specs
 // ---------------------------------------------------------------------------
@@ -6027,7 +5991,9 @@ async fn catalog_metadata_resource(
                 let mut result = Vec::with_capacity(ds_rows.len());
                 for ds in ds_rows {
                     let asset_rows = catalog.list_assets(ds.id).await.map_err(map_catalog_err)?;
-                    result.push(catalog_ds_to_core_ds(ds, asset_rows));
+                    result.push(crate::catalog::data_source::to_core_data_source(
+                        ds, asset_rows,
+                    ));
                 }
                 Some(result)
             } else {

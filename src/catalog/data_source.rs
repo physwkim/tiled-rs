@@ -1,5 +1,7 @@
 //! `data_sources` + `assets` CRUD.
 
+use std::collections::HashMap;
+
 use serde_json::Value;
 use sqlx::Row;
 
@@ -85,6 +87,122 @@ impl Catalog {
                 rows.iter().map(asset_from_postgres_row).collect()
             }
         }
+    }
+
+    /// Batch-load the data sources (each with its assets) for a page of nodes
+    /// in **two** queries total — one `data_sources WHERE node_id IN (...)`, one
+    /// `assets WHERE data_source_id IN (...)` — rather than a per-row query per
+    /// node. Returns a map `node_id -> [(data_source, its assets)]`, each list
+    /// ordered by `data_sources.id` and each asset list by `(num, id)`, matching
+    /// [`list_data_sources`](Self::list_data_sources) / [`list_assets`](Self::list_assets).
+    ///
+    /// A node with no data sources is simply absent from the map (the caller
+    /// defaults it to an empty list). Feeds the `?include_data_sources=true`
+    /// search path (`CatalogAdapter::search_page`); the single-node metadata
+    /// route stays on the per-node `list_data_sources`/`list_assets` calls.
+    pub async fn list_data_sources_for_nodes(
+        &self,
+        node_ids: &[i64],
+    ) -> Result<HashMap<i64, Vec<(DataSource, Vec<Asset>)>>> {
+        let mut out: HashMap<i64, Vec<(DataSource, Vec<Asset>)>> = HashMap::new();
+        if node_ids.is_empty() {
+            return Ok(out);
+        }
+        // (1) All data sources for these nodes, ordered so each node's list is
+        // in id order (parity with the per-node `list_data_sources`).
+        let data_sources: Vec<DataSource> = match self.pool() {
+            DbPool::Sqlite(pool) => {
+                let sql = format!(
+                    "SELECT id, node_id, structure_family, structure, mimetype,
+                            parameters, management
+                       FROM data_sources WHERE node_id IN ({})
+                       ORDER BY node_id, id",
+                    sqlite_placeholders(node_ids.len())
+                );
+                let mut q = sqlx::query(&sql);
+                for id in node_ids {
+                    q = q.bind(id);
+                }
+                q.fetch_all(pool)
+                    .await?
+                    .iter()
+                    .map(ds_from_sqlite_row)
+                    .collect::<Result<_>>()?
+            }
+            DbPool::Postgres(pool) => {
+                let sql = format!(
+                    "SELECT id, node_id, structure_family, structure, mimetype,
+                            parameters, management
+                       FROM data_sources WHERE node_id IN ({})
+                       ORDER BY node_id, id",
+                    postgres_placeholders(node_ids.len(), 1)
+                );
+                let mut q = sqlx::query(&sql);
+                for id in node_ids {
+                    q = q.bind(id);
+                }
+                q.fetch_all(pool)
+                    .await?
+                    .iter()
+                    .map(ds_from_postgres_row)
+                    .collect::<Result<_>>()?
+            }
+        };
+        if data_sources.is_empty() {
+            return Ok(out);
+        }
+        // (2) All assets for those data sources, ordered by (num, id) so each
+        // data source's asset list matches the per-source `list_assets`.
+        let ds_ids: Vec<i64> = data_sources.iter().map(|ds| ds.id).collect();
+        let assets: Vec<Asset> = match self.pool() {
+            DbPool::Sqlite(pool) => {
+                let sql = format!(
+                    "SELECT id, data_source_id, data_uri, is_directory, parameter, num
+                       FROM assets WHERE data_source_id IN ({})
+                       ORDER BY data_source_id, COALESCE(num, 0), id",
+                    sqlite_placeholders(ds_ids.len())
+                );
+                let mut q = sqlx::query(&sql);
+                for id in &ds_ids {
+                    q = q.bind(id);
+                }
+                q.fetch_all(pool)
+                    .await?
+                    .iter()
+                    .map(asset_from_sqlite_row)
+                    .collect::<Result<_>>()?
+            }
+            DbPool::Postgres(pool) => {
+                let sql = format!(
+                    "SELECT id, data_source_id, data_uri, is_directory, parameter, num
+                       FROM assets WHERE data_source_id IN ({})
+                       ORDER BY data_source_id, COALESCE(num, 0), id",
+                    postgres_placeholders(ds_ids.len(), 1)
+                );
+                let mut q = sqlx::query(&sql);
+                for id in &ds_ids {
+                    q = q.bind(id);
+                }
+                q.fetch_all(pool)
+                    .await?
+                    .iter()
+                    .map(asset_from_postgres_row)
+                    .collect::<Result<_>>()?
+            }
+        };
+        // Group assets under their data source, then data sources under their
+        // node. The SQL ORDER BY already fixed the per-list order, so pushing in
+        // scan order preserves it.
+        let mut assets_by_ds: HashMap<i64, Vec<Asset>> = HashMap::new();
+        for a in assets {
+            assets_by_ds.entry(a.data_source_id).or_default().push(a);
+        }
+        for ds in data_sources {
+            let node_id = ds.node_id;
+            let ds_assets = assets_by_ds.remove(&ds.id).unwrap_or_default();
+            out.entry(node_id).or_default().push((ds, ds_assets));
+        }
+        Ok(out)
     }
 
     /// Look up a single asset by id, scoped to `node_id`: the asset must belong
@@ -296,4 +414,69 @@ fn asset_from_postgres_row(row: &sqlx::postgres::PgRow) -> Result<Asset> {
         parameter: row.get("parameter"),
         num: row.try_get("num").ok(),
     })
+}
+
+/// `?, ?, …` — `n` SQLite positional placeholders for an `IN (...)` list.
+fn sqlite_placeholders(n: usize) -> String {
+    vec!["?"; n].join(", ")
+}
+
+/// `$start, $start+1, …` — `n` Postgres numbered placeholders starting at
+/// `$start`, for an `IN (...)` list.
+fn postgres_placeholders(n: usize, start: usize) -> String {
+    (start..start + n)
+        .map(|i| format!("${i}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Convert a catalog ORM [`DataSource`] row (plus its asset rows) into the
+/// `crate::core::data_source::DataSource` wire type used in API responses.
+///
+/// Single source of truth for this mapping — both the single-node metadata
+/// route and the `?include_data_sources=true` search path go through it, so a
+/// data source is shaped identically whichever endpoint returns it.
+pub(crate) fn to_core_data_source(
+    ds: DataSource,
+    assets: Vec<Asset>,
+) -> crate::core::data_source::DataSource {
+    use crate::core::data_source as core_ds;
+    let management = serde_json::from_value(Value::String(ds.management.clone()))
+        .unwrap_or(core_ds::Management::Writable);
+    let structure_family = ds
+        .structure_family
+        .parse::<crate::core::structures::StructureFamily>()
+        .unwrap_or(crate::core::structures::StructureFamily::Container);
+    let core_assets = assets
+        .into_iter()
+        .map(|a| core_ds::Asset {
+            data_uri: a.data_uri,
+            is_directory: a.is_directory,
+            parameter: if a.parameter.is_empty() {
+                None
+            } else {
+                Some(a.parameter)
+            },
+            num: a.num.map(|n| n as usize),
+            id: Some(a.id),
+        })
+        .collect();
+    core_ds::DataSource {
+        structure_family,
+        structure: serde_json::from_value::<Option<crate::core::structures::AnyStructure>>(
+            ds.structure,
+        )
+        .ok()
+        .flatten(),
+        id: Some(ds.id),
+        mimetype: if ds.mimetype.is_empty() {
+            None
+        } else {
+            Some(ds.mimetype)
+        },
+        parameters: ds.parameters,
+        properties: Value::Null,
+        assets: core_assets,
+        management,
+    }
 }

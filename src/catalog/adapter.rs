@@ -220,6 +220,7 @@ impl ContainerAdapter for CatalogAdapter {
         cursor: Option<i64>,
         offset: usize,
         limit: usize,
+        include_data_sources: bool,
     ) -> BoxFuture<'a, crate::core::error::Result<SearchPage>> {
         Box::pin(async move {
             // Default sort = no user sort key (the ORDER BY collapses to the
@@ -268,6 +269,17 @@ impl ContainerAdapter for CatalogAdapter {
                     (rows, total, next_cursor)
                 }
             };
+            // When include_data_sources is set, batch-load every page node's
+            // data sources (+ assets) in two queries — one IN-clause over the
+            // page's node ids per table — instead of a query per row. Left
+            // `None` when the flag is off so the default listing pays nothing.
+            let mut ds_by_node = if include_data_sources {
+                let node_ids: Vec<i64> = rows.iter().map(|n| n.id).collect();
+                Some(self.catalog.list_data_sources_for_nodes(&node_ids).await?)
+            } else {
+                None
+            };
+
             let mut entries = Vec::with_capacity(rows.len());
             for node in rows {
                 // A row with an unrecognised family defaults to Container
@@ -276,6 +288,13 @@ impl ContainerAdapter for CatalogAdapter {
                     .structure_family
                     .parse::<StructureFamily>()
                     .unwrap_or(StructureFamily::Container);
+                // This node's data sources from the batch fetch. `Some(vec![])`
+                // for a node with none (a container, or a leaf with no source) —
+                // matching Python's empty `entry.data_sources`; `None` when the
+                // flag was off.
+                let node_ds = ds_by_node
+                    .as_mut()
+                    .map(|map| map.remove(&node.id).unwrap_or_default());
                 let structure = if matches!(family, StructureFamily::Container) {
                     let count = self.catalog.count_children(Some(node.id)).await?;
                     Some(
@@ -285,10 +304,23 @@ impl ContainerAdapter for CatalogAdapter {
                         })
                         .expect("NodeStructure is always serializable"),
                     )
+                } else if let Some(list) = node_ds.as_ref() {
+                    // Reuse the batch result: a leaf's structure is its first
+                    // data source's, same as the per-row path below.
+                    list.first().map(|(ds, _)| ds.structure.clone())
                 } else {
                     let ds_rows = self.catalog.list_data_sources(node.id).await?;
                     ds_rows.first().map(|ds| ds.structure.clone())
                 };
+                // Convert the ORM rows to the wire type. `None` (flag off) stays
+                // omitted; `Some` (flag on) carries the list, possibly empty.
+                let data_sources = node_ds.map(|list| {
+                    list.into_iter()
+                        .map(|(ds, assets)| {
+                            crate::catalog::data_source::to_core_data_source(ds, assets)
+                        })
+                        .collect()
+                });
                 entries.push(SearchEntry {
                     key: node.key,
                     structure_family: family,
@@ -299,6 +331,7 @@ impl ContainerAdapter for CatalogAdapter {
                     metadata: node.metadata,
                     structure,
                     access_blob: Some(node.access_blob),
+                    data_sources,
                 });
             }
             Ok(SearchPage {

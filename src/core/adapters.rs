@@ -333,6 +333,14 @@ pub struct SearchEntry {
     /// Access-control blob carried through from the backing store. `None` for
     /// adapters that do not track per-node access (in-memory trees).
     pub access_blob: Option<serde_json::Value>,
+    /// The node's data sources (with assets), populated **only** when the
+    /// caller requested `include_data_sources` and the backing store can
+    /// supply them. `None` means "not requested / not available" (omitted on
+    /// the wire); `Some(vec![])` means "requested, but this node has none"
+    /// (e.g. a container) — matching Python's `entry.data_sources` returning an
+    /// empty list for such nodes (catalog/adapter.py:409-410). In-memory / Mongo
+    /// trees leave this `None`.
+    pub data_sources: Option<Vec<crate::core::data_source::DataSource>>,
 }
 
 /// One page of search results plus the totals a listing response needs.
@@ -418,6 +426,14 @@ pub trait ContainerAdapter: BaseAdapter {
     /// filter + sort + keyset/OFFSET down to the database and to carry each
     /// node's `access_blob` and `data_source` structure without resolving the
     /// leaf adapter.
+    ///
+    /// `include_data_sources` asks each row to carry its `data_sources` list
+    /// (with assets), for the `?include_data_sources=true` query param. Only a
+    /// backend that tracks data sources (the SQL catalog) can honor it; the
+    /// default in-memory impl has no such notion, so it ignores the flag and
+    /// leaves every entry's `data_sources` at `None` — matching Python, where a
+    /// tree adapter without `data_sources` simply omits the field
+    /// (core.py:483, `hasattr(entry, "data_sources")`).
     fn search_page<'a>(
         &'a self,
         queries: &'a [crate::core::queries::Query],
@@ -425,6 +441,7 @@ pub trait ContainerAdapter: BaseAdapter {
         _cursor: Option<i64>,
         offset: usize,
         limit: usize,
+        _include_data_sources: bool,
     ) -> BoxFuture<'a, Result<SearchPage>> {
         Box::pin(async move {
             let matched = self.search(queries).await?;
@@ -445,6 +462,9 @@ pub trait ContainerAdapter: BaseAdapter {
                     specs: adapter.specs().to_vec(),
                     structure,
                     access_blob: None,
+                    // In-memory trees do not track data sources; the flag is
+                    // ignored and the field stays omitted on the wire.
+                    data_sources: None,
                 });
             }
             Ok(SearchPage {
