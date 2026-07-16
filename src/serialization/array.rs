@@ -170,6 +170,22 @@ fn serialize_array_csv(
                 }
                 ensure_decimal(f32::from_le_bytes(b).to_string())
             }
+            // numpy half-precision (float16): widen to f32 (lossless — 11→24
+            // significand bits) and format like the `f4` arm. numpy `savetxt`
+            // prints the float16 shortest repr (e.g. "0.1"); we print the
+            // f32-widened decimal (e.g. "0.099975586") — the same stored value,
+            // more digits, consistent with how this serializer prints f32.
+            ("f", 2) => {
+                let mut b: [u8; 2] = bytes.try_into().unwrap_or([0u8; 2]);
+                if big_endian {
+                    b.reverse();
+                }
+                ensure_decimal(
+                    half::f16::from_bits(u16::from_le_bytes(b))
+                        .to_f32()
+                        .to_string(),
+                )
+            }
             ("i", 8) => {
                 let mut b: [u8; 8] = bytes.try_into().unwrap_or([0u8; 8]);
                 if big_endian {
@@ -405,6 +421,10 @@ fn serialize_array_json(
             // `From<f64>`/`From<f32>` map NaN/inf to Value::Null (orjson rule).
             ("f", 8) => serde_json::Value::from(le!(f64, 8)),
             ("f", 4) => serde_json::Value::from(le!(f32, 4)),
+            // float16: widen to f32 (lossless) — matches upstream `array.tolist()`
+            // which promotes each np.float16 to a Python float before orjson
+            // encodes it. From<f32> maps NaN/inf to Value::Null (orjson rule).
+            ("f", 2) => serde_json::Value::from(half::f16::from_bits(le!(u16, 2)).to_f32()),
             ("i", 8) => serde_json::Value::from(le!(i64, 8)),
             ("i", 4) => serde_json::Value::from(le!(i32, 4)),
             ("i", 2) => serde_json::Value::from(le!(i16, 2)),
@@ -778,6 +798,45 @@ mod tests {
         assert_eq!(std::str::from_utf8(&out_2d).unwrap().lines().count(), 2);
     }
 
+    /// float16 arrays serialize to CSV instead of emitting a 200-OK
+    /// "unsupported dtype f2" garbage cell. We widen f16 → f32 (lossless) and
+    /// format like the `f4` arm; exact-in-f16 values print cleanly.
+    #[test]
+    fn csv_float16_widens_to_f32_decimal() {
+        let ser = csv_serializer();
+        // 1.5, 0.5, -2.0 are exact in float16; 2.0 exercises ensure_decimal.
+        let vals = [1.5f32, 0.5, -2.0, 2.0];
+        let data: Vec<u8> = vals
+            .iter()
+            .flat_map(|&v| half::f16::from_f32(v).to_bits().to_le_bytes())
+            .collect();
+        let meta = serde_json::json!({"itemsize": 2, "kind": "f", "shape": [4]});
+        let out = ser(&data, &meta).unwrap();
+        let lines: Vec<&str> = std::str::from_utf8(&out).unwrap().lines().collect();
+        assert_eq!(lines, vec!["1.5", "0.5", "-2.0", "2.0"]);
+
+        // 0.1 is NOT representable in float16; we print the f32-widened decimal
+        // (the exact stored value), a documented textual divergence from numpy
+        // `savetxt`'s float16 shortest repr "0.1". Assert the value round-trips
+        // and is explicitly not "0.1", without hard-coding Ryu's digit choice.
+        let approx: Vec<u8> = half::f16::from_f32(0.1).to_bits().to_le_bytes().to_vec();
+        let out01 = ser(
+            &approx,
+            &serde_json::json!({"itemsize": 2, "kind": "f", "shape": [1]}),
+        )
+        .unwrap();
+        let cell = std::str::from_utf8(&out01).unwrap();
+        assert_eq!(
+            cell.parse::<f32>().unwrap(),
+            half::f16::from_f32(0.1).to_f32(),
+            "CSV cell must round-trip to the exact stored float16 value"
+        );
+        assert_ne!(
+            cell, "0.1",
+            "we print the f32-widened decimal, not numpy's shortest float16 repr"
+        );
+    }
+
     /// M3: `text/html` is registered for arrays and wraps CSV in a minimal HTML
     /// body when PNG is unavailable or fails.  A zero-rank shape ([]) causes
     /// encode_image to return Err("array has zero rank") regardless of whether
@@ -888,6 +947,22 @@ mod tests {
         let out = ser(&data, &meta).unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(parsed, serde_json::json!([1.0, null, null]));
+    }
+
+    /// float16 arrays serialize to JSON by widening f16 → f32, matching upstream
+    /// `array.tolist()` (each np.float16 → Python float before orjson encodes).
+    /// NaN/inf collapse to null like the f4/f8 arms.
+    #[test]
+    fn json_array_float16_widens_and_nan_becomes_null() {
+        let ser = json_array_serializer();
+        let mut data = Vec::new();
+        data.extend_from_slice(&half::f16::from_f32(1.5).to_bits().to_le_bytes());
+        data.extend_from_slice(&half::f16::from_f32(-2.0).to_bits().to_le_bytes());
+        data.extend_from_slice(&half::f16::NAN.to_bits().to_le_bytes());
+        let meta = serde_json::json!({"itemsize": 2, "kind": "f", "shape": [3]});
+        let out = ser(&data, &meta).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(parsed, serde_json::json!([1.5, -2.0, null]));
     }
 
     /// M1: a 0-D array serializes to the bare scalar (no wrapping array).

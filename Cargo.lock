@@ -5071,6 +5071,7 @@ dependencies = [
  "flate2",
  "form_urlencoded",
  "futures",
+ "half",
  "hmac",
  "http",
  "image",
