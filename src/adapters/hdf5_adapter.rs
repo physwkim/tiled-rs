@@ -12,6 +12,26 @@
 //! window. Strided slices (`step > 1`) read the full window and stride
 //! down in Rust, since `rust-hdf5` doesn't expose hyperslab `stride` —
 //! correctness over a one-PR scope win.
+//!
+//! ## SWMR read mode / `libver` (upstream tiled #127) — unsupported
+//!
+//! Upstream reads `TILED_HDF5_SWMR_DEFAULT` and forwards `swmr=` / `libver=`
+//! to `h5py.File`, letting it read a file a concurrent SWMR writer is still
+//! appending to. This port cannot mirror that on its read path:
+//! `rust_hdf5::H5File::open` / `H5FileOptions` expose only a file-*locking*
+//! policy — there is no `swmr` or `libver` option. rust-hdf5 *does* have SWMR
+//! reads, but only through a separate `rust_hdf5::swmr::SwmrFileReader` whose
+//! API is materially reduced: it returns raw bytes plus an element *size*
+//! (`dataset_element_size`) with no accessor for the dataset's datatype CLASS,
+//! so it cannot preserve the Kind/signedness detection this adapter depends on
+//! (FINDING A-1), and it needs `&mut self` + a `refresh()` polling loop instead
+//! of the `H5Dataset` handle every read path here uses. `libver` has no
+//! rust-hdf5 equivalent at all — the reader auto-detects the on-disk format
+//! version. Because `TILED_HDF5_SWMR_DEFAULT` defaults to `0` (off), the
+//! DEFAULT behaviour already matches upstream (a non-SWMR read); only the
+//! opt-in `swmr=True` case is unsupported, and adopting `SwmrFileReader` would
+//! mean a from-scratch second read path that regresses dtype fidelity — so it
+//! is deliberately not wired up here.
 
 #![cfg(feature = "hdf5")]
 
