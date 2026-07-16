@@ -321,8 +321,11 @@ impl ContainerClient {
     ) -> Result<String> {
         let self_link = self.base.require_link("self")?;
         let url = Url::parse(self_link)?;
+        // Wire field is `id`, matching Python tiled's `PostMetadataRequest.id`
+        // (tiled/server/schemas.py:462) — a real Python tiled server ignores
+        // a top-level `key` field.
         let body = serde_json::json!({
-            "key": key,
+            "id": key,
             "structure_family": structure_family,
             "metadata": metadata,
             "specs": specs,

@@ -284,9 +284,13 @@ pub enum EntryFields {
 
 /// Request body for creating a new node.
 ///
-/// `key` is the requested name of the new child under the parent path
-/// (POST `/api/v1/register/<parent>` registers `<parent>/<key>`). cirrus
-/// and other write clients put `key` at top-level, matching Python tiled.
+/// `id` is the requested name (key) of the new child under the parent path
+/// (POST `/api/v1/register/<parent>` registers `<parent>/<id>`). The wire
+/// field is named `id`, matching Python tiled's `PostMetadataRequest.id`
+/// (tiled/server/schemas.py:462) — a real Python tiled server ignores any
+/// top-level `key` field, so a client must send `id` to request an explicit
+/// name. `key` is still accepted on deserialize (`serde(alias)`) for
+/// back-compat with pre-existing Rust clients that sent the old shape.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PostMetadataRequest {
     pub structure_family: StructureFamily,
@@ -296,8 +300,8 @@ pub struct PostMetadataRequest {
     pub specs: Vec<Spec>,
     #[serde(default)]
     pub data_sources: Vec<DataSource>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "key")]
+    pub id: Option<String>,
     /// Optional access blob the client wants to attach to this node.
     /// Passed to `AccessPolicy::init_node` for validation / modification
     /// before being stored. Mirrors Python `PostMetadataRequest.access_blob`.
@@ -405,6 +409,34 @@ mod tests {
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["data"]["id"], "test");
         assert!(json["data"]["attributes"]["ancestors"].is_array());
+    }
+
+    #[test]
+    fn test_post_metadata_request_id_field_wire_shape() {
+        // Upstream shape (Python tiled `PostMetadataRequest.id`,
+        // server/schemas.py:462): top-level `id`.
+        let json = serde_json::json!({
+            "structure_family": "container",
+            "id": "explicit_id",
+        });
+        let req: PostMetadataRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.id.as_deref(), Some("explicit_id"));
+
+        // Legacy Rust-client shape: top-level `key` is still accepted via
+        // serde alias for back-compat.
+        let json = serde_json::json!({
+            "structure_family": "container",
+            "key": "legacy_key",
+        });
+        let req: PostMetadataRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(req.id.as_deref(), Some("legacy_key"));
+
+        // Serialization must always emit the canonical `id` field, never
+        // `key` — this is what makes the Rust HTTP client compatible with a
+        // real Python tiled server.
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["id"], "legacy_key");
+        assert!(json.get("key").is_none());
     }
 
     #[test]

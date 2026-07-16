@@ -414,12 +414,15 @@ async fn navigate_or_create(
 }
 
 async fn create_container(parent: &ContainerClient, key: &str) -> Result<()> {
+    // Wire field is `id`, matching Python tiled's `PostMetadataRequest.id`
+    // (tiled/server/schemas.py:462) — a real Python tiled server ignores a
+    // top-level `key` field.
     let body = serde_json::json!({
         "structure_family": "container",
         "metadata": {},
         "specs": [],
         "data_sources": [],
-        "key": key,
+        "id": key,
     });
     let url = build_register_url(parent)?;
     parent.base().context().post_json(&url, &body).await?;
@@ -571,7 +574,7 @@ async fn try_register_single(
             "management": "external",
             "assets": spec.assets,
         }],
-        "key": key,
+        "id": key,
     });
     node.base().context().post_json(&url, &body).await?;
     Ok(Some(()))
@@ -696,7 +699,7 @@ async fn register_image_sequence(
             "management": "external",
             "assets": assets,
         }],
-        "key": key,
+        "id": key,
     });
     node.base().context().post_json(&url, &body).await?;
     Ok(())
@@ -955,5 +958,54 @@ mod tests {
         walk_and_register(&node, dir.path(), &settings)
             .await
             .expect("an inspect failure is a logged skip, not a walk abort");
+    }
+
+    // -----------------------------------------------------------------------
+    // Wire-format regression: the create-node body must carry the requested
+    // name under `id` (Python tiled's `PostMetadataRequest.id`,
+    // server/schemas.py:462), not a top-level `key` — a real Python tiled
+    // server ignores `key` and silently auto-generates a name instead.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn create_container_body_carries_id_not_key() {
+        use std::sync::Mutex;
+
+        #[derive(Clone)]
+        struct Captured(Arc<Mutex<Option<serde_json::Value>>>);
+
+        async fn capture(
+            axum::extract::State(captured): axum::extract::State<Captured>,
+            axum::Json(body): axum::Json<serde_json::Value>,
+        ) -> axum::http::StatusCode {
+            *captured.0.lock().unwrap() = Some(body);
+            axum::http::StatusCode::CREATED
+        }
+
+        let captured = Captured(Arc::new(Mutex::new(None)));
+        let app = axum::Router::new()
+            .route("/api/v1/register/{*path}", axum::routing::post(capture))
+            .with_state(captured.clone());
+        let base = spawn(app).await;
+        let node = container_at(&base);
+
+        create_container(&node, "sub")
+            .await
+            .expect("create_container POST must succeed");
+
+        let body = captured
+            .0
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("register handler must have captured a body");
+        assert_eq!(
+            body["id"], "sub",
+            "wire body must carry `id` (Python tiled PostMetadataRequest.id, schemas.py:462)"
+        );
+        assert!(
+            body.get("key").is_none(),
+            "client must not emit a top-level `key` field; a real Python tiled server ignores it"
+        );
     }
 }
