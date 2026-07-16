@@ -211,24 +211,33 @@ impl WhereBuilder {
     fn push_neq(&mut self, key: &str, value: &Value) {
         match self.dialect {
             Dialect::Sqlite => {
+                // Mirror upstream `ne(_get_value(attr, type), value)` — a plain
+                // `json_extract(...) != ?` (adapter.py:2035-2051, binary_op with
+                // operator.ne). A missing key makes json_extract → SQL NULL, so
+                // `NULL != ?` is NULL (three-valued logic) and the row is
+                // EXCLUDED. This must match: (a) upstream, which excludes
+                // missing-key rows, and (b) `NotIn(key, [value])`, whose
+                // single-value case is semantically identical and already
+                // excludes them (see `push_not_in`). An `IS NULL OR` arm here
+                // would wrongly INCLUDE missing-key rows and make NotEq disagree
+                // with the equivalent NotIn.
                 let lhs = self.dialect.json_text("metadata", key);
                 let p = self.dialect.placeholder(self.bindings.len());
-                // Treat NULL as "not equal" too — without `IS DISTINCT
-                // FROM`/COALESCE, a JSON key that's missing would otherwise
-                // drop out of the result.
-                self.pieces.push(format!("({lhs} IS NULL OR {lhs} != {p})"));
+                self.pieces.push(format!("{lhs} != {p}"));
                 self.bindings.push(value_to_bind(value));
             }
             Dialect::Postgres => {
                 // Compare jsonb-to-jsonb (`#> ... != $1::jsonb`); a text `#>>`
                 // against a typed int8/float8 bind has no operator. Mirrors
                 // Python `ne(metadata_[keys], type_coerce(value, JSONB))`
-                // (adapter.py:1983-1984). Missing key (NULL) stays "not equal"
-                // per the SQLite arm's semantics above.
+                // (adapter.py:2050). A missing key makes `#>` → SQL NULL, so
+                // `NULL != $1` is NULL and the row is EXCLUDED — matching
+                // upstream and the equivalent `NotIn`. A present-but-JSON-null
+                // value compares as `'null'::jsonb != $1`, i.e. included when the
+                // target is not null, again matching upstream Postgres.
                 let lhs = self.dialect.json_value("metadata", key);
                 let p = self.dialect.placeholder(self.bindings.len());
-                self.pieces
-                    .push(format!("({lhs} IS NULL OR {lhs} != {p}::jsonb)"));
+                self.pieces.push(format!("{lhs} != {p}::jsonb"));
                 self.bindings.push(Bind::Text(
                     serde_json::to_string(value).expect("json serialization"),
                 ));
@@ -1597,12 +1606,28 @@ mod tests {
         let mut b = WhereBuilder::new(Dialect::Postgres);
         b.push_neq("count", &json!(5));
         let (sql, binds) = b.finish();
-        assert_eq!(
-            sql,
-            "((metadata #> '{count}') IS NULL OR (metadata #> '{count}') != $1::jsonb)"
-        );
+        // No `IS NULL OR` arm: a missing key (#> → NULL) makes `NULL != $1`
+        // evaluate to NULL, excluding the row — matching upstream Postgres
+        // `ne(metadata_[keys], type_coerce(value, JSONB))` and the equivalent
+        // NotIn.
+        assert_eq!(sql, "(metadata #> '{count}') != $1::jsonb");
         assert_eq!(binds.len(), 1);
         assert!(matches!(&binds[0], Bind::Text(s) if s == "5"));
+    }
+
+    // NotEq must EXCLUDE missing-key rows, exactly as `NotIn(key, [value])`
+    // does (`notin_two_values_sqlite_excludes_missing_key`) and as upstream
+    // does: a plain `json_extract(...) != ?` with no `IS NULL OR` arm.
+    #[test]
+    fn push_neq_sqlite_excludes_missing_key() {
+        let mut b = WhereBuilder::new(Dialect::Sqlite);
+        b.push_neq("color", &json!("red"));
+        let (sql, _) = b.finish();
+        assert!(
+            !sql.contains("IS NULL OR"),
+            "NotEq must not keep missing-key rows, got: {sql}"
+        );
+        assert_eq!(sql, "json_extract(metadata, '$.color') != ?");
     }
 
     // SQLite arms keep type-aware native comparison (regression guard).

@@ -1035,6 +1035,79 @@ async fn search_numeric_eq_in_notin_sqlite() {
     );
 }
 
+/// Parity: `NotEq(key, value)` must EXCLUDE rows that lack `key`, exactly as
+/// upstream does (`ne(_get_value(attr, type), value)` → `NULL != value` → NULL
+/// → excluded) and exactly as the equivalent `NotIn(key, [value])` does. A row
+/// with no `color` key must NOT appear in the results of `NotEq("color","red")`.
+#[tokio::test]
+async fn neq_excludes_missing_key_and_agrees_with_notin() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("sqlite://{}", dir.path().join("catalog.db").display());
+    let cat = Catalog::connect(&uri).await.unwrap();
+    cat.migrate().await.unwrap();
+
+    // red + blue carry `color`; nocolor has a different key entirely.
+    for (key, meta) in [
+        ("red", json!({"color": "red"})),
+        ("blue", json!({"color": "blue"})),
+        ("nocolor", json!({"shape": "square"})),
+    ] {
+        cat.create_node(
+            None,
+            vec![],
+            RegisterRequest {
+                key: key.into(),
+                structure_family: "container".into(),
+                metadata: meta,
+                specs: json!([]),
+                access_blob: json!({}),
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    // NotEq("color", "red") → only `blue`. `nocolor` (missing key) is EXCLUDED.
+    let (neq_nodes, neq_total) = cat
+        .search_children(
+            None,
+            &[Query::NotEq(NotEq {
+                key: "color".into(),
+                value: json!("red"),
+            })],
+            &[],
+            0,
+            100,
+        )
+        .await
+        .unwrap();
+    let neq_keys: Vec<&str> = neq_nodes.iter().map(|n| n.key.as_str()).collect();
+    assert_eq!(neq_total, 1, "NotEq(color=red) must match exactly 1 node");
+    assert_eq!(neq_keys, vec!["blue"], "missing-key row must be excluded");
+
+    // NotIn("color", ["red"]) must produce the identical result set — NotEq is
+    // the single-value NotIn, so their missing-key handling must agree.
+    let (nin_nodes, nin_total) = cat
+        .search_children(
+            None,
+            &[Query::NotIn(NotIn {
+                key: "color".into(),
+                value: vec![json!("red")],
+            })],
+            &[],
+            0,
+            100,
+        )
+        .await
+        .unwrap();
+    let nin_keys: Vec<&str> = nin_nodes.iter().map(|n| n.key.as_str()).collect();
+    assert_eq!(nin_total, 1, "NotIn(color=[red]) must match exactly 1 node");
+    assert_eq!(
+        nin_keys, neq_keys,
+        "NotEq and NotIn(single) must agree on missing-key handling"
+    );
+}
+
 /// F-C: the `sorting` argument drives ORDER BY — default id tiebreaker
 /// (insertion order), single metadata key ascending/descending, and the
 /// logical "id" key mapping to the `key` (node name) column.
