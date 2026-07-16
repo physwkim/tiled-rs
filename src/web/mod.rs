@@ -77,7 +77,7 @@ pub struct SpecViewEntry {
     /// External viewer URL. May contain `{path}` and `{metadata}`
     /// placeholders that the SPA substitutes before navigating.
     pub url: String,
-    /// Display label for the link/button. Defaults to "Open in <spec>".
+    /// Display label for the link/button. Defaults to `"Open in <spec>"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
 }
