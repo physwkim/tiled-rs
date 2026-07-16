@@ -556,6 +556,158 @@ impl Catalog {
         }
     }
 
+    /// Fast lower bound on the number of children of `parent_id`, counting at
+    /// most `threshold + 1` rows. When the result is `<= threshold` it is the
+    /// exact count; otherwise it is exactly `threshold + 1`, signalling "more
+    /// than `threshold`". Cheap even for huge containers because the inner
+    /// `SELECT ... LIMIT threshold+1` stops scanning early. Mirrors Python
+    /// `lbound_len` (catalog/adapter.py:506-523).
+    pub async fn lbound_count_children(
+        &self,
+        parent_id: Option<i64>,
+        threshold: i64,
+    ) -> Result<i64> {
+        let limit = threshold.saturating_add(1);
+        match self.pool() {
+            DbPool::Sqlite(pool) => {
+                let n: i64 = if parent_id.is_some() {
+                    sqlx::query_scalar(
+                        "SELECT COUNT(*) FROM \
+                         (SELECT 1 FROM nodes WHERE parent_id = ? LIMIT ?) AS sub",
+                    )
+                    .bind(parent_id)
+                    .bind(limit)
+                    .fetch_one(pool)
+                    .await?
+                } else {
+                    sqlx::query_scalar(
+                        "SELECT COUNT(*) FROM \
+                         (SELECT 1 FROM nodes WHERE parent_id IS NULL LIMIT ?) AS sub",
+                    )
+                    .bind(limit)
+                    .fetch_one(pool)
+                    .await?
+                };
+                Ok(n)
+            }
+            DbPool::Postgres(pool) => {
+                let n: i64 = if parent_id.is_some() {
+                    sqlx::query_scalar(
+                        "SELECT COUNT(*) FROM \
+                         (SELECT 1 FROM nodes WHERE parent_id = $1 LIMIT $2) AS sub",
+                    )
+                    .bind(parent_id)
+                    .bind(limit)
+                    .fetch_one(pool)
+                    .await?
+                } else {
+                    sqlx::query_scalar(
+                        "SELECT COUNT(*) FROM \
+                         (SELECT 1 FROM nodes WHERE parent_id IS NULL LIMIT $1) AS sub",
+                    )
+                    .bind(limit)
+                    .fetch_one(pool)
+                    .await?
+                };
+                Ok(n)
+            }
+        }
+    }
+
+    /// Approximate number of children of `parent_id` from table statistics,
+    /// **Postgres only**. Reads the sampled frequency of this parent among the
+    /// `parent_id` column's `most_common_vals` (from `pg_stats`) and scales it
+    /// by the table's estimated live-row count (`pg_class.reltuples`). Mirrors
+    /// Python `approx_len` (catalog/adapter.py:463-504).
+    ///
+    /// Returns `None` — so the caller falls back to an exact/bounded count —
+    /// when any of these hold:
+    /// * the backend is SQLite (no statistics tables);
+    /// * `parent_id` is `None` (the root): root children carry a `NULL`
+    ///   `parent_id`, which `pg_stats` tracks via `null_frac`, not in
+    ///   `most_common_vals`, so there is no common-value entry to match
+    ///   (upstream's node always has a concrete id, so this case cannot arise
+    ///   there);
+    /// * the table has never been `ANALYZE`d, or this parent is not frequent
+    ///   enough to appear among the most-common values.
+    ///
+    /// Requires the `nodes` table to have been vacuumed/analyzed (at least
+    /// once) for the estimate to be meaningful.
+    pub async fn approx_count_children(&self, parent_id: Option<i64>) -> Result<Option<i64>> {
+        let DbPool::Postgres(pool) = self.pool() else {
+            // SQLite (and any non-Postgres backend): no statistics tables.
+            return Ok(None);
+        };
+        let Some(parent_id) = parent_id else {
+            // Root: NULL parent_id is not represented in most_common_vals.
+            return Ok(None);
+        };
+        // Sampled frequency of this parent among the parent_id column values.
+        let freq: Option<f32> = sqlx::query_scalar(
+            "SELECT s.freq FROM \
+             (SELECT unnest(most_common_vals::text::bigint[]) AS parent, \
+                     unnest(most_common_freqs) AS freq \
+              FROM pg_stats \
+              WHERE schemaname = 'public' AND tablename = 'nodes' \
+                AND attname = 'parent_id') AS s \
+             WHERE s.parent = $1",
+        )
+        .bind(parent_id)
+        .fetch_optional(pool)
+        .await?;
+        let Some(freq) = freq else {
+            // Statistics unavailable, or this parent is not among the
+            // most-common values: caller falls back to the exact/bounded count.
+            return Ok(None);
+        };
+        // Estimated live row count for the whole `nodes` table.
+        let total: i64 = sqlx::query_scalar(
+            "SELECT reltuples::bigint FROM pg_class WHERE oid = 'public.nodes'::regclass",
+        )
+        .fetch_one(pool)
+        .await?;
+        // Mirror Python `int(total * freq)` (adapter.py:498): truncate toward 0.
+        Ok(Some((total as f64 * freq as f64) as i64))
+    }
+
+    /// Child count that is exact for small containers and approximate for large
+    /// ones. Mirrors Python `len_or_approx` (server/core.py:65-118) invoked with
+    /// `threshold = exact_count_limit`:
+    ///
+    /// * **SQLite** — always the exact `COUNT(*)`. Unlike upstream (whose SQLite
+    ///   path returns the `threshold + 1` lower bound for large containers), the
+    ///   Rust port deliberately keeps the exact count for SQLite; only Postgres
+    ///   gets the statistics-based estimate.
+    /// * **Postgres** — take a fast lower bound first. If it is `<=`
+    ///   `exact_count_limit` it is the exact count and is returned as-is. For a
+    ///   larger container, use [`Self::approx_count_children`]; if statistics are
+    ///   unavailable (never analyzed, or the root node), fall back to the lower
+    ///   bound (`exact_count_limit + 1`).
+    pub async fn count_children_or_approx(
+        &self,
+        parent_id: Option<i64>,
+        exact_count_limit: i64,
+    ) -> Result<i64> {
+        match self.pool() {
+            DbPool::Sqlite(_) => self.count_children(parent_id).await,
+            DbPool::Postgres(_) => {
+                let lbound = self
+                    .lbound_count_children(parent_id, exact_count_limit)
+                    .await?;
+                if lbound <= exact_count_limit {
+                    // Within the threshold → this lower bound is exact.
+                    return Ok(lbound);
+                }
+                // Large container: prefer the statistics-based estimate.
+                if let Some(approx) = self.approx_count_children(parent_id).await? {
+                    return Ok(approx);
+                }
+                // Statistics unavailable: report the lower bound (threshold + 1).
+                Ok(lbound)
+            }
+        }
+    }
+
     /// Insert a new node under `parent_id`. Returns the inserted record.
     /// Raises `Conflict` on duplicate (parent_id, key).
     pub async fn create_node(
