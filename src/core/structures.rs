@@ -504,6 +504,52 @@ pub enum AnyStructure {
     Container(ContainerStructure),
 }
 
+impl AnyStructure {
+    /// Parse a raw structure JSON under the authority of its sibling
+    /// `structure_family`, choosing the variant by family rather than by
+    /// field-shape guessing.
+    ///
+    /// This is the single owner of the family → variant mapping. It exists
+    /// because the derived `#[serde(untagged)]` `Deserialize` picks a variant by
+    /// trying each in order and taking the first that fits — and a COO
+    /// [`SparseStructure`] carrying a `data_type` is a structurally valid
+    /// [`ArrayStructure`] (`Array` is ordered before `Sparse`, and the extra
+    /// `coord_data_type`/`layout` fields are ignored), so an untagged parse
+    /// silently mislabels every typed sparse structure as `Array`, dropping
+    /// `coord_data_type` and `layout`. The authoritative discriminator is the
+    /// `structure_family` field, which lives *outside* the structure object and
+    /// so cannot steer an untagged parse.
+    ///
+    /// Mirrors upstream, which never parses `structure` as a discriminated
+    /// union: `DataSource.structure` is generic over `StructureT`
+    /// (`tiled/structures/data_source.py:30-33`) and is always narrowed by
+    /// `STRUCTURE_TYPES[structure_family].from_json(...)` — on DB read
+    /// (`DataSource.from_orm`, `tiled/server/schemas.py:185-187`) and on wire
+    /// ingest (`PostMetadataRequest.narrow_structure_type`,
+    /// `tiled/server/schemas.py:479-490`).
+    ///
+    /// `Container` returns `None`: upstream's `narrow_structure_type` skips the
+    /// container family (`tiled/server/schemas.py:484`), a data source never
+    /// carries a `ContainerStructure` (a container's wire `structure` is the
+    /// response-shaped [`NodeStructure`] `{contents, count}`, not
+    /// `{keys}`), and the client already treats a container's parsed structure
+    /// as `None` (`ParsedStructure::from_item`). Each other family delegates to
+    /// its own lenient `from_json`.
+    pub fn from_family_json(
+        family: StructureFamily,
+        value: &serde_json::Value,
+    ) -> Result<Option<Self>> {
+        Ok(match family {
+            StructureFamily::Array => Some(Self::Array(ArrayStructure::from_json(value)?)),
+            StructureFamily::Table => Some(Self::Table(TableStructure::from_json(value)?)),
+            StructureFamily::Sparse => Some(Self::Sparse(SparseStructure::from_json(value)?)),
+            StructureFamily::Awkward => Some(Self::Awkward(AwkwardStructure::from_json(value)?)),
+            StructureFamily::Ragged => Some(Self::Ragged(RaggedStructure::from_json(value)?)),
+            StructureFamily::Container => None,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -591,6 +637,132 @@ mod tests {
         });
         let any: AnyStructure = serde_json::from_value(array).unwrap();
         assert!(matches!(any, AnyStructure::Array(_)));
+    }
+
+    #[test]
+    fn from_family_json_sparse_with_data_type_stays_sparse() {
+        // The core defect: a COO sparse structure that carries a `data_type` is
+        // a structurally valid ArrayStructure (Array is ordered before Sparse in
+        // the untagged enum), so an untagged parse mislabels it Array and drops
+        // `coord_data_type` + `layout`. Under family authority it stays Sparse
+        // and every field survives — including a NON-default (uint32) coord dtype.
+        let raw = serde_json::json!({
+            "chunks": [[3], [3]],
+            "shape": [3, 3],
+            "data_type": {"endianness": "little", "kind": "f", "itemsize": 8},
+            "coord_data_type": {"endianness": "little", "kind": "u", "itemsize": 4},
+            "dims": null,
+            "resizable": false,
+            "layout": "COO"
+        });
+
+        // Untagged (field-shape guessing) gets it WRONG — mislabels as Array.
+        let untagged: AnyStructure = serde_json::from_value(raw.clone()).unwrap();
+        assert!(
+            matches!(untagged, AnyStructure::Array(_)),
+            "precondition: untagged mis-parses sparse-with-data_type as Array"
+        );
+
+        // Family authority gets it RIGHT — Sparse, uint32 coord preserved.
+        let parsed = AnyStructure::from_family_json(StructureFamily::Sparse, &raw)
+            .unwrap()
+            .expect("sparse family yields Some(structure)");
+        match parsed {
+            AnyStructure::Sparse(s) => {
+                assert_eq!(s.shape, vec![3, 3]);
+                assert_eq!(s.chunks, vec![vec![3], vec![3]]);
+                assert_eq!(
+                    s.coord_data_type,
+                    Some(BuiltinDType::new(
+                        Endianness::Little,
+                        Kind::UnsignedInteger,
+                        4
+                    )),
+                    "non-default uint32 coord_data_type must survive"
+                );
+                assert_eq!(s.layout, SparseLayout::COO);
+            }
+            other => panic!("expected Sparse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_family_json_sparse_without_data_type_stays_sparse() {
+        // Without a `data_type`, the untagged parse already lands on Sparse
+        // (Array requires data_type). Family authority agrees.
+        let raw = serde_json::json!({
+            "chunks": [[3], [3]],
+            "shape": [3, 3]
+        });
+        let parsed = AnyStructure::from_family_json(StructureFamily::Sparse, &raw)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(parsed, AnyStructure::Sparse(_)));
+    }
+
+    #[test]
+    fn from_family_json_dispatches_each_family() {
+        let array = serde_json::json!({
+            "data_type": {"endianness": "little", "kind": "f", "itemsize": 8},
+            "chunks": [[4]],
+            "shape": [4],
+            "dims": null,
+            "resizable": false
+        });
+        assert!(matches!(
+            AnyStructure::from_family_json(StructureFamily::Array, &array)
+                .unwrap()
+                .unwrap(),
+            AnyStructure::Array(_)
+        ));
+
+        let ragged = serde_json::json!({
+            "data_type": {"endianness": "little", "kind": "f", "itemsize": 8},
+            "shape": [3, null],
+            "size": 7,
+            "chunks": [[3], null],
+            "dims": null,
+            "resizable": false
+        });
+        assert!(matches!(
+            AnyStructure::from_family_json(StructureFamily::Ragged, &ragged)
+                .unwrap()
+                .unwrap(),
+            AnyStructure::Ragged(_)
+        ));
+
+        let awkward = serde_json::json!({"length": 5, "form": {}});
+        assert!(matches!(
+            AnyStructure::from_family_json(StructureFamily::Awkward, &awkward)
+                .unwrap()
+                .unwrap(),
+            AnyStructure::Awkward(_)
+        ));
+
+        let table = serde_json::json!({
+            "arrow_schema": "data:application/vnd.apache.arrow.file;base64,",
+            "npartitions": 1,
+            "columns": ["a", "b"],
+            "resizable": false
+        });
+        assert!(matches!(
+            AnyStructure::from_family_json(StructureFamily::Table, &table)
+                .unwrap()
+                .unwrap(),
+            AnyStructure::Table(_)
+        ));
+    }
+
+    #[test]
+    fn from_family_json_container_is_none() {
+        // A container carries no data-source structure; upstream's
+        // narrow_structure_type skips the container family entirely.
+        let raw = serde_json::json!({"contents": null, "count": 3});
+        assert!(
+            AnyStructure::from_family_json(StructureFamily::Container, &raw)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
