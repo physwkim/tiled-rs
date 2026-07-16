@@ -107,6 +107,7 @@ fn encode_image(
             .map(|v| v as u8)
             .collect(),
         ("i", 2) => downscale_i16(data, big_endian),
+        ("f", 2) => normalize_f16(data, big_endian),
         ("f", 4) => normalize_f32(data, big_endian),
         ("f", 8) => normalize_f64(data, big_endian),
         ("b", _) => data.iter().map(|&b| if b != 0 { 255 } else { 0 }).collect(),
@@ -194,6 +195,25 @@ fn downscale_i16(data: &[u8], big_endian: bool) -> Vec<u8> {
             (v.saturating_add(i16::MIN.unsigned_abs() as i16) as i32 / 257) as u8
         })
         .collect()
+}
+
+/// Decode numpy half-precision (float16) pixels, widening each to f32
+/// (lossless) before the shared [`normalize_floats`] scaling — mirroring
+/// upstream's `astype(numpy.float32)` (array.py:76) rather than reinterpreting
+/// the raw 2-byte pattern as u8 pixels.
+fn normalize_f16(data: &[u8], big_endian: bool) -> Vec<u8> {
+    let values: Vec<f32> = data
+        .chunks_exact(2)
+        .map(|c| {
+            let bits = if big_endian {
+                u16::from_be_bytes([c[0], c[1]])
+            } else {
+                u16::from_le_bytes([c[0], c[1]])
+            };
+            half::f16::from_bits(bits).to_f32()
+        })
+        .collect();
+    normalize_floats(&values)
 }
 
 fn normalize_f32(data: &[u8], big_endian: bool) -> Vec<u8> {
@@ -305,5 +325,47 @@ mod tests {
             png_le, png_be,
             "BE and LE encodings of the same image must render identically"
         );
+    }
+
+    /// float16 arrays render as images by widening f16 -> f32 (upstream
+    /// `astype(numpy.float32)`, array.py:76), not by reinterpreting the raw f16
+    /// bytes as u8 pixels. A float16 image must produce the same pixels as its
+    /// f32-widened twin.
+    #[test]
+    fn encode_image_float16_matches_f32_widening() {
+        // 2x2 image; values are exact in float16 so widening is lossless.
+        let vals = [0.0f32, 0.25, 0.5, 1.0];
+        let f16_bytes: Vec<u8> = vals
+            .iter()
+            .flat_map(|&v| half::f16::from_f32(v).to_bits().to_le_bytes())
+            .collect();
+        let f32_bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let meta16 =
+            serde_json::json!({"itemsize": 2, "kind": "f", "byteorder": "<", "shape": [2, 2]});
+        let meta32 =
+            serde_json::json!({"itemsize": 4, "kind": "f", "byteorder": "<", "shape": [2, 2]});
+        let png16 = encode_image(&f16_bytes, &meta16, ImageFormat::Png).unwrap();
+        let png32 = encode_image(&f32_bytes, &meta32, ImageFormat::Png).unwrap();
+        assert_eq!(
+            png16, png32,
+            "float16 image must render identically to its f32 widening, not raw-byte garbage"
+        );
+    }
+
+    /// `normalize_f16` widens each half to f32 and scales like `normalize_f32`,
+    /// honoring source byte order (mirrors `normalize_f32_honors_byteorder`).
+    #[test]
+    fn normalize_f16_honors_byteorder() {
+        let vals = [0.0f32, 1.0];
+        let le: Vec<u8> = vals
+            .iter()
+            .flat_map(|v| half::f16::from_f32(*v).to_bits().to_le_bytes())
+            .collect();
+        let be: Vec<u8> = vals
+            .iter()
+            .flat_map(|v| half::f16::from_f32(*v).to_bits().to_be_bytes())
+            .collect();
+        assert_eq!(normalize_f16(&le, false), vec![0, 255]);
+        assert_eq!(normalize_f16(&be, true), vec![0, 255]);
     }
 }
