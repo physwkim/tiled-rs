@@ -1,12 +1,16 @@
 //! SQLite round-trip — open in-memory, migrate, write, read.
 
+use std::sync::Arc;
+
 use serde_json::json;
+use tiled_rs::core::adapters::ContainerAdapter;
 use tiled_rs::core::queries::{Eq, FullText, In, Like, NotEq, NotIn, Query, SpecsQuery};
 use tiled_rs::core::schemas::SortDirection;
 
+use tiled_rs::catalog::adapter::{LeafResolver, UnresolvedLeaf};
 use tiled_rs::catalog::data_source::{AssetSpec, DataSourceSpec};
 use tiled_rs::catalog::db::DbPool;
-use tiled_rs::catalog::{Catalog, RegisterRequest};
+use tiled_rs::catalog::{Catalog, CatalogAdapter, RegisterRequest};
 
 #[tokio::test]
 async fn migrate_create_lookup_delete() {
@@ -1410,4 +1414,191 @@ async fn lbound_and_approx_count_children_sqlite() {
         "SQLite must not produce a statistics-based estimate"
     );
     assert_eq!(cat.approx_count_children(None).await.unwrap(), None);
+}
+
+/// `count_children_batch` returns exact per-parent counts for several
+/// parents in one round trip — the batching this task adds so a
+/// search-results page counts its container entries with a single `GROUP
+/// BY parent_id` query instead of one `count_children` call per row.
+/// A parent with zero children must be absent from the map (`GROUP BY`
+/// never emits an empty group), and an empty `parent_ids` slice must
+/// short-circuit to an empty map without a query.
+#[tokio::test]
+async fn count_children_batch_sqlite() {
+    let cat = Catalog::connect("sqlite::memory:").await.unwrap();
+    cat.migrate().await.unwrap();
+
+    async fn make_container(cat: &Catalog, key: &str) -> tiled_rs::catalog::NodeRecord {
+        cat.create_node(
+            None,
+            vec![],
+            RegisterRequest {
+                key: key.into(),
+                structure_family: "container".into(),
+                metadata: json!({}),
+                specs: json!([]),
+                access_blob: json!({}),
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    let busy = make_container(&cat, "busy").await; // gets 3 children
+    let lonely = make_container(&cat, "lonely").await; // gets 1 child
+    let empty = make_container(&cat, "empty").await; // gets 0 children
+
+    for (parent, n) in [(&busy, 3), (&lonely, 1)] {
+        for i in 0..n {
+            cat.create_node(
+                Some(parent.id),
+                vec![parent.key.clone()],
+                RegisterRequest {
+                    key: format!("child_{i}"),
+                    structure_family: "array".into(),
+                    metadata: json!({}),
+                    specs: json!([]),
+                    access_blob: json!({}),
+                },
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    let counts = cat
+        .count_children_batch(&[busy.id, lonely.id, empty.id])
+        .await
+        .unwrap();
+    assert_eq!(counts.get(&busy.id).copied(), Some(3), "busy must be 3");
+    assert_eq!(counts.get(&lonely.id).copied(), Some(1), "lonely must be 1");
+    assert_eq!(
+        counts.get(&empty.id).copied(),
+        None,
+        "a childless parent must be absent from the map, not present with 0"
+    );
+
+    // Every batched value must match the corresponding per-parent exact
+    // count — the whole point of the batch query is to reproduce
+    // `count_children`'s result set, just in one round trip.
+    for id in [busy.id, lonely.id, empty.id] {
+        let exact = cat.count_children(Some(id)).await.unwrap();
+        let batched = counts.get(&id).copied().unwrap_or(0);
+        assert_eq!(
+            batched, exact,
+            "batched count for node {id} must match count_children"
+        );
+    }
+
+    assert_eq!(
+        cat.count_children_batch(&[]).await.unwrap().len(),
+        0,
+        "empty input must short-circuit to an empty map"
+    );
+}
+
+/// `CatalogAdapter::search_page` per-entry container counts (catalog #1096
+/// follow-up: extending the exact/approximate count to search-page entries,
+/// not just the single-node metadata route). Threads a tight
+/// `exact_count_limit` through [`CatalogAdapter::with_exact_count_limit`] —
+/// on SQLite `count_children_or_approx` is unconditionally exact (the
+/// threshold never triggers an approximation there), so every entry's count
+/// must still be exact and correct despite the small limit. Covers a
+/// container past the threshold, one under it, and one with zero children —
+/// the last exercises the batched `GROUP BY` path's "absent from the map"
+/// case, which must read back as 0, not be skipped or miscounted.
+#[tokio::test]
+async fn search_page_per_entry_counts_exact_with_limit_threaded() {
+    let cat = Catalog::connect("sqlite::memory:").await.unwrap();
+    cat.migrate().await.unwrap();
+
+    async fn make_container(cat: &Catalog, key: &str) -> tiled_rs::catalog::NodeRecord {
+        cat.create_node(
+            None,
+            vec![],
+            RegisterRequest {
+                key: key.into(),
+                structure_family: "container".into(),
+                metadata: json!({}),
+                specs: json!([]),
+                access_blob: json!({}),
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    let busy = make_container(&cat, "busy").await; // 5 children, past the limit below
+    let lonely = make_container(&cat, "lonely").await; // 1 child, under the limit
+    let empty = make_container(&cat, "empty").await; // 0 children
+
+    for (parent, n) in [(&busy, 5), (&lonely, 1)] {
+        for i in 0..n {
+            cat.create_node(
+                Some(parent.id),
+                vec![parent.key.clone()],
+                RegisterRequest {
+                    key: format!("child_{i}"),
+                    structure_family: "array".into(),
+                    metadata: json!({}),
+                    specs: json!([]),
+                    access_blob: json!({}),
+                },
+            )
+            .await
+            .unwrap();
+        }
+    }
+
+    let resolver: Arc<dyn LeafResolver> = Arc::new(UnresolvedLeaf);
+    // limit=1 is smaller than `busy`'s 5 children — on Postgres this would
+    // trigger the lower-bound/approximate path; on SQLite it must have no
+    // effect on correctness.
+    let root = CatalogAdapter::root(cat.clone(), resolver).with_exact_count_limit(1);
+
+    let page = root
+        .search_page(&[], &[], None, 0, 10)
+        .await
+        .expect("search_page must succeed");
+    assert_eq!(page.entries.len(), 3, "all three containers must be listed");
+
+    let count_of = |key: &str| -> usize {
+        page.entries
+            .iter()
+            .find(|e| e.key == key)
+            .unwrap_or_else(|| panic!("entry '{key}' missing from search_page"))
+            .structure
+            .as_ref()
+            .and_then(|s| s.get("count"))
+            .and_then(|c| c.as_u64())
+            .unwrap_or_else(|| panic!("entry '{key}' has no structure.count")) as usize
+    };
+
+    assert_eq!(
+        count_of("busy"),
+        5,
+        "busy must report its exact count, not the threshold"
+    );
+    assert_eq!(count_of("lonely"), 1);
+    assert_eq!(
+        count_of("empty"),
+        0,
+        "childless container must report 0, not be miscounted"
+    );
+
+    // Cross-check against the direct per-parent call with the same
+    // threshold — confirms `search_page` is actually reading
+    // `self.exact_count_limit` (not a hardcoded default) and that its
+    // result matches what `count_children_or_approx` returns.
+    for (key, node) in [("busy", &busy), ("lonely", &lonely), ("empty", &empty)] {
+        let direct = cat
+            .count_children_or_approx(Some(node.id), 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            count_of(key) as i64,
+            direct,
+            "search_page entry for '{key}' must match count_children_or_approx(limit=1)"
+        );
+    }
 }

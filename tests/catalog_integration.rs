@@ -1736,3 +1736,133 @@ async fn exact_count_limit_caps_meta_count() {
         body["meta"]["count"]
     );
 }
+
+/// catalog #1096 follow-up: `exact_count_limit` now also drives the
+/// per-entry container counts inside a search-results page (previously it
+/// only capped the envelope `meta.count`). Threads a tight limit through
+/// `CatalogAdapter::with_exact_count_limit` — the same builder call
+/// `src/cli/mod.rs` now makes with `AppState.exact_count_limit` — and
+/// verifies each listed container's `attributes.structure.count` is still
+/// exact and correct: one past the threshold, one under it, one with zero
+/// children (the batched `GROUP BY` "absent from the map" case).
+#[tokio::test]
+async fn exact_count_limit_threads_into_search_page_entry_counts() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("sqlite://{}", dir.path().join("catalog.db").display());
+    let catalog = Catalog::connect(&uri).await.unwrap();
+    catalog.migrate().await.unwrap();
+
+    let resolver: Arc<dyn tiled_rs::catalog::adapter::LeafResolver> = Arc::new(UnresolvedLeaf);
+    // limit=1: smaller than "busy"'s child count below, so on Postgres this
+    // would take the lower-bound/approximate path; on SQLite it must have
+    // no effect on correctness (count_children_or_approx is unconditionally
+    // exact there).
+    let root_tree: Arc<dyn ContainerAdapter> = Arc::new(
+        tiled_rs::catalog::CatalogAdapter::root(catalog.clone(), resolver)
+            .with_exact_count_limit(1),
+    );
+    let registry = Arc::new(tiled_rs::serialization::default_registry());
+    let state = tiled_rs::server::AppState {
+        root_tree,
+        serialization_registry: registry,
+        query_names: tiled_rs::core::queries::Query::all_query_names()
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        base_url: Some("http://localhost:8000".into()),
+        cors_policy: tiled_rs::server::state::CorsOriginPolicy::Permissive,
+        trust_forwarded_headers: false,
+        api_key: None,
+        catalog: Some(catalog),
+        auth_db: None,
+        issuer: None,
+        authenticators: vec![],
+        proxied_header_auth: None,
+        external_oidc: None,
+        #[cfg(feature = "saml")]
+        saml_providers: vec![],
+        forwarded_allow_ips: None,
+        max_request_body_bytes: 10 * 1024 * 1024,
+        response_bytesize_limit: 300_000_000,
+        streaming_bus: tiled_rs::server::streaming::StreamingBus::new(),
+        access_policy: None,
+        default_login_scopes: tiled_rs::auth::ScopeSet::full(),
+        enable_web: true,
+        web_assets_dir: None,
+        spec_views: Vec::new(),
+        webhook_config: None,
+        request_timeout_secs: 30,
+        expose_raw_assets: true,
+        exact_count_limit: 1,
+        background_tasks: tiled_rs::server::state::BackgroundTasks::new(),
+    };
+    let app = tiled_rs::server::build_app(state);
+
+    // "busy": 5 children (past the limit=1 threshold).
+    let (status, _) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/register/",
+        serde_json::json!({
+            "key": "busy", "structure_family": "container",
+            "metadata": {}, "specs": [], "data_sources": [],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    for i in 0..5 {
+        let (status, _) = json_request(
+            &app,
+            Method::POST,
+            "/api/v1/register/busy",
+            serde_json::json!({
+                "key": format!("child_{i}"), "structure_family": "container",
+                "metadata": {}, "specs": [], "data_sources": [],
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+
+    // "empty": 0 children.
+    let (status, _) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/register/",
+        serde_json::json!({
+            "key": "empty", "structure_family": "container",
+            "metadata": {}, "specs": [], "data_sources": [],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/search/",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let entries = body["data"].as_array().expect("data must be an array");
+    let count_of = |key: &str| -> i64 {
+        entries
+            .iter()
+            .find(|e| e["id"] == key)
+            .unwrap_or_else(|| panic!("entry '{key}' missing from search response"))
+            ["attributes"]["structure"]["count"]
+            .as_i64()
+            .unwrap_or_else(|| panic!("entry '{key}' has no structure.count"))
+    };
+    assert_eq!(
+        count_of("busy"),
+        5,
+        "busy's per-entry count must be exact (5), not capped at exact_count_limit=1"
+    );
+    assert_eq!(
+        count_of("empty"),
+        0,
+        "empty container's per-entry count must be 0, not miscounted by the batched query"
+    );
+}

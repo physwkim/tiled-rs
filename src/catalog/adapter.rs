@@ -31,6 +31,15 @@ use crate::catalog::orm::Node;
 /// `get`/`len` are single round-trips and ignore this.
 const PAGE: i64 = 10_000;
 
+/// Default per-entry search-page count threshold for an adapter built
+/// without [`CatalogAdapter::with_exact_count_limit`]. Effectively "always
+/// exact": SQLite ignores the threshold anyway
+/// ([`Catalog::count_children_or_approx`]), and on Postgres a threshold this
+/// large keeps the lower-bound scan unbounded, i.e. exact — preserving the
+/// pre-existing (always-exact) search-page behaviour for callers that don't
+/// opt into the server's configured limit.
+const DEFAULT_EXACT_COUNT_LIMIT: i64 = i64::MAX;
+
 /// A container view rooted at a given node (or the catalog root).
 pub struct CatalogAdapter {
     catalog: Catalog,
@@ -40,6 +49,11 @@ pub struct CatalogAdapter {
     /// Resolver that turns a leaf `Node` into a concrete adapter (Array,
     /// Table, ...). Injected by the server (file-system adapters).
     leaf_resolver: Arc<dyn LeafResolver>,
+    /// Threshold passed to [`Catalog::count_children_or_approx`] for each
+    /// container's per-entry count in [`ContainerAdapter::search_page`].
+    /// Mirrors `AppState::exact_count_limit`; see
+    /// [`Self::with_exact_count_limit`].
+    exact_count_limit: i64,
 }
 
 /// Strategy that produces a leaf adapter from a node row + its data
@@ -67,7 +81,20 @@ impl CatalogAdapter {
             metadata: serde_json::Value::Object(serde_json::Map::new()),
             specs: vec![Spec::with_version("CatalogOfBlueskyRuns", "1")],
             leaf_resolver,
+            exact_count_limit: DEFAULT_EXACT_COUNT_LIMIT,
         }
+    }
+
+    /// Configure the per-entry search-page child-count threshold — wires
+    /// `AppState::exact_count_limit` (server/state.rs) through to
+    /// [`ContainerAdapter::search_page`], so a container's per-entry count
+    /// uses the same exact/approximate cutoff as the metadata endpoint and
+    /// the envelope `meta.count` cap. Consuming builder; call on the root
+    /// adapter before use — [`Self::child_container`] carries the value to
+    /// every descendant.
+    pub fn with_exact_count_limit(mut self, limit: i64) -> Self {
+        self.exact_count_limit = limit;
+        self
     }
 
     fn child_container(&self, node: &Node) -> Self {
@@ -77,6 +104,7 @@ impl CatalogAdapter {
             metadata: node.metadata.clone(),
             specs: parse_specs(&node.specs),
             leaf_resolver: self.leaf_resolver.clone(),
+            exact_count_limit: self.exact_count_limit,
         }
     }
 
@@ -269,10 +297,56 @@ impl ContainerAdapter for CatalogAdapter {
                     (rows, total, next_cursor)
                 }
             };
+            // Per-entry container counts for this page. Two strategies,
+            // chosen once per page rather than per row:
+            //
+            // - SQLite: `count_children_or_approx` is unconditionally exact
+            //   here (see its docs), so the whole page's container counts
+            //   are fetched in one `GROUP BY parent_id` query instead of one
+            //   `count_children` round trip per container row (the N+1 this
+            //   task closes).
+            // - Postgres: `count_children_or_approx` bounds its scan per
+            //   parent — a `LIMIT`-capped lower bound, or an O(1) `pg_stats`
+            //   lookup for a container past the threshold — specifically so
+            //   a huge container's entry never costs a full `COUNT(*)`. A
+            //   page-wide `GROUP BY` would force exactly that full scan for
+            //   every container in the page, defeating the approximation.
+            //   Each Postgres container therefore still gets its own
+            //   per-parent call.
+            //
+            // Parsed once per row up front — reused to scope the batch query
+            // below and inside the entry loop, and keeps the "unrecognised
+            // family defaults to Container" fallback (a never-stored case;
+            // parity with the prior search path) consistent between the two
+            // instead of re-deriving it from the raw string twice.
+            let families: Vec<StructureFamily> = rows
+                .iter()
+                .map(|n| {
+                    n.structure_family
+                        .parse::<StructureFamily>()
+                        .unwrap_or(StructureFamily::Container)
+                })
+                .collect();
+
+            let is_sqlite = self.catalog.pool().is_sqlite();
+            let batched_counts = if is_sqlite {
+                let container_ids: Vec<i64> = rows
+                    .iter()
+                    .zip(&families)
+                    .filter(|(_, family)| matches!(family, StructureFamily::Container))
+                    .map(|(n, _)| n.id)
+                    .collect();
+                self.catalog.count_children_batch(&container_ids).await?
+            } else {
+                std::collections::HashMap::new()
+            };
+
             // When include_data_sources is set, batch-load every page node's
             // data sources (+ assets) in two queries — one IN-clause over the
             // page's node ids per table — instead of a query per row. Left
             // `None` when the flag is off so the default listing pays nothing.
+            // Independent of the count batching above: separate queries over
+            // the same page node ids, not sharing any state.
             let mut ds_by_node = if include_data_sources {
                 let node_ids: Vec<i64> = rows.iter().map(|n| n.id).collect();
                 Some(self.catalog.list_data_sources_for_nodes(&node_ids).await?)
@@ -281,13 +355,7 @@ impl ContainerAdapter for CatalogAdapter {
             };
 
             let mut entries = Vec::with_capacity(rows.len());
-            for node in rows {
-                // A row with an unrecognised family defaults to Container
-                // (a never-stored case; parity with the prior search path).
-                let family = node
-                    .structure_family
-                    .parse::<StructureFamily>()
-                    .unwrap_or(StructureFamily::Container);
+            for (node, family) in rows.into_iter().zip(families) {
                 // This node's data sources from the batch fetch. `Some(vec![])`
                 // for a node with none (a container, or a leaf with no source) —
                 // matching Python's empty `entry.data_sources`; `None` when the
@@ -296,7 +364,13 @@ impl ContainerAdapter for CatalogAdapter {
                     .as_mut()
                     .map(|map| map.remove(&node.id).unwrap_or_default());
                 let structure = if matches!(family, StructureFamily::Container) {
-                    let count = self.catalog.count_children(Some(node.id)).await?;
+                    let count = if is_sqlite {
+                        batched_counts.get(&node.id).copied().unwrap_or(0)
+                    } else {
+                        self.catalog
+                            .count_children_or_approx(Some(node.id), self.exact_count_limit)
+                            .await?
+                    };
                     Some(
                         serde_json::to_value(NodeStructure {
                             contents: None,
