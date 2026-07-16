@@ -202,6 +202,10 @@ fn decode_v3_scalar(b: &BuiltinDType, bytes: &[u8]) -> serde_json::Value {
         (Kind::UnsignedInteger, 8) => serde_json::json!(rd!(u64, 8)),
         (Kind::Float, 4) => serde_json::json!(rd!(f32, 4)),
         (Kind::Float, 8) => serde_json::json!(rd!(f64, 8)),
+        // float16: widen to f32 (lossless) so a 0-dimensional float16 array
+        // reports its real scalar fill value instead of falling through to
+        // v3_default_scalar's 0.0. dtype_v3_name already emits "float16".
+        (Kind::Float, 2) => serde_json::json!(half::f16::from_bits(rd!(u16, 2)).to_f32()),
         _ => v3_default_scalar(b),
     }
 }
@@ -928,5 +932,23 @@ mod tests {
     fn numpy_descr_renders_builtin_string() {
         let dt = DType::Builtin(BuiltinDType::new(Endianness::Little, Kind::Float, 8));
         assert_eq!(dtype_to_numpy_descr(&dt), serde_json::json!("<f8"));
+    }
+
+    /// A 0-dimensional float16 array reports its real scalar fill value: the
+    /// decoder widens f16 -> f32 rather than falling through to the default
+    /// 0.0, and dtype_v3_name labels it "float16".
+    #[test]
+    fn decode_v3_scalar_handles_float16() {
+        let f16 = BuiltinDType::new(Endianness::Little, Kind::Float, 2);
+        assert_eq!(dtype_v3_name(&f16).unwrap(), "float16");
+
+        // 1.5 and -2.5 are exact in float16.
+        let bytes = half::f16::from_f32(1.5).to_bits().to_le_bytes();
+        assert_eq!(decode_v3_scalar(&f16, &bytes), serde_json::json!(1.5));
+
+        // A nonzero value must NOT collapse to the default 0.0.
+        let bytes = half::f16::from_f32(-2.5).to_bits().to_le_bytes();
+        assert_eq!(decode_v3_scalar(&f16, &bytes), serde_json::json!(-2.5));
+        assert_ne!(decode_v3_scalar(&f16, &bytes), serde_json::json!(0.0));
     }
 }
