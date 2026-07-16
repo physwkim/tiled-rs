@@ -54,6 +54,7 @@ fix problems in code we never wrote.
 | #1302 | Multi-chunk `?block=` range | e3660db | `BlockSpec::Range` + cartesian-product walk + ND row-major copy; 7 unit tests. Single-chunk fast-path preserved. |
 | #143  | RGB TIFF support | (this batch) | Color TIFFs were silently coerced to grayscale + u16; now `[h, w, channels]` shape with native dtype (u8/u16/u32/f32/f64). |
 | #1164 | HDF5 locking parameter | (this batch) | rust-hdf5 0.2.8 added `H5File::options().locking(...)` (mirrors libhdf5's `HDF5_USE_FILE_LOCKING`); ported `Hdf5Locking::{Default,Disabled,BestEffort}` + `from_path_with_locking` constructor. Earlier audit marked N/A because 0.2.0 was lock-less. |
+| #1018 | Background-task lifecycle | a9f6df8 | `AppState::background_tasks` (`BackgroundTasks`: JoinSet registry + watch-channel cancellation) is the single owner for process-lifetime tasks; the webhook dispatcher registers with it and selects on `cancellation()` instead of a detached `tokio::spawn`. `cli::run()` calls `background_tasks.shutdown()` (signal + await, exactly once) after the HTTP listener stops accepting connections. Per-webhook delivery tasks stay detached (bounded lifetime, documented in `webhook_dispatch.rs`). |
 
 ## Already covered (no code change)
 
@@ -81,7 +82,6 @@ fix problems in code we never wrote.
 | PR | Title | Reason |
 |----|-------|--------|
 | #1096 | Postgres approximate length for large containers | `pg_class.reltuples` estimate — premature without 50M+ row workload. |
-| #1018 | Background-task lifecycle | Our webhook_dispatch spawn isn't registered with axum's graceful shutdown. Soft issue. |
 | #1314 | External-array shape race during streaming | Race between SWMR/zarr writer + cached reader metadata. Complex to fix deterministically. |
 | #1320 | Postgres `nodes` parent_id index | We have the index; production-scale planner tuning is the actual issue. |
 | #588  | btree_gin (vs plain GIN) | We have plain GIN over jsonb; btree_gin only helps hybrid btree+gin queries. |
