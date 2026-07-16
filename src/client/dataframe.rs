@@ -18,7 +18,7 @@ use crate::client::any_client::AnyClient;
 use crate::client::base::{BaseClient, Item, ParsedStructure};
 use crate::client::context::Context;
 use crate::client::error::{ClientError, Result};
-use crate::client::utils::{ARROW_FILE_MIME_TYPE, decode_response, retry};
+use crate::client::utils::{ARROW_FILE_MIME_TYPE, decode_response, resolve_export_format, retry};
 
 /// Characters escaped when a column name becomes one path segment of the
 /// child-metadata URL, so `?`, `#`, `/`, `%`, ... in a name cannot reshape the
@@ -299,14 +299,20 @@ impl TableClient {
         .await
     }
 
-    /// Export the whole table to a file at `dest` in the requested `format`
-    /// (e.g. `"csv"`, `"json"`, `"parquet"`). Sends
-    /// `GET /api/v1/table/full/{path}?format=<fmt>` and writes the body to
-    /// `dest`, mirroring Python `DataFrameClient.export`.
-    pub async fn export(&self, dest: &std::path::Path, format: &str) -> Result<()> {
+    /// Export the whole table to a file at `dest`, mirroring Python
+    /// `DataFrameClient.export`: sends `GET /api/v1/table/full/{path}?format=<fmt>`
+    /// and writes the body to `dest`.
+    ///
+    /// `format` is resolved by the shared `resolve_export_format` helper:
+    /// `Some(fmt)` (e.g. `"csv"`, `"json"`, `"parquet"`) is used as given with a
+    /// single leading `.` stripped, while `None` infers the format from `dest`'s
+    /// file extension (e.g. `table.csv` → `csv`). The server resolves the result
+    /// as an alias or media type; an unsupported format returns a server error.
+    pub async fn export(&self, dest: &std::path::Path, format: Option<&str>) -> Result<()> {
+        let resolved = resolve_export_format(dest, format)?;
         let link = self.base.require_link("full")?;
         let mut url = Url::parse(link)?;
-        url.query_pairs_mut().append_pair("format", format);
+        url.query_pairs_mut().append_pair("format", &resolved);
         let _permit = self.base.context.data_fetch_permit().await;
         let bytes = retry(|| async { self.base.context.get_bytes(&url, "*/*").await }).await?;
         std::fs::write(dest, &bytes)

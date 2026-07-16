@@ -33,7 +33,7 @@ use crate::client::any_client::AnyClient;
 use crate::client::base::{BaseClient, Item};
 use crate::client::context::Context;
 use crate::client::error::{ClientError, Result};
-use crate::client::utils::{decode_response, retry};
+use crate::client::utils::{decode_response, resolve_export_format, retry};
 
 /// Sort direction for container child ordering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -454,43 +454,6 @@ impl ContainerClient {
         let bytes = retry(|| async { self.base.context.get_bytes(&url, "*/*").await }).await?;
         std::fs::write(dest, &bytes)
             .map_err(|e| ClientError::Invalid(format!("write {}: {e}", dest.display())))
-    }
-}
-
-/// Resolve the `format` query value for a container export, matching Python
-/// `tiled.client.utils.export_util`: an explicit `format` wins (a single leading
-/// `.` is stripped); otherwise the format is inferred from `dest`'s filename
-/// suffixes.
-fn resolve_export_format(dest: &std::path::Path, format: Option<&str>) -> Result<String> {
-    if let Some(f) = format {
-        return Ok(f.strip_prefix('.').unwrap_or(f).to_string());
-    }
-    format_from_suffixes(dest).ok_or_else(|| {
-        ClientError::Invalid(format!(
-            "cannot infer export format from '{}'; pass an explicit format",
-            dest.display()
-        ))
-    })
-}
-
-/// Join a filename's suffixes without dots, matching Python
-/// `pathlib.Path.suffixes`: `export.zip` → `Some("zip")`, `run.tar.gz` →
-/// `Some("tar.gz")`. A name with no interior `.`, a trailing `.`, or only
-/// leading dots (a hidden file) yields `None`.
-fn format_from_suffixes(dest: &std::path::Path) -> Option<String> {
-    let name = dest.file_name()?.to_str()?;
-    // Python `Path.suffixes` returns [] when the name ends with '.'.
-    if name.ends_with('.') {
-        return None;
-    }
-    // Leading dots (hidden files) are part of the stem, not suffix separators.
-    let mut parts = name.trim_start_matches('.').split('.');
-    parts.next()?; // discard the stem
-    let suffixes: Vec<&str> = parts.collect();
-    if suffixes.is_empty() {
-        None
-    } else {
-        Some(suffixes.join("."))
     }
 }
 
