@@ -523,21 +523,42 @@ fn require_asset_id(asset: &Asset) -> Result<i64> {
     })
 }
 
-/// The on-disk filename for a single-file asset: the basename of its `file://`
-/// `data_uri`. This reproduces the server's `Content-Disposition` attachment
-/// filename (`get_asset_bytes` sets it from the same basename).
+/// The on-disk filename for a single-file asset: the last path segment of its
+/// `file://` `data_uri`, percent-decoded. This reproduces the server's
+/// `Content-Disposition` attachment filename (`get_asset_bytes` sets it from
+/// the same basename).
+///
+/// The derivation stays at the URI-string level on purpose. `data_uri` names a
+/// *server-side* path, so running it through the *client*-platform
+/// [`file_uri_to_path`] would let client path semantics intrude: a
+/// drive-letterless Unix server path (`file:///data/x.h5`) is not a valid
+/// absolute path on Windows, so the conversion yields `None` and no filename.
+/// Splitting the URL path is platform-independent by construction — `C:` is
+/// just another segment on every platform.
+///
+/// [`file_uri_to_path`]: crate::core::file_uri::file_uri_to_path
 fn single_file_name(asset: &Asset) -> Result<String> {
-    crate::core::file_uri::file_uri_to_path(&asset.data_uri)
-        .as_deref()
-        .and_then(Path::file_name)
-        .and_then(|n| n.to_str())
-        .map(str::to_string)
-        .ok_or_else(|| {
-            ClientError::Invalid(format!(
-                "cannot derive a filename from asset data_uri '{}'",
-                asset.data_uri
-            ))
-        })
+    let invalid = || {
+        ClientError::Invalid(format!(
+            "cannot derive a filename from asset data_uri '{}'",
+            asset.data_uri
+        ))
+    };
+    let url = Url::parse(&asset.data_uri).map_err(|_| invalid())?;
+    if url.scheme() != "file" {
+        return Err(invalid());
+    }
+    // Last path segment, rejecting an empty tail (a trailing slash or missing
+    // path names a directory or the root, which has no filename).
+    let segment = url
+        .path_segments()
+        .and_then(|mut segments| segments.next_back())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(invalid)?;
+    percent_encoding::percent_decode_str(segment)
+        .decode_utf8()
+        .map(|name| name.into_owned())
+        .map_err(|_| invalid())
 }
 
 /// Write `bytes` to `target`, creating parent directories first so a directory
@@ -799,18 +820,40 @@ mod tests {
     }
 
     #[test]
-    fn single_file_name_is_data_uri_basename() {
-        // Matches the server's Content-Disposition attachment filename, which is
-        // the basename of the asset's file:// path.
+    fn single_file_name_derives_basename_cross_platform() {
+        // Derivation is at the URI string level, so each case yields the same
+        // filename on every platform — no cfg-gated assertions. Matches the
+        // server's Content-Disposition attachment filename.
+        //
+        // Unix-style server path (drive-letterless) — the Windows-CI regression:
+        // this previously ran through the client's PathBuf conversion, which
+        // rejects a driveletterless path on Windows.
         assert_eq!(
             single_file_name(&asset("file:///data/scan001.h5", Some(1))).unwrap(),
             "scan001.h5"
         );
+        // Windows-style server path — `C:` is just a leading path segment.
+        assert_eq!(
+            single_file_name(&asset("file:///C:/data/scan001.h5", Some(1))).unwrap(),
+            "scan001.h5"
+        );
+        // A percent-encoded segment decodes back to the literal filename.
+        assert_eq!(
+            single_file_name(&asset("file:///data/my%20scan.h5", Some(1))).unwrap(),
+            "my scan.h5"
+        );
     }
 
     #[test]
-    fn single_file_name_rejects_non_file_uri() {
-        let err = single_file_name(&asset("s3://bucket/obj", Some(1))).unwrap_err();
-        assert!(matches!(err, ClientError::Invalid(_)));
+    fn single_file_name_rejects_unusable_uris() {
+        // A non-file scheme, a directory (trailing slash), and the bare root all
+        // lack a usable filename segment → Invalid.
+        for uri in ["s3://bucket/obj", "file:///data/", "file://"] {
+            let err = single_file_name(&asset(uri, Some(1))).unwrap_err();
+            assert!(
+                matches!(err, ClientError::Invalid(_)),
+                "expected Invalid for {uri}, got {err:?}"
+            );
+        }
     }
 }
