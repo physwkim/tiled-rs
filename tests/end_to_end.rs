@@ -1445,6 +1445,162 @@ async fn table_export_to_file() {
     assert!(content.contains('1') && content.contains('z'), "csv data");
 }
 
+/// Read the entry names out of an in-memory zip archive.
+fn zip_entry_names(bytes: &[u8]) -> Vec<String> {
+    let mut archive =
+        zip::ZipArchive::new(std::io::Cursor::new(bytes.to_vec())).expect("valid zip archive");
+    (0..archive.len())
+        .map(|i| archive.by_index(i).unwrap().name().to_string())
+        .collect()
+}
+
+/// `ContainerClient::export` — download a subtree (array + table child) to a
+/// local zip file, plus the format-resolution surface (explicit format,
+/// extension inference, explicit-over-extension, unknown → error).
+#[tokio::test]
+async fn container_export_to_zip() {
+    use arrow::array::{Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use tiled_rs::core::data_source::{DataSource, Management};
+    use tiled_rs::core::dtype::{BuiltinDType, DType, Endianness, Kind};
+    use tiled_rs::core::structures::{
+        AnyStructure, ArrayStructure, StructureFamily, TableStructure,
+    };
+
+    let (base, _wd, _db) = spawn_write_server().await;
+    let root = from_uri(&base).await.unwrap().into_container().unwrap();
+
+    // Array child, then write its data.
+    let arr_ds = DataSource {
+        structure_family: StructureFamily::Array,
+        structure: Some(AnyStructure::Array(ArrayStructure {
+            data_type: DType::Builtin(BuiltinDType::new(Endianness::Little, Kind::Float, 8)),
+            chunks: vec![vec![4]],
+            shape: vec![4],
+            dims: None,
+            resizable: Default::default(),
+        })),
+        id: None,
+        mimetype: Some("application/x-npy".into()),
+        parameters: serde_json::json!({}),
+        properties: serde_json::json!({}),
+        assets: vec![],
+        management: Management::Writable,
+    };
+    root.create_node(
+        Some("arr"),
+        StructureFamily::Array,
+        serde_json::json!({}),
+        vec![],
+        vec![arr_ds],
+    )
+    .await
+    .unwrap();
+    let arr = root.get("arr").await.unwrap().into_array().unwrap();
+    let payload: bytes::Bytes = [1.0f64, 2.0, 3.0, 4.0]
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+    arr.write(payload).await.unwrap();
+
+    // Table child, then write one batch.
+    let tbl_ds = DataSource {
+        structure_family: StructureFamily::Table,
+        structure: Some(AnyStructure::Table(TableStructure {
+            arrow_schema: String::new(),
+            npartitions: 1,
+            columns: vec!["x".into(), "y".into()],
+            resizable: Default::default(),
+        })),
+        id: None,
+        mimetype: Some("text/csv".into()),
+        parameters: serde_json::json!({}),
+        properties: serde_json::json!({}),
+        assets: vec![],
+        management: Management::Writable,
+    };
+    root.create_node(
+        Some("tbl"),
+        StructureFamily::Table,
+        serde_json::json!({}),
+        vec![],
+        vec![tbl_ds],
+    )
+    .await
+    .unwrap();
+    let tbl = root.get("tbl").await.unwrap().into_table().unwrap();
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("x", DataType::Int64, false),
+        Field::new("y", DataType::Utf8, false),
+    ]));
+    let batch = arrow::array::RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![1i64])),
+            Arc::new(StringArray::from(vec!["z"])),
+        ],
+    )
+    .unwrap();
+    tbl.write(&schema, &[batch]).await.unwrap();
+
+    let container = from_uri(&base).await.unwrap().into_container().unwrap();
+    let out = tempfile::tempdir().unwrap();
+
+    // 1. Explicit format "zip": file exists, non-empty, zip magic, expected entries.
+    let explicit = out.path().join("explicit.zip");
+    container
+        .export(&explicit, Some("zip"))
+        .await
+        .expect("export zip");
+    let bytes = std::fs::read(&explicit).unwrap();
+    assert!(!bytes.is_empty(), "zip export is non-empty");
+    assert_eq!(&bytes[..4], b"PK\x03\x04", "zip local-file-header magic");
+    let names = zip_entry_names(&bytes);
+    assert!(
+        names.iter().any(|n| n == "arr.bin"),
+        "array leaf entry present: {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n == "tbl.arrow"),
+        "table leaf entry present: {names:?}"
+    );
+
+    // 2. Format inferred from the ".zip" extension (format = None).
+    let inferred = out.path().join("inferred.zip");
+    container
+        .export(&inferred, None)
+        .await
+        .expect("export inferred zip");
+    let inferred_bytes = std::fs::read(&inferred).unwrap();
+    assert_eq!(
+        &inferred_bytes[..4],
+        b"PK\x03\x04",
+        "inferred-format zip magic"
+    );
+    let inferred_names = zip_entry_names(&inferred_bytes);
+    assert!(inferred_names.iter().any(|n| n == "arr.bin"));
+    assert!(inferred_names.iter().any(|n| n == "tbl.arrow"));
+
+    // 3. Explicit format overrides the extension: a ".bin" dest still gets a zip.
+    let override_dest = out.path().join("override.bin");
+    container
+        .export(&override_dest, Some(".zip"))
+        .await
+        .expect("explicit format overrides extension");
+    let override_bytes = std::fs::read(&override_dest).unwrap();
+    assert_eq!(
+        &override_bytes[..4],
+        b"PK\x03\x04",
+        "explicit .zip produced a zip despite the .bin filename"
+    );
+
+    // 4. Unknown format → mapped server error; nothing is written through.
+    let bad = out.path().join("bad.zip");
+    let err = container.export(&bad, Some("bogus")).await;
+    assert!(err.is_err(), "unknown format maps to an error, got {err:?}");
+    assert!(!bad.exists(), "no file written when the request fails");
+}
+
 // ---------------------------------------------------------------------------
 // Blosc2 content-encoding tests
 // ---------------------------------------------------------------------------
