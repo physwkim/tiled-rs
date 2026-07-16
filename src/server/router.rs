@@ -77,13 +77,31 @@ async fn resolve_entry_catalog(
         .catalog
         .as_ref()
         .expect("resolve_entry_catalog requires catalog");
+    let mut prev_was_table = false;
     for i in 0..segments.len() {
         let prefix = &segments[..=i];
-        let node = catalog
-            .lookup(prefix)
-            .await
-            .map_err(map_catalog_err)?
-            .ok_or_else(|| ServerError::NotFound(format!("'{}' not found", segments.join("/"))))?;
+        let node = match catalog.lookup(prefix).await.map_err(map_catalog_err)? {
+            Some(node) => node,
+            None => {
+                // A `[table, column]` path has no DB node for the column: the
+                // column is a synthesized array child of the table leaf.
+                // Upstream `lookup_adapter` falls back to `adapter.get(segment)`
+                // on the deepest data-source-backed node when the DB lookup
+                // misses (catalog/adapter.py:557-566). Mirror that just for the
+                // final segment of a table: the column inherits the table's
+                // already-narrowed access, so the current context stands. The
+                // route's `walk_tree` (→ `core::table_column_as_array`) is the
+                // single point that 404s a column absent from the schema, so
+                // the auth gate must not 404 a valid column here.
+                if i + 1 == segments.len() && prev_was_table {
+                    return Ok(auth);
+                }
+                return Err(ServerError::NotFound(format!(
+                    "'{}' not found",
+                    segments.join("/")
+                )));
+            }
+        };
         auth = auth
             .narrow_for_node(
                 state.access_policy.as_deref(),
@@ -101,6 +119,7 @@ async fn resolve_entry_catalog(
                 segments.join("/")
             )));
         }
+        prev_was_table = node.structure_family == "table";
     }
     Ok(auth)
 }
@@ -453,6 +472,7 @@ pub async fn metadata(
     let mut resource = if let Some(ref catalog) = state.catalog {
         catalog_metadata_resource(
             catalog,
+            state.root_tree.as_ref(),
             &segments,
             &base_url,
             include_data_sources,
@@ -5901,6 +5921,7 @@ pub async fn delete_metadata(
 /// write sees the latest state.
 async fn catalog_metadata_resource(
     catalog: &crate::catalog::Catalog,
+    root_tree: &dyn ContainerAdapter,
     segments: &[String],
     base_url: &str,
     include_data_sources: bool,
@@ -5946,11 +5967,40 @@ async fn catalog_metadata_resource(
         });
     }
 
-    let node = catalog
-        .lookup(segments)
-        .await
-        .map_err(map_catalog_err)?
-        .ok_or_else(|| ServerError::NotFound(format!("'{}' not found", segments.join("/"))))?;
+    let node = match catalog.lookup(segments).await.map_err(map_catalog_err)? {
+        Some(node) => node,
+        None => {
+            // No DB node for this path. A `[table, column]` path addresses a
+            // synthesized array child of a table leaf, which the catalog does
+            // not index — upstream `lookup_adapter` falls back to
+            // `adapter.get(segment)` on the deepest data-source-backed node
+            // (catalog/adapter.py:557-566). When the parent is a table, resolve
+            // the column through the same path the array/zarr routes use —
+            // `walk_tree` synthesizes it via `core::table_column_as_array` — and
+            // build the resource from that array adapter with the shared
+            // `construct_resource`, so every route agrees on a catalog-backed
+            // server. A column absent from the schema 404s inside `walk_tree`.
+            if segments.len() >= 2 {
+                let parent = &segments[..segments.len() - 1];
+                let parent_is_table = catalog
+                    .lookup(parent)
+                    .await
+                    .map_err(map_catalog_err)?
+                    .map(|n| n.structure_family == "table")
+                    .unwrap_or(false);
+                if parent_is_table {
+                    let adapter = core::walk_tree(root_tree, segments).await?;
+                    let id = segments.last().cloned().unwrap_or_default();
+                    let path = segments.join("/");
+                    return core::construct_resource(&adapter, &id, &path, base_url).await;
+                }
+            }
+            return Err(ServerError::NotFound(format!(
+                "'{}' not found",
+                segments.join("/")
+            )));
+        }
+    };
     let path = segments.join("/");
     let id = segments.last().cloned().unwrap_or_default();
     let family = parse_structure_family(&node.structure_family)?;
