@@ -2225,3 +2225,186 @@ async fn blosc2_not_requested_gets_uncompressed_body() {
     let bytes = resp.bytes().await.unwrap();
     assert_eq!(bytes.len(), 200 * 8);
 }
+
+// ---------------------------------------------------------------------------
+// Server-level sparse managed create + resolve: create a sparse node over a
+// catalog (exercising default_creation_mimetype(Sparse) +
+// managed_init_storage's sparse arm + init_storage_sparse_parquet), then
+// resolve it back through the FileLeafResolver's sparse branch and read the
+// COO data — the catalog sparse-resolution regression (before this wiring, a
+// created sparse node could not be resolved to an adapter at all).
+// ---------------------------------------------------------------------------
+
+/// Build a `SparseData` from block-local `(coords, data)`: one int64 coord
+/// column per dimension plus an f64 value column — the shape the sparse write
+/// face consumes.
+fn make_sparse_data(coords: Vec<Vec<i64>>, data: Vec<f64>) -> tiled_rs::core::adapters::SparseData {
+    use tiled_rs::core::dtype::{BuiltinDType, DynNDArray, Endianness, Kind};
+    let nnz = data.len();
+    let i64_dtype = BuiltinDType::new(Endianness::Little, Kind::Integer, 8);
+    let f64_dtype = BuiltinDType::new(Endianness::Little, Kind::Float, 8);
+    let coord_dyn: Vec<DynNDArray> = coords
+        .into_iter()
+        .map(|c| {
+            let bytes: Vec<u8> = c.iter().flat_map(|v| v.to_le_bytes()).collect();
+            DynNDArray::new(Bytes::from(bytes), i64_dtype.clone(), vec![nnz])
+        })
+        .collect();
+    let data_bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let data_dyn = DynNDArray::new(Bytes::from(data_bytes), f64_dtype, vec![nnz]);
+    tiled_rs::core::adapters::SparseData {
+        coords: coord_dyn,
+        data: data_dyn,
+    }
+}
+
+#[tokio::test]
+async fn sparse_managed_create_resolves_and_reads_back() {
+    use tiled_rs::catalog::Catalog;
+    use tiled_rs::core::data_source::{DataSource, Management};
+    use tiled_rs::core::dtype::{BuiltinDType, DType, Endianness, Kind};
+    use tiled_rs::core::structures::{AnyStructure, SparseStructure, StructureFamily};
+    use tiled_rs::server::file_resolver::FileLeafResolver;
+
+    // --- inline catalog-backed server, keeping the root_tree handle so the
+    // test can drive create (HTTP) → resolve/write (server tree) → read (HTTP).
+    let db_dir = tempfile::tempdir().unwrap();
+    let writable_dir = tempfile::tempdir().unwrap();
+    let writable_root = writable_dir.path().canonicalize().unwrap();
+    let db_uri = format!("sqlite://{}", db_dir.path().join("catalog.db").display());
+    let catalog = Catalog::connect(&db_uri)
+        .await
+        .unwrap()
+        .with_managed_delete_dirs(vec![writable_root.clone()])
+        .with_writable_storage(vec![writable_root.clone()]);
+    catalog.migrate().await.unwrap();
+    let resolver: Arc<dyn tiled_rs::catalog::adapter::LeafResolver> =
+        Arc::new(FileLeafResolver::new(vec![writable_root.clone()]));
+    let root_tree: Arc<dyn ContainerAdapter> = Arc::new(tiled_rs::catalog::CatalogAdapter::root(
+        catalog.clone(),
+        resolver,
+    ));
+
+    let state = tiled_rs::server::AppState {
+        root_tree: root_tree.clone(),
+        serialization_registry: Arc::new(tiled_rs::serialization::default_registry()),
+        query_names: Query::all_query_names()
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        base_url: None,
+        cors_policy: tiled_rs::server::state::CorsOriginPolicy::Permissive,
+        trust_forwarded_headers: false,
+        api_key: None,
+        catalog: Some(catalog.clone()),
+        auth_db: None,
+        issuer: None,
+        authenticators: vec![],
+        proxied_header_auth: None,
+        external_oidc: None,
+        #[cfg(feature = "saml")]
+        saml_providers: vec![],
+        forwarded_allow_ips: None,
+        max_request_body_bytes: 10 * 1024 * 1024,
+        response_bytesize_limit: 300_000_000,
+        streaming_bus: tiled_rs::server::streaming::StreamingBus::new(),
+        access_policy: None,
+        default_login_scopes: tiled_rs::auth::ScopeSet::full(),
+        enable_web: false,
+        web_assets_dir: None,
+        spec_views: Vec::new(),
+        webhook_config: None,
+        request_timeout_secs: 30,
+        expose_raw_assets: true,
+        exact_count_limit: u64::MAX,
+        background_tasks: tiled_rs::server::state::BackgroundTasks::new(),
+    };
+    let app = tiled_rs::server::build_app(state);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base = format!("http://{addr}");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let root = from_uri(&base).await.unwrap().into_container().unwrap();
+
+    // Single-chunk 3×3 COO node → one block. No pinned mimetype: exercise
+    // default_creation_mimetype(Sparse) → application/x-parquet;structure=sparse,
+    // then managed_init_storage → init_storage_sparse_parquet.
+    let structure = SparseStructure {
+        chunks: vec![vec![3], vec![3]],
+        shape: vec![3, 3],
+        data_type: Some(DType::Builtin(BuiltinDType::new(
+            Endianness::Little,
+            Kind::Float,
+            8,
+        ))),
+        ..Default::default()
+    };
+    let ds = DataSource {
+        structure_family: StructureFamily::Sparse,
+        structure: Some(AnyStructure::Sparse(structure)),
+        id: None,
+        mimetype: None,
+        parameters: serde_json::json!({}),
+        properties: serde_json::json!({}),
+        assets: vec![],
+        management: Management::Writable,
+    };
+    root.create_node(
+        Some("sp"),
+        StructureFamily::Sparse,
+        serde_json::json!({"note": "coo"}),
+        vec![],
+        vec![ds],
+    )
+    .await
+    .expect("create sparse node");
+
+    // Resolve the created node through the server tree — this exercises the
+    // FileLeafResolver sparse branch (build_sparse_blocks_adapter). The managed
+    // node must resolve to a writable sparse adapter with the declared structure.
+    let seg = vec!["sp".to_string()];
+    let adapter = tiled_rs::server::core::walk_tree(root_tree.as_ref(), &seg)
+        .await
+        .expect("resolve created sparse node");
+    let sparse = adapter
+        .as_sparse_arc()
+        .expect("managed sparse node resolves to a sparse adapter");
+    assert_eq!(sparse.structure().shape, vec![3, 3], "resolved shape");
+    assert_eq!(
+        sparse.structure().chunks,
+        vec![vec![3], vec![3]],
+        "resolved chunk grid"
+    );
+    let writable = sparse
+        .as_writable()
+        .expect("a managed sparse node under writable storage is writable");
+
+    // Write the single block: (0,1)=1.5 and (2,0)=3.7.
+    writable
+        .write(make_sparse_data(
+            vec![vec![0, 2], vec![1, 0]],
+            vec![1.5, 3.7],
+        ))
+        .await
+        .expect("write sparse block");
+
+    // Read back through the HTTP client — the server resolves the node again
+    // (through build_sparse_blocks_adapter) and serves the COO table.
+    let node = root.get("sp").await.unwrap();
+    let sc = node.as_sparse().expect("sp resolves to a sparse client");
+    let block = sc.read().await.expect("read sparse COO");
+    assert_eq!(block.shape, vec![3, 3]);
+    let mut got: Vec<((i64, i64), f64)> = (0..block.data.len())
+        .map(|i| ((block.coords[0][i], block.coords[1][i]), block.data[i]))
+        .collect();
+    got.sort_by_key(|a| a.0);
+    assert_eq!(
+        got,
+        vec![((0, 1), 1.5), ((2, 0), 3.7)],
+        "read-back COO must match what was written to the resolved managed node"
+    );
+}
