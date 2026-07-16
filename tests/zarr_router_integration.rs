@@ -16,7 +16,7 @@ use bytes::Bytes;
 use indexmap::IndexMap;
 use tower::ServiceExt;
 
-use tiled_rs::adapters::{ArrayAdapter, MapAdapter};
+use tiled_rs::adapters::{ArrayAdapter, CooAdapter, MapAdapter};
 use tiled_rs::core::adapters::{AnyAdapter, ArrayAdapterRead, ContainerAdapter};
 use tiled_rs::core::dtype::{BuiltinDType, Endianness, Kind};
 use tiled_rs::core::ndslice::NDSlice;
@@ -68,6 +68,89 @@ fn build_root(arr: Arc<ArrayAdapter>, arr3: Arc<ArrayAdapter>) -> Arc<dyn Contai
         serde_json::json!({"description": "zarr test"}),
         vec![],
     ))
+}
+
+fn f64_dtype() -> BuiltinDType {
+    BuiltinDType::new(Endianness::Little, Kind::Float, 8)
+}
+
+/// `sparse_known`: 3x3 sparse array, one whole-array chunk (`CooAdapter::from_arrays`),
+/// two known non-zeros: (0,1)=1.5, (2,0)=3.7 — for the exact-dense-bytes test.
+fn build_sparse_known() -> Arc<CooAdapter> {
+    Arc::new(
+        CooAdapter::from_arrays(
+            vec![vec![0i64, 2], vec![1i64, 0]],
+            Bytes::from(f64_le(&[1.5, 3.7])),
+            f64_dtype(),
+            vec![3, 3],
+            None,
+            serde_json::json!({}),
+            vec![],
+        )
+        .unwrap(),
+    )
+}
+
+/// `sparse_boundary`: 1-D shape `[5]` on chunks `[[3, 2]]` → zarr chunk size 3,
+/// so chunk 1 covers `[3:6)`, clipped to `[3:5)` at the array's edge and
+/// zero-padded up to length 3. One non-zero at global index 4 (chunk 1, local
+/// index 1); chunk 0 has no non-zeros at all.
+fn build_sparse_boundary() -> Arc<CooAdapter> {
+    Arc::new(
+        CooAdapter::from_blocks(
+            vec![5],
+            vec![vec![3, 2]],
+            f64_dtype(),
+            None,
+            serde_json::json!({}),
+            vec![],
+            vec![(vec![1], vec![vec![1i64]], Bytes::from(f64_le(&[9.0])))],
+        )
+        .unwrap(),
+    )
+}
+
+/// `sparse_empty`: 1-D shape `[9]` on chunks `[[3, 3, 3]]` → zarr chunk size 3,
+/// exactly tiling the shape (no boundary padding). Non-zeros only in chunks 0
+/// and 1 (global indices 1 and 4); chunk 2 (`[6:9)`) has no non-zeros anywhere
+/// — a fully empty chunk, distinct from the boundary-padding case above.
+fn build_sparse_empty_chunk() -> Arc<CooAdapter> {
+    Arc::new(
+        CooAdapter::from_blocks(
+            vec![9],
+            vec![vec![3, 3, 3]],
+            f64_dtype(),
+            None,
+            serde_json::json!({}),
+            vec![],
+            vec![
+                (vec![0], vec![vec![1i64]], Bytes::from(f64_le(&[5.0]))),
+                (vec![1], vec![vec![1i64]], Bytes::from(f64_le(&[7.0]))),
+            ],
+        )
+        .unwrap(),
+    )
+}
+
+fn build_sparse_root() -> Arc<dyn ContainerAdapter> {
+    let mut mapping = IndexMap::new();
+    mapping.insert(
+        "sparse_known".into(),
+        AnyAdapter::Sparse(build_sparse_known()),
+    );
+    mapping.insert(
+        "sparse_boundary".into(),
+        AnyAdapter::Sparse(build_sparse_boundary()),
+    );
+    mapping.insert(
+        "sparse_empty".into(),
+        AnyAdapter::Sparse(build_sparse_empty_chunk()),
+    );
+    Arc::new(MapAdapter::new(mapping, serde_json::json!({}), vec![]))
+}
+
+fn sparse_app() -> axum::Router {
+    build_app(build_sparse_root(), None)
 }
 
 fn build_app(root: Arc<dyn ContainerAdapter>, api_key: Option<String>) -> axum::Router {
@@ -296,6 +379,104 @@ async fn v3_group_doc_and_listing() {
         urls[0].ends_with("/zarr/v3/subgroup/nested_arr"),
         "{urls:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// sparse arrays — densified via `SparseData::densify` (core/adapters.rs)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn v2_sparse_array_doc_and_chunk_known_coo_points() {
+    let app = sparse_app();
+
+    // .zarray metadata — same shape as the dense-array doc, dtype/shape/chunks
+    // sourced from the sparse structure.
+    let (status, doc) = get_json(&app, "/zarr/v2/sparse_known/.zarray").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(doc["zarr_format"], 2);
+    assert_eq!(doc["dtype"], "<f8");
+    assert_eq!(doc["chunks"], serde_json::json!([3, 3]));
+    assert_eq!(doc["shape"], serde_json::json!([3, 3]));
+    assert_eq!(doc["order"], "C");
+    assert_eq!(doc["compressor"], serde_json::Value::Null);
+    assert_eq!(doc["fill_value"], serde_json::Value::Null);
+
+    // Dense C-order bytes for the whole 3x3 array (one chunk, "0.0"), zeros
+    // included: (0,1)=1.5 and (2,0)=3.7, everything else implicit zero.
+    let (status, chunk) = get(&app, "/zarr/v2/sparse_known/0.0").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        f64s(&chunk),
+        vec![0.0, 1.5, 0.0, 0.0, 0.0, 0.0, 3.7, 0.0, 0.0]
+    );
+}
+
+#[tokio::test]
+async fn v3_sparse_array_doc_and_chunk() {
+    let app = sparse_app();
+
+    let (status, doc) = get_json(&app, "/zarr/v3/sparse_known/zarr.json").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(doc["zarr_format"], 3);
+    assert_eq!(doc["node_type"], "array");
+    assert_eq!(doc["data_type"], "float64");
+    assert_eq!(doc["shape"], serde_json::json!([3, 3]));
+    assert_eq!(
+        doc["chunk_grid"]["configuration"]["chunk_shape"],
+        serde_json::json!([3, 3])
+    );
+    assert_eq!(doc["chunk_key_encoding"]["configuration"]["separator"], "/");
+    // A sparse array's implicit fill value is its zero element.
+    assert_eq!(doc["fill_value"], serde_json::json!(0.0));
+    assert_eq!(doc["codecs"][0]["name"], "bytes");
+
+    let (status, chunk) = get(&app, "/zarr/v3/sparse_known/c/0/0").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        f64s(&chunk),
+        vec![0.0, 1.5, 0.0, 0.0, 0.0, 0.0, 3.7, 0.0, 0.0]
+    );
+}
+
+#[tokio::test]
+async fn sparse_boundary_chunk_is_zero_padded() {
+    let app = sparse_app();
+    // shape [5], zarr chunk size 3 -> chunk 1 covers global [3,6), clipped to
+    // [3,5): local 0 = global 3 (implicit zero), local 1 = global 4 (9.0),
+    // local 2 is padding past the array's actual end (there is no global 5).
+    let (status, chunk1) = get(&app, "/zarr/v2/sparse_boundary/1").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(f64s(&chunk1), vec![0.0, 9.0, 0.0]);
+
+    // Chunk 0 [0,3) is a full, non-boundary chunk with no non-zeros at all.
+    let (status, chunk0) = get(&app, "/zarr/v2/sparse_boundary/0").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(f64s(&chunk0), vec![0.0, 0.0, 0.0]);
+
+    // v3 chunk key for the same boundary chunk agrees.
+    let (status, chunk1_v3) = get(&app, "/zarr/v3/sparse_boundary/c/1").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(f64s(&chunk1_v3), vec![0.0, 9.0, 0.0]);
+}
+
+#[tokio::test]
+async fn sparse_chunk_with_no_nonzeros_is_all_zero() {
+    let app = sparse_app();
+    // shape [9], chunks [3,3,3] tile exactly (no boundary padding involved).
+    // Chunk 2 ([6,9)) has no non-zeros anywhere in the array's data.
+    let (status, chunk2) = get(&app, "/zarr/v2/sparse_empty/2").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(f64s(&chunk2), vec![0.0, 0.0, 0.0]);
+
+    // Sanity: the other two chunks do carry their known values, so chunk 2's
+    // zeros are not a symptom of the whole array reading as empty.
+    let (status, chunk0) = get(&app, "/zarr/v2/sparse_empty/0").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(f64s(&chunk0), vec![0.0, 5.0, 0.0]);
+
+    let (status, chunk1) = get(&app, "/zarr/v2/sparse_empty/1").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(f64s(&chunk1), vec![0.0, 7.0, 0.0]);
 }
 
 // ---------------------------------------------------------------------------
