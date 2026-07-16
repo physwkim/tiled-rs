@@ -869,6 +869,7 @@ async fn build_array_response(
     format_param: Option<&str>,
     headers: &HeaderMap,
     state: &AppState,
+    filename: Option<&str>,
 ) -> Result<axum::response::Response, ServerError> {
     // Cap the decoded array size before serialization (Python: array.nbytes).
     check_response_size(
@@ -928,7 +929,7 @@ async fn build_array_response(
         .map_err(|e| ServerError::Internal(format!("serialize task failed: {e}")))?
         .map_err(map_serialize_error)?;
 
-    Ok(serve_with_range(headers, &media_type, body))
+    Ok(serve_with_range(headers, &media_type, body, filename))
 }
 
 // Shared by `table_partition` and `table_full`: encode an already-read
@@ -943,6 +944,7 @@ async fn build_table_response(
     format_param: Option<&str>,
     headers: &HeaderMap,
     state: &AppState,
+    filename: Option<&str>,
 ) -> Result<axum::response::Response, ServerError> {
     // Cap the decoded table size before serialization (Python:
     // df.memory_usage().sum()).
@@ -1015,7 +1017,7 @@ async fn build_table_response(
         .map_err(|e| ServerError::Internal(format!("serialize task failed: {e}")))?
         .map_err(map_serialize_error)?;
 
-    Ok(serve_with_range(headers, &media_type, body))
+    Ok(serve_with_range(headers, &media_type, body, filename))
 }
 
 /// Convert a `DynNDArray` (raw little-endian element bytes + dtype) into an
@@ -1070,6 +1072,7 @@ async fn build_sparse_response(
     format_param: Option<&str>,
     headers: &HeaderMap,
     state: &AppState,
+    filename: Option<&str>,
 ) -> Result<axum::response::Response, ServerError> {
     // Cap the decoded size before serialization: coords (ndim * nnz) + data.
     let nbytes: usize =
@@ -1153,7 +1156,7 @@ async fn build_sparse_response(
             .map_err(|e| ServerError::Internal(format!("serialize task failed: {e}")))?
             .map_err(map_serialize_error)?;
 
-    Ok(serve_with_range(headers, &media_type, body))
+    Ok(serve_with_range(headers, &media_type, body, filename))
 }
 
 // Shared by `ragged_full`: encode an already-read `RaggedData` through the
@@ -1165,6 +1168,7 @@ async fn build_ragged_response(
     format_param: Option<&str>,
     headers: &HeaderMap,
     state: &AppState,
+    filename: Option<&str>,
 ) -> Result<axum::response::Response, ServerError> {
     // Cap the decoded size before serialization. Python guards on
     // `array._impl.nbytes` (the Awkward buffers' total size, router.py:882); the
@@ -1223,7 +1227,7 @@ async fn build_ragged_response(
         .map_err(|e| ServerError::Internal(format!("serialize task failed: {e}")))?
         .map_err(map_serialize_error)?;
 
-    Ok(serve_with_range(headers, &media_type, body))
+    Ok(serve_with_range(headers, &media_type, body, filename))
 }
 
 // ---------------------------------------------------------------------------
@@ -1257,6 +1261,7 @@ pub async fn array_block(
         .map(|s| s.to_string())
         .unwrap_or_default();
     let format_str = params.get("format").map(|s| s.to_string());
+    let filename_str = params.get("filename").map(|s| s.to_string());
     // The async tree walk resolves each hop on the executor (a blocking
     // backend offloads its own sync work internally). It hands back an owned
     // `Arc` clone of the leaf; the read itself is a `Send` future that
@@ -1283,7 +1288,14 @@ pub async fn array_block(
                 .collect::<Result<Vec<_>, _>>()?
         };
         let data = sparse.read_block(&block).await.map_err(ServerError::from)?;
-        return build_sparse_response(data, format_str.as_deref(), &headers, &state).await;
+        return build_sparse_response(
+            data,
+            format_str.as_deref(),
+            &headers,
+            &state,
+            filename_str.as_deref(),
+        )
+        .await;
     }
 
     let array_adapter: Arc<dyn crate::core::adapters::ArrayAdapterRead> =
@@ -1334,17 +1346,29 @@ pub async fn array_block(
         read_block_range(array_adapter.as_ref(), &block_specs).await?
     };
 
-    build_array_response(data, format_str.as_deref(), &headers, &state).await
+    build_array_response(
+        data,
+        format_str.as_deref(),
+        &headers,
+        &state,
+        filename_str.as_deref(),
+    )
+    .await
 }
 
 /// Build a Response that honors `Range: bytes=...` when present
 /// (upstream tiled PR #762). Used by data routes that produce a full
 /// byte buffer in memory — DuckDB httpfs and similar tools rely on
 /// partial GETs to scan only the file slices they need.
+/// `filename`, when present, is the client's `?filename=` query param
+/// (Python `construct_data_response`, core.py:436-437): it sets
+/// `Content-Disposition: attachment; filename="..."` so a browser downloads
+/// the response under that name instead of rendering/naming it from the URL.
 fn serve_with_range(
     headers: &HeaderMap,
     content_type: &str,
     body: bytes::Bytes,
+    filename: Option<&str>,
 ) -> axum::response::Response {
     use axum::http::{HeaderName, HeaderValue, StatusCode, header};
     let total = body.len();
@@ -1356,7 +1380,7 @@ fn serve_with_range(
         HeaderName::from_static("accept-ranges"),
         HeaderValue::from_static("bytes"),
     );
-    match range {
+    let mut resp = match range {
         Some((start, end)) if end >= start && end < total => {
             let slice = body.slice(start..=end);
             let mut resp = (
@@ -1395,7 +1419,17 @@ fn serve_with_range(
             body,
         )
             .into_response(),
+    };
+    if let Some(name) = filename
+        && let Ok(value) = HeaderValue::from_str(&format!(
+            "attachment; filename=\"{}\"",
+            name.replace('"', "")
+        ))
+    {
+        resp.headers_mut()
+            .insert(header::CONTENT_DISPOSITION, value);
     }
+    resp
 }
 
 /// Parse a single-range `Range: bytes=START-END` header. Multi-range
@@ -1792,6 +1826,8 @@ pub struct LongRequest {
     pub block: Option<String>,
     #[serde(default)]
     pub format: Option<String>,
+    #[serde(default)]
+    pub filename: Option<String>,
 }
 
 impl LongRequest {
@@ -1805,6 +1841,9 @@ impl LongRequest {
         }
         if let Some(f) = &self.format {
             p.insert("format".to_string(), f.clone());
+        }
+        if let Some(name) = &self.filename {
+            p.insert("filename".to_string(), name.clone());
         }
         p
     }
@@ -1916,6 +1955,7 @@ pub async fn container_full(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     let format_str = params.get("format").map(|s| s.to_string());
+    let filename_str = params.get("filename").map(|s| s.to_string());
     // Resolve effective media type once: format param beats Accept header. An
     // explicit but unserviceable format/Accept resolves to `None` → HTTP 406,
     // consistent with the array/table/sparse handlers (no silent HTML fallback).
@@ -2099,6 +2139,7 @@ pub async fn container_full(
             &headers,
             "application/zip",
             bytes::Bytes::from(buf),
+            filename_str.as_deref(),
         ));
     }
 
@@ -2115,6 +2156,7 @@ pub async fn container_full(
             &headers,
             crate::core::media_type::mime::HDF5,
             h5,
+            filename_str.as_deref(),
         ));
     }
 
@@ -2185,7 +2227,12 @@ pub async fn container_full(
         )));
     };
 
-    Ok(serve_with_range(&headers, &media_type, body))
+    Ok(serve_with_range(
+        &headers,
+        &media_type,
+        body,
+        filename_str.as_deref(),
+    ))
 }
 
 /// One leaf to bundle into a deep-export zip. Phase 1 captures only an OWNED
@@ -2880,6 +2927,7 @@ pub async fn array_full(
         .map(|s| s.to_string())
         .unwrap_or_default();
     let format_str = params.get("format").map(|s| s.to_string());
+    let filename_str = params.get("filename").map(|s| s.to_string());
     // The async tree walk resolves each hop on the executor and hands back an
     // owned `Arc` clone of the leaf; the read future offloads its own blocking
     // and is awaited on the executor below.
@@ -2895,7 +2943,14 @@ pub async fn array_full(
     // applying the optional `?slice=` via the adapter's `read`.
     if let Some(sparse) = adapter.as_sparse_arc() {
         let data = sparse.read(&slice).await.map_err(ServerError::from)?;
-        return build_sparse_response(data, format_str.as_deref(), &headers, &state).await;
+        return build_sparse_response(
+            data,
+            format_str.as_deref(),
+            &headers,
+            &state,
+            filename_str.as_deref(),
+        )
+        .await;
     }
 
     let array_adapter: Arc<dyn crate::core::adapters::ArrayAdapterRead> =
@@ -2908,7 +2963,14 @@ pub async fn array_full(
         .await
         .map_err(ServerError::from)?;
 
-    build_array_response(data, format_str.as_deref(), &headers, &state).await
+    build_array_response(
+        data,
+        format_str.as_deref(),
+        &headers,
+        &state,
+        filename_str.as_deref(),
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -2945,6 +3007,7 @@ pub async fn ragged_full(
         .map(|s| s.to_string())
         .unwrap_or_default();
     let format_str = params.get("format").map(|s| s.to_string());
+    let filename_str = params.get("filename").map(|s| s.to_string());
     let adapter = core::walk_tree(state.root_tree.as_ref(), &segments).await?;
 
     let slice = match slice_str.as_str() {
@@ -2968,7 +3031,14 @@ pub async fn ragged_full(
         other => ServerError::from(other),
     })?;
 
-    build_ragged_response(data, format_str.as_deref(), &headers, &state).await
+    build_ragged_response(
+        data,
+        format_str.as_deref(),
+        &headers,
+        &state,
+        filename_str.as_deref(),
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -3357,6 +3427,7 @@ async fn build_awkward_response(
     format_param: Option<&str>,
     headers: &HeaderMap,
     state: &AppState,
+    filename: Option<&str>,
 ) -> Result<axum::response::Response, ServerError> {
     let nbytes: usize = buffers.values().map(|b| b.len()).sum();
     check_response_size(
@@ -3403,7 +3474,7 @@ async fn build_awkward_response(
         .map_err(|e| ServerError::Internal(format!("serialize task failed: {e}")))?
         .map_err(map_serialize_error)?;
 
-    Ok(serve_with_range(headers, &media_type, body))
+    Ok(serve_with_range(headers, &media_type, body, filename))
 }
 
 // ---------------------------------------------------------------------------
@@ -3437,6 +3508,7 @@ pub async fn awkward_full(
     .await?;
 
     let format_str = params.get("format").cloned();
+    let filename_str = params.get("filename").cloned();
     let adapter = core::walk_tree(state.root_tree.as_ref(), &segments).await?;
 
     let awkward = adapter.as_awkward_arc().ok_or_else(|| {
@@ -3446,7 +3518,15 @@ pub async fn awkward_full(
     let buffers = awkward.read().await.map_err(ServerError::from)?;
     let structure = awkward.structure().clone();
 
-    build_awkward_response(buffers, &structure, format_str.as_deref(), &headers, &state).await
+    build_awkward_response(
+        buffers,
+        &structure,
+        format_str.as_deref(),
+        &headers,
+        &state,
+        filename_str.as_deref(),
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -3534,6 +3614,10 @@ pub async fn awkward_buffers(
         .iter()
         .find(|(k, _)| k == "format")
         .map(|(_, v)| v.clone());
+    let filename_str = params
+        .iter()
+        .find(|(k, _)| k == "filename")
+        .map(|(_, v)| v.clone());
 
     let adapter = core::walk_tree(state.root_tree.as_ref(), &segments).await?;
     let awkward = adapter.as_awkward_arc().ok_or_else(|| {
@@ -3552,7 +3636,15 @@ pub async fn awkward_buffers(
         .map_err(ServerError::from)?;
     let structure = awkward.structure().clone();
 
-    build_awkward_response(buffers, &structure, format_str.as_deref(), &headers, &state).await
+    build_awkward_response(
+        buffers,
+        &structure,
+        format_str.as_deref(),
+        &headers,
+        &state,
+        filename_str.as_deref(),
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -3585,6 +3677,7 @@ pub async fn post_awkward_buffers(
     .await?;
 
     let format_str = params.get("format").cloned();
+    let filename_str = params.get("filename").cloned();
 
     let adapter = core::walk_tree(state.root_tree.as_ref(), &segments).await?;
     let awkward = adapter.as_awkward_arc().ok_or_else(|| {
@@ -3603,7 +3696,15 @@ pub async fn post_awkward_buffers(
         .map_err(ServerError::from)?;
     let structure = awkward.structure().clone();
 
-    build_awkward_response(buffers, &structure, format_str.as_deref(), &headers, &state).await
+    build_awkward_response(
+        buffers,
+        &structure,
+        format_str.as_deref(),
+        &headers,
+        &state,
+        filename_str.as_deref(),
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -3631,6 +3732,7 @@ pub async fn table_partition(
         .collect();
     let fields: Option<Vec<String>> = (!columns.is_empty()).then_some(columns);
     let format_param = table_partition_format(&params);
+    let filename_param = table_partition_filename(&params);
 
     table_partition_core(
         &state,
@@ -3639,6 +3741,7 @@ pub async fn table_partition(
         partition,
         fields,
         format_param,
+        filename_param,
         &headers,
     )
     .await
@@ -3661,6 +3764,7 @@ pub async fn post_table_partition(
     let segments = segments_from_uri(&uri, "/api/v1/table/partition/");
     let partition = table_partition_index(&params);
     let format_param = table_partition_format(&params);
+    let filename_param = table_partition_filename(&params);
     let fields = columns.map(|Json(c)| c).filter(|c| !c.is_empty());
 
     table_partition_core(
@@ -3670,6 +3774,7 @@ pub async fn post_table_partition(
         partition,
         fields,
         format_param,
+        filename_param,
         &headers,
     )
     .await
@@ -3690,10 +3795,18 @@ fn table_partition_format(params: &[(String, String)]) -> Option<String> {
         .map(|(_, v)| v.clone())
 }
 
+fn table_partition_filename(params: &[(String, String)]) -> Option<String> {
+    params
+        .iter()
+        .find(|(k, _)| k == "filename")
+        .map(|(_, v)| v.clone())
+}
+
 /// Shared read+respond core for the GET and POST `table/partition` handlers.
 /// The two differ only in where the column projection comes from (repeated
 /// query params vs a JSON body); auth, the per-node policy check, the tree
 /// walk, the bounds check, and response negotiation are identical.
+#[allow(clippy::too_many_arguments)]
 async fn table_partition_core(
     state: &AppState,
     auth: &crate::server::AuthContext,
@@ -3701,6 +3814,7 @@ async fn table_partition_core(
     partition: usize,
     fields: Option<Vec<String>>,
     format_param: Option<String>,
+    filename_param: Option<String>,
     headers: &HeaderMap,
 ) -> Result<axum::response::Response, ServerError> {
     auth.require(crate::auth::Scope::ReadData)?;
@@ -3729,7 +3843,15 @@ async fn table_partition_core(
         .map_err(ServerError::from)?;
 
     let metadata = table_adapter.metadata().clone();
-    build_table_response(table, metadata, format_param.as_deref(), headers, state).await
+    build_table_response(
+        table,
+        metadata,
+        format_param.as_deref(),
+        headers,
+        state,
+        filename_param.as_deref(),
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -3777,6 +3899,10 @@ pub async fn table_full(
         .iter()
         .find(|(k, _)| k == "format")
         .map(|(_, v)| v.clone());
+    let filename_param = params
+        .iter()
+        .find(|(k, _)| k == "filename")
+        .map(|(_, v)| v.clone());
 
     // The async tree walk resolves each hop on the executor and hands back an
     // owned `Arc` clone of the leaf; the read future offloads its own blocking
@@ -3793,7 +3919,15 @@ pub async fn table_full(
         .map_err(ServerError::from)?;
 
     let metadata = table_adapter.metadata().clone();
-    build_table_response(table, metadata, format_param.as_deref(), &headers, &state).await
+    build_table_response(
+        table,
+        metadata,
+        format_param.as_deref(),
+        &headers,
+        &state,
+        filename_param.as_deref(),
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -3815,6 +3949,8 @@ pub struct TableFullRequest {
     pub columns: Option<Vec<String>>,
     #[serde(default)]
     pub format: Option<String>,
+    #[serde(default)]
+    pub filename: Option<String>,
 }
 
 pub async fn table_full_post(
@@ -3838,6 +3974,9 @@ pub async fn table_full_post(
     }
     if let Some(f) = &req.format {
         query.push(("format".to_string(), f.clone()));
+    }
+    if let Some(name) = &req.filename {
+        query.push(("filename".to_string(), name.clone()));
     }
 
     table_full(state, OriginalUri(uri), Query(query), headers, auth)
@@ -5560,6 +5699,7 @@ pub async fn get_asset_bytes(
         &headers,
         "application/octet-stream",
         bytes::Bytes::from(bytes),
+        None,
     );
     if let Ok(value) = axum::http::HeaderValue::from_str(&format!(
         "attachment; filename=\"{}\"",

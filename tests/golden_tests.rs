@@ -1670,6 +1670,114 @@ async fn test_table_full_endpoint() {
 }
 
 // ---------------------------------------------------------------------------
+// `?filename=` → `Content-Disposition: attachment; filename="..."` on data
+// export routes (Python `construct_data_response`, core.py:436-437).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_array_full_filename_sets_content_disposition() {
+    let app = build_app();
+    let (status, headers, _) =
+        get_with_headers(&app, "/api/v1/array/full/some_array?filename=data.bin", &[]).await;
+    assert_eq!(status, 200);
+    let cd = headers
+        .get("content-disposition")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert_eq!(cd, "attachment; filename=\"data.bin\"");
+
+    // Absent when the param is not given.
+    let (status, headers, _) = get_with_headers(&app, "/api/v1/array/full/some_array", &[]).await;
+    assert_eq!(status, 200);
+    assert!(
+        headers.get("content-disposition").is_none(),
+        "Content-Disposition must be absent without ?filename="
+    );
+}
+
+#[tokio::test]
+async fn test_array_block_filename_sets_content_disposition() {
+    let app = build_app();
+    let (status, headers, _) = get_with_headers(
+        &app,
+        "/api/v1/array/block/some_array?block=0&filename=block.bin",
+        &[],
+    )
+    .await;
+    assert_eq!(status, 200);
+    let cd = headers
+        .get("content-disposition")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert_eq!(cd, "attachment; filename=\"block.bin\"");
+}
+
+#[cfg(feature = "csv-adapter")]
+#[tokio::test]
+async fn test_table_full_filename_sets_content_disposition() {
+    use std::io::Write;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t.csv");
+    let mut f = std::fs::File::create(&path).unwrap();
+    writeln!(f, "x,y").unwrap();
+    writeln!(f, "1,10").unwrap();
+    f.flush().unwrap();
+    let app = build_table_app(path, 300_000_000);
+
+    // GET.
+    let (status, headers, _) = get_with_headers(
+        &app,
+        "/api/v1/table/full/some_table?filename=table.arrow",
+        &[],
+    )
+    .await;
+    assert_eq!(status, 200);
+    let cd = headers
+        .get("content-disposition")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert_eq!(cd, "attachment; filename=\"table.arrow\"");
+
+    // POST long-request form carries filename in the JSON body.
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/table/full")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(
+                &serde_json::json!({"path": "some_table", "filename": "posted.arrow"}),
+            )
+            .unwrap(),
+        ))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let cd = resp
+        .headers()
+        .get("content-disposition")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert_eq!(cd, "attachment; filename=\"posted.arrow\"");
+}
+
+#[tokio::test]
+async fn test_container_full_filename_sets_content_disposition() {
+    let app = build_app();
+    let (status, headers, _) = get_with_headers(
+        &app,
+        "/api/v1/container/full/?format=json&filename=tree.json",
+        &[],
+    )
+    .await;
+    assert_eq!(status, 200);
+    let cd = headers
+        .get("content-disposition")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert_eq!(cd, "attachment; filename=\"tree.json\"");
+}
+
+// ---------------------------------------------------------------------------
 // GET/PUT /api/v1/node/full/{path} — deprecated family-agnostic alias
 // (Python router.py:1477 GET / 2162 PUT). Dispatches to the same core as
 // `/table/full` or `/container/full` depending on the target node's
