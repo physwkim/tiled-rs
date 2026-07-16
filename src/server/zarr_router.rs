@@ -28,9 +28,12 @@
 //!
 //! Arrays, sparse arrays, and containers are fully supported. Tables are
 //! surfaced as zarr *groups* whose listing enumerates the column names
-//! (mirroring upstream), but the per-column arrays are not resolvable because
-//! the Rust adapter layer models a table as a leaf, not a container. Reported
-//! as UNFIXED in the task report.
+//! (mirroring upstream), and each per-column URL resolves to a zarr array:
+//! `walk_tree` synthesizes an array-adapter view over the column (see
+//! [`crate::server::core`]), so a table column's `.zarray`/`zarr.json` and chunk
+//! reads work like any other array. A column whose Arrow dtype is non-numeric
+//! (string, temporal, nested) cannot be served as an array yet — reported as
+//! UNFIXED in the task report.
 //!
 //! ## Sparse arrays: densify via a full read, not a partial slice
 //!
