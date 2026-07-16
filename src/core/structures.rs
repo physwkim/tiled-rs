@@ -30,6 +30,23 @@ pub enum StructureFamily {
     Table,
 }
 
+impl StructureFamily {
+    /// Every structure family, in declaration order. The single source of truth
+    /// for "all families": enumerations that must cover the whole set — e.g. the
+    /// server About payload's `formats` / `aliases` maps
+    /// ([`SerializationRegistry::all_formats`](crate::serialization::SerializationRegistry::all_formats))
+    /// — iterate this so a newly added variant cannot silently drop out of one
+    /// copy of a hand-maintained list.
+    pub const ALL: [StructureFamily; 6] = [
+        Self::Array,
+        Self::Awkward,
+        Self::Container,
+        Self::Ragged,
+        Self::Sparse,
+        Self::Table,
+    ];
+}
+
 impl std::fmt::Display for StructureFamily {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

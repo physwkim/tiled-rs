@@ -103,30 +103,23 @@ impl SerializationRegistry {
     }
 
     /// Get all formats as a HashMap (family_name → Vec<media_type>).
+    ///
+    /// Iterates [`StructureFamily::ALL`] — the canonical family set — so every
+    /// family the registry can serialize (including `ragged`) appears in the
+    /// server's About `formats` map, matching upstream's dynamic
+    /// `serialization_registry.structure_families` enumeration.
     pub fn all_formats(&self) -> HashMap<String, Vec<String>> {
-        let families = [
-            StructureFamily::Array,
-            StructureFamily::Table,
-            StructureFamily::Sparse,
-            StructureFamily::Awkward,
-            StructureFamily::Container,
-        ];
-        families
+        StructureFamily::ALL
             .iter()
             .map(|f| (f.to_string(), self.media_types(*f)))
             .collect()
     }
 
-    /// Get all aliases grouped by family.
+    /// Get all aliases grouped by family. Iterates [`StructureFamily::ALL`] for
+    /// the same reason as [`all_formats`](Self::all_formats); a family with no
+    /// registered aliases is omitted from the map.
     pub fn all_aliases(&self) -> HashMap<String, HashMap<String, Vec<String>>> {
-        let families = [
-            StructureFamily::Array,
-            StructureFamily::Table,
-            StructureFamily::Sparse,
-            StructureFamily::Awkward,
-            StructureFamily::Container,
-        ];
-        families
+        StructureFamily::ALL
             .iter()
             .filter_map(|f| {
                 let a = self.aliases(*f);
