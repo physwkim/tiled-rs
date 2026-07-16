@@ -532,4 +532,46 @@ mod tests {
             other => panic!("expected Sparse, got {other:?}"),
         }
     }
+
+    #[test]
+    fn to_core_data_source_loads_array_shaped_sparse_row() {
+        // A row written before the family-authoritative fix: the untagged parse
+        // stored a sparse node's structure Array-shaped — data_type present, but
+        // no coord_data_type and no layout. to_core_data_source must still load
+        // it under structure_family = "sparse", re-defaulting the missing coord
+        // to uint64-LE (SparseStructure::from_json) rather than dropping the whole
+        // structure to None. This proves old/corrupted rows survive the narrowing.
+        let ds = DataSource {
+            id: 9,
+            node_id: 1,
+            structure_family: "sparse".into(),
+            structure: serde_json::json!({
+                "chunks": [[3], [3]],
+                "shape": [3, 3],
+                "data_type": {"endianness": "little", "kind": "f", "itemsize": 8}
+            }),
+            mimetype: "application/x-parquet;structure=sparse".into(),
+            parameters: serde_json::json!({}),
+            management: "writable".into(),
+        };
+        let core = to_core_data_source(ds, vec![]);
+        assert_eq!(core.structure_family, StructureFamily::Sparse);
+        match core.structure {
+            Some(AnyStructure::Sparse(s)) => {
+                assert_eq!(s.shape, vec![3, 3]);
+                // Missing coord_data_type re-defaults to uint64-LE, not None,
+                // and the row is not dropped.
+                assert_eq!(
+                    s.coord_data_type,
+                    Some(BuiltinDType::new(
+                        Endianness::Little,
+                        Kind::UnsignedInteger,
+                        8
+                    )),
+                    "array-shaped sparse row must re-default coord to uint64-LE"
+                );
+            }
+            other => panic!("expected Sparse, got {other:?}"),
+        }
+    }
 }
