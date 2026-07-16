@@ -420,6 +420,78 @@ impl ContainerClient {
         }
         Ok(url)
     }
+
+    /// Export this whole subtree to a file at `dest`, mirroring Python
+    /// `Container.export` (container.py:625). Downloads the container's full
+    /// contents via `GET /api/v1/container/full/{path}?format=<fmt>` and streams
+    /// the response body to `dest` — the same idiom as
+    /// [`ArrayClient::export`](crate::client::array::ArrayClient::export) and
+    /// [`TableClient::export`](crate::client::dataframe::TableClient::export).
+    ///
+    /// `format` selects the output serialization and is resolved like Python
+    /// `tiled.client.utils.export_util`:
+    /// - `Some(fmt)` — used as given, with a single leading `.` stripped
+    ///   (`Some(".zip")` and `Some("zip")` are equivalent). For a container the
+    ///   only content-bundling format the server produces is `zip`, which packs
+    ///   each leaf array/table as a zip entry; `json`/`html` yield the metadata
+    ///   tree / browseable index.
+    /// - `None` — the format is inferred from `dest`'s filename suffixes joined
+    ///   without dots (`export.zip` → `zip`, matching Python
+    ///   `pathlib.Path.suffixes`). A `dest` with no extension to infer from
+    ///   yields [`ClientError::Invalid`] rather than sending an empty format the
+    ///   server would reject.
+    ///
+    /// The server resolves the resulting format as an alias or media type; an
+    /// unsupported format surfaces as a mapped server error. Unlike Python this
+    /// does not accept a `fields` filter — the Rust `/container/full` route does
+    /// not read a `field` param.
+    pub async fn export(&self, dest: &std::path::Path, format: Option<&str>) -> Result<()> {
+        let resolved = resolve_export_format(dest, format)?;
+        let link = self.base.require_link("full")?;
+        let mut url = Url::parse(link).map_err(ClientError::from)?;
+        url.query_pairs_mut().append_pair("format", &resolved);
+        let _permit = self.base.context.data_fetch_permit().await;
+        let bytes = retry(|| async { self.base.context.get_bytes(&url, "*/*").await }).await?;
+        std::fs::write(dest, &bytes)
+            .map_err(|e| ClientError::Invalid(format!("write {}: {e}", dest.display())))
+    }
+}
+
+/// Resolve the `format` query value for a container export, matching Python
+/// `tiled.client.utils.export_util`: an explicit `format` wins (a single leading
+/// `.` is stripped); otherwise the format is inferred from `dest`'s filename
+/// suffixes.
+fn resolve_export_format(dest: &std::path::Path, format: Option<&str>) -> Result<String> {
+    if let Some(f) = format {
+        return Ok(f.strip_prefix('.').unwrap_or(f).to_string());
+    }
+    format_from_suffixes(dest).ok_or_else(|| {
+        ClientError::Invalid(format!(
+            "cannot infer export format from '{}'; pass an explicit format",
+            dest.display()
+        ))
+    })
+}
+
+/// Join a filename's suffixes without dots, matching Python
+/// `pathlib.Path.suffixes`: `export.zip` → `Some("zip")`, `run.tar.gz` →
+/// `Some("tar.gz")`. A name with no interior `.`, a trailing `.`, or only
+/// leading dots (a hidden file) yields `None`.
+fn format_from_suffixes(dest: &std::path::Path) -> Option<String> {
+    let name = dest.file_name()?.to_str()?;
+    // Python `Path.suffixes` returns [] when the name ends with '.'.
+    if name.ends_with('.') {
+        return None;
+    }
+    // Leading dots (hidden files) are part of the stem, not suffix separators.
+    let mut parts = name.trim_start_matches('.').split('.');
+    parts.next()?; // discard the stem
+    let suffixes: Vec<&str> = parts.collect();
+    if suffixes.is_empty() {
+        None
+    } else {
+        Some(suffixes.join("."))
+    }
 }
 
 #[derive(Debug, Deserialize)]
