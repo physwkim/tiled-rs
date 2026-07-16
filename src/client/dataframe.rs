@@ -11,12 +11,31 @@ use crate::core::structures::TableStructure;
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use arrow::ipc::reader::FileReader;
+use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use url::Url;
 
+use crate::client::any_client::AnyClient;
 use crate::client::base::{BaseClient, Item, ParsedStructure};
 use crate::client::context::Context;
 use crate::client::error::{ClientError, Result};
-use crate::client::utils::{ARROW_FILE_MIME_TYPE, retry};
+use crate::client::utils::{ARROW_FILE_MIME_TYPE, decode_response, retry};
+
+/// Characters escaped when a column name becomes one path segment of the
+/// child-metadata URL, so `?`, `#`, `/`, `%`, ... in a name cannot reshape the
+/// request. Matches `container.rs`/`constructors.rs`, which each keep the same
+/// per-module copy (the client's established convention for this set).
+const PATH_SEGMENT: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'<')
+    .add(b'>')
+    .add(b'#')
+    .add(b'?')
+    .add(b'`')
+    .add(b'{')
+    .add(b'}')
+    .add(b'/')
+    .add(b'%');
 
 /// A single partition decoded into Arrow record batches.
 #[derive(Debug, Clone)]
@@ -65,6 +84,62 @@ impl TableClient {
     /// Number of partitions.
     pub fn npartitions(&self) -> usize {
         self.structure().npartitions
+    }
+
+    /// Address one `column` of this table as a child *array* node.
+    ///
+    /// Mirrors upstream `DataFrameClient.__getitem__` (`dataframe.py:202-220`):
+    /// issue a metadata GET of the child path `<self>/<column>` and dispatch the
+    /// returned item to its family client via [`client_for_item`]. The server
+    /// resolves a `[table, column]` metadata path to a synthesized array node
+    /// (`ArrayAdapter.from_array(self.read([column])[column].values)`,
+    /// `adapters/table.py:143-146`), so this yields an [`AnyClient::Array`] — call
+    /// [`AnyClient::into_array`] to narrow and then `read`/`read_block`. A column
+    /// absent from the table is a 404, surfaced as [`ClientError::KeyNotFound`]
+    /// (upstream raises `KeyError(column)`).
+    ///
+    /// The request is a bare metadata GET, identical to the one upstream issues;
+    /// the resulting client inherits this table's `include_data_sources` flag,
+    /// matching how [`ContainerClient::get`] propagates it to a fetched child.
+    ///
+    /// [`client_for_item`]: crate::client::AnyClient::from_item
+    /// [`AnyClient::Array`]: crate::client::AnyClient::Array
+    /// [`AnyClient::into_array`]: crate::client::AnyClient::into_array
+    /// [`ContainerClient::get`]: crate::client::ContainerClient::get
+    pub async fn get_column(&self, column: &str) -> Result<AnyClient> {
+        // Append `/<column>` to this node's metadata self link. self link points
+        // to /metadata/.../<table>; the extra segment walks into the column.
+        let mut url = Url::parse(self.base.require_link("self")?)?;
+        let encoded = utf8_percent_encode(column, PATH_SEGMENT).to_string();
+        let new_path = if url.path().ends_with('/') {
+            format!("{}{}", url.path(), encoded)
+        } else {
+            format!("{}/{}", url.path(), encoded)
+        };
+        url.set_path(&new_path);
+
+        let result = retry(|| async {
+            let r = self.base.context.get(&url).await?;
+            decode_response::<MetadataEnvelope>(r).await
+        })
+        .await;
+
+        let envelope = match result {
+            Ok(env) => env,
+            // Upstream maps a 404 on the column path to `KeyError(column)`.
+            Err(ClientError::Server { status: 404, .. }) => {
+                return Err(ClientError::KeyNotFound(format!("no column '{column}'")));
+            }
+            Err(e) => return Err(e),
+        };
+        let item = envelope
+            .data
+            .ok_or_else(|| ClientError::KeyNotFound(format!("no column '{column}'")))?;
+        AnyClient::from_item(
+            self.base.context.clone(),
+            item,
+            self.base.include_data_sources,
+        )
     }
 
     /// Read one partition as Arrow record batches. Optional column projection
@@ -247,6 +322,14 @@ impl TableClient {
         }
         Ok(out)
     }
+}
+
+/// Single-resource envelope for a `/metadata/.../<column>` response
+/// (`{data: <item>}`), the shape [`TableClient::get_column`] decodes. Mirrors
+/// the private `ResourceEnvelope` the container client uses for a child fetch.
+#[derive(Debug, serde::Deserialize)]
+struct MetadataEnvelope {
+    data: Option<Item>,
 }
 
 /// Encode `batches` as an Arrow IPC FILE stream — the body shape every table
