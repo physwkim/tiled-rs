@@ -487,13 +487,22 @@ pub struct NodeStructure {
 
 /// Any structure variant.
 ///
-/// Uses `#[serde(untagged)]` because in the wire format, `structure_family` and `structure`
-/// are separate sibling fields on `NodeAttributes`, not nested.
+/// **Serialize only.** `#[serde(untagged)]` emits the held variant's structure
+/// object verbatim — with no tag — because in the wire format `structure_family`
+/// and `structure` are separate sibling fields (on `NodeAttributes` and
+/// `DataSource`), not nested.
 ///
-/// `Ragged` is listed first: `RaggedStructure` is the only variant with a
-/// required `size` field, so a ragged structure matches it while every other
-/// (size-less) structure falls through to its own variant.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// `Deserialize` is deliberately *not* derived. An untagged `Deserialize` picks
+/// a variant by trying each in order and taking the first that fits, which
+/// silently mislabels a COO [`SparseStructure`] carrying a `data_type` as
+/// [`ArrayStructure`] (a sparse structure is a structural superset of an array
+/// one). Because the authoritative discriminator — `structure_family` — lives
+/// *outside* the structure object, it cannot steer such a parse. Callers must
+/// parse under family authority via [`AnyStructure::from_family_json`] (or, for
+/// a whole data source, [`DataSource`](crate::core::data_source::DataSource)'s
+/// family-aware `Deserialize`), making the mislabel unrepresentable by
+/// construction rather than guarded at runtime.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum AnyStructure {
     Ragged(RaggedStructure),
@@ -607,45 +616,14 @@ mod tests {
     }
 
     #[test]
-    fn test_any_structure_picks_ragged() {
-        // A ragged structure (has required `size`) must deserialize as Ragged,
-        // not be mislabeled Array/Sparse by the untagged enum.
-        let any: AnyStructure = serde_json::from_value(ragged_json()).unwrap();
-        assert!(matches!(any, AnyStructure::Ragged(_)));
-
-        // A fully-fixed ragged structure (no null dims) still has `size`, so it
-        // must NOT be stolen by the Array variant which lacks that field.
-        let fixed = serde_json::json!({
-            "data_type": {"endianness": "little", "kind": "f", "itemsize": 8},
-            "shape": [3, 2],
-            "size": 6,
-            "chunks": [[3], [2]],
-            "dims": null,
-            "resizable": false
-        });
-        let any: AnyStructure = serde_json::from_value(fixed).unwrap();
-        assert!(matches!(any, AnyStructure::Ragged(_)));
-
-        // An array structure (no `size`) must still deserialize as Array,
-        // i.e. adding Ragged-first did not capture array payloads.
-        let array = serde_json::json!({
-            "data_type": {"endianness": "little", "kind": "f", "itemsize": 8},
-            "chunks": [[100], [100]],
-            "shape": [100, 100],
-            "dims": null,
-            "resizable": false
-        });
-        let any: AnyStructure = serde_json::from_value(array).unwrap();
-        assert!(matches!(any, AnyStructure::Array(_)));
-    }
-
-    #[test]
     fn from_family_json_sparse_with_data_type_stays_sparse() {
-        // The core defect: a COO sparse structure that carries a `data_type` is
-        // a structurally valid ArrayStructure (Array is ordered before Sparse in
-        // the untagged enum), so an untagged parse mislabels it Array and drops
-        // `coord_data_type` + `layout`. Under family authority it stays Sparse
-        // and every field survives — including a NON-default (uint32) coord dtype.
+        // The core defect this change closes: a COO sparse structure carrying a
+        // `data_type` is a structural superset of an ArrayStructure, so a
+        // field-shape-guessing parse would mislabel it Array and drop
+        // `coord_data_type` + `layout`. Under family authority it stays Sparse and
+        // every field survives — including a NON-default (uint32) coord dtype.
+        // (AnyStructure no longer derives an untagged `Deserialize`, so the wrong
+        // parse is not merely avoided but unrepresentable.)
         let raw = serde_json::json!({
             "chunks": [[3], [3]],
             "shape": [3, 3],
@@ -656,14 +634,6 @@ mod tests {
             "layout": "COO"
         });
 
-        // Untagged (field-shape guessing) gets it WRONG — mislabels as Array.
-        let untagged: AnyStructure = serde_json::from_value(raw.clone()).unwrap();
-        assert!(
-            matches!(untagged, AnyStructure::Array(_)),
-            "precondition: untagged mis-parses sparse-with-data_type as Array"
-        );
-
-        // Family authority gets it RIGHT — Sparse, uint32 coord preserved.
         let parsed = AnyStructure::from_family_json(StructureFamily::Sparse, &raw)
             .unwrap()
             .expect("sparse family yields Some(structure)");
@@ -762,6 +732,59 @@ mod tests {
             AnyStructure::from_family_json(StructureFamily::Container, &raw)
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn any_structure_serialize_wire_snapshot_unchanged() {
+        // Wire-format contract: removing AnyStructure's untagged Deserialize must
+        // NOT change serialized output. The retained untagged Serialize emits the
+        // held variant's structure object verbatim, with no tag. Snapshot the
+        // sparse shape (the variant the parse fix was about) and the array shape.
+        let sparse = AnyStructure::Sparse(SparseStructure {
+            chunks: vec![vec![3], vec![3]],
+            shape: vec![3, 3],
+            data_type: Some(DType::Builtin(BuiltinDType::new(
+                Endianness::Little,
+                Kind::Float,
+                8,
+            ))),
+            coord_data_type: Some(BuiltinDType::new(
+                Endianness::Little,
+                Kind::UnsignedInteger,
+                4,
+            )),
+            ..Default::default()
+        });
+        assert_eq!(
+            serde_json::to_value(&sparse).unwrap(),
+            serde_json::json!({
+                "chunks": [[3], [3]],
+                "shape": [3, 3],
+                "data_type": {"endianness": "little", "kind": "f", "itemsize": 8},
+                "coord_data_type": {"endianness": "little", "kind": "u", "itemsize": 4},
+                "resizable": false,
+                "layout": "COO"
+            }),
+            "sparse structure must serialize untagged, with coord_data_type + layout"
+        );
+
+        let array = AnyStructure::Array(ArrayStructure {
+            data_type: DType::Builtin(BuiltinDType::new(Endianness::Little, Kind::Float, 8)),
+            chunks: vec![vec![4]],
+            shape: vec![4],
+            dims: None,
+            resizable: Resizable::default(),
+        });
+        assert_eq!(
+            serde_json::to_value(&array).unwrap(),
+            serde_json::json!({
+                "data_type": {"endianness": "little", "kind": "f", "itemsize": 8},
+                "chunks": [[4]],
+                "shape": [4],
+                "resizable": false
+            }),
+            "array structure must serialize untagged"
         );
     }
 
