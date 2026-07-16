@@ -1974,8 +1974,12 @@ pub async fn post_container_full(
         return serve_container_arrow(&state, &segments, fields, filename_param, &headers).await;
     }
 
-    // Non-arrow POST: delegate to the shared GET logic. The body (field list) is
-    // only meaningful for the arrow projection, so it is not forwarded.
+    // Non-arrow POST: delegate to the shared GET logic. The bare-list body is the
+    // column projection (upstream `container_full(field=field)` is shared by GET
+    // and POST, router.py:1428); forward it as repeated `field=` query keys so the
+    // GET path resolves the projection through the same `repeated_query_values`
+    // call — one projection resolution for both entry points, applied uniformly to
+    // every non-arrow format. format/filename ride the `Query` map as before.
     let mut query: HashMap<String, String> = HashMap::new();
     if let Some(f) = format_param {
         query.insert("format".to_string(), f);
@@ -1983,6 +1987,11 @@ pub async fn post_container_full(
     if let Some(name) = filename_param {
         query.insert("filename".to_string(), name);
     }
+    let body_fields = fields.map(|Json(f)| f).filter(|f| !f.is_empty());
+    let uri = match body_fields {
+        Some(fields) => append_field_query(&uri, &fields)?,
+        None => uri,
+    };
     container_full(
         state,
         OriginalUri(uri),
@@ -2020,6 +2029,68 @@ fn repeated_query_values(uri: &axum::http::Uri, keys: &[&str]) -> Option<Vec<Str
         .map(|(_, v)| v.into_owned())
         .collect();
     (!vals.is_empty()).then_some(vals)
+}
+
+/// Restrict a container's top-level children to the requested column projection,
+/// mirroring upstream `MapAdapter.read(fields)` (adapters/mapping.py:280-294):
+/// the projected container exposes exactly `fields`, in request order, and an
+/// absent field raises `KeyError` — which the shared `container_full` router
+/// turns into HTTP 400 `No such field {key}.` (router.py:1442-1445). The
+/// parity-fork more-precise-status rule does not apply (upstream already answers
+/// 400, not 500), so we return 400 verbatim with the same detail string.
+///
+/// Access filtering composes on top exactly as upstream — `read(fields)` first,
+/// then per-node `filter_for_access` — so a field that exists but the caller
+/// cannot see is dropped silently, not rejected. `all_keys` is the container's
+/// full, unfiltered child set (the validation universe, matching `self._mapping`
+/// in `read`); `visible_keys` is the access-filtered set (equal to `all_keys`
+/// when no access policy is in force). Returns the projected keys in field
+/// order, or the first unknown field's 400.
+fn apply_child_projection(
+    all_keys: &[String],
+    visible_keys: &[String],
+    fields: &[String],
+) -> Result<Vec<String>, ServerError> {
+    let mut projected = Vec::with_capacity(fields.len());
+    for field in fields {
+        if !all_keys.iter().any(|k| k == field) {
+            return Err(ServerError::BadRequest(format!("No such field {field}.")));
+        }
+        if visible_keys.iter().any(|k| k == field) {
+            projected.push(field.clone());
+        }
+    }
+    Ok(projected)
+}
+
+/// Append a column projection to `uri` as repeated `field=` query keys,
+/// preserving the existing scheme/authority/path/query. The POST
+/// `/container/full` entry point carries the projection as a bare-list body;
+/// forwarding it this way lets the shared GET logic resolve it via
+/// [`repeated_query_values`], so both entry points share ONE projection-
+/// resolution path (upstream `container_full(field=field)` is likewise shared by
+/// GET and POST, router.py:1376/1421).
+fn append_field_query(
+    uri: &axum::http::Uri,
+    fields: &[String],
+) -> Result<axum::http::Uri, ServerError> {
+    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+    for f in fields {
+        serializer.append_pair("field", f);
+    }
+    let encoded = serializer.finish();
+    let path = uri.path();
+    let path_and_query = match uri.query() {
+        Some(q) if !q.is_empty() => format!("{path}?{q}&{encoded}"),
+        _ => format!("{path}?{encoded}"),
+    };
+    let path_and_query: axum::http::uri::PathAndQuery = path_and_query
+        .parse()
+        .map_err(|e| ServerError::Internal(format!("uri rebuild: {e}")))?;
+    let mut parts = uri.clone().into_parts();
+    parts.path_and_query = Some(path_and_query);
+    axum::http::Uri::from_parts(parts)
+        .map_err(|e| ServerError::Internal(format!("uri rebuild: {e}")))
 }
 
 /// Serialize an `xarray_dataset` container's array children as a single Arrow IPC
@@ -2284,6 +2355,15 @@ pub async fn container_full(
         return serve_container_arrow(&state, &segments, fields, filename_str, &headers).await;
     }
 
+    // Column projection — resolved ONCE here, before the format dispatch below, so
+    // every non-arrow format (zip, hdf5, json, json-seq/html) restricts its walk
+    // to the same top-level child set. Upstream applies `entry.read(fields=field)`
+    // before `construct_data_response` dispatches on `format` (router.py:1440), so
+    // the projection is format-agnostic. The POST entry point forwards its bare-
+    // list body as repeated `field=` query keys (see `post_container_full`), so GET
+    // and POST converge on this single resolution.
+    let projection = repeated_query_values(&uri, &["field", "column"]);
+
     // Resolve effective media type once: format param beats Accept header. An
     // explicit but unserviceable format/Accept resolves to `None` → HTTP 406,
     // consistent with the array/table/sparse handlers (no silent HTML fallback).
@@ -2357,6 +2437,7 @@ pub async fn container_full(
             &mut group_metas,
             0,
             max_depth,
+            projection.as_deref(),
         )
         .await?;
 
@@ -2478,8 +2559,15 @@ pub async fn container_full(
     // intermediate containers → groups.
     #[cfg(feature = "hdf5-serializer")]
     if media_type == crate::core::media_type::mime::HDF5 {
-        let h5 =
-            container_full_hdf5(&state, &segments, &path, access_filter.as_ref(), &params).await?;
+        let h5 = container_full_hdf5(
+            &state,
+            &segments,
+            &path,
+            access_filter.as_ref(),
+            &params,
+            projection.as_deref(),
+        )
+        .await?;
         return Ok(serve_with_range(
             &headers,
             crate::core::media_type::mime::HDF5,
@@ -2507,7 +2595,9 @@ pub async fn container_full(
         // Root node: the container's own metadata plus the recursively-built
         // child tree. The access filter is applied at every level inside the
         // helper (parity with Python's per-node `filter_for_access`).
-        let contents = build_container_json_contents(container, access_filter.as_ref()).await?;
+        let contents =
+            build_container_json_contents(container, access_filter.as_ref(), projection.as_deref())
+                .await?;
         let mut tree = serde_json::Map::new();
         tree.insert("contents".into(), serde_json::Value::Object(contents));
         tree.insert("metadata".into(), container.metadata().clone());
@@ -2518,11 +2608,28 @@ pub async fn container_full(
         let queries: Vec<crate::core::queries::Query> = access_filter
             .map(|f| vec![crate::core::queries::Query::AccessBlobFilter(f)])
             .unwrap_or_default();
+        let has_access_filter = !queries.is_empty();
         let visible_keys = if queries.is_empty() {
             container.keys().await?
         } else {
             // An unsupported query variant propagates as HTTP 400.
             container.search(&queries).await?
+        };
+        // Column projection: restrict the listing to the requested fields, in
+        // field order. Validation is against the FULL child set (upstream
+        // `read(fields)` checks the whole mapping before access filtering); the
+        // access-visible set only decides which projected fields survive.
+        let visible_keys = match projection.as_deref() {
+            None => visible_keys,
+            Some(fields) => {
+                let all_keys = if has_access_filter {
+                    container.keys().await?
+                } else {
+                    // no access filter → visible_keys is already the full set
+                    visible_keys.clone()
+                };
+                apply_child_projection(&all_keys, &visible_keys, fields)?
+            }
         };
         let mut children: Vec<crate::core::schemas::Resource> = Vec::new();
         for k in &visible_keys {
@@ -2635,6 +2742,7 @@ async fn container_full_hdf5(
     path: &str,
     access_filter: Option<&crate::core::queries::AccessBlobFilter>,
     params: &HashMap<String, String>,
+    projection: Option<&[String]>,
 ) -> Result<bytes::Bytes, ServerError> {
     use crate::serialization::hdf5_container::Hdf5TreeBuilder;
 
@@ -2668,6 +2776,7 @@ async fn container_full_hdf5(
         &mut group_metas,
         0,
         max_depth,
+        projection,
     )
     .await?;
 
@@ -2831,6 +2940,10 @@ fn collect_zip_entries<'a>(
     group_metas: &'a mut Vec<(String, serde_json::Value)>,
     current_depth: usize,
     max_depth: Option<usize>,
+    // Column projection, applied only at the export root (`current_depth == 0`);
+    // nested containers are serialized whole, matching upstream `read(fields)`
+    // which projects only the top-level mapping (mapping.py:280-294).
+    projection: Option<&'a [String]>,
 ) -> crate::core::adapters::BoxFuture<'a, Result<(), ServerError>> {
     Box::pin(async move {
         let visible_keys = match access_filter {
@@ -2842,6 +2955,21 @@ fn collect_zip_entries<'a>(
                     .await?
             }
             None => container.keys().await?,
+        };
+        // Restrict the root level to the requested fields, in field order.
+        // Validation is against the FULL child set (upstream `read(fields)`
+        // checks the whole mapping before access filtering).
+        let visible_keys = match projection {
+            Some(fields) if current_depth == 0 => {
+                let all_keys = if access_filter.is_some() {
+                    container.keys().await?
+                } else {
+                    // no access filter → visible_keys is already the full set
+                    visible_keys.clone()
+                };
+                apply_child_projection(&all_keys, &visible_keys, fields)?
+            }
+            _ => visible_keys,
         };
         for key in visible_keys {
             let Some(child) = container.get(&key).await? else {
@@ -2896,6 +3024,10 @@ fn collect_zip_entries<'a>(
                         group_metas,
                         current_depth + 1,
                         max_depth,
+                        // Projection is root-only; the `current_depth == 0` guard
+                        // above ignores it below the root, so forwarding it here is
+                        // inert but keeps the recursion signature uniform.
+                        projection,
                     )
                     .await?;
                 }
@@ -2942,6 +3074,10 @@ fn collect_zip_entries<'a>(
 fn build_container_json_contents<'a>(
     container: &'a dyn ContainerAdapter,
     access_filter: Option<&'a crate::core::queries::AccessBlobFilter>,
+    // Column projection, applied only at the root node (this function recurses
+    // with `None`); nested children are serialized whole, matching upstream
+    // `read(fields)` which projects only the top-level mapping (mapping.py:280).
+    projection: Option<&'a [String]>,
 ) -> crate::core::adapters::BoxFuture<
     'a,
     Result<serde_json::Map<String, serde_json::Value>, ServerError>,
@@ -2955,6 +3091,21 @@ fn build_container_json_contents<'a>(
             }
             None => container.keys().await?,
         };
+        // Restrict the root level to the requested fields, in field order.
+        // Validation is against the FULL child set (upstream `read(fields)`
+        // checks the whole mapping before access filtering).
+        let visible_keys = match projection {
+            None => visible_keys,
+            Some(fields) => {
+                let all_keys = if access_filter.is_some() {
+                    container.keys().await?
+                } else {
+                    // no access filter → visible_keys is already the full set
+                    visible_keys.clone()
+                };
+                apply_child_projection(&all_keys, &visible_keys, fields)?
+            }
+        };
         let mut contents = serde_json::Map::new();
         for key in visible_keys {
             let Some(child) = container.get(&key).await? else {
@@ -2967,6 +3118,8 @@ fn build_container_json_contents<'a>(
                             .as_container()
                             .expect("container family => as_container"),
                         access_filter,
+                        // Projection is root-only; nested containers serialize whole.
+                        None,
                     )
                     .await?;
                     if sub.is_empty() {
