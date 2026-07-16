@@ -7,6 +7,7 @@
 //! - the parsed structure (`ArrayStructure`, `TableStructure`, ...),
 //! - per-family helpers like `metadata`, `specs`, `uri`.
 
+use serde::Deserialize;
 use url::Url;
 
 use crate::core::schemas::{NodeAttributes, Resource};
@@ -17,6 +18,7 @@ use crate::core::structures::{
 
 use crate::client::context::Context;
 use crate::client::error::{ClientError, Result};
+use crate::client::utils::retry;
 
 /// Content-type discriminator sent in the `PATCH /metadata` body — mirrors
 /// Python's `base.py:741-757` where the body `content-type` field selects
@@ -286,5 +288,241 @@ impl BaseClient {
             "access_blob": access_blob,
         });
         self.context.put_json(&url, &body).await.map(|_| ())
+    }
+
+    /// Access this node's metadata revision history, served by
+    /// `GET`/`DELETE /api/v1/revisions/{path}`.
+    ///
+    /// Mirrors Python `BaseClient.metadata_revisions` (`base.py:910`): the
+    /// revisions link is the node's `self` link with its `/metadata` segment
+    /// rewritten to `/revisions` (the first occurrence, so a node whose key is
+    /// literally `metadata` is unaffected). Revisions are a catalog capability
+    /// — against a server with no catalog every call returns a `405`
+    /// [`ClientError::Server`].
+    pub fn revisions(&self) -> Result<MetadataRevisions> {
+        let self_link = self.require_link("self")?;
+        let link = self_link.replacen("/metadata", "/revisions", 1);
+        Ok(MetadataRevisions::new(self.context.clone(), link))
+    }
+}
+
+/// One historical version of a node's metadata, as served by a single item of
+/// `GET /api/v1/revisions/{path}`.
+///
+/// Mirrors the item shape the server's `get_revisions` builds (Python
+/// `construct_revisions_response`): `{revision_number, attributes: {metadata,
+/// specs, time_updated}}`. The server stores an `access_blob` snapshot on each
+/// revision but intentionally omits it from this listing (matching upstream),
+/// so there is no access-control field to surface here.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Revision {
+    /// Per-node sequential revision number, 1-based and ascending with age
+    /// (revision 1 is the oldest recorded version).
+    pub revision_number: i64,
+    /// The node's user metadata as of this revision.
+    pub metadata: serde_json::Value,
+    /// The specs the node conformed to as of this revision.
+    pub specs: Vec<Spec>,
+    /// When this version was superseded (the stored `time_created`), as the
+    /// server-formatted timestamp string.
+    pub time_updated: String,
+}
+
+/// Wire shape of one `data` item from the revisions endpoint.
+#[derive(Debug, Deserialize)]
+struct RevisionWire {
+    revision_number: i64,
+    #[serde(default)]
+    attributes: RevisionAttributesWire,
+}
+
+/// Wire shape of a revision item's `attributes` object.
+#[derive(Debug, Default, Deserialize)]
+struct RevisionAttributesWire {
+    #[serde(default)]
+    metadata: serde_json::Value,
+    /// `Option` so an explicit `null` (a node that had no specs) decodes to
+    /// `None` rather than failing; both `None` and absent become an empty vec.
+    #[serde(default)]
+    specs: Option<Vec<Spec>>,
+    #[serde(default)]
+    time_updated: String,
+}
+
+impl From<RevisionWire> for Revision {
+    fn from(w: RevisionWire) -> Self {
+        Self {
+            revision_number: w.revision_number,
+            metadata: w.attributes.metadata,
+            specs: w.attributes.specs.unwrap_or_default(),
+            time_updated: w.attributes.time_updated,
+        }
+    }
+}
+
+/// Accessor for a node's metadata revision history, backed by the server's
+/// `/api/v1/revisions/{path}` endpoint. Obtained via [`BaseClient::revisions`].
+///
+/// Mirrors Python `tiled.client.base.MetadataRevisions` (`base.py:28`), whose
+/// `len()` / `[i]` / `[start:stop]` / `delete_revision(n)` map here to
+/// [`count`](Self::count) / [`get`](Self::get) / [`list`](Self::list) /
+/// [`delete`](Self::delete). Unlike the Python class this holds no length
+/// cache — each [`count`](Self::count) call refetches.
+#[derive(Debug, Clone)]
+pub struct MetadataRevisions {
+    context: Context,
+    /// Fully-qualified `/api/v1/revisions/{path}` URL.
+    link: String,
+}
+
+impl MetadataRevisions {
+    fn new(context: Context, link: String) -> Self {
+        Self { context, link }
+    }
+
+    /// Total number of stored revisions for the node.
+    ///
+    /// Wire: `GET {revisions link}?page[offset]=0&page[limit]=0`, returning
+    /// `meta.count` — the node-wide total, independent of pagination (correct
+    /// post-#1409). Mirrors Python `MetadataRevisions.__len__` (`base.py:34`).
+    pub async fn count(&self) -> Result<usize> {
+        let mut url = Url::parse(&self.link)?;
+        url.query_pairs_mut()
+            .append_pair("page[offset]", "0")
+            .append_pair("page[limit]", "0");
+        let resp =
+            retry(|| async { self.context.get_json::<Vec<RevisionWire>>(&url).await }).await?;
+        let count = resp
+            .meta
+            .as_ref()
+            .and_then(|m| m.get("count"))
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| ClientError::Invalid("revisions response missing meta.count".into()))?;
+        Ok(count as usize)
+    }
+
+    /// Fetch a single revision by its **offset** in the oldest-first ordering
+    /// (offset 0 = the oldest revision), not by its `revision_number`.
+    ///
+    /// Wire: `GET {revisions link}?page[offset]={offset}&page[limit]=1`,
+    /// returning the one `data` entry. Mirrors Python
+    /// `MetadataRevisions.__getitem__` for an integer index (`base.py:61`). An
+    /// offset past the end maps to [`ClientError::KeyNotFound`].
+    pub async fn get(&self, offset: usize) -> Result<Revision> {
+        let mut url = Url::parse(&self.link)?;
+        url.query_pairs_mut()
+            .append_pair("page[offset]", &offset.to_string())
+            .append_pair("page[limit]", "1");
+        let resp =
+            retry(|| async { self.context.get_json::<Vec<RevisionWire>>(&url).await }).await?;
+        resp.data
+            .unwrap_or_default()
+            .into_iter()
+            .next()
+            .map(Revision::from)
+            .ok_or_else(|| ClientError::KeyNotFound(format!("no revision at offset {offset}")))
+    }
+
+    /// List revisions starting at `offset`, oldest first, following the
+    /// server's `next` pagination links until the history is exhausted.
+    ///
+    /// `limit` bounds the per-request page size (the server caps it at its own
+    /// maximum); `None` uses the server default. Either way every revision from
+    /// `offset` onward is returned — a small `limit` just means more
+    /// round-trips. Mirrors Python `MetadataRevisions.__getitem__` for a slice
+    /// (`base.py:84`): the same `page[offset]`/`page[limit]` request followed
+    /// by the `links.next` walk.
+    pub async fn list(&self, offset: usize, limit: Option<usize>) -> Result<Vec<Revision>> {
+        let mut url = Url::parse(&self.link)?;
+        {
+            let mut q = url.query_pairs_mut();
+            q.append_pair("page[offset]", &offset.to_string());
+            if let Some(l) = limit {
+                q.append_pair("page[limit]", &l.to_string());
+            }
+        }
+        let mut out: Vec<Revision> = Vec::new();
+        let mut next = Some(url);
+        while let Some(page_url) = next {
+            let resp =
+                retry(|| async { self.context.get_json::<Vec<RevisionWire>>(&page_url).await })
+                    .await?;
+            if let Some(page) = resp.data {
+                out.extend(page.into_iter().map(Revision::from));
+            }
+            next = match resp.links.as_ref().and_then(|l| l.get("next")) {
+                Some(serde_json::Value::String(s)) => Some(Url::parse(s)?),
+                _ => None,
+            };
+        }
+        Ok(out)
+    }
+
+    /// Delete one stored revision by its `revision_number`.
+    ///
+    /// Wire: `DELETE {revisions link}?number={number}`. Mirrors Python
+    /// `MetadataRevisions.delete_revision` (`base.py:112`). Deleting a
+    /// nonexistent revision surfaces the server's `404` as
+    /// [`ClientError::Server`].
+    pub async fn delete(&self, number: i64) -> Result<()> {
+        let mut url = Url::parse(&self.link)?;
+        url.query_pairs_mut()
+            .append_pair("number", &number.to_string());
+        retry(|| async { self.context.delete(&url).await })
+            .await
+            .map(|_| ())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn wire(item: serde_json::Value) -> Revision {
+        serde_json::from_value::<RevisionWire>(item).unwrap().into()
+    }
+
+    #[test]
+    fn revision_wire_maps_attributes_and_specs() {
+        let rev = wire(serde_json::json!({
+            "revision_number": 3,
+            "attributes": {
+                "metadata": {"a": 1},
+                "specs": [{"name": "foo", "version": "1.0"}, {"name": "bar"}],
+                "time_updated": "2026-07-17T00:00:00Z",
+            },
+        }));
+        assert_eq!(rev.revision_number, 3);
+        assert_eq!(rev.metadata, serde_json::json!({"a": 1}));
+        assert_eq!(rev.time_updated, "2026-07-17T00:00:00Z");
+        assert_eq!(rev.specs.len(), 2);
+        assert_eq!(rev.specs[0].name, "foo");
+        assert_eq!(rev.specs[0].version.as_deref(), Some("1.0"));
+        assert_eq!(rev.specs[1].name, "bar");
+        assert_eq!(rev.specs[1].version, None);
+    }
+
+    #[test]
+    fn revision_wire_null_specs_becomes_empty_vec() {
+        // A node that never had specs may serialize `specs: null`; the
+        // `Option<Vec<Spec>>` shape must decode that to an empty vec, not error.
+        let rev = wire(serde_json::json!({
+            "revision_number": 1,
+            "attributes": {"metadata": {}, "specs": null, "time_updated": "t"},
+        }));
+        assert!(rev.specs.is_empty());
+    }
+
+    #[test]
+    fn revision_wire_absent_fields_default() {
+        // Absent metadata → Null, absent specs → empty, absent time → empty.
+        let rev = wire(serde_json::json!({
+            "revision_number": 7,
+            "attributes": {},
+        }));
+        assert_eq!(rev.revision_number, 7);
+        assert_eq!(rev.metadata, serde_json::Value::Null);
+        assert!(rev.specs.is_empty());
+        assert_eq!(rev.time_updated, "");
     }
 }

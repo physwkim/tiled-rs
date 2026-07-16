@@ -50,7 +50,8 @@ pub use auth::{
 };
 pub use awkward::{AwkwardBuffers, AwkwardClient};
 pub use base::{
-    BaseClient, Item, JSON_PATCH_MIME, MERGE_PATCH_MIME, ParsedStructure, PatchContentType,
+    BaseClient, Item, JSON_PATCH_MIME, MERGE_PATCH_MIME, MetadataRevisions, ParsedStructure,
+    PatchContentType, Revision,
 };
 pub use cache::{CacheControl, CacheEntry, HttpCache};
 pub use composite::{CompositeClient, CompositePart};
