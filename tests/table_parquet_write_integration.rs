@@ -77,6 +77,7 @@ async fn build_write_app() -> (axum::Router, tempfile::TempDir, tempfile::TempDi
         request_timeout_secs: 30,
         expose_raw_assets: true,
         exact_count_limit: u64::MAX,
+        background_tasks: tiled_rs::server::state::BackgroundTasks::new(),
     };
     (tiled_rs::server::build_app(state), writable_dir, db_dir)
 }

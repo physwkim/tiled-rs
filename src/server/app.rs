@@ -39,17 +39,20 @@ pub fn build_app(state: AppState) -> Router {
     // by config + a catalog DB is present. The dispatcher subscribes to
     // the streaming bus's root channel so it sees every event without
     // touching request paths.
+    //
+    // Registered via `state.background_tasks` rather than a bare
+    // `tokio::spawn` (upstream tiled #1018): a detached handle would leave
+    // the dispatcher with nothing to cancel or await it, so the CLI's
+    // graceful-shutdown path (`cli::mod::run`) could exit while it was
+    // still running. `BackgroundTasks` is the single owner that signals
+    // and awaits it exactly once, from `AppState::background_tasks`.
     if let (Some(cfg), Some(catalog)) = (state.webhook_config.as_ref(), state.catalog.as_ref()) {
-        // `spawn` already drives the dispatcher on the runtime via `tokio::spawn`
-        // and hands back the `JoinHandle`. We intentionally detach it: the
-        // dispatcher lives for the lifetime of the process and is torn down when
-        // the runtime stops. Drop the handle explicitly (not `let _`) so the
-        // detach is deliberate rather than an accidentally-dropped future.
-        drop(crate::server::webhook_dispatch::spawn(
+        crate::server::webhook_dispatch::spawn(
             catalog.clone(),
             state.streaming_bus.clone(),
             cfg.clone(),
-        ));
+            &state.background_tasks,
+        );
     }
 
     let cors = match &state.cors_policy {

@@ -127,6 +127,97 @@ pub struct AppState {
     /// set to this limit (a lower-bound estimate). Mirrors Python
     /// `Settings.exact_count_limit` (`settings.py`, default 100).
     pub exact_count_limit: u64,
+    /// Single owner for process-lifetime background tasks (upstream tiled
+    /// #1018 — "background-task lifecycle"). Long-lived spawns (e.g. the
+    /// webhook dispatcher) must register here via [`BackgroundTasks::spawn`]
+    /// instead of calling `tokio::spawn` directly, so the CLI's shutdown
+    /// path can signal and await them exactly once. See
+    /// [`BackgroundTasks::shutdown`].
+    pub background_tasks: BackgroundTasks,
+}
+
+/// Owner for background tasks meant to live for the process's lifetime,
+/// not a single request (upstream tiled #1018).
+///
+/// A bare `tokio::spawn` detaches immediately: the returned `JoinHandle` is
+/// the only handle on the task, and dropping it (or never storing it)
+/// leaves the task running with nothing to cancel or await it.
+/// `axum::serve(..).with_graceful_shutdown(..)` only waits for in-flight
+/// HTTP connections to finish — it has no idea a detached task exists, so
+/// the process can exit (or be reaped by a supervisor) while the task is
+/// mid-work.
+///
+/// `BackgroundTasks` closes that gap: every long-lived task is registered
+/// via [`spawn`](Self::spawn) instead, and [`shutdown`](Self::shutdown) —
+/// called exactly once, after the HTTP listener stops accepting new
+/// connections — signals every registered task via [`cancellation`
+/// ](Self::cancellation) and then awaits all of them before returning.
+#[derive(Clone)]
+pub struct BackgroundTasks {
+    joins: Arc<std::sync::Mutex<tokio::task::JoinSet<()>>>,
+    cancel: Arc<tokio::sync::watch::Sender<bool>>,
+}
+
+impl Default for BackgroundTasks {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BackgroundTasks {
+    pub fn new() -> Self {
+        let (cancel, _rx) = tokio::sync::watch::channel(false);
+        Self {
+            joins: Arc::new(std::sync::Mutex::new(tokio::task::JoinSet::new())),
+            cancel: Arc::new(cancel),
+        }
+    }
+
+    /// A receiver a registered task's loop selects on alongside its normal
+    /// work. `shutdown()` flips the watched value to `true`; the task
+    /// should treat that as "stop, cooperatively, now."
+    pub fn cancellation(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.cancel.subscribe()
+    }
+
+    /// Register a process-lifetime task. This is the only sanctioned path
+    /// onto the runtime for such tasks — call this instead of
+    /// `tokio::spawn` so `shutdown()` can find and await it. The task
+    /// itself is responsible for exiting once `cancellation()` reports
+    /// `true` (typically via `tokio::select!`); `shutdown()` does not abort
+    /// tasks, it only signals and waits.
+    pub fn spawn<F>(&self, fut: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.joins
+            .lock()
+            .expect("BackgroundTasks registry mutex poisoned")
+            .spawn(fut);
+    }
+
+    /// Signal every registered task to stop, then await all of them.
+    ///
+    /// MUST be called exactly once, and only after the HTTP listener has
+    /// stopped accepting new connections (i.e. after
+    /// `axum::serve(..).with_graceful_shutdown(..)` resolves) — that
+    /// ordering ensures no new work arrives for a task that is already
+    /// being told to stop.
+    pub async fn shutdown(&self) {
+        let _ = self.cancel.send(true);
+        let mut joins = std::mem::replace(
+            &mut *self
+                .joins
+                .lock()
+                .expect("BackgroundTasks registry mutex poisoned"),
+            tokio::task::JoinSet::new(),
+        );
+        while let Some(res) = joins.join_next().await {
+            if let Err(e) = res {
+                tracing::warn!(target: "tiled.lifecycle", "background task panicked: {e}");
+            }
+        }
+    }
 }
 
 /// One `spec_views` entry. Wire-compatible with tiled-web's
