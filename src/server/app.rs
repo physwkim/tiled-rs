@@ -243,6 +243,19 @@ pub fn build_app(state: AppState) -> Router {
             get(router::table_full).put(router::table_full_put),
         )
         .route("/api/v1/table/full", post(router::table_full_post))
+        // Deprecated family-agnostic alias (Python router.py:1477 GET /
+        // 2162 PUT, deprecated since upstream commit c7edd9d but still
+        // served for old-client back-compat). PUT delegates to the same
+        // core as `/table/full` PUT — Python decorates `put_node_full`
+        // with both paths; GET dispatches by resolved structure family
+        // (see `router::node_full`). The bare `/node/full/` root needs its
+        // own route, same as `/container/full/` above: axum's `{*path}`
+        // wildcard does not match a zero-segment path.
+        .route("/api/v1/node/full/", get(router::node_full_root))
+        .route(
+            "/api/v1/node/full/{*path}",
+            get(router::node_full).put(router::node_full_put),
+        )
         // Ragged read+write paths (Python router.py:838-1047). GET/PUT/PATCH on
         // /ragged/full and PUT on /ragged/block (the advertised `block` link is
         // PUT-only; Python serves no GET `/ragged/block`).
