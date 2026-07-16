@@ -1557,7 +1557,7 @@ async fn search_page_per_entry_counts_exact_with_limit_threaded() {
     let root = CatalogAdapter::root(cat.clone(), resolver).with_exact_count_limit(1);
 
     let page = root
-        .search_page(&[], &[], None, 0, 10)
+        .search_page(&[], &[], None, 0, 10, false)
         .await
         .expect("search_page must succeed");
     assert_eq!(page.entries.len(), 3, "all three containers must be listed");
