@@ -88,6 +88,13 @@ pub struct Hdf5Adapter {
     /// `read_slice` so libhdf5 accepts the call.
     scalar_promoted: bool,
     locking: Hdf5Locking,
+    /// Pre-materialised array for datasets that can't be read lazily by
+    /// hyperslab. Currently only variable-length string datasets (#157),
+    /// which upstream/h5py coerces to a fixed-length `S<N>` bytes array; we
+    /// materialise the whole thing at construction (like upstream's eager
+    /// `numpy.stack`) so reads slice this buffer instead of reopening the
+    /// file. `None` for the ordinary numeric hyperslab path.
+    materialized: Option<DynNDArray>,
 }
 
 impl Hdf5Adapter {
@@ -110,6 +117,28 @@ impl Hdf5Adapter {
         let ds = file
             .dataset(dataset)
             .map_err(|e| TiledError::Internal(format!("hdf5 dataset {dataset}: {e}")))?;
+
+        // Pull the dataset's HDF5 attributes into the node metadata, mirroring
+        // upstream tiled's `metadata.update(get_hdf5_attrs(...))` in
+        // `HDF5ArrayAdapter.from_catalog` (hdf5.py:335). Attributes win on key
+        // collision, matching Python `dict.update`. Attribute reading is
+        // independent of the dataset's element type, so it happens for both
+        // the numeric and the variable-length-string branch below.
+        let metadata = merge_hdf5_attrs(metadata, read_hdf5_attrs(&ds));
+
+        // h5py represents variable-length string datasets with numpy's object
+        // dtype; upstream coerces them to a fixed-length `S<N>` bytes array via
+        // `numpy.asarray(ds[()], dtype=bytes)` (hdf5.py:211-219). Detect them
+        // from the stored datatype CLASS and materialise them here rather than
+        // letting `dtype_from_hdf5` (which maps only numeric classes) error.
+        // (#157)
+        let datatype = ds
+            .datatype()
+            .map_err(|e| TiledError::Internal(format!("hdf5 datatype: {e}")))?;
+        if matches!(datatype, rust_hdf5::DatatypeMessage::VarLenString { .. }) {
+            return Self::from_vlen_string_dataset(path, dataset, &ds, metadata, locking);
+        }
+
         // Upstream tiled #944 covers scalar (`shape=()`) and
         // shape-with-zero datasets. We surface zero-rank as a 1-element
         // 1-D array so callers don't need to special-case it. Truly
@@ -131,12 +160,6 @@ impl Hdf5Adapter {
         // too.
         let dtype = dtype_from_hdf5(&ds)?;
 
-        // Pull the dataset's HDF5 attributes into the node metadata, mirroring
-        // upstream tiled's `metadata.update(get_hdf5_attrs(...))` in
-        // `HDF5ArrayAdapter.from_catalog` (hdf5.py:335). Attributes win on key
-        // collision, matching Python `dict.update`.
-        let metadata = merge_hdf5_attrs(metadata, read_hdf5_attrs(&ds));
-
         let chunks: Vec<Vec<usize>> = shape.iter().map(|d| vec![*d]).collect();
         let structure = ArrayStructure {
             data_type: DType::Builtin(dtype.clone()),
@@ -154,6 +177,86 @@ impl Hdf5Adapter {
             specs: vec![Spec::new("hdf5")],
             scalar_promoted,
             locking,
+            materialized: None,
+        })
+    }
+
+    /// Build an adapter for a variable-length string dataset (#157).
+    ///
+    /// h5py exposes vlen strings through numpy's object dtype; upstream tiled
+    /// coerces them to a fixed-length `S<N>` bytes array with
+    /// `numpy.asarray(ds[()], dtype=bytes)` (hdf5.py:217-219). We mirror that:
+    /// read every element, take `N` = the longest element's byte length, and
+    /// pack the elements row-major into null-padded `N`-byte fields — exactly
+    /// numpy's `S<N>` layout. The array is materialised in memory (matching
+    /// upstream's eager `numpy.stack`/`from_array(stacked)`), because the fixed
+    /// width `N` is data-dependent and must be known to report the structure's
+    /// dtype up front; reads then slice this buffer instead of reopening the
+    /// file.
+    fn from_vlen_string_dataset(
+        path: PathBuf,
+        dataset: &str,
+        ds: &rust_hdf5::H5Dataset,
+        metadata: serde_json::Value,
+        locking: Hdf5Locking,
+    ) -> Result<Self> {
+        // Same zero-rank promotion as the numeric path: a scalar vlen string
+        // becomes a 1-element 1-D array.
+        let raw_shape: Vec<usize> = ds.shape();
+        let scalar_promoted = raw_shape.is_empty();
+        let shape = if scalar_promoted {
+            vec![1usize]
+        } else {
+            raw_shape
+        };
+
+        let strings = ds
+            .read_vlen_strings()
+            .map_err(|e| TiledError::Internal(format!("hdf5 vlen string read {dataset}: {e}")))?;
+
+        // read_vlen_strings yields one element per dataset item in row-major
+        // order; the count must match the shape so slices address the right
+        // bytes.
+        let expected: usize = shape.iter().product();
+        if strings.len() != expected {
+            return Err(TiledError::Internal(format!(
+                "hdf5 vlen string {dataset}: read {} elements but shape {shape:?} implies {expected}",
+                strings.len()
+            )));
+        }
+
+        // Fixed width = longest element in bytes, matching numpy's `S<N>`
+        // coercion. String bytes are the raw UTF-8, which for h5py's UTF-8 /
+        // ASCII vlen charsets is exactly what `ds[()]` returns as `bytes`.
+        let width = strings.iter().map(|s| s.len()).max().unwrap_or(0);
+        let mut buf = Vec::with_capacity(strings.len() * width);
+        for s in &strings {
+            let b = s.as_bytes();
+            buf.extend_from_slice(b);
+            // width >= b.len() by construction, so no underflow.
+            buf.resize(buf.len() + (width - b.len()), 0);
+        }
+
+        let dtype = BuiltinDType::new(Endianness::NotApplicable, Kind::String, width);
+        let materialized = DynNDArray::new(Bytes::from(buf), dtype.clone(), shape.clone());
+        let chunks: Vec<Vec<usize>> = shape.iter().map(|d| vec![*d]).collect();
+        let structure = ArrayStructure {
+            data_type: DType::Builtin(dtype.clone()),
+            chunks,
+            shape,
+            dims: None,
+            resizable: Default::default(),
+        };
+        Ok(Self {
+            path,
+            dataset: dataset.to_string(),
+            dtype,
+            structure,
+            metadata,
+            specs: vec![Spec::new("hdf5")],
+            scalar_promoted,
+            locking,
+            materialized: Some(materialized),
         })
     }
 }
@@ -555,6 +658,13 @@ impl ArrayAdapterRead for Hdf5Adapter {
         &self.structure
     }
     fn read<'a>(&'a self, slice: &'a NDSlice) -> BoxFuture<'a, Result<DynNDArray>> {
+        // Materialised (vlen-string) datasets are already in memory; slice the
+        // cached buffer instead of reopening the file. (#157)
+        if let Some(arr) = &self.materialized {
+            let arr = arr.clone();
+            let slice = slice.clone();
+            return Box::pin(async move { arr.apply_slice(&slice) });
+        }
         let path = self.path.clone();
         let dataset = self.dataset.clone();
         let dtype = self.dtype.clone();
@@ -575,6 +685,23 @@ impl ArrayAdapterRead for Hdf5Adapter {
         block: &'a [usize],
         slice: &'a NDSlice,
     ) -> BoxFuture<'a, Result<DynNDArray>> {
+        // Materialised (vlen-string) datasets: single chunk per axis, sliced
+        // in memory. Validate the block index like the numeric path. (#157)
+        if let Some(arr) = &self.materialized {
+            let arr = arr.clone();
+            let slice = slice.clone();
+            let block = block.to_vec();
+            return Box::pin(async move {
+                for (axis, &b) in block.iter().enumerate() {
+                    if b != 0 {
+                        return Err(TiledError::Validation(format!(
+                            "hdf5 adapter is single-chunk per axis; block[{axis}] = {b}"
+                        )));
+                    }
+                }
+                arr.apply_slice(&slice)
+            });
+        }
         let path = self.path.clone();
         let dataset = self.dataset.clone();
         let dtype = self.dtype.clone();
@@ -760,5 +887,112 @@ mod dtype_class {
         let base = serde_json::json!({"source": "catalog"});
         let adapter = Hdf5Adapter::from_path(path, "i64", base.clone()).unwrap();
         assert_eq!(adapter.metadata(), &base);
+    }
+}
+
+#[cfg(test)]
+mod vlen_string {
+    //! Variable-length string datasets (#157).
+    //!
+    //! h5py stores vlen strings under numpy's object dtype; upstream tiled
+    //! coerces them to a fixed-length `S<N>` bytes array. Before this support
+    //! the adapter errored in `dtype_from_hdf5` ("datatype ... not supported")
+    //! on any vlen-string dataset. These tests assert the coercion: a
+    //! `Kind::String` structure of width `N` = the longest element, and reads
+    //! that yield the elements packed row-major into null-padded `N`-byte
+    //! fields.
+    use std::path::PathBuf;
+
+    use super::*;
+
+    /// Write a 1-D vlen (UTF-8) string dataset and return the flushed file.
+    fn write_vlen(name: &str, strings: &[&str]) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vlen.h5");
+        let file = rust_hdf5::H5File::create(&path).unwrap();
+        file.write_vlen_strings(name, strings).unwrap();
+        file.close().unwrap();
+        (dir, path)
+    }
+
+    /// The structure reports `S<N>` with `N` = the longest element in bytes,
+    /// byte-order-agnostic (numpy `|`), and the dataset's shape — no error.
+    #[test]
+    fn reports_string_kind_and_width() {
+        let (_dir, path) = write_vlen("s", &["a", "bb", "ccc"]);
+        let adapter = Hdf5Adapter::from_path(path, "s", serde_json::json!({})).unwrap();
+        let st = adapter.structure();
+        assert_eq!(st.shape, vec![3]);
+        match &st.data_type {
+            DType::Builtin(b) => {
+                assert_eq!(b.kind, Kind::String);
+                assert_eq!(b.itemsize, 3);
+                assert_eq!(b.endianness, Endianness::NotApplicable);
+                assert_eq!(b.to_numpy_str(), "|S3");
+            }
+            other => panic!("expected builtin dtype, got {other:?}"),
+        }
+    }
+
+    /// A full read packs every element into a null-padded `N`-byte field,
+    /// row-major — exactly numpy's `S<N>` in-memory layout.
+    #[tokio::test]
+    async fn reads_null_padded_bytes() {
+        let (_dir, path) = write_vlen("s", &["a", "bb", "ccc"]);
+        let adapter = Hdf5Adapter::from_path(path, "s", serde_json::json!({})).unwrap();
+        let arr = adapter.read(&NDSlice::empty()).await.unwrap();
+        assert_eq!(arr.shape, vec![3]);
+        assert_eq!(&arr.data[..], b"a\0\0bb\0ccc");
+    }
+
+    /// A range slice selects a contiguous run of elements, preserving the
+    /// fixed-width layout.
+    #[tokio::test]
+    async fn range_slice_selects_elements() {
+        let (_dir, path) = write_vlen("s", &["a", "bb", "ccc"]);
+        let adapter = Hdf5Adapter::from_path(path, "s", serde_json::json!({})).unwrap();
+        let slice = NDSlice::from_numpy_str("0:2").unwrap();
+        let arr = adapter.read(&slice).await.unwrap();
+        assert_eq!(arr.shape, vec![2]);
+        assert_eq!(&arr.data[..], b"a\0\0bb\0");
+    }
+
+    /// An integer index collapses the axis, returning one null-padded element.
+    #[tokio::test]
+    async fn integer_index_collapses_axis() {
+        let (_dir, path) = write_vlen("s", &["a", "bb", "ccc"]);
+        let adapter = Hdf5Adapter::from_path(path, "s", serde_json::json!({})).unwrap();
+        let slice = NDSlice::from_numpy_str("1").unwrap();
+        let arr = adapter.read(&slice).await.unwrap();
+        assert_eq!(arr.shape, Vec::<usize>::new());
+        assert_eq!(&arr.data[..], b"bb\0");
+    }
+
+    /// Width is measured in BYTES, so a multi-byte UTF-8 element sets the
+    /// field width to its encoded length (`α` = 2 bytes → `S2`).
+    #[tokio::test]
+    async fn utf8_width_is_bytes() {
+        let (_dir, path) = write_vlen("s", &["a", "α"]);
+        let adapter = Hdf5Adapter::from_path(path, "s", serde_json::json!({})).unwrap();
+        match &adapter.structure().data_type {
+            DType::Builtin(b) => assert_eq!(b.itemsize, 2),
+            other => panic!("expected builtin dtype, got {other:?}"),
+        }
+        let arr = adapter.read(&NDSlice::empty()).await.unwrap();
+        assert_eq!(arr.shape, vec![2]);
+        // "a" -> [0x61, 0x00]; "α" -> [0xCE, 0xB1]
+        assert_eq!(&arr.data[..], &[0x61, 0x00, 0xCE, 0xB1]);
+    }
+
+    /// `read_block` accepts the single chunk `[0]` and rejects any other
+    /// block index, like the numeric path.
+    #[tokio::test]
+    async fn read_block_single_chunk_only() {
+        let (_dir, path) = write_vlen("s", &["a", "bb", "ccc"]);
+        let adapter = Hdf5Adapter::from_path(path, "s", serde_json::json!({})).unwrap();
+        let full = adapter.read_block(&[0], &NDSlice::empty()).await.unwrap();
+        assert_eq!(full.shape, vec![3]);
+        assert_eq!(&full.data[..], b"a\0\0bb\0ccc");
+        assert!(adapter.read_block(&[1], &NDSlice::empty()).await.is_err());
     }
 }
