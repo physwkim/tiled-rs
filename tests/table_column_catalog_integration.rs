@@ -62,11 +62,19 @@ fn write_table_file(path: &std::path::Path) {
 /// SQLite catalog and the backing `.arrow` file survive for the request).
 async fn build_catalog_app() -> (axum::Router, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
+    // `root_dir` (canonicalized) is used only where a *canonical* path is
+    // required: the `FileLeafResolver` allow-list and the `.arrow` file it
+    // resolves — `check_allowed` canonicalizes the asset path, so the allowed
+    // root must be canonical too, or the containment check would mismatch.
     let root_dir = dir.path().canonicalize().unwrap();
     let table_path = root_dir.join("some_table.arrow");
     write_table_file(&table_path);
 
-    let uri = format!("sqlite://{}", root_dir.join("catalog.db").display());
+    // The SQLite URL must use the RAW tempdir path, never `root_dir`: on Windows
+    // `canonicalize()` returns a verbatim `\\?\C:\...` path whose `?` sqlx reads
+    // as the URL query separator, failing connect. Every other catalog test
+    // builds its `sqlite://` URL from the raw `dir.path()` for the same reason.
+    let uri = format!("sqlite://{}", dir.path().join("catalog.db").display());
     let catalog = Catalog::connect(&uri).await.unwrap();
     catalog.migrate().await.unwrap();
 
