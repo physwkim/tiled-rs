@@ -621,6 +621,16 @@ async fn test_ready_endpoint() {
     assert!(body["nodes"].as_u64().unwrap() > 0);
 }
 
+#[tokio::test]
+async fn test_healthz_endpoint() {
+    // Python tiled serves `/healthz` (app.py:262) as the well-known
+    // Kubernetes/container liveness path, distinct from `/health` above.
+    let app = build_app();
+    let (status, body) = get_json(&app, "/healthz").await;
+    assert_eq!(status, 200);
+    assert_eq!(body["status"], "ready");
+}
+
 // ---------------------------------------------------------------------------
 // Edge cases
 // ---------------------------------------------------------------------------
