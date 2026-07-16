@@ -48,7 +48,14 @@ pub struct Asset {
 /// Each data source specifies a MIME type, adapter parameters, and physical assets.
 ///
 /// Maps to Python `DataSource` generic dataclass.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// `Deserialize` is hand-written (see below) rather than derived: the
+/// `structure` field must be parsed under the authority of the sibling
+/// `structure_family`, not by `AnyStructure`'s field-shape-guessing untagged
+/// `Deserialize`. `Serialize` stays derived — serialization was never
+/// ambiguous (the held variant's fields are emitted verbatim), and the wire
+/// bytes are unchanged by the custom parse.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct DataSource {
     /// Which structure family this data source produces.
     pub structure_family: StructureFamily,
@@ -73,6 +80,60 @@ pub struct DataSource {
     /// Management mode.
     #[serde(default = "default_management")]
     pub management: Management,
+}
+
+/// Deserialization mirror of [`DataSource`] with `structure` left as raw JSON.
+///
+/// Every serde default/naming rule stays declarative here (the only footgun of
+/// a hand-written `Deserialize` is silently dropping a `#[serde(default)]`); the
+/// custom impl only re-parses `structure` under `structure_family` authority via
+/// [`AnyStructure::from_family_json`]. `Option` fields default to `None` without
+/// an explicit attribute (serde treats missing `Option<T>` as `None`).
+#[derive(Deserialize)]
+struct DataSourceWire {
+    structure_family: StructureFamily,
+    #[serde(default)]
+    structure: Option<serde_json::Value>,
+    #[serde(default)]
+    id: Option<i64>,
+    #[serde(default)]
+    mimetype: Option<String>,
+    #[serde(default)]
+    parameters: serde_json::Value,
+    #[serde(default)]
+    properties: serde_json::Value,
+    #[serde(default)]
+    assets: Vec<Asset>,
+    #[serde(default = "default_management")]
+    management: Management,
+}
+
+impl<'de> Deserialize<'de> for DataSource {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = DataSourceWire::deserialize(deserializer)?;
+        // Narrow `structure` by the sibling `structure_family` — the illegal
+        // combination (family=Sparse holding an Array-shaped variant) is
+        // unrepresentable because the variant is a function of the family, not
+        // of field shape.
+        let structure = match &wire.structure {
+            Some(v) => AnyStructure::from_family_json(wire.structure_family, v)
+                .map_err(serde::de::Error::custom)?,
+            None => None,
+        };
+        Ok(DataSource {
+            structure_family: wire.structure_family,
+            structure,
+            id: wire.id,
+            mimetype: wire.mimetype,
+            parameters: wire.parameters,
+            properties: wire.properties,
+            assets: wire.assets,
+            management: wire.management,
+        })
+    }
 }
 
 fn default_management() -> Management {
@@ -121,5 +182,84 @@ mod tests {
         let json = serde_json::to_value(&ds).unwrap();
         assert_eq!(json["structure_family"], "array");
         assert_eq!(json["management"], "external");
+    }
+
+    #[test]
+    fn sparse_data_source_roundtrips_as_sparse_with_nondefault_coord() {
+        use crate::core::dtype::{BuiltinDType, DType, Endianness, Kind};
+        use crate::core::structures::{SparseLayout, SparseStructure};
+
+        // A sparse structure with a data_type AND a non-default (uint32)
+        // coord_data_type. Under the old untagged Deserialize this survived
+        // serialization but came back as AnyStructure::Array, dropping
+        // coord_data_type and layout. Family authority keeps it Sparse.
+        let structure = SparseStructure {
+            chunks: vec![vec![3], vec![3]],
+            shape: vec![3, 3],
+            data_type: Some(DType::Builtin(BuiltinDType::new(
+                Endianness::Little,
+                Kind::Float,
+                8,
+            ))),
+            coord_data_type: Some(BuiltinDType::new(
+                Endianness::Little,
+                Kind::UnsignedInteger,
+                4,
+            )),
+            ..Default::default()
+        };
+        let ds = DataSource {
+            structure_family: StructureFamily::Sparse,
+            structure: Some(AnyStructure::Sparse(structure)),
+            id: None,
+            mimetype: None,
+            parameters: serde_json::json!({}),
+            properties: serde_json::json!({}),
+            assets: vec![],
+            management: Management::Writable,
+        };
+
+        let json = serde_json::to_value(&ds).unwrap();
+        let back: DataSource = serde_json::from_value(json).unwrap();
+        match back.structure {
+            Some(AnyStructure::Sparse(s)) => {
+                assert_eq!(s.shape, vec![3, 3]);
+                assert_eq!(s.chunks, vec![vec![3], vec![3]]);
+                assert_eq!(
+                    s.coord_data_type,
+                    Some(BuiltinDType::new(
+                        Endianness::Little,
+                        Kind::UnsignedInteger,
+                        4
+                    )),
+                    "non-default uint32 coord_data_type must survive the round-trip"
+                );
+                assert_eq!(s.layout, SparseLayout::COO);
+            }
+            other => panic!("expected Sparse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vec_data_source_deserializes_sparse_by_family() {
+        // The ingest shape: a `Vec<DataSource>` (as in PostMetadataRequest and
+        // NodeAttributes) routes through the custom Deserialize per element.
+        let raw = serde_json::json!([{
+            "structure_family": "sparse",
+            "structure": {
+                "chunks": [[3], [3]],
+                "shape": [3, 3],
+                "data_type": {"endianness": "little", "kind": "f", "itemsize": 8},
+                "coord_data_type": {"endianness": "little", "kind": "u", "itemsize": 4},
+                "layout": "COO"
+            },
+            "management": "writable"
+        }]);
+        let dss: Vec<DataSource> = serde_json::from_value(raw).unwrap();
+        assert_eq!(dss.len(), 1);
+        assert!(
+            matches!(dss[0].structure, Some(AnyStructure::Sparse(_))),
+            "family-authoritative parse must yield Sparse, not Array"
+        );
     }
 }
