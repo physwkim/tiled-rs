@@ -57,7 +57,7 @@ pub use cache::{CacheControl, CacheEntry, HttpCache};
 pub use composite::{CompositeClient, CompositePart};
 pub use constructors::{from_context, from_uri, from_uri_with_options};
 pub use container::{ContainerClient, SortDirection};
-pub use context::{Context, ContextOptions};
+pub use context::{ApiKeyCreated, ApiKeyInfo, Context, ContextOptions};
 pub use dataframe::{TableClient, TablePartition};
 pub use dataset::{Dataset, Variable};
 pub use error::{ClientError, Result};
