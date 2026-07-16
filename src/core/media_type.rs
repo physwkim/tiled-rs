@@ -28,6 +28,11 @@ pub mod mime {
     /// SQL-backed ragged array storage — Python `RAGGED_SQL_MIMETYPE`
     /// (`tiled/mimetypes.py`). The managed-write backend for ragged nodes.
     pub const RAGGED_SQL: &str = "application/x-ragged+sql";
+    /// Directory-of-buffers awkward-array storage — Python
+    /// `AWKWARD_BUFFERS_MIMETYPE` (`tiled/mimetypes.py:13`). The managed-write
+    /// backend for awkward nodes; `DEFAULT_CREATION_MIMETYPE[awkward]`
+    /// (`tiled/catalog/adapter.py:120`).
+    pub const AWKWARD_BUFFERS: &str = "application/x-awkward-buffers";
 }
 
 /// Content encodings (compression).

@@ -898,6 +898,91 @@ async fn write_ragged_helper_roundtrip() {
 }
 
 // ---------------------------------------------------------------------------
+// Server-level awkward managed-write: create + write + read-back over a
+// catalog node (exercises the resolver's awkward arm + the on-disk buffer
+// directory), not the in-memory test tree.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn awkward_managed_write_roundtrip() {
+    use std::collections::HashMap;
+    use tiled_rs::core::data_source::{DataSource, Management};
+    use tiled_rs::core::structures::{AnyStructure, AwkwardStructure, StructureFamily};
+
+    let (base, _wd, _db) = spawn_write_server().await;
+    let root = from_uri(&base).await.unwrap().into_container().unwrap();
+
+    // A single NumpyArray leaf: form_key "node0" backs the buffer "node0-data".
+    let structure = AwkwardStructure {
+        length: 3,
+        form: serde_json::json!({
+            "class": "NumpyArray",
+            "primitive": "float64",
+            "form_key": "node0"
+        }),
+    };
+    let ds = DataSource {
+        structure_family: StructureFamily::Awkward,
+        structure: Some(AnyStructure::Awkward(structure)),
+        id: None,
+        // No pinned mimetype: exercise `default_creation_mimetype(Awkward)` ->
+        // application/x-awkward-buffers, then `managed_init_storage` ->
+        // `init_storage_awkward`.
+        mimetype: None,
+        parameters: serde_json::json!({}),
+        properties: serde_json::json!({}),
+        assets: vec![],
+        management: Management::Writable,
+    };
+    root.create_node(
+        Some("ak_managed"),
+        StructureFamily::Awkward,
+        serde_json::json!({"note": "awk"}),
+        vec![],
+        vec![ds],
+    )
+    .await
+    .expect("create awkward node");
+
+    let ak = root
+        .get("ak_managed")
+        .await
+        .unwrap()
+        .into_awkward()
+        .unwrap();
+
+    // Boundary: reading a managed awkward node before any write — the buffer
+    // directory was created empty by `init_storage_awkward`, so no buffers.
+    let before = ak.read().await.expect("read before write");
+    assert!(
+        before.buffers.is_empty(),
+        "no buffers before the first write"
+    );
+
+    // First write to the empty managed directory.
+    let mut v1 = HashMap::new();
+    v1.insert("node0-data".to_string(), Bytes::from(vec![1u8; 24]));
+    ak.write(v1).await.expect("first write to empty node");
+
+    let read1 = ak.read().await.expect("read after first write");
+    assert_eq!(read1.buffers.len(), 1, "one buffer after first write");
+    assert_eq!(&read1.buffers["node0-data"][..], &[1u8; 24][..]);
+
+    // Boundary: re-write (overwrite) the same key — upstream's DirectoryContainer
+    // overwrites per form_key, so the new bytes replace the old on disk.
+    let mut v2 = HashMap::new();
+    v2.insert("node0-data".to_string(), Bytes::from(vec![2u8; 24]));
+    ak.write(v2).await.expect("re-write over existing buffer");
+
+    let read2 = ak.read().await.expect("read after re-write");
+    assert_eq!(
+        &read2.buffers["node0-data"][..],
+        &[2u8; 24][..],
+        "re-write overwrites the buffer in place"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Scope 2: TableClient::write
 // ---------------------------------------------------------------------------
 
