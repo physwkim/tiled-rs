@@ -323,8 +323,15 @@ pub fn build_app(state: AppState) -> Router {
             get(crate::server::webhook_router::history),
         );
 
+    // Read-only Zarr protocol routers (upstream app.py:419-420). Mounted inside
+    // the auth-guarded group so every zarr request passes through the same auth
+    // middleware as the tiled API; the handlers additionally apply per-node
+    // access policy via `resolve_entry`, exactly like the array/container routes.
+    let zarr = crate::server::zarr_router::zarr_router();
+
     let guarded = api
         .merge(private_auth)
+        .merge(zarr)
         // ETag/If-None-Match for GET responses. Layered INSIDE auth (auth is
         // applied after, so it wraps this): the ETag layer only ever sees
         // responses from authorized handlers, never the 401 auth short-circuits.
