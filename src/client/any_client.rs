@@ -248,4 +248,14 @@ impl AnyClient {
             }),
         }
     }
+
+    pub fn into_sparse(self) -> Result<SparseClient> {
+        match self {
+            Self::Sparse(s) => Ok(s),
+            other => Err(ClientError::StructureMismatch {
+                expected: "sparse".into(),
+                got: other.structure_family().to_string(),
+            }),
+        }
+    }
 }
