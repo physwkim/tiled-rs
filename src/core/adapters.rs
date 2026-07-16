@@ -10,7 +10,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use crate::core::dtype::{ArrowTable, DynNDArray};
+use crate::core::dtype::{ArrowTable, DynNDArray, Endianness, Kind};
 use crate::core::error::{Result, TiledError};
 use crate::core::ndslice::NDSlice;
 use crate::core::schemas::SortDirection;
@@ -173,6 +173,91 @@ pub trait TableAdapterWrite: TableAdapterRead {
 pub struct SparseData {
     pub coords: Vec<DynNDArray>,
     pub data: DynNDArray,
+}
+
+impl SparseData {
+    /// Materialize a rectangular region of this COO data as a dense,
+    /// zero-filled, C-order buffer — the Rust equivalent of upstream's
+    /// `sparse.COO.todense()` (`tiled/server/zarr.py`).
+    ///
+    /// `starts[d]` is the region's lower bound along dimension `d`, in the
+    /// same coordinate frame as `self.coords`, and `shape[d]` is the region's
+    /// extent. A non-zero is placed in the output only when its coordinate
+    /// falls within `[starts[d], starts[d] + shape[d])` on every axis
+    /// (remapped to `coord[d] - starts[d]`); non-zeros outside the region are
+    /// dropped. Passing all-zero `starts` with `shape` equal to the full array
+    /// shape densifies the whole array.
+    ///
+    /// Callers wanting a sub-region (e.g. one zarr chunk) should read the
+    /// *whole* array first (`SparseAdapterRead::read(&NDSlice::empty())`,
+    /// which every adapter assembles correctly into one global coordinate
+    /// frame) and pass that region's `starts`/`shape` here, rather than
+    /// relying on `SparseAdapterRead::read` with a non-trivial slice — not
+    /// every adapter implements slice filtering (see
+    /// `sparse_blocks_parquet_adapter.rs`'s `apply_sparse_slice`).
+    ///
+    /// Duplicate coordinates (multiple non-zeros at the same position) are
+    /// last-write-wins, not summed; well-formed COO data has no duplicates.
+    pub fn densify(&self, starts: &[usize], shape: &[usize]) -> DynNDArray {
+        let dtype = self.data.dtype.clone();
+        let esz = dtype.element_size();
+        let ndim = shape.len();
+        let total: usize = shape.iter().product();
+        let mut out = vec![0u8; total * esz];
+
+        // C-order element strides over the output region.
+        let mut strides = vec![1usize; ndim];
+        for d in (0..ndim.saturating_sub(1)).rev() {
+            strides[d] = strides[d + 1] * shape[d + 1];
+        }
+
+        let nnz = self.data.len();
+        'nz: for i in 0..nnz {
+            let mut flat = 0usize;
+            for d in 0..ndim {
+                let local = read_coord_i64(&self.coords[d], i) - starts[d] as i64;
+                if local < 0 || local as usize >= shape[d] {
+                    continue 'nz;
+                }
+                flat += local as usize * strides[d];
+            }
+            let dst = flat * esz;
+            let src = i * esz;
+            out[dst..dst + esz].copy_from_slice(&self.data.data[src..src + esz]);
+        }
+        DynNDArray::new(bytes::Bytes::from(out), dtype, shape.to_vec())
+    }
+}
+
+/// Decode element `i` of an integer-typed [`DynNDArray`] (a COO coordinate
+/// column) as `i64`. Coordinate columns are always an integer kind — signed
+/// or unsigned, 1/2/4/8 bytes, either endianness.
+fn read_coord_i64(arr: &DynNDArray, i: usize) -> i64 {
+    let esz = arr.dtype.element_size();
+    let off = i * esz;
+    let b = &arr.data[off..off + esz];
+    let le = arr.dtype.endianness != Endianness::Big;
+    macro_rules! rd {
+        ($ty:ty) => {{
+            let a: [u8; std::mem::size_of::<$ty>()] = b.try_into().unwrap();
+            (if le {
+                <$ty>::from_le_bytes(a)
+            } else {
+                <$ty>::from_be_bytes(a)
+            }) as i64
+        }};
+    }
+    match (arr.dtype.kind, esz) {
+        (Kind::Integer, 1) => rd!(i8),
+        (Kind::Integer, 2) => rd!(i16),
+        (Kind::Integer, 4) => rd!(i32),
+        (Kind::Integer, 8) => rd!(i64),
+        (Kind::UnsignedInteger, 1) => rd!(u8),
+        (Kind::UnsignedInteger, 2) => rd!(u16),
+        (Kind::UnsignedInteger, 4) => rd!(u32),
+        (Kind::UnsignedInteger, 8) => rd!(u64),
+        other => unreachable!("sparse coordinate dtype must be an integer kind, got {other:?}"),
+    }
 }
 
 pub trait SparseAdapterRead: BaseAdapter {
@@ -631,5 +716,83 @@ impl AnyAdapter {
             Self::Awkward(a) => Some(Arc::clone(a)),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod sparse_densify_tests {
+    use super::SparseData;
+    use crate::core::dtype::{BuiltinDType, DynNDArray, Endianness, Kind};
+    use bytes::Bytes;
+
+    fn i64_coords(vals: &[i64]) -> DynNDArray {
+        let dtype = BuiltinDType::new(Endianness::Little, Kind::Integer, 8);
+        let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+        DynNDArray::new(Bytes::from(bytes), dtype, vec![vals.len()])
+    }
+
+    fn f64_data(vals: &[f64]) -> DynNDArray {
+        let dtype = BuiltinDType::new(Endianness::Little, Kind::Float, 8);
+        let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+        DynNDArray::new(Bytes::from(bytes), dtype, vec![vals.len()])
+    }
+
+    fn read_f64s(arr: &DynNDArray) -> Vec<f64> {
+        arr.data
+            .chunks_exact(8)
+            .map(|b| f64::from_le_bytes(b.try_into().unwrap()))
+            .collect()
+    }
+
+    #[test]
+    fn densify_whole_array_scatters_at_global_coords() {
+        // 3x3 grid, non-zeros at (0,1)=1.5 and (2,0)=3.7.
+        let sd = SparseData {
+            coords: vec![i64_coords(&[0, 2]), i64_coords(&[1, 0])],
+            data: f64_data(&[1.5, 3.7]),
+        };
+        let dense = sd.densify(&[0, 0], &[3, 3]);
+        assert_eq!(dense.shape, vec![3, 3]);
+        assert_eq!(
+            read_f64s(&dense),
+            vec![0.0, 1.5, 0.0, 0.0, 0.0, 0.0, 3.7, 0.0, 0.0]
+        );
+    }
+
+    #[test]
+    fn densify_region_remaps_to_local_and_drops_outside() {
+        // Global non-zeros at (1,1)=10.0 and (2,2)=20.0. Region starting at
+        // (2,2) with shape (2,2) keeps only (2,2), remapped to local (0,0);
+        // (1,1) falls outside the region and is dropped.
+        let sd = SparseData {
+            coords: vec![i64_coords(&[1, 2]), i64_coords(&[1, 2])],
+            data: f64_data(&[10.0, 20.0]),
+        };
+        let dense = sd.densify(&[2, 2], &[2, 2]);
+        assert_eq!(dense.shape, vec![2, 2]);
+        assert_eq!(read_f64s(&dense), vec![20.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn densify_empty_sparse_data_is_all_zeros() {
+        let sd = SparseData {
+            coords: vec![i64_coords(&[]), i64_coords(&[])],
+            data: f64_data(&[]),
+        };
+        let dense = sd.densify(&[0, 0], &[2, 2]);
+        assert_eq!(read_f64s(&dense), vec![0.0, 0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn densify_boundary_region_zero_pads_past_array_edge() {
+        // Array shape (3,), one non-zero at global index 2. A boundary chunk
+        // covering [2, 4) (padded past the array edge at 3) keeps index 2 at
+        // local 0, and zero-fills local index 1 (which has no backing data).
+        let sd = SparseData {
+            coords: vec![i64_coords(&[2])],
+            data: f64_data(&[9.0]),
+        };
+        let dense = sd.densify(&[2], &[2]);
+        assert_eq!(read_f64s(&dense), vec![9.0, 0.0]);
     }
 }

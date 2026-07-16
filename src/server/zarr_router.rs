@@ -26,20 +26,35 @@
 //!
 //! ## Scope
 //!
-//! Arrays and containers are fully supported. Tables are surfaced as zarr
-//! *groups* whose listing enumerates the column names (mirroring upstream), but
-//! the per-column arrays are not resolvable because the Rust adapter layer
-//! models a table as a leaf, not a container. Sparse arrays are not exported.
-//! Both are reported as UNFIXED in the task report.
+//! Arrays, sparse arrays, and containers are fully supported. Tables are
+//! surfaced as zarr *groups* whose listing enumerates the column names
+//! (mirroring upstream), but the per-column arrays are not resolvable because
+//! the Rust adapter layer models a table as a leaf, not a container. Reported
+//! as UNFIXED in the task report.
+//!
+//! ## Sparse arrays: densify via a full read, not a partial slice
+//!
+//! Upstream densifies a sparse chunk with `array.todense()` after reading the
+//! block's slice (`entry.read(slice=block_slices)`). This port reads the
+//! *whole* sparse array once per chunk request
+//! (`SparseAdapterRead::read(&NDSlice::empty())`) and densifies just the
+//! requested chunk region from that via [`crate::core::adapters::SparseData::densify`],
+//! rather than requesting the chunk's slice directly from the adapter: not
+//! every `SparseAdapterRead` implementation applies a non-trivial slice (see
+//! `sparse_blocks_parquet_adapter.rs`'s `apply_sparse_slice`), while every
+//! adapter's *empty*-slice read correctly assembles the full array into one
+//! global coordinate frame. Sparse data is small by definition, so re-reading
+//! the whole array per chunk is an acceptable trade for not depending on a
+//! partially-implemented slice path.
 
 use axum::extract::{OriginalUri, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 
-use crate::core::adapters::{AnyAdapter, ArrayAdapterRead};
+use crate::core::adapters::{AnyAdapter, ArrayAdapterRead, SparseAdapterRead};
 use crate::core::dtype::{BuiltinDType, DType, DynNDArray, Kind};
 use crate::core::ndslice::NDSlice;
-use crate::core::structures::StructureFamily;
+use crate::core::structures::{SparseStructure, StructureFamily};
 use crate::server::AuthContext;
 use crate::server::core;
 use crate::server::error::ServerError;
@@ -298,6 +313,46 @@ fn pad_c_order(arr: &DynNDArray, target: &[usize]) -> DynNDArray {
     DynNDArray::new(bytes::Bytes::from(out), arr.dtype.clone(), target.to_vec())
 }
 
+/// Read one zarr chunk from a sparse adapter and return its densified raw
+/// C-order bytes — the sparse-family counterpart of [`read_zarr_chunk`].
+///
+/// Mirrors upstream: the chunk maps to the region `[i*c : (i+1)*c]` per
+/// dimension (`c` = zarr chunk size). Unlike the dense-array path, this reads
+/// the *whole* array via `SparseAdapterRead::read(&NDSlice::empty())` (see the
+/// module docs for why) and densifies just the requested region with
+/// [`crate::core::adapters::SparseData::densify`], which — because it only
+/// places non-zeros whose coordinates fall inside the region — zero-pads a
+/// boundary chunk automatically; no separate padding step is needed here.
+async fn read_zarr_chunk_sparse(
+    adapter: &dyn SparseAdapterRead,
+    block: &[usize],
+) -> Result<bytes::Bytes, ServerError> {
+    let structure = adapter.structure();
+    let zc = convert_chunks_for_zarr(&structure.chunks);
+
+    // Scalar (0-d) array: the only valid chunk key is `0`. Otherwise the block
+    // index length must match the array rank. (Upstream raises 400.)
+    let is_scalar = zc.is_empty() && block == [0];
+    if !is_scalar && zc.len() != block.len() {
+        return Err(ServerError::BadRequest(format!(
+            "Requested zarr block index {block:?} is inconsistent with the shape of array, {:?}.",
+            structure.shape
+        )));
+    }
+
+    let (starts, shape): (Vec<usize>, Vec<usize>) = if is_scalar {
+        (vec![], vec![])
+    } else {
+        (block.iter().zip(&zc).map(|(&i, &c)| i * c).collect(), zc)
+    };
+
+    let sparse_data = adapter
+        .read(&NDSlice::empty())
+        .await
+        .map_err(ServerError::from)?;
+    Ok(sparse_data.densify(&starts, &shape).data)
+}
+
 // ---------------------------------------------------------------------------
 // Response builders
 // ---------------------------------------------------------------------------
@@ -431,13 +486,17 @@ pub async fn zarr_v2(
         ".zarray" => {
             let entry = &segments[..segments.len() - 1];
             let node = resolve_zarr_node(&state, &auth, entry).await?;
-            let array = node
-                .as_ref()
-                .and_then(AnyAdapter::as_array_arc)
-                .ok_or_else(|| {
-                    ServerError::NotFound(format!("'{}' is not a zarr array", entry.join("/")))
-                })?;
-            Ok(json_response(&zarray_metadata(array.as_ref())))
+            let doc = match &node {
+                Some(AnyAdapter::Array(a)) => zarray_metadata(a.as_ref()),
+                Some(AnyAdapter::Sparse(s)) => sparse_zarray_metadata(s.structure())?,
+                _ => {
+                    return Err(ServerError::NotFound(format!(
+                        "'{}' is not a zarr array",
+                        entry.join("/")
+                    )));
+                }
+            };
+            Ok(json_response(&doc))
         }
         _ => {
             // Group listing or a chunk read. A trailing dotted-digits segment is
@@ -460,22 +519,26 @@ pub async fn zarr_v2(
                     let urls = group_listing(&state, &node, &base).await?;
                     Ok(json_response(&serde_json::json!(urls)))
                 }
-                Some(other) => {
-                    let array = other.as_array_arc().ok_or_else(|| {
-                        ServerError::NotFound(format!(
-                            "'{}' cannot be read as a zarr array",
-                            entry.join("/")
-                        ))
-                    })?;
-                    match block {
-                        Some(idx) => {
-                            let body = read_zarr_chunk(array.as_ref(), &idx).await?;
-                            Ok(chunk_response(body))
-                        }
-                        // Whole-array URL with no chunk key: upstream returns `{}`.
-                        None => Ok(json_response(&serde_json::json!({}))),
+                Some(AnyAdapter::Array(a)) => match block {
+                    Some(idx) => {
+                        let body = read_zarr_chunk(a.as_ref(), &idx).await?;
+                        Ok(chunk_response(body))
                     }
-                }
+                    // Whole-array URL with no chunk key: upstream returns `{}`.
+                    None => Ok(json_response(&serde_json::json!({}))),
+                },
+                Some(AnyAdapter::Sparse(s)) => match block {
+                    Some(idx) => {
+                        let body = read_zarr_chunk_sparse(s.as_ref(), &idx).await?;
+                        Ok(chunk_response(body))
+                    }
+                    // Whole-array URL with no chunk key: upstream returns `{}`.
+                    None => Ok(json_response(&serde_json::json!({}))),
+                },
+                Some(_) => Err(ServerError::NotFound(format!(
+                    "'{}' cannot be read as a zarr array",
+                    entry.join("/")
+                ))),
             }
         }
     }
@@ -494,6 +557,34 @@ fn zarray_metadata(adapter: &dyn ArrayAdapterRead) -> serde_json::Value {
         "shape": s.shape,
         "zarr_format": 2,
     })
+}
+
+/// A sparse array's declared value dtype, or a 500 if unset. Shared by the v2
+/// and v3 sparse metadata builders below — [`SparseStructure::data_type`] is
+/// optional on the wire (unlike [`crate::core::structures::ArrayStructure::data_type`]),
+/// but every adapter that actually serves data sets it.
+fn sparse_data_type(s: &SparseStructure) -> Result<&DType, ServerError> {
+    s.data_type
+        .as_ref()
+        .ok_or_else(|| ServerError::Internal("sparse array has no data_type set".to_string()))
+}
+
+/// Build a v2 `.zarray` document for a sparse array (uncompressed — see module
+/// docs). Same shape as [`zarray_metadata`], mirroring upstream's single
+/// `get_zarr_array_metadata` handler, which serves both `StructureFamily.array`
+/// and `StructureFamily.sparse` from `entry.structure()`.
+fn sparse_zarray_metadata(s: &SparseStructure) -> Result<serde_json::Value, ServerError> {
+    let dt = sparse_data_type(s)?;
+    Ok(serde_json::json!({
+        "chunks": convert_chunks_for_zarr(&s.chunks),
+        "compressor": serde_json::Value::Null,
+        "dtype": dtype_to_numpy_descr(dt),
+        "fill_value": serde_json::Value::Null,
+        "filters": serde_json::Value::Null,
+        "order": "C",
+        "shape": s.shape,
+        "zarr_format": 2,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -523,13 +614,16 @@ pub async fn zarr_v3(
     // upstream `{path:path}/c/{block:path}` route).
     if let Some((entry, block)) = split_v3_chunk(&segments) {
         let node = resolve_zarr_node(&state, &auth, entry).await?;
-        let array = node
-            .as_ref()
-            .and_then(AnyAdapter::as_array_arc)
-            .ok_or_else(|| {
-                ServerError::NotFound(format!("'{}' is not a zarr array", entry.join("/")))
-            })?;
-        let body = read_zarr_chunk(array.as_ref(), &block).await?;
+        let body = match &node {
+            Some(AnyAdapter::Array(a)) => read_zarr_chunk(a.as_ref(), &block).await?,
+            Some(AnyAdapter::Sparse(s)) => read_zarr_chunk_sparse(s.as_ref(), &block).await?,
+            _ => {
+                return Err(ServerError::NotFound(format!(
+                    "'{}' is not a zarr array",
+                    entry.join("/")
+                )));
+            }
+        };
         return Ok(chunk_response(body));
     }
 
@@ -583,6 +677,10 @@ async fn zarr_v3_metadata(
     match node {
         Some(AnyAdapter::Array(a)) => {
             let doc = array_v3_metadata(a.as_ref()).await?;
+            Ok(json_response(&doc))
+        }
+        Some(AnyAdapter::Sparse(s)) => {
+            let doc = sparse_array_v3_metadata(s.structure(), s.metadata())?;
             Ok(json_response(&doc))
         }
         // Container / table / root → group document.
@@ -649,6 +747,55 @@ async fn array_v3_metadata(
         ],
         "dimension_names": dimension_names,
         "attributes": adapter.metadata().clone(),
+    }))
+}
+
+/// Build the v3 `array` metadata document for a sparse array (uncompressed —
+/// see module docs). Same shape as [`array_v3_metadata`], mirroring
+/// upstream's single `get_zarr_metadata` handler which serves both
+/// `StructureFamily.array` and `StructureFamily.sparse` alike.
+///
+/// Unlike the dense-array builder, the 0-dimensional fill-value case does not
+/// read the array back: a sparse array's implicit fill value is its zero
+/// element by definition, so the default zero scalar always applies, even
+/// for a 0-d shape.
+fn sparse_array_v3_metadata(
+    s: &SparseStructure,
+    metadata: &serde_json::Value,
+) -> Result<serde_json::Value, ServerError> {
+    let dt = sparse_data_type(s)?;
+    let builtin = match dt {
+        DType::Builtin(b) => b.clone(),
+        DType::Struct(_) => {
+            return Err(ServerError::Validation(
+                "zarr v3 export does not support structured dtypes".to_string(),
+            ));
+        }
+    };
+    let data_type = dtype_v3_name(&builtin)?;
+    let fill_value = v3_default_scalar(&builtin);
+
+    let dimension_names = match &s.dims {
+        Some(d) => serde_json::json!(d),
+        None => serde_json::Value::Null,
+    };
+
+    Ok(serde_json::json!({
+        "zarr_format": 3,
+        "node_type": "array",
+        "shape": s.shape,
+        "data_type": data_type,
+        "chunk_grid": {
+            "name": "regular",
+            "configuration": {"chunk_shape": convert_chunks_for_zarr(&s.chunks)},
+        },
+        "chunk_key_encoding": {"name": "default", "configuration": {"separator": "/"}},
+        "fill_value": fill_value,
+        "codecs": [
+            {"name": "bytes", "configuration": {"endian": "little"}},
+        ],
+        "dimension_names": dimension_names,
+        "attributes": metadata,
     }))
 }
 
