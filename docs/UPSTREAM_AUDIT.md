@@ -65,6 +65,7 @@ fix problems in code we never wrote.
 | (core) | String + temporal table column dtypes | c42ae12 + e73209b | Extends table-column walkability to non-numeric Arrow types, mirroring `ArrayAdapter.from_array` on object/datetime pandas columns. **String** (`Utf8`/`LargeUtf8`) → numpy fixed-width unicode `<U{n}` (UCS4/UTF-32-LE, right-padded `U+0000`) where `n` is the longest value over the *concatenated* column; null → literal `"None"` (`str(None)`, array.py:78), empty → `<U0` — the one place a dtype is data-derived rather than schema-fixed. **Temporal** (`Timestamp`/`Date32`/`Date64`) → numpy `datetime64` `<M8[unit]` int64 ticks (Timestamp keeps its unit, Date32 `[D]`, Date64 `[ms]`); null → `i64::MIN` (NaT), tz dropped (numpy `datetime64` is tz-naive — upstream parity). Served by `/array/full`, `text/csv`, and zarr v2; **zarr v3 → 422** (the v3 spec has no fixed-width-unicode / `datetime64` core data type — a clean parity ceiling, where upstream feeds the dtype to `parse_data_type(zarr_format=3)` unguarded at zarr.py:314). Non-numeric/non-string/non-temporal columns (nested) still rejected. |
 | (core) | JSON serialization of `U`/`S` arrays | e559716 | `/array/full?format=json` previously errored on unicode/bytes arrays; now matches upstream `safe_json_dump` (serialization/array.py:33-37 → orjson + `default` fallback, utils.py:558-582). **U** (`<U`) → JSON strings via `tolist()` (orjson has no numpy unicode fast-path; trailing NUL padding stripped at code-point level, interior NULs preserved). **S** (bytes) → base64 data URI `data:application/octet-stream;base64,…` (utils.py's first `isinstance bytes` branch wins over the utf-8 branch — S is base64, not text). U decoder shared with the CSV serializer (`decode_u_element`); S diverges by design (CSV renders bytes as utf-8 text). Behaviour traced from source (numpy not installed), not run. |
 | #1409 | Metadata-revision pagination (`revisions_count`) | 1008d12 | `GET /revisions` set `meta.count = revisions.len()` (the *page* length), so `pagination_links` derived `last_offset = 0` and emitted no `next`/`last` — revisions past the first page were unreachable (upstream #1409, closes #1389). Added `Catalog::count_revisions(node_id)` — a page-independent `SELECT COUNT(*) FROM revisions WHERE node_id = ?` (SQLite/Postgres split mirroring `count_children`) — and fed its total to both `meta.count` and the links; the page still comes from `list_revisions` (already `ORDER BY revision`). Upstream folds count + page into one windowed `COUNT() OVER()` query (`revisions_with_count`, catalog/adapter.py); the separate COUNT is semantically identical (the total is offset/limit-independent) and sidesteps the empty-window edge that forces upstream's own COUNT fallback. |
+| #1415 | HDF5 non-string object dtype | 2bb1bd3 | A dataset whose numpy dtype is object `O` but is not a vlen string (a vlen array / HDF5 object reference) can't be read as an array; upstream serves an empty placeholder of the same shape, dtype `S0` (`numpy.empty(ds.shape, dtype="S0")`, hdf5.py:204-235). `from_path` intercepts the `VarLenSequence` datatype CLASS before `dtype_from_hdf5` — parallel to the vlen-string interception (#157) — and materialises an `S0` (zero-width bytes) structure over the shape with an empty buffer; `apply_slice` already returns empty bytes for itemsize 0, so `/array/full`, `/array/block`, and zarr serve it uniformly, plus a warning. Only `VarLenSequence` is reachable — rust-hdf5 has no `Reference` (class 7) `DatatypeMessage` variant, so object references are structurally unreachable from this port. The sibling `dtype_from_hdf5` rejections (FixedString→`S<N>`, Compound, Enum, Array) are distinct numpy kinds, not object dtype, so #1415 does not cover them. |
 
 ## Already covered (no code change)
 
@@ -99,7 +100,6 @@ fix problems in code we never wrote.
 | #1320 | Postgres `nodes` parent_id index | We have the index; production-scale planner tuning is the actual issue. |
 | #588  | btree_gin (vs plain GIN) | We have plain GIN over jsonb; btree_gin only helps hybrid btree+gin queries. |
 | #1271 | Preemptive reshape | Our HDF5 reads `ds.shape()` directly; can't diverge by design. |
-| #1415 | HDF5 non-string object-dtype placeholder | vlen-string object datasets are ported (#157, `0be4d0e` → fixed-width `S<N>`), but other object dtypes (vlen arrays, HDF5 object references) fall through to `dtype_from_hdf5` (`hdf5_adapter.rs:161`), which errors. Upstream now serves an empty `S0` placeholder of the same shape instead of raising (hdf5.py, #1415). Low value — these dtypes are rare and h5py-only. |
 
 Resolved out of Deferred: #1096 (ported, see above); #1378 (confirmed
 correct — single-row json-seq framing covered by a unit + HTTP smoke
@@ -193,18 +193,19 @@ Prior batches account through **#1378** (the Ported / Already-covered tables
 top out at #1374; #1378 is resolved-out-of-Deferred above). This batch swept
 every merged upstream PR numbered above #1378 — 24 PRs, #1381 through #1435
 (upstream local checkout HEAD `da03df0f` = the #1434 merge; #1435 is a
-GitHub-only pixi change). Classification: **5 already covered**, **2 deferred /
-actionable**, **17 N/A**.
+GitHub-only pixi change). Classification: **5 already covered**, **2 ported**,
+**0 deferred / actionable**, **17 N/A**.
 
 * **Already covered (5)** — rows in the Already-covered table: #1381, #1382,
   #1383, #1385 (the Entra/OIDC + role-scope follow-ups to #1364 / #1178 / #465
   were already folded into `external_oidc.rs` / `auth_router.rs` / `app.rs`)
   and #1391 (empty `sort=`).
-* **Deferred / actionable (1)** — row in the Deferred table: **#1415** (HDF5
-  non-string object-dtype placeholder — low value). **#1409**
-  (metadata-revision total-count pagination — a real defect: multi-page
-  revision listings were uncapped-count and un-pageable) has since been
-  ported (`1008d12`, see the Ported table).
+* **Ported (2)** — rows in the Ported table: **#1415** (HDF5 non-string
+  object-dtype `S0` placeholder, `2bb1bd3`) and **#1409** (metadata-revision
+  total-count pagination — a real defect: multi-page revision listings were
+  uncapped-count and un-pageable; `1008d12`).
+* **Deferred / actionable (0)** — both former actionable items from this sweep
+  are now ported.
 
 N/A batch (17), each with the structural reason it does not apply:
 
