@@ -33,6 +33,13 @@ pub mod mime {
     /// backend for awkward nodes; `DEFAULT_CREATION_MIMETYPE[awkward]`
     /// (`tiled/catalog/adapter.py:120`).
     pub const AWKWARD_BUFFERS: &str = "application/x-awkward-buffers";
+    /// Directory-of-parquet-blocks sparse (COO) array storage — Python
+    /// `SPARSE_BLOCKS_PARQUET_MIMETYPE` (`tiled/mimetypes.py:11`). The
+    /// managed-write backend for sparse nodes;
+    /// `DEFAULT_CREATION_MIMETYPE[sparse]` (`tiled/catalog/adapter.py:122`). Note
+    /// the `;structure=sparse` parameter distinguishes it from the plain
+    /// `application/x-parquet` table mimetype.
+    pub const SPARSE_BLOCKS_PARQUET: &str = "application/x-parquet;structure=sparse";
 }
 
 /// Content encodings (compression).

@@ -65,7 +65,7 @@ pub use ragged_sql_adapter::{
     ChunkRow, RaggedSQLAdapter, RaggedSqlInit, RaggedSqlStore, init_storage_ragged_sql,
 };
 #[cfg(feature = "parquet")]
-pub use sparse_blocks_parquet_adapter::SparseBlocksParquetAdapter;
+pub use sparse_blocks_parquet_adapter::{SparseBlocksParquetAdapter, init_storage_sparse_parquet};
 #[cfg(feature = "sql-adapter")]
 pub use sql_adapter::SqlTableAdapter;
 #[cfg(feature = "tiff")]

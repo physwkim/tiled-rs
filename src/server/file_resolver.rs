@@ -196,6 +196,42 @@ impl LeafResolver for FileLeafResolver {
                 })?;
             }
 
+            // Sparse (COO) nodes resolve from *all* block assets — one parquet
+            // file per block — not just the first, so they branch out before the
+            // single-asset `uri_to_path` below. The block files may not exist yet
+            // on a created-but-unwritten node (init_storage lays out the assets
+            // but leaves each file to its first write), so containment is checked
+            // on the block directory rather than each file.
+            #[cfg(feature = "parquet")]
+            if ds.mimetype == crate::core::media_type::mime::SPARSE_BLOCKS_PARQUET {
+                // `list_assets` already orders by `num`; sort again so the
+                // block-grid order the adapter reconstructs is local and explicit
+                // rather than implied by the query.
+                let mut ordered: Vec<_> = assets.iter().collect();
+                ordered.sort_by_key(|a| a.num.unwrap_or(0));
+                let mut paths = Vec::with_capacity(ordered.len());
+                for a in &ordered {
+                    paths.push(uri_to_path(&a.data_uri)?);
+                }
+                let scope = self.scope.clone();
+                let writable_storage = catalog.writable_storage().to_vec();
+                let structure_json = ds.structure.clone();
+                let metadata = node.metadata.clone();
+                return tokio::task::spawn_blocking(move || {
+                    build_sparse_blocks_adapter(
+                        &scope,
+                        &writable_storage,
+                        paths,
+                        &structure_json,
+                        metadata,
+                    )
+                })
+                .await
+                .map_err(|e| {
+                    CatalogError::Validation(format!("sparse resolve task failed: {e}"))
+                })?;
+            }
+
             let path = uri_to_path(&asset.data_uri)?;
             let scope = self.scope.clone();
             // Write-containment mirror of `scope`: an adapter is built writable
@@ -479,6 +515,65 @@ fn build_ragged_sql_adapter(
         adapter = adapter.into_writable();
     }
     Ok(AnyAdapter::Ragged(Arc::new(adapter)))
+}
+
+/// Build a sparse-blocks-parquet leaf adapter from its ordered block file paths
+/// and the COO structure the create path persisted. Pure blocking work (two
+/// `canonicalize` containment checks on the block directory), so it is only ever
+/// called inside `spawn_blocking`.
+///
+/// Containment (`check_allowed`) and writability (`is_writable_path`) are checked
+/// on the block *directory* — the location `init_storage_sparse_parquet` created
+/// — not on each block file: a created-but-unwritten node has no block files yet,
+/// and `canonicalize` would fail on a missing path. The block files still live
+/// inside that directory, so the directory is the correct containment unit.
+///
+/// The COO structure (shape + chunks + data dtype + dims) is not on disk — the
+/// block parquet files hold only coords + values — so it travels from the
+/// catalog data_source JSON, exactly as `SparseBlocksParquetAdapter::from_paths`
+/// needs it. Writable only when the directory is under writable storage, the
+/// same single write-containment gate the other managed adapters use.
+#[cfg(feature = "parquet")]
+fn build_sparse_blocks_adapter(
+    scope: &ReadScope,
+    writable_storage: &[PathBuf],
+    paths: Vec<PathBuf>,
+    structure_json: &serde_json::Value,
+    metadata: serde_json::Value,
+) -> std::result::Result<AnyAdapter, CatalogError> {
+    let directory = paths
+        .first()
+        .and_then(|p| p.parent())
+        .ok_or_else(|| {
+            CatalogError::Validation("sparse node has no block assets to resolve".into())
+        })?
+        .to_path_buf();
+    check_allowed(scope, &directory)?;
+    let writable = is_writable_path(writable_storage, &directory);
+
+    let structure = crate::core::structures::SparseStructure::from_json(structure_json)
+        .map_err(|e| CatalogError::Validation(e.to_string()))?;
+    let data_dtype = match &structure.data_type {
+        Some(crate::core::dtype::DType::Builtin(b)) => b.clone(),
+        _ => {
+            return Err(CatalogError::Validation(
+                "sparse node data_source has no builtin value dtype to resolve".into(),
+            ));
+        }
+    };
+    let mut adapter = crate::adapters::SparseBlocksParquetAdapter::from_paths(
+        paths,
+        structure.shape.clone(),
+        structure.chunks.clone(),
+        data_dtype,
+        structure.dims.clone(),
+        metadata,
+    )
+    .map_err(|e| CatalogError::Validation(e.to_string()))?;
+    if writable {
+        adapter = adapter.into_writable();
+    }
+    Ok(AnyAdapter::Sparse(Arc::new(adapter)))
 }
 
 /// Decode a `sqlite://` data_uri into its backing database file path, for the

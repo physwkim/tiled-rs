@@ -5240,10 +5240,17 @@ fn default_creation_mimetype(
         // files. Upstream `DEFAULT_CREATION_MIMETYPE[awkward]`
         // (tiled/catalog/adapter.py:120) → `AWKWARD_BUFFERS_MIMETYPE`.
         SF::Awkward => Ok(crate::core::media_type::mime::AWKWARD_BUFFERS),
+        // Sparse nodes have one managed-write backend: a directory of per-block
+        // parquet files. Upstream `DEFAULT_CREATION_MIMETYPE[sparse]`
+        // (tiled/catalog/adapter.py:122) → `SPARSE_BLOCKS_PARQUET_MIMETYPE`.
+        #[cfg(feature = "parquet")]
+        SF::Sparse => Ok(crate::core::media_type::mime::SPARSE_BLOCKS_PARQUET),
         other => Err(ServerError::UnsupportedMediaType(format!(
             "no managed-write backend for {} nodes in this build \
              (array: application/x-zarr or application/x-npy; \
-             table: application/x-parquet or text/csv)",
+             table: application/x-parquet or text/csv; \
+             awkward: application/x-awkward-buffers; \
+             sparse: application/x-parquet;structure=sparse)",
             ds_family_str(other)
         ))),
     }
@@ -5404,12 +5411,32 @@ async fn managed_init_storage(
                     .map_err(ServerError::from)?;
             Ok((mimetype, to_asset_specs(assets), parameters))
         }
+        crate::core::media_type::mime::SPARSE_BLOCKS_PARQUET => {
+            #[cfg(feature = "parquet")]
+            {
+                let structure = managed_sparse_structure(ds, &mimetype)?;
+                let (_data_uri, assets) = crate::adapters::init_storage_sparse_parquet(
+                    writable_root,
+                    &path_parts,
+                    &structure,
+                )
+                .map_err(ServerError::from)?;
+                Ok((mimetype, to_asset_specs(assets), parameters))
+            }
+            #[cfg(not(feature = "parquet"))]
+            {
+                Err(ServerError::UnsupportedMediaType(
+                    "sparse (parquet blocks) support not built in".into(),
+                ))
+            }
+        }
         other => Err(ServerError::UnsupportedMediaType(format!(
             "managed writes are not supported for mimetype {other} in this build \
              (supported: application/x-zarr, application/x-npy for array nodes; \
              application/x-parquet, text/csv for table nodes; \
              application/x-ragged+sql for ragged nodes; \
-             application/x-awkward-buffers for awkward nodes)"
+             application/x-awkward-buffers for awkward nodes; \
+             application/x-parquet;structure=sparse for sparse nodes)"
         ))),
     }
 }
@@ -5434,6 +5461,50 @@ fn managed_awkward_structure(
             "a managed awkward create requires an awkward structure (form + length)".into(),
         )),
     }
+}
+
+/// Validate that a managed sparse-mimetype create carries a sparse structure and
+/// return it. The sparse analog of [`managed_array_structure`]. The structure
+/// (shape + chunks) drives the block layout `init_storage_sparse_parquet` lays
+/// out, so a create whose family/structure does not match is rejected here.
+///
+/// Unlike the array/table/ragged helpers, this does not match on
+/// `AnyStructure::Sparse`: `AnyStructure` is `#[serde(untagged)]` with `Array`
+/// ordered before `Sparse`, and a COO structure (data_type + chunks + shape) is
+/// a valid `ArrayStructure`, so an incoming sparse structure deserializes as
+/// `AnyStructure::Array`. The authoritative discriminator is the sibling
+/// `structure_family` field, which lives outside the structure and so cannot
+/// steer the untagged parse. Having confirmed `structure_family == Sparse`, we
+/// re-derive the [`SparseStructure`] from the structure's raw JSON via its own
+/// lenient `from_json` (which recovers `chunks`/`shape`/`data_type` and defaults
+/// `coord_data_type`/`layout`). The array-shaped mis-parse preserves every field
+/// this path needs. (The structural cause is the untagged `AnyStructure`; a
+/// family-aware `DataSource` deserialization would fix it globally but is well
+/// out of scope for the sparse write port.)
+#[cfg(feature = "parquet")]
+fn managed_sparse_structure(
+    ds: &crate::core::data_source::DataSource,
+    mimetype: &str,
+) -> Result<crate::core::structures::SparseStructure, ServerError> {
+    if ds.structure_family != crate::core::structures::StructureFamily::Sparse {
+        return Err(ServerError::UnsupportedMediaType(format!(
+            "mimetype {mimetype} is only valid for sparse nodes, not {}",
+            ds_family_str(ds.structure_family)
+        )));
+    }
+    let structure = ds.structure.as_ref().ok_or_else(|| {
+        ServerError::Validation(
+            "a managed sparse create requires a sparse structure (shape + chunks)".into(),
+        )
+    })?;
+    let raw = serde_json::to_value(structure).map_err(|e| {
+        ServerError::Internal(format!("re-serializing sparse structure failed: {e}"))
+    })?;
+    crate::core::structures::SparseStructure::from_json(&raw).map_err(|e| {
+        ServerError::Validation(format!(
+            "a managed sparse create requires a valid sparse structure (shape + chunks): {e}"
+        ))
+    })
 }
 
 /// Validate that a managed ragged-mimetype create carries a ragged structure and
