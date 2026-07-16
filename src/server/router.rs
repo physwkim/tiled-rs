@@ -5441,7 +5441,16 @@ pub async fn get_revisions(
         .list_revisions(node.id, offset, limit)
         .await
         .map_err(map_catalog_err)?;
-    let count = revisions.len();
+    // `meta.count` and the `next`/`last` pagination links must reflect the
+    // TOTAL revision count for the node, not this page's length. Feeding the
+    // page length made `pagination_links` derive `last_offset = 0` and never
+    // emit a `next` link, so clients could not page past the first page
+    // (upstream #1409, closes #1389). The page still comes from
+    // `list_revisions`; `count_revisions` supplies the page-independent total.
+    let count = catalog
+        .count_revisions(node.id)
+        .await
+        .map_err(map_catalog_err)? as usize;
     // Each item: `{revision_number, attributes: {metadata, specs, time_updated}}`
     // (Python construct_revisions_response, server/core.py:339-348). access_blob
     // is intentionally not surfaced.

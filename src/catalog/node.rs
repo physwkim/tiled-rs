@@ -1135,6 +1135,32 @@ impl Catalog {
         }
     }
 
+    /// Count a node's total metadata revisions, independent of pagination.
+    /// Feeds `meta.count` and the `next`/`last` pagination links of the
+    /// revisions endpoint. Mirrors the total returned by upstream
+    /// `CatalogNodeAdapter.revisions_with_count` (catalog/adapter.py, PR #1409):
+    /// a page-independent `COUNT(*)` of the node's `revisions` rows. Dialect
+    /// split matches `count_children`.
+    pub async fn count_revisions(&self, node_id: i64) -> Result<i64> {
+        match self.pool() {
+            DbPool::Sqlite(pool) => {
+                let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM revisions WHERE node_id = ?")
+                    .bind(node_id)
+                    .fetch_one(pool)
+                    .await?;
+                Ok(n)
+            }
+            DbPool::Postgres(pool) => {
+                let n: i64 =
+                    sqlx::query_scalar("SELECT COUNT(*) FROM revisions WHERE node_id = $1")
+                        .bind(node_id)
+                        .fetch_one(pool)
+                        .await?;
+                Ok(n)
+            }
+        }
+    }
+
     /// Delete one revision of a node by its `revision_number`. Returns
     /// `Ok(false)` when no such revision exists (the caller maps that to 404),
     /// `Ok(true)` on success. Mirrors Python
