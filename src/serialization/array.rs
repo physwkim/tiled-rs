@@ -76,6 +76,38 @@ fn ensure_decimal(s: String) -> String {
     }
 }
 
+/// Decode one fixed-width numpy unicode (`U`, UCS-4 / UTF-32) element to a
+/// `String`. `bytes` is a single element (itemsize = 4 × n_chars); each 4-byte
+/// code unit is read little- or big-endian per `big_endian`. Trailing U+0000
+/// padding is stripped — numpy renders a fixed-width `<U` element with its
+/// trailing NULs removed (`ndarray.tolist()`); interior NULs are preserved and
+/// invalid code points (surrogates / out-of-range) are skipped. Single source
+/// of truth for `U` decoding, shared by the CSV and JSON array serializers.
+fn decode_u_element(bytes: &[u8], big_endian: bool) -> String {
+    let decoded: String = bytes
+        .chunks_exact(4)
+        .filter_map(|chunk| {
+            let word: [u8; 4] = chunk.try_into().expect("chunks_exact(4) yields 4 bytes");
+            let cp = if big_endian {
+                u32::from_be_bytes(word)
+            } else {
+                u32::from_le_bytes(word)
+            };
+            char::from_u32(cp)
+        })
+        .collect();
+    decoded.trim_end_matches('\0').to_string()
+}
+
+/// Strip trailing NUL padding from a fixed-width numpy byte-string (`S`)
+/// element. numpy pads such elements to `itemsize` with NULs and treats the
+/// trailing NULs as insignificant (interior NULs are preserved), so
+/// `ndarray.tolist()` yields the bytes with trailing NULs removed.
+fn strip_trailing_nuls(bytes: &[u8]) -> &[u8] {
+    let end = bytes.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
+    &bytes[..end]
+}
+
 /// CSV serializer for 1-D/2-D arrays (Python `serialize_csv`, array.py:41-46).
 fn serialize_array_csv(
     data: &[u8],
@@ -240,24 +272,9 @@ fn serialize_array_csv(
                     .trim_end_matches('\0')
                     .to_string()
             }
-            ("U", _) => {
-                // UCS-4 (4 bytes per character); honor byte order per character.
-                bytes
-                    .chunks(4)
-                    .filter_map(|c| {
-                        let arr: [u8; 4] = c.try_into().ok()?;
-                        let cp = if big_endian {
-                            u32::from_be_bytes(arr)
-                        } else {
-                            u32::from_le_bytes(arr)
-                        };
-                        if cp == 0 {
-                            return None;
-                        }
-                        char::from_u32(cp)
-                    })
-                    .collect::<String>()
-            }
+            // UCS-4 (4 bytes per character); honor byte order per character.
+            // Single source of truth with the JSON serializer's `U` arm.
+            ("U", _) => decode_u_element(bytes, big_endian),
             _ => format!("unsupported dtype {kind}{itemsize}"),
         }
     };
@@ -404,6 +421,24 @@ fn serialize_array_json(
             // timedelta64 is an 8-byte int64 tick count; orjson can't serialize
             // it, so tiled falls back to tolist() — see timedelta64_to_json.
             ("m", 8) => timedelta64_to_json(le!(i64, 8), dt_unit)?,
+            // numpy fixed-width unicode (`<U`): orjson's OPT_SERIALIZE_NUMPY has
+            // no fast-path for it, so upstream `safe_json_dump` falls to its
+            // `default` → `array.tolist()` (utils.py:571-575), which renders each
+            // element as a Python `str` (trailing NUL padding removed) and orjson
+            // then emits a JSON string. Match that via the shared decoder.
+            ("U", _) => serde_json::Value::String(decode_u_element(bytes, big_endian)),
+            // numpy byte strings (`S`/bytes): orjson likewise has no fast-path, so
+            // `tolist()` yields Python `bytes`; recursing on each, `safe_json_dump`'s
+            // `default` hits its FIRST `isinstance(_, bytes)` branch and returns a
+            // base64 data URI (utils.py:559-561) — NOT the utf-8 branch
+            // (utils.py:576-577), which a `bytes` element can never reach. numpy's
+            // `tolist()` has already stripped trailing NUL padding, so strip it
+            // before encoding.
+            ("S", _) => {
+                use base64::Engine as _;
+                let b64 = base64::engine::general_purpose::STANDARD.encode(strip_trailing_nuls(bytes));
+                serde_json::Value::String(format!("data:application/octet-stream;base64,{b64}"))
+            }
             _ => {
                 return Err(format!(
                     "application/json array serializer does not support dtype {kind}{itemsize}"
@@ -877,6 +912,140 @@ mod tests {
             err.to_string().contains("does not support"),
             "error must name the unsupported dtype: {err}"
         );
+    }
+
+    fn octet_stream_serializer() -> std::sync::Arc<crate::serialization::registry::SerializerFn> {
+        let reg = SerializationRegistry::new();
+        register_array_serializers(&reg);
+        reg.dispatch(StructureFamily::Array, mime::OCTET_STREAM)
+            .expect("array application/octet-stream must be registered")
+    }
+
+    /// Encode `strings` as a numpy `<U{width}` buffer: UCS-4 little-endian,
+    /// each element NUL-padded to `width` code points (itemsize = 4 × width).
+    fn ucs4_le_buffer(strings: &[&str], width: usize) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(strings.len() * width * 4);
+        for s in strings {
+            let mut chars = 0;
+            for ch in s.chars() {
+                buf.extend_from_slice(&(ch as u32).to_le_bytes());
+                chars += 1;
+            }
+            for _ in chars..width {
+                buf.extend_from_slice(&0u32.to_le_bytes());
+            }
+        }
+        buf
+    }
+
+    /// Encode `items` as a numpy `S{width}` buffer: each element NUL-padded to
+    /// `width` bytes (itemsize = width).
+    fn s_buffer(items: &[&[u8]], width: usize) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(items.len() * width);
+        for it in items {
+            let mut v = it.to_vec();
+            v.resize(width, 0);
+            buf.extend_from_slice(&v);
+        }
+        buf
+    }
+
+    fn b64(bytes: &[u8]) -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    /// A 1-D `<U` array renders as JSON strings (upstream `safe_json_dump`
+    /// falls back to `tolist()`; numpy strips trailing NUL padding).
+    #[test]
+    fn json_array_u_1d_renders_strings() {
+        let ser = json_array_serializer();
+        let data = ucs4_le_buffer(&["ab", "cdef"], 4); // <U4
+        let meta = serde_json::json!({"itemsize": 16, "kind": "U", "shape": [2]});
+        let out = ser(&data, &meta).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(parsed, serde_json::json!(["ab", "cdef"]));
+    }
+
+    /// A 2-D `<U` array nests row-major, same as the numeric path.
+    #[test]
+    fn json_array_u_2d_nested_row_major() {
+        let ser = json_array_serializer();
+        let data = ucs4_le_buffer(&["a", "bb", "ccc", "d"], 3); // <U3, 2x2
+        let meta = serde_json::json!({"itemsize": 12, "kind": "U", "shape": [2, 2]});
+        let out = ser(&data, &meta).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(parsed, serde_json::json!([["a", "bb"], ["ccc", "d"]]));
+    }
+
+    /// Boundary elements: an empty string (all NUL padding) and a full-width
+    /// element (fills the itemsize, no padding to strip).
+    #[test]
+    fn json_array_u_empty_and_full_width_elements() {
+        let ser = json_array_serializer();
+        let data = ucs4_le_buffer(&["", "abcd"], 4); // <U4: "" then exactly 4 chars
+        let meta = serde_json::json!({"itemsize": 16, "kind": "U", "shape": [2]});
+        let out = ser(&data, &meta).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(parsed, serde_json::json!(["", "abcd"]));
+    }
+
+    /// A numpy `S`/bytes array renders as base64 data URIs — matching
+    /// upstream `safe_json_dump`'s first `isinstance(_, bytes)` branch
+    /// (utils.py:559-561), NOT the utf-8 branch. Trailing NUL padding is
+    /// stripped before encoding (`tolist()` does).
+    #[test]
+    fn json_array_s_renders_base64_data_uri() {
+        let ser = json_array_serializer();
+        let data = s_buffer(&[b"abc", b"de"], 3); // S3: "abc", "de\0"
+        let meta = serde_json::json!({"itemsize": 3, "kind": "S", "shape": [2]});
+        let out = ser(&data, &meta).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(
+            parsed,
+            serde_json::json!([
+                format!("data:application/octet-stream;base64,{}", b64(b"abc")),
+                format!("data:application/octet-stream;base64,{}", b64(b"de")),
+            ])
+        );
+    }
+
+    /// An empty `S` element (all NUL) yields an empty-payload data URI.
+    #[test]
+    fn json_array_s_empty_element_is_empty_payload() {
+        let ser = json_array_serializer();
+        let data = s_buffer(&[b"", b"z"], 1); // S1: "\0", "z"
+        let meta = serde_json::json!({"itemsize": 1, "kind": "S", "shape": [2]});
+        let out = ser(&data, &meta).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(
+            parsed,
+            serde_json::json!([
+                "data:application/octet-stream;base64,",
+                format!("data:application/octet-stream;base64,{}", b64(b"z")),
+            ])
+        );
+    }
+
+    /// Round-trip through the octet-stream dtype: the raw element bytes the
+    /// octet-stream serializer emits are exactly what the JSON serializer
+    /// consumes, and JSON decodes them back to the original strings.
+    #[test]
+    fn json_array_u_roundtrips_octet_stream_bytes() {
+        let octet = octet_stream_serializer();
+        let json = json_array_serializer();
+        let strings = ["hi", "world"];
+        let data = ucs4_le_buffer(&strings, 5); // <U5
+        let meta = serde_json::json!({"itemsize": 20, "kind": "U", "shape": [2]});
+
+        // octet-stream is the raw wire buffer (zero-copy passthrough).
+        let raw = octet(&data, &meta).unwrap();
+        assert_eq!(&raw[..], &data[..], "octet-stream must be the raw buffer");
+
+        // Feeding that same buffer to JSON recovers the strings.
+        let out = json(&raw, &meta).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(parsed, serde_json::json!(["hi", "world"]));
     }
 
     /// orjson renders numpy `datetime64` arrays as ISO-8601 strings (array.py:33-38
