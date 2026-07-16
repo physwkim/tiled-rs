@@ -175,9 +175,17 @@ pub async fn construct_entries_response(
     queries: &[crate::core::queries::Query],
     sorting: &[(String, SortDirection)],
     exact_count_limit: u64,
+    include_data_sources: bool,
 ) -> Result<Response<Vec<Resource>>, ServerError> {
     let page = container
-        .search_page(queries, sorting, cursor, offset, limit)
+        .search_page(
+            queries,
+            sorting,
+            cursor,
+            offset,
+            limit,
+            include_data_sources,
+        )
         .await?;
     let (entries, next_cursor) = (page.entries, page.next_cursor);
     // Cap the reported total at `exact_count_limit`. When the true count
@@ -241,7 +249,9 @@ fn resource_from_entry(entry: SearchEntry, child_path: &str, base_url: &str) -> 
             structure: entry.structure,
             access_blob: entry.access_blob,
             sorting,
-            data_sources: None,
+            // Populated by the adapter only when the request set
+            // `include_data_sources`; `None` otherwise (omitted on the wire).
+            data_sources: entry.data_sources,
         },
         links: links::links_for_node(family, base_url, child_path),
     }

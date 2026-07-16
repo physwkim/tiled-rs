@@ -1195,6 +1195,170 @@ async fn fields_projection_on_search_prunes_attributes() {
     }
 }
 
+/// `?include_data_sources=true` on `/search` attaches each entry's
+/// `data_sources` list (with assets) to the response, mirroring the single-node
+/// metadata route (Python router.py:324 / core.py:483). A node that has data
+/// sources gets them populated; a container (none) gets an empty list; and
+/// WITHOUT the flag the field is omitted on every entry. The catalog serves this
+/// from one batched IN-clause fetch per table over the page's node ids, not a
+/// query per row.
+#[tokio::test]
+async fn search_include_data_sources_populates_and_omits() {
+    let (app, dir) = build_test_app().await;
+    let data_uri =
+        tiled_rs::core::file_uri::path_to_file_uri(&dir.path().join("frame.h5")).unwrap();
+
+    // A leaf array node carrying one data source (with one asset)...
+    let (status, body) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/register/",
+        serde_json::json!({
+            "key": "arr",
+            "structure_family": "array",
+            "metadata": {"kind": "image"},
+            "specs": [],
+            "data_sources": [{
+                "structure_family": "array",
+                "mimetype": "application/x-hdf5",
+                "management": "writable",
+                "assets": [{
+                    "data_uri": data_uri.clone(),
+                    "is_directory": false,
+                    "parameter": "data_uri"
+                }]
+            }]
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "register arr: {body}");
+
+    // ...and a container node with NO data sources — the mixed page.
+    let (status, body) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/register/",
+        serde_json::json!({
+            "key": "grp",
+            "structure_family": "container",
+            "metadata": {"kind": "group"},
+            "specs": [],
+            "data_sources": [],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "register grp: {body}");
+
+    let find = |body: &serde_json::Value, id: &str| -> serde_json::Value {
+        body["data"]
+            .as_array()
+            .expect("data is array")
+            .iter()
+            .find(|e| e["id"] == id)
+            .unwrap_or_else(|| panic!("entry {id} missing: {body}"))
+            .clone()
+    };
+
+    // (a) With the flag: `arr` carries its data source (+ asset); `grp` (a
+    // container with none) carries an empty list.
+    let (status, body) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/search/?include_data_sources=true",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "search +ds: {body}");
+    assert_eq!(
+        body["data"].as_array().unwrap().len(),
+        2,
+        "two entries: {body}"
+    );
+
+    let arr = find(&body, "arr");
+    let ds = arr["attributes"]["data_sources"]
+        .as_array()
+        .unwrap_or_else(|| panic!("arr data_sources not an array: {}", arr["attributes"]));
+    assert_eq!(ds.len(), 1, "arr has exactly one data source: {arr}");
+    assert_eq!(ds[0]["structure_family"], "array", "ds family: {}", ds[0]);
+    assert_eq!(
+        ds[0]["mimetype"], "application/x-hdf5",
+        "ds mimetype: {}",
+        ds[0]
+    );
+    let assets = ds[0]["assets"].as_array().expect("ds assets is array");
+    assert_eq!(assets.len(), 1, "ds carries its one asset: {}", ds[0]);
+    assert_eq!(
+        assets[0]["data_uri"], data_uri,
+        "asset data_uri: {}",
+        assets[0]
+    );
+    assert_eq!(
+        assets[0]["parameter"], "data_uri",
+        "asset parameter: {}",
+        assets[0]
+    );
+
+    let grp = find(&body, "grp");
+    let grp_ds = grp["attributes"]["data_sources"]
+        .as_array()
+        .unwrap_or_else(|| {
+            panic!(
+                "grp data_sources should be an (empty) array, got {}",
+                grp["attributes"]
+            )
+        });
+    assert!(grp_ds.is_empty(), "container has empty data_sources: {grp}");
+
+    // (b) Without the flag: `data_sources` omitted on every entry.
+    let (status, body) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/search/",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "search no-ds: {body}");
+    for item in body["data"].as_array().unwrap() {
+        assert!(
+            item["attributes"].get("data_sources").is_none(),
+            "data_sources omitted without the flag: {}",
+            item["attributes"]
+        );
+    }
+
+    // (c) The `?fields=` projection must NOT strip data_sources — upstream gates
+    // it by include_data_sources alone (core.py:483), independent of `fields`.
+    // So `fields=metadata&include_data_sources=true` keeps metadata AND data
+    // sources while still pruning `specs`.
+    let (status, body) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/search/?fields=metadata&include_data_sources=true",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "search fields+ds: {body}");
+    let arr = find(&body, "arr");
+    assert!(
+        arr["attributes"].get("metadata").is_some(),
+        "fields=metadata keeps metadata: {arr}"
+    );
+    assert!(
+        arr["attributes"].get("specs").is_none(),
+        "fields=metadata prunes specs: {arr}"
+    );
+    let ds = arr["attributes"]["data_sources"]
+        .as_array()
+        .unwrap_or_else(|| {
+            panic!(
+                "data_sources must survive the fields projection, got {}",
+                arr["attributes"]
+            )
+        });
+    assert_eq!(ds.len(), 1, "data_sources survive fields projection: {arr}");
+}
+
 /// Conditional GET: a JSON metadata response carries a strong (quoted) `ETag`,
 /// and a follow-up `If-None-Match` carrying that value returns `304 Not
 /// Modified` with an empty body (ETag retained) — activating the client's
