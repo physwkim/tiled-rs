@@ -14,8 +14,10 @@
 
 use std::sync::Arc;
 
-use arrow::array::{BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray};
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::array::{
+    BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray, TimestampMillisecondArray,
+};
+use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::ipc::writer::FileWriter;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
@@ -130,6 +132,40 @@ fn build_string_app() -> (axum::Router, tempfile::TempDir) {
 
     let table = ArrowIpcAdapter::from_paths(vec![p0, p1], serde_json::json!({})).unwrap();
     let root = single_table_root("str_table", AnyAdapter::Table(Arc::new(table)));
+    (app_for_root(root), dir)
+}
+
+/// Write one Arrow IPC file holding a single nullable `Timestamp(ms)` column
+/// `t`.
+fn write_timestamp_partition(path: &std::path::Path, ticks: Vec<Option<i64>>) {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "t",
+        DataType::Timestamp(TimeUnit::Millisecond, None),
+        true,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(TimestampMillisecondArray::from(ticks))],
+    )
+    .unwrap();
+    let f = std::fs::File::create(path).unwrap();
+    let mut w = FileWriter::try_new(f, &schema).unwrap();
+    w.write(&batch).unwrap();
+    w.finish().unwrap();
+}
+
+/// App whose root holds a two-partition table `ts_table` with one nullable
+/// `Timestamp(ms)` column `t`: ticks `[1000, null]` then `[3000]`. The null
+/// becomes numpy `NaT` (`i64::MIN`); the unit is `<M8[ms]` (8-byte int64 ticks).
+fn build_temporal_app() -> (axum::Router, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let p0 = dir.path().join("t0.arrow");
+    let p1 = dir.path().join("t1.arrow");
+    write_timestamp_partition(&p0, vec![Some(1000), None]);
+    write_timestamp_partition(&p1, vec![Some(3000)]);
+
+    let table = ArrowIpcAdapter::from_paths(vec![p0, p1], serde_json::json!({})).unwrap();
+    let root = single_table_root("ts_table", AnyAdapter::Table(Arc::new(table)));
     (app_for_root(root), dir)
 }
 
@@ -429,5 +465,75 @@ async fn zarr_v3_string_column_is_422() {
     // (and this port) reject a string column with 422 rather than inventing one.
     let (app, _dir) = build_string_app();
     let (status, _) = get(&app, "/zarr/v3/str_table/name/zarr.json").await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+// ---------------------------------------------------------------------------
+// temporal columns (Timestamp/Date → datetime64 `<M8[unit]`)
+//
+// Parity: upstream serves a datetime column as numpy `datetime64`, an 8-byte
+// int64 tick count under a unit-tagged dtype. A null is `NaT` (`i64::MIN`). A
+// tz-aware timestamp becomes tz-naive UTC ticks (numpy `datetime64` carries no
+// tz). zarr v3 has no datetime64 core data type — a parity ceiling, 422.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn metadata_of_timestamp_column_is_datetime64() {
+    let (app, _dir) = build_temporal_app();
+
+    let (status, body) = get_json(&app, "/api/v1/metadata/ts_table/t").await;
+    assert_eq!(status, StatusCode::OK);
+    let structure = &body["data"]["attributes"]["structure"];
+    assert_eq!(structure["shape"], serde_json::json!([3]), "3 rows");
+    let dt = &structure["data_type"];
+    assert_eq!(dt["kind"], "M", "datetime64");
+    assert_eq!(dt["itemsize"], 8);
+    assert_eq!(dt["dt_units"], "[ms]", "Timestamp(ms) unit carried through");
+}
+
+#[tokio::test]
+async fn array_full_of_timestamp_column_is_int64_ticks() {
+    let (app, _dir) = build_temporal_app();
+
+    let (status, body) = get(&app, "/api/v1/array/full/ts_table/t").await;
+    assert_eq!(status, StatusCode::OK);
+    // 3 rows × 8 bytes int64 ticks; the null slot is `NaT` (i64::MIN).
+    assert_eq!(i64s(&body), vec![1000, i64::MIN, 3000]);
+}
+
+#[tokio::test]
+async fn csv_of_timestamp_column_renders_iso_cells() {
+    let (app, _dir) = build_temporal_app();
+
+    let (status, body) = get(&app, "/api/v1/array/full/ts_table/t?format=text/csv").await;
+    assert_eq!(status, StatusCode::OK);
+    // ms unit → `str(numpy.datetime64)` ISO with a 3-digit fraction; NaT → "NaT".
+    assert_eq!(
+        String::from_utf8(body).unwrap(),
+        "1970-01-01T00:00:01.000\nNaT\n1970-01-01T00:00:03.000"
+    );
+}
+
+#[tokio::test]
+async fn zarr_v2_timestamp_column_zarray_and_chunk() {
+    let (app, _dir) = build_temporal_app();
+
+    let (status, doc) = get_json(&app, "/zarr/v2/ts_table/t/.zarray").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(doc["zarr_format"], 2);
+    assert_eq!(doc["dtype"], "<M8[ms]");
+    assert_eq!(doc["shape"], serde_json::json!([3]));
+
+    // Its chunk bytes are the raw int64 ticks.
+    let (status, chunk) = get(&app, "/zarr/v2/ts_table/t/0").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(i64s(&chunk), vec![1000, i64::MIN, 3000]);
+}
+
+#[tokio::test]
+async fn zarr_v3_timestamp_column_is_422() {
+    // Parity ceiling: zarr v3 has no datetime64 core data type.
+    let (app, _dir) = build_temporal_app();
+    let (status, _) = get(&app, "/zarr/v3/ts_table/t/zarr.json").await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
 }
