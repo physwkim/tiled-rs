@@ -5,6 +5,7 @@
 //!
 //! GAP #2 — API-key management: `which_api_key` / `create_api_key` /
 //! `revoke_api_key`.
+//! GAP #3 — session management: `revoke_session`.
 
 use std::sync::Arc;
 
@@ -256,4 +257,107 @@ async fn create_with_scopes_expiry_note_roundtrips() {
         info.expiration_time, created.expiration_time,
         "expiration_time round-trips identically through which_api_key"
     );
+}
+
+/// Log alice in via the dummy authenticator; returns her refresh token.
+async fn login_refresh(base: &str) -> String {
+    let body: serde_json::Value = reqwest::Client::new()
+        .post(format!("{base}/api/v1/auth/dummy/login"))
+        .json(&serde_json::json!({"username": "alice", "password": "wonderland"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    body["refresh_token"].as_str().unwrap().to_string()
+}
+
+/// Status of `POST /api/v1/auth/refresh` for a given refresh token.
+async fn refresh_status(base: &str, refresh: &str) -> reqwest::StatusCode {
+    reqwest::Client::new()
+        .post(format!("{base}/api/v1/auth/refresh"))
+        .json(&serde_json::json!({"refresh_token": refresh}))
+        .send()
+        .await
+        .unwrap()
+        .status()
+}
+
+/// GAP #3: `revoke_session(session_id)` invalidates exactly that session's
+/// refresh token, while an untouched session keeps refreshing. The Context is
+/// authenticated as alice via a bootstrap API key (revoke requires the caller
+/// to own the session).
+#[tokio::test]
+async fn revoke_session_invalidates_only_that_sessions_refresh() {
+    let (base, auth_db, _dir) = spawn_auth_server().await;
+
+    // Two independent alice sessions (each dummy login mints a fresh session).
+    let refresh_a = login_refresh(&base).await;
+    let refresh_b = login_refresh(&base).await;
+
+    // The test controls the issuer secret, so decode refresh_a to recover its
+    // session UUID.
+    let issuer = Issuer::new(ISSUER_SECRET).unwrap();
+    let session_a = issuer.verify_refresh(&refresh_a).unwrap().sid;
+
+    // A Context that authenticates AS alice (same principal that owns the
+    // sessions), able to revoke by UUID.
+    let bootstrap = bootstrap_alice_key(&auth_db).await;
+    let (ctx, _) =
+        Context::from_uri_with_options(&base, ContextOptions::default().api_key(bootstrap))
+            .unwrap();
+
+    ctx.revoke_session(&session_a)
+        .await
+        .expect("owner revoke_session must succeed");
+
+    // Session A's refresh is now dead; session B (untouched) still refreshes —
+    // proving the revoke targeted exactly one session.
+    assert_eq!(
+        refresh_status(&base, &refresh_a).await,
+        reqwest::StatusCode::UNAUTHORIZED,
+        "a refresh on the revoked session must be 401"
+    );
+    assert_eq!(
+        refresh_status(&base, &refresh_b).await,
+        reqwest::StatusCode::OK,
+        "an untouched session must keep refreshing (control)"
+    );
+}
+
+/// GAP #3 ownership: revoking a session the caller does not own is opaque —
+/// the Rust server answers 404, surfaced as a `Server { status: 404, .. }`
+/// error rather than success.
+#[tokio::test]
+async fn revoke_session_foreign_session_is_not_found() {
+    let (base, auth_db, _dir) = spawn_auth_server().await;
+
+    // bob owns a session; alice (the Context principal) does not.
+    let (bob, _) = auth_db.ensure_principal("dummy", "bob").await.unwrap();
+    let bob_session = auth_db
+        .create_session(
+            bob.id,
+            ScopeSet::for_role("user"),
+            chrono::Utc::now() + chrono::Duration::hours(1),
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+
+    let bootstrap = bootstrap_alice_key(&auth_db).await;
+    let (ctx, _) =
+        Context::from_uri_with_options(&base, ContextOptions::default().api_key(bootstrap))
+            .unwrap();
+
+    let err = ctx
+        .revoke_session(&bob_session.uuid)
+        .await
+        .expect_err("revoking another principal's session must fail");
+    match err {
+        tiled_rs::client::ClientError::Server { status, .. } => {
+            assert_eq!(status, 404, "cross-principal revoke must be opaque 404");
+        }
+        other => panic!("expected Server{{status:404}}, got {other:?}"),
+    }
 }
