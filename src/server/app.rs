@@ -76,6 +76,8 @@ pub fn build_app(state: AppState) -> Router {
         // Operational endpoints (never require auth)
         .route("/health", get(router::health))
         .route("/ready", get(router::ready))
+        // Well-known Kubernetes/container liveness path (Python app.py:262).
+        .route("/healthz", get(router::healthz))
         // Discovery endpoint — clients (incl. the SPA) need to fetch
         // this BEFORE they can authenticate, since it advertises which
         // providers are available. Mirrors upstream tiled, which also

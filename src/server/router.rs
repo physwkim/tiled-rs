@@ -147,6 +147,17 @@ pub async fn health() -> impl IntoResponse {
     Json(serde_json::json!({"status": "ok"}))
 }
 
+/// `GET /healthz` — the well-known Kubernetes/container liveness path.
+/// Upstream `tiled` serves this exact path + body (`app.py:262-264`,
+/// "Standardized for Kubernetes, but also used by other systems.");
+/// operators porting a deployment from Python tiled expect it to keep
+/// working. Kept distinct from `health`/`ready` above (Rust-native paths
+/// with their own response shapes) rather than aliased, so neither side's
+/// body drifts if one changes independently.
+pub async fn healthz() -> impl IntoResponse {
+    Json(serde_json::json!({"status": "ready"}))
+}
+
 pub async fn ready(State(state): State<AppState>) -> impl IntoResponse {
     // `.len()` is async — for adapters like tiled_mongo's MongoCatalog the
     // first call triggers a load (offloaded to `spawn_blocking` internally).
