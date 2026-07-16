@@ -24,6 +24,31 @@ use crate::client::error::{ClientError, Result};
 pub const JSON_PATCH_MIME: &str = "application/json-patch+json";
 pub const MERGE_PATCH_MIME: &str = "application/merge-patch+json";
 
+/// Which patch algorithm a [`BaseClient::patch_metadata`] call applies —
+/// selects the wire `content-type` field of the `PATCH /metadata` body.
+/// Mirrors Python's `content_type` parameter (`base.py:713-741`), which
+/// accepts the two MIME strings directly; here the two valid values are an
+/// enum so an invalid MIME string cannot be constructed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatchContentType {
+    /// RFC 6902 JSON Patch: `metadata`/`specs`/`access_blob` are each an
+    /// array of patch operations, applied directly to that document.
+    JsonPatch,
+    /// RFC 7396 JSON Merge Patch: `metadata`/`specs`/`access_blob` are each
+    /// a partial document merged in (`null` deletes a key; an absent field
+    /// means "no change").
+    MergePatch,
+}
+
+impl PatchContentType {
+    fn mime(self) -> &'static str {
+        match self {
+            Self::JsonPatch => JSON_PATCH_MIME,
+            Self::MergePatch => MERGE_PATCH_MIME,
+        }
+    }
+}
+
 /// The `data` field of a `/metadata/.../<path>` response. We carry it whole so
 /// the family-specific clients can reach for whatever attribute they need.
 pub type Item = Resource<NodeAttributes>;
@@ -197,28 +222,38 @@ impl BaseClient {
         self.context.delete(&url).await.map(|_| ())
     }
 
-    /// Apply a merge-patch (`RFC 7396`) to the node's metadata and/or specs.
+    /// Patch this node's metadata, specs, and/or access_blob via
+    /// `PATCH /api/v1/metadata/{path}`. Mirrors Python
+    /// `BaseClient.patch_metadata` (`base.py:713-834`).
     ///
-    /// `metadata`: partial document to merge (null keys delete fields; absent
-    /// keys are unchanged). `specs`: new specs array, or `None` to leave
-    /// unchanged. Sends `PATCH /api/v1/metadata/{path}` with body
-    /// `{"content-type": "application/merge-patch+json", "metadata": ..., "specs": ...}`.
+    /// `content_type` selects the patch algorithm: with
+    /// [`PatchContentType::JsonPatch`], each of `metadata`/`specs`/`access_blob`
+    /// is an RFC 6902 patch-operations array applied directly to that
+    /// document; with [`PatchContentType::MergePatch`], each is an RFC 7396
+    /// partial document merged in (`null` deletes a key). `metadata`, `specs`,
+    /// and `access_blob` are three independent patch documents — pass `None`
+    /// to leave a field unchanged. `drop_revision`, when true, discards the
+    /// pre-patch version instead of recording it in the revision history
+    /// (`?drop_revision=true`).
     pub async fn patch_metadata(
         &self,
-        metadata: serde_json::Value,
+        metadata: Option<serde_json::Value>,
         specs: Option<serde_json::Value>,
+        access_blob: Option<serde_json::Value>,
+        content_type: PatchContentType,
+        drop_revision: bool,
     ) -> Result<()> {
         let self_link = self.require_link("self")?;
-        let url = Url::parse(self_link)?;
-        let mut body = serde_json::json!({
-            "content-type": MERGE_PATCH_MIME,
-            "metadata": metadata,
-        });
-        if let Some(s) = specs {
-            body.as_object_mut()
-                .expect("body is object")
-                .insert("specs".into(), s);
+        let mut url = Url::parse(self_link)?;
+        if drop_revision {
+            url.query_pairs_mut().append_pair("drop_revision", "true");
         }
+        let body = serde_json::json!({
+            "content-type": content_type.mime(),
+            "metadata": metadata,
+            "specs": specs,
+            "access_blob": access_blob,
+        });
         self.context.patch_json(&url, &body).await.map(|_| ())
     }
 }
