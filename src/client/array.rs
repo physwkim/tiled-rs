@@ -14,7 +14,7 @@ use url::Url;
 use crate::client::base::{BaseClient, Item, ParsedStructure};
 use crate::client::context::Context;
 use crate::client::error::{ClientError, Result};
-use crate::client::utils::{OCTET_STREAM_MIME_TYPE, decode_response, retry};
+use crate::client::utils::{OCTET_STREAM_MIME_TYPE, decode_response, resolve_export_format, retry};
 
 /// A single block of array bytes plus the dtype/shape needed to interpret it.
 #[derive(Debug, Clone)]
@@ -286,15 +286,21 @@ impl ArrayClient {
         .await
     }
 
-    /// Export the whole array to a file at `dest` in the requested `format`
-    /// (e.g. `"npy"`, `"csv"`, `"json"`). Mirrors Python `ArrayClient.export`:
-    /// sends `GET /api/v1/array/full/{path}?format=<ext>` and streams the
-    /// response bytes to `dest`. The server resolves `format` as an alias or
-    /// media-type; passing an unsupported format returns a server error.
-    pub async fn export(&self, dest: &std::path::Path, format: &str) -> Result<()> {
+    /// Export the whole array to a file at `dest`, mirroring Python
+    /// `ArrayClient.export`: sends `GET /api/v1/array/full/{path}?format=<fmt>`
+    /// and streams the response bytes to `dest`.
+    ///
+    /// `format` is resolved by the shared `resolve_export_format` helper:
+    /// `Some(fmt)` (e.g. `"csv"`, `"json"`, `"application/octet-stream"`) is used
+    /// as given with a single leading `.` stripped, while `None` infers the
+    /// format from `dest`'s file extension (e.g. `values.csv` → `csv`). The
+    /// server resolves the result as an alias or media type; an unsupported
+    /// format returns a server error.
+    pub async fn export(&self, dest: &std::path::Path, format: Option<&str>) -> Result<()> {
+        let resolved = resolve_export_format(dest, format)?;
         let link = self.base.require_link("full")?;
         let mut url = Url::parse(link)?;
-        url.query_pairs_mut().append_pair("format", format);
+        url.query_pairs_mut().append_pair("format", &resolved);
         let _permit = self.base.context.data_fetch_permit().await;
         let bytes = retry(|| async { self.base.context.get_bytes(&url, "*/*").await }).await?;
         std::fs::write(dest, &bytes)

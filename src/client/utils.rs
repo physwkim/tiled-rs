@@ -257,6 +257,58 @@ fn is_transient(err: &ClientError) -> bool {
     }
 }
 
+/// Resolve the `format` query value for a client `export`, mirroring Python
+/// `tiled.client.utils.export_util`. Shared by [`ArrayClient::export`],
+/// [`TableClient::export`], and [`ContainerClient::export`] so the three agree
+/// on one rule.
+///
+/// - `Some(fmt)` — used as given, with a single leading `.` stripped
+///   (`Some(".csv")` and `Some("csv")` are equivalent). A full media type
+///   (`"text/csv"`) passes through unchanged.
+/// - `None` — inferred from `dest`'s filename suffixes joined without dots
+///   (`export.csv` → `csv`, matching Python `pathlib.Path.suffixes`). A `dest`
+///   with no extension to infer from yields [`ClientError::Invalid`] rather than
+///   sending an empty format the server would reject.
+///
+/// [`ArrayClient::export`]: crate::client::array::ArrayClient::export
+/// [`TableClient::export`]: crate::client::dataframe::TableClient::export
+/// [`ContainerClient::export`]: crate::client::container::ContainerClient::export
+pub(crate) fn resolve_export_format(
+    dest: &std::path::Path,
+    format: Option<&str>,
+) -> Result<String> {
+    if let Some(f) = format {
+        return Ok(f.strip_prefix('.').unwrap_or(f).to_string());
+    }
+    format_from_suffixes(dest).ok_or_else(|| {
+        ClientError::Invalid(format!(
+            "cannot infer export format from '{}'; pass an explicit format",
+            dest.display()
+        ))
+    })
+}
+
+/// Join a filename's suffixes without dots, matching Python
+/// `pathlib.Path.suffixes`: `export.zip` → `Some("zip")`, `run.tar.gz` →
+/// `Some("tar.gz")`. A name with no interior `.`, a trailing `.`, or only
+/// leading dots (a hidden file) yields `None`.
+fn format_from_suffixes(dest: &std::path::Path) -> Option<String> {
+    let name = dest.file_name()?.to_str()?;
+    // Python `Path.suffixes` returns [] when the name ends with '.'.
+    if name.ends_with('.') {
+        return None;
+    }
+    // Leading dots (hidden files) are part of the stem, not suffix separators.
+    let mut parts = name.trim_start_matches('.').split('.');
+    parts.next()?; // discard the stem
+    let suffixes: Vec<&str> = parts.collect();
+    if suffixes.is_empty() {
+        None
+    } else {
+        Some(suffixes.join("."))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -371,5 +423,43 @@ mod tests {
         .expect_err("a 400 is not transient");
         assert!(matches!(err, ClientError::Server { status: 400, .. }));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn resolve_export_format_explicit_wins_and_strips_leading_dot() {
+        let p = std::path::Path::new("ignored.zip");
+        // Explicit format is used verbatim, regardless of the dest extension.
+        assert_eq!(resolve_export_format(p, Some("csv")).unwrap(), "csv");
+        // A single leading dot is stripped, like Python `export_util`.
+        assert_eq!(resolve_export_format(p, Some(".csv")).unwrap(), "csv");
+        // A full media type passes through unchanged.
+        assert_eq!(
+            resolve_export_format(p, Some("text/csv")).unwrap(),
+            "text/csv"
+        );
+    }
+
+    #[test]
+    fn resolve_export_format_infers_from_suffixes() {
+        let infer = |name: &str| resolve_export_format(std::path::Path::new(name), None);
+        assert_eq!(infer("export.zip").unwrap(), "zip");
+        assert_eq!(infer("table.csv").unwrap(), "csv");
+        // All suffixes join without dots (Python `Path.suffixes`).
+        assert_eq!(infer("run.tar.gz").unwrap(), "tar.gz");
+        // A hidden file's leading dot is part of the stem, not a suffix.
+        assert_eq!(infer(".hidden.csv").unwrap(), "csv");
+    }
+
+    #[test]
+    fn resolve_export_format_no_inferable_extension_errors() {
+        let no_ext = |name: &str| resolve_export_format(std::path::Path::new(name), None);
+        // No interior dot, a trailing dot, and a bare hidden file all have no
+        // suffix to infer from → Invalid, not an empty format string.
+        for name in ["noext", "trailing.", ".hidden"] {
+            assert!(
+                matches!(no_ext(name), Err(ClientError::Invalid(_))),
+                "expected Invalid for {name:?}"
+            );
+        }
     }
 }

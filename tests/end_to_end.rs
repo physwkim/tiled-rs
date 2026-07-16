@@ -1376,13 +1376,48 @@ async fn array_export_to_file() {
     let payload: bytes::Bytes = values.iter().flat_map(|v| v.to_le_bytes()).collect();
     arr.write(payload).await.unwrap();
 
-    let dest = tempfile::NamedTempFile::new().unwrap();
-    arr.export(dest.path(), "application/octet-stream")
-        .await
-        .expect("export");
+    let out = tempfile::tempdir().unwrap();
 
-    let exported = std::fs::read(dest.path()).unwrap();
-    assert_eq!(exported.len(), 32, "4 × 8 bytes in octet-stream export");
+    // 1. Explicit media type: raw bytes (4 × 8 = 32 bytes).
+    let explicit = out.path().join("explicit.bin");
+    arr.export(&explicit, Some("application/octet-stream"))
+        .await
+        .expect("export octet-stream");
+    assert_eq!(
+        std::fs::read(&explicit).unwrap().len(),
+        32,
+        "4 × 8 bytes in octet-stream export"
+    );
+
+    // 2. Format inferred from the `.csv` extension (format = None).
+    let inferred = out.path().join("values.csv");
+    arr.export(&inferred, None)
+        .await
+        .expect("export inferred csv");
+    let csv = std::fs::read_to_string(&inferred).unwrap();
+    assert!(!csv.is_empty(), "inferred csv is non-empty");
+    assert!(
+        csv.contains('1') && csv.contains('4'),
+        "csv holds the data: {csv:?}"
+    );
+
+    // 3. Explicit format overrides the extension: a `.csv` dest with an explicit
+    //    octet-stream request yields the 32 raw bytes, not CSV text.
+    let override_dest = out.path().join("override.csv");
+    arr.export(&override_dest, Some("application/octet-stream"))
+        .await
+        .expect("explicit format overrides extension");
+    assert_eq!(
+        std::fs::read(&override_dest).unwrap().len(),
+        32,
+        "explicit octet-stream produced raw bytes despite the .csv name"
+    );
+
+    // 4. Unknown format → mapped server error; nothing is written through.
+    let bad = out.path().join("bad.bin");
+    let err = arr.export(&bad, Some("bogus")).await;
+    assert!(err.is_err(), "unknown format maps to an error, got {err:?}");
+    assert!(!bad.exists(), "no file written when the request fails");
 }
 
 #[tokio::test]
@@ -1437,12 +1472,45 @@ async fn table_export_to_file() {
     .unwrap();
     tbl.write(&schema, &[batch]).await.unwrap();
 
-    let dest = tempfile::NamedTempFile::new().unwrap();
-    tbl.export(dest.path(), "csv").await.expect("export csv");
+    let out = tempfile::tempdir().unwrap();
 
-    let content = std::fs::read_to_string(dest.path()).unwrap();
+    // 1. Explicit format "csv".
+    let explicit = out.path().join("explicit.csv");
+    tbl.export(&explicit, Some("csv"))
+        .await
+        .expect("export csv");
+    let content = std::fs::read_to_string(&explicit).unwrap();
     assert!(content.contains("x") && content.contains("y"), "csv header");
     assert!(content.contains('1') && content.contains('z'), "csv data");
+
+    // 2. Format inferred from the `.csv` extension (format = None).
+    let inferred = out.path().join("table.csv");
+    tbl.export(&inferred, None)
+        .await
+        .expect("export inferred csv");
+    let inferred_csv = std::fs::read_to_string(&inferred).unwrap();
+    assert!(
+        inferred_csv.contains('1') && inferred_csv.contains('z'),
+        "inferred csv holds the data: {inferred_csv:?}"
+    );
+
+    // 3. Explicit format overrides the extension: a `.csv` dest with an explicit
+    //    `json` request yields JSON (quoted `"x"` key), not CSV.
+    let override_dest = out.path().join("override.csv");
+    tbl.export(&override_dest, Some("json"))
+        .await
+        .expect("explicit format overrides extension");
+    let override_body = std::fs::read_to_string(&override_dest).unwrap();
+    assert!(
+        override_body.contains("\"x\""),
+        "explicit json produced JSON despite the .csv name: {override_body:?}"
+    );
+
+    // 4. Unknown format → mapped server error; nothing is written through.
+    let bad = out.path().join("bad.bin");
+    let err = tbl.export(&bad, Some("bogus")).await;
+    assert!(err.is_err(), "unknown format maps to an error, got {err:?}");
+    assert!(!bad.exists(), "no file written when the request fails");
 }
 
 /// Read the entry names out of an in-memory zip archive.
