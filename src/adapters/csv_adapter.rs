@@ -3,6 +3,10 @@
 //! Reads a CSV file into Arrow `RecordBatch`es using `arrow::csv::Reader`.
 //! Schema is inferred from the first ~64 rows. Single partition only —
 //! large multi-GB CSVs should use parquet/h5 instead.
+//!
+//! An all-empty column (Arrow infers the typeless `Null` type) is promoted to
+//! nullable `float64` so the reported schema and served data match upstream's
+//! pandas read (see [`promote_null_columns`]).
 
 #![cfg(feature = "csv-adapter")]
 
@@ -56,6 +60,10 @@ impl CsvAdapter {
         for b in reader {
             batches.push(b.map_err(|e| TiledError::Internal(format!("csv read: {e}")))?);
         }
+        // An all-empty column is inferred by Arrow as the typeless `Null` type;
+        // promote it to nullable `float64` so both the reported schema and the
+        // served data match upstream (see `promote_null_columns`).
+        let (schema, batches) = promote_null_columns(schema, batches)?;
         let columns: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
         let structure = TableStructure {
             arrow_schema: encode_schema(schema.as_ref()),
@@ -307,6 +315,75 @@ pub fn init_storage_csv(
     Ok((data_uri, vec![asset]))
 }
 
+/// Promote every all-empty column (Arrow `DataType::Null`) to nullable
+/// `Float64`, in both the schema and the data batches.
+///
+/// Arrow's CSV reader infers a column whose every cell is empty as the typeless
+/// `Null` type. A Python tiled client's `pyarrow.Table.to_pandas()` surfaces a
+/// `Null` column as an `object`/`None` column, whereas upstream `CSVAdapter`
+/// reads the same file with pandas and reports an all-NaN `float64` column
+/// (`tiled/adapters/csv.py` → `TableStructure.from_dask_dataframe`,
+/// `tiled/structures/table.py:44`). Casting `Null` → `float64` here makes the
+/// reported `arrow_schema` and the served data match upstream (float64 + NaN),
+/// and avoids serializing a typeless column.
+///
+/// Typed-nullable columns (e.g. an `Int64` column with some empty cells) are
+/// left untouched: Arrow carries their nulls natively, and a default client
+/// `to_pandas()` reads int64-with-nulls back as float64/NaN — already matching
+/// upstream observably — so promoting them would only risk int64→float64
+/// precision loss with no fidelity gain.
+fn promote_null_columns(
+    schema: SchemaRef,
+    batches: Vec<RecordBatch>,
+) -> Result<(SchemaRef, Vec<RecordBatch>)> {
+    use arrow::compute::cast;
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    if !schema
+        .fields()
+        .iter()
+        .any(|f| f.data_type() == &DataType::Null)
+    {
+        return Ok((schema, batches));
+    }
+
+    let new_fields: Vec<Field> = schema
+        .fields()
+        .iter()
+        .map(|f| {
+            if f.data_type() == &DataType::Null {
+                Field::new(f.name(), DataType::Float64, true)
+            } else {
+                f.as_ref().clone()
+            }
+        })
+        .collect();
+    let new_schema = Arc::new(Schema::new_with_metadata(
+        new_fields,
+        schema.metadata().clone(),
+    )) as SchemaRef;
+
+    let mut out = Vec::with_capacity(batches.len());
+    for b in batches {
+        let mut cols = Vec::with_capacity(b.num_columns());
+        for (i, col) in b.columns().iter().enumerate() {
+            if schema.field(i).data_type() == &DataType::Null {
+                cols.push(
+                    cast(col, &DataType::Float64)
+                        .map_err(|e| TiledError::Internal(format!("cast null col to f64: {e}")))?,
+                );
+            } else {
+                cols.push(col.clone());
+            }
+        }
+        out.push(
+            RecordBatch::try_new(new_schema.clone(), cols)
+                .map_err(|e| TiledError::Internal(format!("rebuild batch: {e}")))?,
+        );
+    }
+    Ok((new_schema, out))
+}
+
 fn project(
     schema: &SchemaRef,
     batches: &[RecordBatch],
@@ -379,6 +456,70 @@ mod tests {
             .unwrap();
         assert_eq!(table.schema.fields().len(), 1);
         assert_eq!(table.batches[0].num_rows(), 2);
+    }
+
+    // An all-empty column: Arrow infers the typeless `Null` type, which a Python
+    // client's `to_pandas()` surfaces as object/None. Upstream `CSVAdapter` reads
+    // it via pandas as an all-NaN float64 column, so we promote `Null` -> float64
+    // in both the reported schema and the served data.
+    #[tokio::test]
+    async fn all_empty_column_reports_float64_and_reads_all_nan() {
+        use arrow::array::Array;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.csv");
+        let mut f = std::fs::File::create(&path).unwrap();
+        // Column `b` is entirely empty (trailing comma each data row).
+        f.write_all(b"a,b\n1,\n2,\n3,\n").unwrap();
+
+        let adapter = CsvAdapter::from_path(path, serde_json::json!({})).unwrap();
+        // Reported schema (encoded verbatim into structure.arrow_schema): float64.
+        assert_eq!(adapter.schema.field(0).data_type(), &DataType::Int64);
+        assert_eq!(
+            adapter.schema.field(1).data_type(),
+            &DataType::Float64,
+            "an all-empty column must be reported as float64, matching pandas"
+        );
+        assert_eq!(adapter.structure().columns, vec!["a", "b"]);
+
+        // Served data: a real float64 column, all null (i.e. all NaN).
+        let table = adapter.read(None).await.unwrap();
+        let b = table.batches[0].column(1);
+        assert_eq!(b.data_type(), &DataType::Float64);
+        assert_eq!(b.len(), 3);
+        assert_eq!(
+            b.null_count(),
+            3,
+            "every cell of the all-empty column must be null (NaN)"
+        );
+    }
+
+    // A partially-empty int column: Arrow keeps it `Int64` with a null bitmap.
+    // We deliberately do NOT promote it — Arrow carries the nulls natively and a
+    // default client `to_pandas()` reads int64-with-nulls back as float64/NaN,
+    // already matching upstream observably. This pins that accepted behavior.
+    #[tokio::test]
+    async fn partially_empty_int_column_stays_int64_nullable() {
+        use arrow::array::Array;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.csv");
+        let mut f = std::fs::File::create(&path).unwrap();
+        // Column `b` is int-looking with one empty cell.
+        f.write_all(b"a,b\n1,10\n2,\n3,30\n").unwrap();
+
+        let adapter = CsvAdapter::from_path(path, serde_json::json!({})).unwrap();
+        assert_eq!(
+            adapter.schema.field(1).data_type(),
+            &DataType::Int64,
+            "a typed nullable int column is carried natively, not promoted"
+        );
+        let table = adapter.read(None).await.unwrap();
+        let b = table.batches[0].column(1);
+        assert_eq!(b.data_type(), &DataType::Int64);
+        assert_eq!(
+            b.null_count(),
+            1,
+            "the missing cell is carried as a native null, not corrupted"
+        );
     }
 
     use arrow::array::{Int64Array, StringArray};
