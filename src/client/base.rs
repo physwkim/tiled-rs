@@ -234,6 +234,26 @@ impl BaseClient {
         self.context.delete(&url).await.map(|_| ())
     }
 
+    /// Declare the end of this node's stream of writes via
+    /// `DELETE /api/v1/stream/close/{path}`.
+    ///
+    /// A stream *producer* calls this to signal end-of-stream: the server ends
+    /// the node's stream — every live subscriber's WebSocket closes cleanly with
+    /// 1000 "Producer ended stream" — and fires a `stream-closed` webhook.
+    /// Mirrors Python `BaseClient.close_stream` (`base.py:940-945`): the
+    /// close-stream link is this node's `self` link with its first `/metadata`
+    /// segment rewritten to `/stream/close` (so a node whose key is literally
+    /// `metadata` is unaffected, matching [`revisions`](Self::revisions)). The
+    /// server gates the call on `write:data` for the node.
+    pub async fn close_stream(&self) -> Result<()> {
+        let self_link = self.require_link("self")?;
+        let link = self_link.replacen("/metadata", "/stream/close", 1);
+        let url = Url::parse(&link)?;
+        retry(|| async { self.context.delete(&url).await })
+            .await
+            .map(|_| ())
+    }
+
     /// Patch this node's metadata, specs, and/or access_blob via
     /// `PATCH /api/v1/metadata/{path}`. Mirrors Python
     /// `BaseClient.patch_metadata` (`base.py:713-834`).

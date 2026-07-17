@@ -2206,6 +2206,55 @@ async fn close_stream_missing_path_is_not_found() {
     );
 }
 
+/// Client-driven end-of-stream: the CLIENT method `BaseClient::close_stream`
+/// (upstream `client/base.py:940`) issues the `DELETE /api/v1/stream/close/{path}`
+/// a stream *producer* uses to end its stream, and the server disconnects a live
+/// subscriber with the producer end-of-stream close (1000 / "Producer ended
+/// stream"). The raw-HTTP test above drives the same route directly; this proves
+/// the client method builds the correct request (right method + rewritten path)
+/// and reaches it.
+#[tokio::test]
+async fn client_close_stream_ends_a_live_subscriber() {
+    let (base, _client, _catalog, _node_id, _dir) = spawn_webhook_stream_server().await;
+
+    // Resolve the producer's node client up front (two round-trips) so the window
+    // between opening the subscriber and closing the stream stays tight.
+    let node = tiled_rs::client::from_uri(&base)
+        .await
+        .unwrap()
+        .into_container()
+        .unwrap()
+        .get("arr")
+        .await
+        .unwrap();
+
+    // A live subscriber on `arr`: consume the schema, then let the handler reach
+    // its live loop before the producer closes.
+    let url = ws_url(&base, "arr");
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    assert_eq!(
+        next_text_json(&mut ws).await.expect("schema")["type"],
+        "array-schema"
+    );
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // The producer ends the stream through the client method (anonymous → full
+    // scopes include write:data). A 200 maps to `Ok(())`.
+    node.base()
+        .unwrap()
+        .close_stream()
+        .await
+        .expect("client close_stream must issue the DELETE and succeed");
+
+    // The subscriber is disconnected with the producer end-of-stream close.
+    let close = next_close_frame(&mut ws).await;
+    assert_eq!(
+        close,
+        Some((1000, "Producer ended stream".to_string())),
+        "client close_stream must end the stream for a live subscriber"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Finding #1: a subscribed node's OWN lifecycle events (node-deleted, then
 // end_of_stream) always reach the subscriber and are followed by the stream
