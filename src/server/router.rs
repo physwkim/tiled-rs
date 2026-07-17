@@ -6613,10 +6613,15 @@ pub async fn put_data_source(
             "PUT /data_source requires a node path".into(),
         ));
     }
-    // Per-ancestor auth gate (compound scope: WriteData or WriteMetadata).
+    // Rewriting a node's storage mapping requires BOTH write:metadata AND
+    // register, matching upstream (router.py:1944/1948:
+    // `Security(check_scopes, ["write:metadata","register"])` +
+    // `get_entry(path, ["write:metadata","register"])`). register is what keeps
+    // a plain `user` — who holds write:data/write:metadata but not register —
+    // from repointing a node at different storage.
     let auth = resolve_entry_catalog(&state, auth, &segments).await?;
-    auth.require(crate::auth::Scope::WriteData)
-        .or_else(|_| auth.require(crate::auth::Scope::WriteMetadata))?;
+    auth.require(crate::auth::Scope::WriteMetadata)?;
+    auth.require(crate::auth::Scope::Register)?;
     let node = catalog
         .lookup(&segments)
         .await
