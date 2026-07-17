@@ -308,6 +308,15 @@ pub struct AuthConfig {
     /// the compiled-in default (7 days) is used.
     #[serde(default)]
     pub refresh_token_max_age: Option<f64>,
+    /// Absolute session lifetime in seconds — the hard cap on a session's
+    /// `expiration_time`, set at login and never extended by refresh. Mirrors
+    /// Python `Authentication.session_max_age` (`config.py:152`; server default
+    /// 365 d, `settings.py:36`). Distinct from `refresh_token_max_age`: the
+    /// refresh *token* rotates every 7 d, but the session itself lives up to
+    /// this cap. Only takes effect in multi-user mode (`--auth-db-uri`). When
+    /// absent the compiled-in default (365 days) is used.
+    #[serde(default)]
+    pub session_max_age: Option<f64>,
     /// Principals that must have the `"admin"` role at server startup.
     /// Mirrors Python `Authentication.tiled_admins` (`config.py`). The server
     /// bootstraps each `(provider, id)` pair idempotently: the identity is
@@ -324,7 +333,7 @@ pub struct AuthConfig {
     #[serde(default)]
     pub providers: Vec<AuthProviderConfig>,
     /// Catch-all for authentication config keys the Rust port does not yet
-    /// model (e.g. `session_max_age`).
+    /// model (e.g. `allow_anonymous_access`).
     /// Warn-logged at startup.
     #[serde(flatten)]
     pub unknown: BTreeMap<String, serde_yaml::Value>,
@@ -1690,13 +1699,13 @@ authentication:
         );
     }
 
-    // authentication.access_token_max_age and refresh_token_max_age parse into
-    // AuthConfig and are NOT in the unknown catch-all (they are modelled and
-    // wired to Issuer::with_ttls in lib.rs).
+    // authentication.access_token_max_age, refresh_token_max_age and
+    // session_max_age parse into AuthConfig and are NOT in the unknown catch-all
+    // (they are modelled and wired to the Issuer TTLs in lib.rs).
     #[test]
     fn auth_token_ages_parse_and_are_not_unknown() {
         let cfg: TiledConfig = serde_yaml::from_str(
-            "trees: []\nauthentication:\n  access_token_max_age: 900\n  refresh_token_max_age: 604800\n",
+            "trees: []\nauthentication:\n  access_token_max_age: 900\n  refresh_token_max_age: 604800\n  session_max_age: 31536000\n",
         )
         .unwrap();
         let auth = cfg
@@ -1705,6 +1714,7 @@ authentication:
             .expect("authentication block present");
         assert_eq!(auth.access_token_max_age, Some(900.0));
         assert_eq!(auth.refresh_token_max_age, Some(604_800.0));
+        assert_eq!(auth.session_max_age, Some(31_536_000.0));
         assert!(
             !auth.unknown.contains_key("access_token_max_age"),
             "access_token_max_age is modelled — must not appear in catch-all"
@@ -1712,6 +1722,10 @@ authentication:
         assert!(
             !auth.unknown.contains_key("refresh_token_max_age"),
             "refresh_token_max_age is modelled — must not appear in catch-all"
+        );
+        assert!(
+            !auth.unknown.contains_key("session_max_age"),
+            "session_max_age is modelled — must not appear in catch-all"
         );
     }
 
@@ -1790,7 +1804,7 @@ authentication:
     #[test]
     fn unknown_auth_key_is_captured_not_dropped() {
         let cfg: TiledConfig = serde_yaml::from_str(
-            "trees: []\nauthentication:\n  session_max_age: 3600\n  providers: []\n",
+            "trees: []\nauthentication:\n  some_future_auth_key: 42\n  providers: []\n",
         )
         .unwrap();
         let auth = cfg
@@ -1798,8 +1812,8 @@ authentication:
             .as_ref()
             .expect("authentication block present");
         assert!(
-            auth.unknown.contains_key("session_max_age"),
-            "unknown auth key 'session_max_age' must be captured; got {:?}",
+            auth.unknown.contains_key("some_future_auth_key"),
+            "unknown auth key 'some_future_auth_key' must be captured; got {:?}",
             auth.unknown
         );
         // `providers` is now modeled — it must parse into the typed field and

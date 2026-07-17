@@ -187,7 +187,9 @@ async fn login_submit(
     // directly would let a broadened `default_login_scopes` hand a low-role
     // principal more than its role allows (latent privilege escalation).
     let scopes = ScopeSet::for_role(&principal.role).intersect(&state.default_login_scopes);
-    let session_ttl = issuer.refresh_ttl;
+    // Absolute session cap (`session_max_age`, default 365 d) — NOT the 7-day
+    // refresh-token TTL. Matches the API session-mint sites (auth_router.rs).
+    let session_ttl = issuer.session_ttl;
     let session = match db
         .create_session(
             principal.id,

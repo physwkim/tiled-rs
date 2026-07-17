@@ -98,7 +98,7 @@ pub async fn login(
         .create_session(
             principal.id,
             scopes.clone(),
-            Utc::now() + issuer.refresh_ttl,
+            Utc::now() + issuer.session_ttl,
             // Non-OIDC login: no upstream tokens to carry.
             serde_json::json!({}),
         )
@@ -287,7 +287,7 @@ pub async fn device_token(
                 .create_session(
                     principal_id,
                     scopes.clone(),
-                    Utc::now() + issuer.refresh_ttl,
+                    Utc::now() + issuer.session_ttl,
                     // Device-code grant: no upstream tokens to carry.
                     serde_json::json!({}),
                 )
@@ -963,7 +963,7 @@ pub async fn oidc_callback(
         .create_session(
             principal.id,
             scopes.clone(),
-            Utc::now() + issuer.refresh_ttl,
+            Utc::now() + issuer.session_ttl,
             code_flow.session_state,
         )
         .await
@@ -1193,7 +1193,7 @@ pub async fn oidc_device_code_submit(
         .create_session(
             principal.id,
             scopes,
-            Utc::now() + issuer.refresh_ttl,
+            Utc::now() + issuer.session_ttl,
             code_flow.session_state,
         )
         .await
@@ -1406,7 +1406,7 @@ pub async fn saml_acs(
         .create_session(
             principal.id,
             scopes.clone(),
-            Utc::now() + issuer.refresh_ttl,
+            Utc::now() + issuer.session_ttl,
             // Non-OIDC login: no upstream tokens to carry.
             serde_json::json!({}),
         )
