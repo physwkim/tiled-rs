@@ -65,7 +65,17 @@ pub struct Issuer {
     /// loops over `secret_keys`, authentication.py:165-172).
     decoding: Vec<DecodingKey>,
     pub access_ttl: Duration,
+    /// Lifetime of a refresh *token* — how long one refresh token stays valid
+    /// before the client must present it for rotation (Python
+    /// `refresh_token_max_age`, `settings.py:35`, default 7 d).
     pub refresh_ttl: Duration,
+    /// Absolute lifetime of a *session* — the hard cap on `expiration_time` set
+    /// at `create_session`, independent of (and much longer than) the refresh
+    /// token TTL. Mirrors Python `session_max_age` (`settings.py:36`, default
+    /// 365 d). Refresh rotates the refresh token but never extends this cap
+    /// (`authentication.py` `slide_session`), so a session dies this long after
+    /// login regardless of activity.
+    pub session_ttl: Duration,
 }
 
 impl std::fmt::Debug for Issuer {
@@ -73,6 +83,7 @@ impl std::fmt::Debug for Issuer {
         f.debug_struct("Issuer")
             .field("access_ttl", &self.access_ttl)
             .field("refresh_ttl", &self.refresh_ttl)
+            .field("session_ttl", &self.session_ttl)
             .field("encoding", &"<redacted>")
             .field("decoding", &"<redacted>")
             .finish()
@@ -119,6 +130,7 @@ impl Issuer {
                 .collect(),
             access_ttl: Duration::minutes(15),
             refresh_ttl: Duration::days(7),
+            session_ttl: Duration::days(365),
         })
     }
 
@@ -147,6 +159,14 @@ impl Issuer {
     pub fn with_ttls(mut self, access: Duration, refresh: Duration) -> Self {
         self.access_ttl = access;
         self.refresh_ttl = refresh;
+        self
+    }
+
+    /// Override the absolute session lifetime ([`Self::session_ttl`], the
+    /// `session_max_age` cap). Separate from [`Self::with_ttls`] because it
+    /// governs the session row, not the JWT token TTLs.
+    pub fn with_session_ttl(mut self, session: Duration) -> Self {
+        self.session_ttl = session;
         self
     }
 
