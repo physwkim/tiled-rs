@@ -163,6 +163,7 @@ fn build_app(root: Arc<dyn ContainerAdapter>, api_key: Option<String>) -> axum::
             .map(String::from)
             .collect(),
         base_url: Some("http://localhost:8000".into()),
+        root_path: String::new(),
         cors_policy: tiled_rs::server::state::CorsOriginPolicy::Permissive,
         trust_forwarded_headers: false,
         api_key,

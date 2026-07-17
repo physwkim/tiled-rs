@@ -322,11 +322,18 @@ pub async fn about(State(state): State<AppState>, BaseUrl(base_url): BaseUrl) ->
             ),
         ]),
         // Python: `request.scope.get("root_path") or "" + "/api"`, and `+`
-        // binds tighter than `or`, so this is `root_path or "/api"` — the
-        // no-proxy default is "/api", not "". Rust has no ASGI scope / proxy
-        // root_path source plumbed, so we emit the no-proxy default. (A proxy
-        // mount prefix override is not yet implemented; see router.py:301.)
-        meta: HashMap::from([("root_path".into(), serde_json::Value::String("/api".into()))]),
+        // binds tighter than `or`, so this is `root_path or "/api"` — when the
+        // server is served behind a proxy under a sub-path the configured
+        // `root_path` prefix is reported, otherwise the no-proxy default "/api".
+        // `state.root_path` is the normalized mount prefix (empty when direct).
+        meta: HashMap::from([(
+            "root_path".into(),
+            serde_json::Value::String(if state.root_path.is_empty() {
+                "/api".into()
+            } else {
+                state.root_path.clone()
+            }),
+        )]),
     };
 
     Json(about)

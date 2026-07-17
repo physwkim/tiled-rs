@@ -87,6 +87,7 @@ async fn spawn_server_with_root(
             .map(String::from)
             .collect(),
         base_url: None,
+        root_path: String::new(),
         cors_policy: tiled_rs::server::state::CorsOriginPolicy::Permissive,
         trust_forwarded_headers: false,
         api_key,
@@ -447,6 +448,7 @@ async fn spawn_write_server() -> (String, tempfile::TempDir, tempfile::TempDir) 
             .map(String::from)
             .collect(),
         base_url: None,
+        root_path: String::new(),
         cors_policy: tiled_rs::server::state::CorsOriginPolicy::Permissive,
         trust_forwarded_headers: false,
         api_key: None,
@@ -2588,6 +2590,7 @@ async fn spawn_blosc2_server() -> String {
             .map(String::from)
             .collect(),
         base_url: None,
+        root_path: String::new(),
         cors_policy: tiled_rs::server::state::CorsOriginPolicy::Permissive,
         trust_forwarded_headers: false,
         api_key: None,
@@ -2810,6 +2813,7 @@ async fn sparse_managed_create_resolves_and_reads_back() {
             .map(String::from)
             .collect(),
         base_url: None,
+        root_path: String::new(),
         cors_policy: tiled_rs::server::state::CorsOriginPolicy::Permissive,
         trust_forwarded_headers: false,
         api_key: None,

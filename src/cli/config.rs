@@ -72,6 +72,13 @@ pub struct TiledConfig {
     /// disabled (a no-op cache). See [`StreamingConfig`].
     #[serde(default)]
     pub streaming: Option<StreamingConfig>,
+    /// Optional `uvicorn:` block. tiled-rs runs on axum, not uvicorn, so only
+    /// `root_path` (the reverse-proxy mount prefix, upstream `config.py:411` →
+    /// `uvicorn.get("root_path")`) is read; the rest of uvicorn's keys are
+    /// captured in [`UvicornConfig::unknown`] and warn-logged at startup. See
+    /// [`Self::root_path`].
+    #[serde(default)]
+    pub uvicorn: Option<UvicornConfig>,
     /// Catch-all for config keys the Rust port does not yet model.
     /// Captured keys are warn-logged once at startup (see
     /// [`TiledConfig::warn_unknown_keys`]) so operators know their
@@ -101,6 +108,23 @@ pub fn default_expose_raw_assets() -> bool {
 /// tiled (`Settings.exact_count_limit`, `settings.py`).
 pub fn default_exact_count_limit() -> u64 {
     100
+}
+
+/// `uvicorn:` block — mirrors upstream tiled's free-form uvicorn settings dict
+/// (`config.py:282`). tiled-rs is served by axum rather than uvicorn, so only
+/// `root_path` is modelled here; host/port/workers/ssl and friends are supplied
+/// by CLI flags or ignored (captured in [`Self::unknown`] and warned about at
+/// startup).
+#[derive(Debug, Deserialize)]
+pub struct UvicornConfig {
+    /// Reverse-proxy mount prefix (upstream `uvicorn.root_path`). Prepended to
+    /// generated links when the server is fronted by a proxy under a sub-path.
+    /// The `--root-path` CLI flag takes precedence over this.
+    #[serde(default)]
+    pub root_path: Option<String>,
+    /// Uvicorn keys tiled-rs does not model (host, port, workers, ssl_*, …).
+    #[serde(flatten)]
+    pub unknown: BTreeMap<String, serde_yaml::Value>,
 }
 
 /// `streaming:` block selecting the per-node data streaming cache backend.
@@ -186,6 +210,7 @@ impl Default for TiledConfig {
             allow_origins: Vec::new(),
             exact_count_limit: default_exact_count_limit(),
             streaming: None,
+            uvicorn: None,
             unknown: BTreeMap::new(),
         }
     }
@@ -1145,6 +1170,20 @@ impl TiledConfig {
                 );
             }
         }
+        if let Some(uvicorn) = &self.uvicorn {
+            for key in uvicorn.unknown.keys() {
+                tracing::warn!(
+                    "config key 'uvicorn.{key}' is not modelled in tiled-rs and has no effect"
+                );
+            }
+        }
+    }
+
+    /// Reverse-proxy `root_path` declared in the `uvicorn:` block (upstream
+    /// `config.py:411` → `uvicorn.get("root_path")`). `None` when unset. The
+    /// `--root-path` CLI flag takes precedence over this (resolved in `run`).
+    pub fn root_path(&self) -> Option<&str> {
+        self.uvicorn.as_ref().and_then(|u| u.root_path.as_deref())
     }
 
     /// Extract the MongoDB URI from the first tree that looks like a mongo adapter.
@@ -1192,6 +1231,20 @@ impl TiledConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uvicorn_root_path_parses_and_is_accessible() {
+        // Absent `uvicorn:` block → no root_path.
+        let cfg: TiledConfig = serde_yaml::from_str("trees: []").unwrap();
+        assert_eq!(cfg.root_path(), None);
+        // `uvicorn.root_path` is read; sibling uvicorn keys are captured (and
+        // warned about) rather than rejected, mirroring upstream's free-form
+        // uvicorn settings dict.
+        let cfg: TiledConfig =
+            serde_yaml::from_str("uvicorn:\n  root_path: /instrument1\n  port: 9000").unwrap();
+        assert_eq!(cfg.root_path(), Some("/instrument1"));
+        assert!(cfg.uvicorn.as_ref().unwrap().unknown.contains_key("port"));
+    }
 
     #[test]
     fn response_bytesize_limit_defaults_and_overrides() {

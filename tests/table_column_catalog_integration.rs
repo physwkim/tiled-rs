@@ -131,6 +131,7 @@ async fn build_catalog_app() -> (axum::Router, tempfile::TempDir) {
             .map(String::from)
             .collect(),
         base_url: Some("http://localhost:8000".to_string()),
+        root_path: String::new(),
         cors_policy: tiled_rs::server::state::CorsOriginPolicy::Permissive,
         trust_forwarded_headers: false,
         api_key: None,

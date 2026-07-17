@@ -52,6 +52,7 @@ async fn make_app(default_login_scopes: ScopeSet) -> (axum::Router, tempfile::Te
             .map(String::from)
             .collect(),
         base_url: Some("http://localhost:8000".into()),
+        root_path: String::new(),
         cors_policy: tiled_rs::server::state::CorsOriginPolicy::Permissive,
         trust_forwarded_headers: false,
         api_key: None,

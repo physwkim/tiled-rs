@@ -43,6 +43,7 @@ async fn build_test_app() -> (axum::Router, tempfile::TempDir, Catalog, AuthDb) 
             .map(String::from)
             .collect(),
         base_url: Some("http://localhost:8000".into()),
+        root_path: String::new(),
         cors_policy: tiled_rs::server::state::CorsOriginPolicy::Permissive,
         trust_forwarded_headers: false,
         api_key: None,
@@ -863,6 +864,7 @@ async fn build_oidc_state(
             .map(String::from)
             .collect(),
         base_url: Some("http://localhost:8000".into()),
+        root_path: String::new(),
         cors_policy: tiled_rs::server::state::CorsOriginPolicy::Permissive,
         trust_forwarded_headers: false,
         api_key: None,
@@ -2125,6 +2127,7 @@ async fn build_code_flow_app_with_mapping(
         serialization_registry: registry,
         query_names: vec![],
         base_url: Some("http://localhost:8000".into()),
+        root_path: String::new(),
         cors_policy: tiled_rs::server::state::CorsOriginPolicy::Permissive,
         trust_forwarded_headers: false,
         api_key: None,
