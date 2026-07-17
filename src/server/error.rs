@@ -52,10 +52,16 @@ pub enum ServerError {
     /// thing at this route", not "your request body/params are invalid".
     WrongType(String),
     /// An index (block index, partition number) was out of the valid range.
-    /// Maps to HTTP 400 to match Python tiled, which catches `IndexError` from
-    /// `read_block` / `read_partition` and answers `HTTP_400_BAD_REQUEST`
-    /// (router.py:609-613, 1176-1179). Distinct from [`Self::Validation`]
-    /// (422): the request is structurally valid but names a non-existent slot.
+    /// Maps to HTTP 400, matching Python tiled's table partition path, which
+    /// catches `IndexError` from `read_partition` and answers
+    /// `HTTP_400_BAD_REQUEST` ("Partition out of range", router.py:1176-1179).
+    /// Upstream's array *block* path is inconsistent here — it catches
+    /// `IndexError` from `read_block` and answers `HTTP_500_INTERNAL_SERVER_ERROR`
+    /// ("Block index out of range", router.py:609-613), *not* 400 — but tiled-rs
+    /// surfaces an out-of-range block read through the adapter error
+    /// (`ServerError::from`), not this variant, so no parity is claimed there.
+    /// Distinct from [`Self::Validation`] (422): the request is structurally
+    /// valid but names a non-existent slot.
     BadRequest(String),
     /// The target node does not support this operation. Maps to HTTP 405 to
     /// match Python tiled, which raises `HTTP_405_METHOD_NOT_ALLOWED` when an
