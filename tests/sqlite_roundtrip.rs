@@ -18,7 +18,7 @@ async fn migrate_create_lookup_delete() {
     let path = dir.path().join("catalog.db");
     let uri = format!("sqlite://{}", path.display());
 
-    let cat = Catalog::connect(&uri).await.unwrap();
+    let cat = Catalog::connect_with_pool_size(&uri, 1).await.unwrap();
     cat.migrate().await.unwrap();
     assert_eq!(
         cat.applied_migrations().await.unwrap(),
@@ -140,7 +140,7 @@ async fn migrate_create_lookup_delete() {
 async fn delete_refuses_internally_managed_subtree() {
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("sqlite://{}", dir.path().join("catalog.db").display());
-    let cat = Catalog::connect(&uri).await.unwrap();
+    let cat = Catalog::connect_with_pool_size(&uri, 1).await.unwrap();
     cat.migrate().await.unwrap();
 
     // container/frame, where `frame` carries a *writable* (internally-managed)
@@ -232,10 +232,10 @@ async fn delete_reclaims_managed_files_keeps_external() {
     use std::fs;
 
     let dir = tempfile::tempdir().unwrap();
-    let cat = Catalog::connect(&format!(
-        "sqlite://{}",
-        dir.path().join("catalog.db").display()
-    ))
+    let cat = Catalog::connect_with_pool_size(
+        &format!("sqlite://{}", dir.path().join("catalog.db").display()),
+        1,
+    )
     .await
     .unwrap();
     cat.migrate().await.unwrap();
@@ -414,10 +414,13 @@ async fn restricted_delete_refuses_managed_asset_outside_allowed_dirs() {
     let victim = outside.join("victim.bin");
     fs::write(&victim, b"do-not-delete").unwrap();
 
-    let cat = Catalog::connect(&format!("sqlite://{}", dir.path().join("c.db").display()))
-        .await
-        .unwrap()
-        .with_managed_delete_dirs(vec![allowed.clone()]);
+    let cat = Catalog::connect_with_pool_size(
+        &format!("sqlite://{}", dir.path().join("c.db").display()),
+        1,
+    )
+    .await
+    .unwrap()
+    .with_managed_delete_dirs(vec![allowed.clone()]);
     cat.migrate().await.unwrap();
     let node_id = register_managed_leaf(
         &cat,
@@ -449,10 +452,13 @@ async fn restricted_delete_allows_managed_asset_inside_allowed_dirs() {
     let managed = allowed.join("managed.bin");
     fs::write(&managed, b"bytes").unwrap();
 
-    let cat = Catalog::connect(&format!("sqlite://{}", dir.path().join("c.db").display()))
-        .await
-        .unwrap()
-        .with_managed_delete_dirs(vec![allowed.clone()]);
+    let cat = Catalog::connect_with_pool_size(
+        &format!("sqlite://{}", dir.path().join("c.db").display()),
+        1,
+    )
+    .await
+    .unwrap()
+    .with_managed_delete_dirs(vec![allowed.clone()]);
     cat.migrate().await.unwrap();
     let node_id = register_managed_leaf(
         &cat,
@@ -479,10 +485,13 @@ async fn restricted_empty_dirs_denies_managed_delete() {
     let victim = dir.path().join("victim.bin");
     fs::write(&victim, b"do-not-delete").unwrap();
 
-    let cat = Catalog::connect(&format!("sqlite://{}", dir.path().join("c.db").display()))
-        .await
-        .unwrap()
-        .with_managed_delete_dirs(vec![]);
+    let cat = Catalog::connect_with_pool_size(
+        &format!("sqlite://{}", dir.path().join("c.db").display()),
+        1,
+    )
+    .await
+    .unwrap()
+    .with_managed_delete_dirs(vec![]);
     cat.migrate().await.unwrap();
     let node_id = register_managed_leaf(
         &cat,
@@ -509,10 +518,13 @@ async fn restricted_delete_skips_absent_managed_file() {
     let dir = tempfile::tempdir().unwrap();
     let missing = dir.path().join("never-created.bin");
 
-    let cat = Catalog::connect(&format!("sqlite://{}", dir.path().join("c.db").display()))
-        .await
-        .unwrap()
-        .with_managed_delete_dirs(vec![]);
+    let cat = Catalog::connect_with_pool_size(
+        &format!("sqlite://{}", dir.path().join("c.db").display()),
+        1,
+    )
+    .await
+    .unwrap()
+    .with_managed_delete_dirs(vec![]);
     cat.migrate().await.unwrap();
     let node_id = register_managed_leaf(
         &cat,
@@ -653,7 +665,7 @@ async fn write_validate_non_file_uri_accepted() {
 async fn asset_by_id_is_node_scoped() {
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("sqlite://{}", dir.path().join("catalog.db").display());
-    let cat = Catalog::connect(&uri).await.unwrap();
+    let cat = Catalog::connect_with_pool_size(&uri, 1).await.unwrap();
     cat.migrate().await.unwrap();
 
     let make_array = |key: &str| RegisterRequest {
@@ -727,7 +739,7 @@ async fn asset_by_id_is_node_scoped() {
 async fn metadata_size_limit_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("sqlite://{}", dir.path().join("catalog.db").display());
-    let cat = Catalog::connect(&uri).await.unwrap();
+    let cat = Catalog::connect_with_pool_size(&uri, 1).await.unwrap();
     cat.migrate().await.unwrap();
     let big = "x".repeat(11 * 1024 * 1024);
     let err = cat
@@ -754,7 +766,7 @@ async fn metadata_size_limit_rejected() {
 async fn duplicate_key_at_same_level_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("sqlite://{}", dir.path().join("catalog.db").display());
-    let cat = Catalog::connect(&uri).await.unwrap();
+    let cat = Catalog::connect_with_pool_size(&uri, 1).await.unwrap();
     cat.migrate().await.unwrap();
     let req = || RegisterRequest {
         key: "dup".into(),
@@ -773,7 +785,7 @@ async fn duplicate_key_at_same_level_rejected() {
 async fn search_like_filters_correct_subset() {
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("sqlite://{}", dir.path().join("catalog.db").display());
-    let cat = Catalog::connect(&uri).await.unwrap();
+    let cat = Catalog::connect_with_pool_size(&uri, 1).await.unwrap();
     cat.migrate().await.unwrap();
 
     for (key, material) in [("cu_run", "Cu"), ("ni_run", "Ni"), ("fe_run", "Fe")] {
@@ -833,7 +845,7 @@ async fn search_like_filters_correct_subset() {
 async fn search_specs_include_and_exclude() {
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("sqlite://{}", dir.path().join("catalog.db").display());
-    let cat = Catalog::connect(&uri).await.unwrap();
+    let cat = Catalog::connect_with_pool_size(&uri, 1).await.unwrap();
     cat.migrate().await.unwrap();
 
     // "xas_run" has BlueskyRun + XAS; "nd_run" has BlueskyRun + NXdata; "bare" has none.
@@ -928,7 +940,7 @@ async fn search_specs_include_and_exclude() {
 async fn search_numeric_eq_in_notin_sqlite() {
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("sqlite://{}", dir.path().join("catalog.db").display());
-    let cat = Catalog::connect(&uri).await.unwrap();
+    let cat = Catalog::connect_with_pool_size(&uri, 1).await.unwrap();
     cat.migrate().await.unwrap();
 
     // Three nodes with integer metadata fields.
@@ -1047,7 +1059,7 @@ async fn search_numeric_eq_in_notin_sqlite() {
 async fn neq_excludes_missing_key_and_agrees_with_notin() {
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("sqlite://{}", dir.path().join("catalog.db").display());
-    let cat = Catalog::connect(&uri).await.unwrap();
+    let cat = Catalog::connect_with_pool_size(&uri, 1).await.unwrap();
     cat.migrate().await.unwrap();
 
     // red + blue carry `color`; nocolor has a different key entirely.
@@ -1119,7 +1131,7 @@ async fn neq_excludes_missing_key_and_agrees_with_notin() {
 async fn search_children_honors_sorting() {
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("sqlite://{}", dir.path().join("catalog.db").display());
-    let cat = Catalog::connect(&uri).await.unwrap();
+    let cat = Catalog::connect_with_pool_size(&uri, 1).await.unwrap();
     cat.migrate().await.unwrap();
 
     // Insertion order gamma,alpha,beta so id order differs from name and color.
@@ -1191,7 +1203,7 @@ async fn search_children_honors_sorting() {
 async fn full_text_search_uses_fts5_token_match() {
     let dir = tempfile::tempdir().unwrap();
     let uri = format!("sqlite://{}", dir.path().join("catalog.db").display());
-    let cat = Catalog::connect(&uri).await.unwrap();
+    let cat = Catalog::connect_with_pool_size(&uri, 1).await.unwrap();
     cat.migrate().await.unwrap();
 
     let parent = cat
