@@ -137,6 +137,33 @@ impl ScopeSet {
         Self([Scope::ReadMetadata, Scope::ReadData].into_iter().collect())
     }
 
+    /// Scopes granted to the single-user API key. Mirrors upstream
+    /// `SINGLE_USER_SCOPES` exactly (`tiled/access_control/scopes.py:32-46`):
+    /// the node-I/O scopes plus `metrics` and the webhook scopes, but
+    /// **deliberately excluding** the credential/principal-management scopes
+    /// (`create:apikeys`, `revoke:apikeys`, `admin:apikeys`, `read:principals`,
+    /// `write:principals`) and the `admin` superscope — single-user mode has no
+    /// principal/API-key database to manage. Upstream grants this set (not the
+    /// full set) in the single-user branch of `get_scopes_from_api_key`
+    /// (`tiled/server/authentication.py:352-356`); granting `full()` here would
+    /// hand the single-user key `admin`, which — in a mixed-mode
+    /// misconfiguration — is a privilege-escalation backdoor.
+    pub fn single_user() -> Self {
+        Self::from_iter([
+            Scope::ReadMetadata,
+            Scope::ReadData,
+            Scope::WriteMetadata,
+            Scope::WriteData,
+            Scope::DeleteRevision,
+            Scope::DeleteNode,
+            Scope::CreateNode,
+            Scope::Register,
+            Scope::Metrics,
+            Scope::ReadWebhooks,
+            Scope::WriteWebhooks,
+        ])
+    }
+
     /// Scopes granted to principals with the named role. Mirrors Python's
     /// `create_default_roles` in `tiled/authn_database/core.py`.
     ///
@@ -410,6 +437,51 @@ mod tests {
         for s in canonical {
             let scope = Scope::parse(s).unwrap_or_else(|| panic!("failed to parse: {s}"));
             assert_eq!(scope.as_str(), s, "as_str mismatch for {s}");
+        }
+    }
+
+    /// `single_user()` must mirror upstream `SINGLE_USER_SCOPES`
+    /// (`tiled/access_control/scopes.py:32-46`) exactly: the 11 node-I/O +
+    /// metrics + webhook scopes, and NONE of the credential/principal
+    /// management scopes or the `admin` superscope. This is the set the
+    /// single-user key is granted instead of `full()`.
+    #[test]
+    fn single_user_matches_upstream_single_user_scopes() {
+        let s = ScopeSet::single_user();
+        let expected = [
+            Scope::ReadMetadata,
+            Scope::ReadData,
+            Scope::WriteMetadata,
+            Scope::WriteData,
+            Scope::DeleteRevision,
+            Scope::DeleteNode,
+            Scope::CreateNode,
+            Scope::Register,
+            Scope::Metrics,
+            Scope::ReadWebhooks,
+            Scope::WriteWebhooks,
+        ];
+        for sc in expected {
+            assert!(s.contains(sc), "single_user() must grant {}", sc.as_str());
+        }
+        // Exactly the 11 upstream scopes — nothing extra crept in.
+        assert_eq!(s.iter().count(), expected.len());
+        // The credential/principal-management scopes and `admin` superscope
+        // upstream excludes — the whole point of not using full().
+        for sc in [
+            Scope::CreateApiKeys,
+            Scope::RevokeApiKeys,
+            Scope::AdminApiKeys,
+            Scope::ReadPrincipals,
+            Scope::WritePrincipals,
+            Scope::Admin,
+            Scope::Inherit,
+        ] {
+            assert!(
+                !s.contains(sc),
+                "single_user() must NOT grant {}",
+                sc.as_str()
+            );
         }
     }
 }
