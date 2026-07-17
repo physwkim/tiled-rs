@@ -1144,6 +1144,11 @@ pub struct ContextOptions {
     /// size. `None` → [`MAX_CONCURRENT_CONNECTIONS`] (16). Mirrors upstream
     /// `max_connections`, which feeds both `httpx.Limits` and the semaphore.
     pub max_connections: Option<usize>,
+    /// Whether construction may non-interactively resume a saved login session
+    /// from the on-disk token cache. `None`/`Some(true)` attempt resume (the
+    /// upstream default); `Some(false)` starts anonymous. Mirrors upstream
+    /// `from_uri(..., remember_me=...)`.
+    pub remember_me: Option<bool>,
 }
 
 impl std::fmt::Debug for ContextOptions {
@@ -1157,6 +1162,7 @@ impl std::fmt::Debug for ContextOptions {
             .field("verify", &self.verify)
             .field("headers", &self.headers.as_ref().map(|h| h.len()))
             .field("max_connections", &self.max_connections)
+            .field("remember_me", &self.remember_me)
             .finish()
     }
 }
@@ -1199,6 +1205,11 @@ impl ContextOptions {
 
     pub fn max_connections(mut self, max_connections: usize) -> Self {
         self.max_connections = Some(max_connections);
+        self
+    }
+
+    pub fn remember_me(mut self, remember_me: bool) -> Self {
+        self.remember_me = Some(remember_me);
         self
     }
 }
