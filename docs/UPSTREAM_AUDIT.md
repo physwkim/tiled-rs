@@ -175,31 +175,60 @@ deferred port:
   architectural change, not a bounded port — revisit only if/when a
   concrete Rust service-backed adapter lands.
 
-## Auth-hardening backlog (wave-22)
+## Auth-hardening: wave-22 sweep + wave-23 landings
 
-The wave-22 auth-security sweep landed the four fixes in the Ported table
-above (single-user-key confinement + `SINGLE_USER_SCOPES`,
+Wave-22's auth-security sweep landed four fixes in the Ported table above
+(single-user-key confinement + `SINGLE_USER_SCOPES`,
 `default_login_scopes = full()`, `register` on `PUT /data_source`, and the
-zarr group-listing access filter). The same sweep surveyed these further
-auth-parity items and confirmed each is **still unimplemented** in this
-port — tracked for a later batch, not silent divergences:
+zarr group-listing access filter) and surfaced an eight-item backlog.
+**Wave-23** independently re-verified every backlog item (each panel tried
+to *refute* the finding, with `file:line` on both the tiled-rs and upstream
+sides) and landed the six that were real divergences:
 
-* **`delete:revision` on `delete_metadata`** — `DELETE /metadata` requires
-  only `delete:node`; upstream gates it with `delete:node` **and**
-  `delete:revision`. Same family as the `PUT /data_source` register-scope
-  fix above.
-* **Sliding-session `session_max_age`** — an absolute session-lifetime cap
-  on refresh, not yet ported.
-* **Webhook per-node access gate** — webhook routes are not gated by the
-  per-node access policy.
-* **WebSocket `read:data` scope** — the streaming WS path does not require
-  `read:data` for subscribed nodes.
-* **Device-code plaintext** — device-authorization code handling.
-* **`expires_in` wire rename** — token-response field-name parity.
-* **API-key / session count limits** — per-principal `API_KEY` / `SESSION`
-  limits.
-* **`resolve_entry` scope-set variant** — a multi-scope variant of the entry
-  resolver for routes that require several scopes at once.
+* **Webhook per-node access gate** (`d0130d1`) — all four webhook routes
+  (register/list/delete/history) now narrow the resolved node through the
+  per-node access policy via one `authorize_node` gate, matching upstream
+  `get_entry(access_policy=…)`; previously only the global scope was checked.
+* **`session_max_age` absolute cap** (`8b06df5`) — session lifetime is now
+  capped by a modeled `session_max_age` (default 365d) threaded into the
+  `Issuer`, split from the 7-day `refresh_ttl` (which governs only the
+  refresh token); previously the absolute cap collapsed onto `refresh_ttl`,
+  hard-expiring sessions ~52× sooner. No sliding added — upstream's
+  `slide_session` rotates the refresh token *without* extending the absolute
+  `expiration_time`, which this matches.
+* **`expires_in` wire alias** (`2b94698`) — `ApiKeyCreateRequest` accepts the
+  upstream python-client `expires_in` spelling via `#[serde(alias)]` (the
+  canonical Rust name `expires_in_seconds` is kept); previously a python
+  client's requested expiry was silently dropped, minting a permanent key.
+* **`delete:revision` on `DELETE /metadata`** (`a048c24`) — now requires
+  `delete:node` **and** `delete:revision` on the narrowed context, matching
+  upstream; deleting a node cascade-destroys its revisions. (Low severity:
+  built-in roles bundle both scopes, so only a custom scope-splitting
+  `AccessPolicy` reaches the gate.)
+* **Device-code hash-at-rest** (`bf2408e`) — the native device-code polling
+  secret is stored `sha256_hex`-hashed (raw returned once, hashed before
+  lookup), mirroring the `pending_session` sibling and upstream; previously
+  plaintext. `user_code` stays plaintext (verified non-redeemable). Migration
+  `0009_hash_device_code`.
+* **Per-principal key/session caps** (`af7f85f`) — `API_KEY_LIMIT = 100` /
+  `SESSION_LIMIT = 200` enforced inside the sole INSERT-owners
+  (`create_api_key` / `create_session`), returning HTTP 400, matching
+  upstream's pre-insert hard-reject (counts all rows, not just active).
+
+Reclassified after wave-23 verification (not landed — not silent divergences):
+
+* **WebSocket `read:data` scope** — verified **correct as-is**. tiled-rs's
+  `/stream/single` streams metadata/structure events (`ChildCreated`,
+  `MetadataUpdated`, `NodeDeleted`, and `DataAppended` *notifications*), not
+  array values, so `read:metadata` is the right tier — upstream requires
+  `read:data` because *its* stream carries data payloads. One LOW residual:
+  the `DataAppended` activity notification reaches a `read:metadata`-only
+  principal; optional hardening would gate that single event kind behind
+  `read:data`.
+* **`resolve_entry` scope-set variant** — deliberately **not built**. The one
+  multi-scope route (`delete_metadata`) reaches the narrowed `AuthContext`
+  directly and chains `require(…)`; a generic scope-set abstraction for a
+  single call site failed the senior-reviewer self-test.
 
 ## N/A (Python-specific or feature not in our port)
 
