@@ -184,12 +184,22 @@ pub fn build_app(mut state: AppState) -> Router {
             "/api/v1/auth/apikeys/{first_eight}",
             delete(auth_router::api_key_revoke),
         )
-        // GET /auth/apikey — info about the API key used in the current request
-        // (mirrors Python current_apikey_info, authentication.py:1584).
-        // DELETE /auth/apikey?first_eight=... — revoke own API key by query param
-        // (mirrors Python revoke_apikey, authentication.py:1621; note: singular
-        // /apikey vs plural /apikeys/{first_eight} which is also kept for compat).
-        .route("/api/v1/auth/apikey", get(auth_router::current_apikey_info))
+        // Singular /auth/apikey — the spec-advertised path (About `links.apikey`,
+        // router.rs). It serves all three verbs, mirroring upstream tiled
+        // (authentication.py:1553 POST, :1584 GET, :1621 DELETE), so a
+        // spec-conformant client (incl. python-tiled, which hits `links.apikey`
+        // for create/info/revoke) never gets a 405:
+        //   POST   — create a key for the current principal (create:apikeys)
+        //   GET    — info about the API key used in the current request
+        //   DELETE /auth/apikey?first_eight=... — revoke own key by query param
+        // The plural /apikeys (+ /apikeys/{first_eight}) routes above are kept
+        // for backward compatibility.
+        .route(
+            "/api/v1/auth/apikey",
+            post(auth_router::api_key_create)
+                .get(auth_router::current_apikey_info)
+                .delete(auth_router::current_apikey_revoke),
+        )
         // Session revoke by UUID (own session only, requires auth).
         .route(
             "/api/v1/auth/session/revoke/{session_id}",
