@@ -94,6 +94,7 @@ async fn migrate_and_principal_lifecycle() {
             "0006_add_session_state".to_string(),
             "0007_add_pending_sessions".to_string(),
             "0008_add_oidc_flow_states".to_string(),
+            "0009_hash_device_code".to_string(),
         ]
     );
 
@@ -547,7 +548,9 @@ async fn device_code_flow() {
     // Stored code is canonical (no dash, uppercase); display adds the dash.
     assert_eq!(dc.user_code.len(), 16);
     assert!(!dc.user_code.contains('-'));
-    assert!(dc.principal_id.is_none());
+    // `initiate_device_code` returns the raw device_code (only its hash is
+    // persisted). A fresh code is unapproved — the first poll below confirms
+    // `Pending`, which is the observable "not yet approved" state.
 
     // First poll: pending.
     let st = db.poll_device_code(&dc.device_code).await.unwrap();

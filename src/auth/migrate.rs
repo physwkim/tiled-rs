@@ -38,6 +38,10 @@ const SQLITE_MIGRATIONS: &[(&str, &str)] = &[
         "0008_add_oidc_flow_states",
         include_str!("migrations/sqlite/0008_add_oidc_flow_states.sql"),
     ),
+    (
+        "0009_hash_device_code",
+        include_str!("migrations/sqlite/0009_hash_device_code.sql"),
+    ),
 ];
 
 const POSTGRES_MIGRATIONS: &[(&str, &str)] = &[
@@ -72,6 +76,10 @@ const POSTGRES_MIGRATIONS: &[(&str, &str)] = &[
     (
         "0008_add_oidc_flow_states",
         include_str!("migrations/postgres/0008_add_oidc_flow_states.sql"),
+    ),
+    (
+        "0009_hash_device_code",
+        include_str!("migrations/postgres/0009_hash_device_code.sql"),
     ),
 ];
 

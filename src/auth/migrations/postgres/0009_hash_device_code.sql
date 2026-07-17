@@ -1,0 +1,14 @@
+-- Hash the native RFC-8628 device-code polling secret at rest.
+--
+-- `device_codes.device_code` now stores the SHA-256 hash (hex) of the client's
+-- device_code, mirroring `pending_sessions.hashed_device_code` and upstream
+-- (authentication.py:758). The raw code is returned to the client once at
+-- creation and never persisted, so a read-only DB leak cannot replay it.
+-- `user_code` stays plaintext — it is not a bearer secret (approval is gated by
+-- the approver's own authenticated session).
+--
+-- Purge any pre-existing PLAINTEXT rows: after this deploy the poll path hashes
+-- the incoming code before the lookup, so old plaintext rows can never match and
+-- would otherwise linger as cleartext secrets until expiry. Device codes are
+-- short-lived (minutes), so in-flight logins at deploy time simply re-initiate.
+DELETE FROM device_codes;

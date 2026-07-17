@@ -11,15 +11,32 @@
 
 use chrono::{DateTime, Duration, Utc};
 use rand::Rng;
+use sha2::{Digest, Sha256};
 use sqlx::Row;
 
 use crate::auth::db::{AuthDb, AuthPool};
 use crate::auth::error::{AuthError, Result};
 
+/// Secrets returned by [`AuthDb::initiate_device_code`] to hand to the client.
+/// `device_code` is the RAW hex polling secret — only its SHA-256 hash is
+/// persisted (see [`DeviceCodeRecord::hashed_device_code`]), so a DB leak cannot
+/// replay it. `user_code` is the canonical (no-dash, uppercase) form. Mirrors
+/// the raw/hashed split in [`crate::auth::pending_session::PendingSessionInit`].
+#[derive(Debug, Clone)]
+pub struct DeviceCodeInit {
+    pub device_code: String,
+    pub user_code: String,
+    pub interval_seconds: i32,
+}
+
+/// A device-code row as read back from the DB. The stored secret is the
+/// SHA-256 hash of the client's `device_code`, never the raw code.
 #[derive(Debug, Clone)]
 pub struct DeviceCodeRecord {
     pub id: i64,
-    pub device_code: String,
+    /// SHA-256 hash (hex) of the polling `device_code`. Held in the
+    /// `device_codes.device_code` column; the raw code is never persisted.
+    pub hashed_device_code: String,
     pub user_code: String,
     pub principal_id: Option<i64>,
     pub expires_at: DateTime<Utc>,
@@ -45,8 +62,12 @@ impl AuthDb {
         &self,
         ttl: Duration,
         interval: Duration,
-    ) -> Result<DeviceCodeRecord> {
+    ) -> Result<DeviceCodeInit> {
         let device_code = random_hex(DEVICE_CODE_BYTES);
+        // Only the hash is persisted; the raw `device_code` is returned to the
+        // client once below and never stored (mirrors pending_session.rs and
+        // upstream authentication.py:758).
+        let hashed = sha256_hex(device_code.as_bytes());
         let user_code = random_user_code(USER_CODE_LEN);
         let expires = Utc::now() + ttl;
         // RFC 8628 default is 5s; allow 0 for tests / non-rate-limited paths.
@@ -54,47 +75,49 @@ impl AuthDb {
         let expires_iso = expires.to_rfc3339();
         match self.pool() {
             AuthPool::Sqlite(pool) => {
-                let row = sqlx::query(
+                sqlx::query(
                     "INSERT INTO device_codes (device_code, user_code, expires_at,
                                                 interval_seconds)
-                     VALUES (?, ?, ?, ?)
-                     RETURNING id, device_code, user_code, principal_id, expires_at,
-                               interval_seconds, last_polled_at",
+                     VALUES (?, ?, ?, ?)",
                 )
-                .bind(&device_code)
+                .bind(&hashed)
                 .bind(&user_code)
                 .bind(&expires_iso)
                 .bind(interval_s)
-                .fetch_one(pool)
+                .execute(pool)
                 .await?;
-                device_from_sqlite(&row)
             }
             AuthPool::Postgres(pool) => {
-                let row = sqlx::query(
+                sqlx::query(
                     "INSERT INTO device_codes (device_code, user_code, expires_at,
                                                 interval_seconds)
-                     VALUES ($1, $2, $3::timestamptz, $4)
-                     RETURNING id, device_code, user_code, principal_id, expires_at,
-                               interval_seconds, last_polled_at",
+                     VALUES ($1, $2, $3::timestamptz, $4)",
                 )
-                .bind(&device_code)
+                .bind(&hashed)
                 .bind(&user_code)
                 .bind(&expires_iso)
                 .bind(interval_s)
-                .fetch_one(pool)
+                .execute(pool)
                 .await?;
-                device_from_postgres(&row)
             }
         }
+        Ok(DeviceCodeInit {
+            device_code,
+            user_code,
+            interval_seconds: interval_s,
+        })
     }
 
     /// Poll the status of a device code. Updates `last_polled_at` and
     /// enforces the polling `interval_seconds` (returns `SlowDown` if the
     /// caller polled faster than that).
     pub async fn poll_device_code(&self, device_code: &str) -> Result<DeviceStatus> {
-        let row = self.lookup_device_code(device_code).await?;
+        // Hash the incoming raw code once; every DB operation below keys on the
+        // hash, matching the at-rest form (never the plaintext).
+        let hashed = sha256_hex(device_code.as_bytes());
+        let row = self.lookup_device_code_by_hash(&hashed).await?;
         if Utc::now() > row.expires_at {
-            self.delete_device_code(&row.device_code).await.ok();
+            self.delete_device_code(&hashed).await.ok();
             return Ok(DeviceStatus::Expired);
         }
         if let Some(last) = row.last_polled_at {
@@ -103,10 +126,10 @@ impl AuthDb {
                 return Ok(DeviceStatus::SlowDown);
             }
         }
-        self.touch_device_code(device_code).await.ok();
+        self.touch_device_code(&hashed).await.ok();
         match row.principal_id {
             Some(pid) => {
-                self.delete_device_code(device_code).await.ok();
+                self.delete_device_code(&hashed).await.ok();
                 Ok(DeviceStatus::Granted(pid))
             }
             None => Ok(DeviceStatus::Pending),
@@ -160,7 +183,10 @@ impl AuthDb {
         Ok(())
     }
 
-    pub async fn lookup_device_code(&self, device_code: &str) -> Result<DeviceCodeRecord> {
+    /// Look up a device-code row by the SHA-256 hash of the client's code. The
+    /// caller ([`Self::poll_device_code`]) hashes the incoming raw code first,
+    /// so the plaintext never reaches the query.
+    async fn lookup_device_code_by_hash(&self, hashed: &str) -> Result<DeviceCodeRecord> {
         match self.pool() {
             AuthPool::Sqlite(pool) => {
                 let row = sqlx::query(
@@ -168,7 +194,7 @@ impl AuthDb {
                             interval_seconds, last_polled_at
                        FROM device_codes WHERE device_code = ?",
                 )
-                .bind(device_code)
+                .bind(hashed)
                 .fetch_optional(pool)
                 .await?
                 .ok_or_else(|| AuthError::NotFound("device_code".into()))?;
@@ -180,7 +206,7 @@ impl AuthDb {
                             interval_seconds, last_polled_at
                        FROM device_codes WHERE device_code = $1",
                 )
-                .bind(device_code)
+                .bind(hashed)
                 .fetch_optional(pool)
                 .await?
                 .ok_or_else(|| AuthError::NotFound("device_code".into()))?;
@@ -189,14 +215,14 @@ impl AuthDb {
         }
     }
 
-    async fn touch_device_code(&self, device_code: &str) -> Result<()> {
+    async fn touch_device_code(&self, hashed: &str) -> Result<()> {
         match self.pool() {
             AuthPool::Sqlite(pool) => {
                 sqlx::query(
                     "UPDATE device_codes SET last_polled_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
                        WHERE device_code = ?",
                 )
-                .bind(device_code)
+                .bind(hashed)
                 .execute(pool)
                 .await?;
             }
@@ -204,7 +230,7 @@ impl AuthDb {
                 sqlx::query(
                     "UPDATE device_codes SET last_polled_at = now() WHERE device_code = $1",
                 )
-                .bind(device_code)
+                .bind(hashed)
                 .execute(pool)
                 .await?;
             }
@@ -212,17 +238,17 @@ impl AuthDb {
         Ok(())
     }
 
-    async fn delete_device_code(&self, device_code: &str) -> Result<()> {
+    async fn delete_device_code(&self, hashed: &str) -> Result<()> {
         match self.pool() {
             AuthPool::Sqlite(pool) => {
                 sqlx::query("DELETE FROM device_codes WHERE device_code = ?")
-                    .bind(device_code)
+                    .bind(hashed)
                     .execute(pool)
                     .await?;
             }
             AuthPool::Postgres(pool) => {
                 sqlx::query("DELETE FROM device_codes WHERE device_code = $1")
-                    .bind(device_code)
+                    .bind(hashed)
                     .execute(pool)
                     .await?;
             }
@@ -235,9 +261,19 @@ fn random_hex(bytes: usize) -> String {
     use rand::RngCore;
     let mut buf = vec![0u8; bytes];
     rand::thread_rng().fill_bytes(&mut buf);
-    let mut out = String::with_capacity(buf.len() * 2);
+    hex_encode(&buf)
+}
+
+/// SHA-256 of `bytes`, lowercase hex. Used to hash the `device_code` at rest so
+/// a DB leak cannot replay it (mirrors `pending_session::sha256_hex`).
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex_encode(&Sha256::digest(bytes))
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    for &b in &buf {
+    for &b in bytes {
         out.push(HEX[(b >> 4) as usize] as char);
         out.push(HEX[(b & 0x0f) as usize] as char);
     }
@@ -284,7 +320,9 @@ fn device_from_sqlite(row: &sqlx::sqlite::SqliteRow) -> Result<DeviceCodeRecord>
     use crate::auth::principal::parse_dt_sqlite;
     Ok(DeviceCodeRecord {
         id: row.get("id"),
-        device_code: row.get("device_code"),
+        // The `device_code` column stores the SHA-256 hash (hash-at-rest); the
+        // raw code is never persisted. See `initiate_device_code`.
+        hashed_device_code: row.get("device_code"),
         user_code: row.get("user_code"),
         // Be explicit about the Option type — sqlx-sqlite's `try_get::<i64, _>`
         // returns 0 for SQL NULL on integer columns, so type inference via
@@ -304,7 +342,8 @@ fn device_from_sqlite(row: &sqlx::sqlite::SqliteRow) -> Result<DeviceCodeRecord>
 fn device_from_postgres(row: &sqlx::postgres::PgRow) -> Result<DeviceCodeRecord> {
     Ok(DeviceCodeRecord {
         id: row.get("id"),
-        device_code: row.get("device_code"),
+        // See `device_from_sqlite`: the column holds the SHA-256 hash.
+        hashed_device_code: row.get("device_code"),
         user_code: row.get("user_code"),
         principal_id: row.try_get("principal_id").ok(),
         expires_at: row.get("expires_at"),
