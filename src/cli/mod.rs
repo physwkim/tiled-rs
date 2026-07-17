@@ -3,7 +3,7 @@ pub mod config;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use clap::Subcommand;
+use clap::{Args, Subcommand};
 use indexmap::IndexMap;
 
 use crate::adapters::{ArrayAdapter, MapAdapter};
@@ -77,7 +77,21 @@ fn build_redis_streaming_cache(_c: &config::StreamingConfig) -> Arc<dyn Streamin
 #[derive(Subcommand)]
 pub enum Command {
     /// Start the Tiled server
+    ///
+    /// The bare `serve` command starts a server from a `--demo` / `--mongo-uri`
+    /// / `--catalog-uri` / `--temp` / `--config` source (flat flags below). The
+    /// `serve directory <path>` subcommand instead builds an ephemeral catalog,
+    /// registers a directory's files, and serves them — mirroring upstream
+    /// `tiled serve directory` (_serve.py). The flat flags and the subcommand
+    /// are mutually exclusive.
+    #[command(args_conflicts_with_subcommands = true)]
     Serve {
+        /// Serve a directory of files (`serve directory <path>`). Present only
+        /// for the subcommand form; the flat flags below are ignored when it is
+        /// used.
+        #[command(subcommand)]
+        directory: Option<ServeSubcommand>,
+
         /// Path to configuration file (YAML)
         #[arg(short, long)]
         config: Option<String>,
@@ -401,6 +415,76 @@ pub enum Command {
         #[command(subcommand)]
         command: AdminCommand,
     },
+}
+
+/// `tiled serve <subcommand>`. Currently only `directory`; the other flat
+/// `serve` modes (demo / mongo / catalog / temp / config) are expressed by the
+/// flags on the [`Command::Serve`] variant itself, not as subcommands.
+#[derive(Subcommand)]
+pub enum ServeSubcommand {
+    /// Serve a directory of files: build an ephemeral (temporary) catalog,
+    /// register the directory's contents over HTTP, then serve them. Mirrors
+    /// upstream `tiled serve directory` (_serve.py).
+    Directory(ServeDirectoryArgs),
+}
+
+/// Options for `tiled serve directory`. Mirrors the upstream `serve_directory`
+/// option surface (_serve.py). The advanced hooks upstream also exposes
+/// (`--adapter`, `--walker`, `--mimetype-hook`) have no tiled-rs analogue and
+/// are omitted, matching the `tiled register` command.
+#[derive(Args, Debug)]
+pub struct ServeDirectoryArgs {
+    /// A directory to serve.
+    pub directory: std::path::PathBuf,
+
+    /// Host to bind to. Defaults to 127.0.0.1 (loopback); use 0.0.0.0 to
+    /// expose on all interfaces.
+    #[arg(long)]
+    pub host: Option<String>,
+
+    /// Port to bind to. Defaults to 8000; use 0 for an OS-assigned port.
+    #[arg(short, long)]
+    pub port: Option<u16>,
+
+    /// Turn off the API-key requirement for *reading*: admit unauthenticated
+    /// requests as the public principal with read-only scopes. Writing still
+    /// requires the API key. Mirrors upstream `--public`.
+    #[arg(long)]
+    pub public: bool,
+
+    /// Single-user API key. Also read from TILED_SINGLE_USER_API_KEY; when
+    /// neither is set a random key is generated and printed at startup.
+    /// Mirrors upstream `--api-key`.
+    #[arg(long)]
+    pub api_key: Option<String>,
+
+    /// Serve a file like `measurements.csv` under its full name including the
+    /// extension, instead of stripping it to `measurements`. Mirrors upstream
+    /// `--keep-ext`.
+    #[arg(long)]
+    pub keep_ext: bool,
+
+    /// Include only files with these extensions (repeatable). Include the
+    /// leading '.', e.g. `--include-ext .csv`. Mirrors upstream `--include-ext`.
+    #[arg(long = "include-ext")]
+    pub include_ext: Vec<String>,
+
+    /// Map a custom file extension to a known mimetype (repeatable). Spell like
+    /// `.tif=image/tiff`. Mirrors upstream `--ext`.
+    #[arg(long)]
+    pub ext: Vec<String>,
+
+    /// Keep the catalog in sync with the directory: initial walk, then
+    /// re-register on filesystem changes, while serving. Mirrors upstream
+    /// `--watch`. Runs until interrupted (Ctrl-C / SIGTERM).
+    #[arg(short, long)]
+    pub watch: bool,
+
+    /// Log details of traversal/registration. Accepted for CLI compatibility;
+    /// the register engine emits progress under the `tiled.register` tracing
+    /// target (`RUST_LOG=tiled_rs::client::register=debug` for per-file detail).
+    #[arg(short, long)]
+    pub verbose: bool,
 }
 
 #[derive(Subcommand)]
@@ -742,6 +826,51 @@ fn create_temp_catalog() -> Result<TempCatalog> {
     })
 }
 
+/// Build the register-engine [`crate::client::register::Settings`] from the
+/// `--ext` / `--keep-ext` / `--include-ext` options shared by `tiled register`
+/// and `tiled serve directory`. Mirrors Python `_register.py` /
+/// `_serve.py:serve_directory`:
+/// * `--ext` items (`.tif=image/tiff`) become the mimetype override map,
+/// * `--keep-ext` serves files under their full name (identity key) instead of
+///   stripping suffixes,
+/// * `--include-ext` restricts the walk to files whose last extension is in the
+///   allow-list (directories always descend, subject to the hidden-name check).
+fn build_register_settings(
+    ext: &[String],
+    keep_ext: bool,
+    include_ext: &[String],
+) -> Result<crate::client::register::Settings> {
+    use crate::client::register::{Settings, default_filter, strip_suffixes};
+
+    let mimetypes_by_ext = parse_ext_overrides(ext)?;
+
+    let key_from_filename: Box<dyn Fn(&str) -> String + Send + Sync> = if keep_ext {
+        Box::new(|s: &str| s.to_string())
+    } else {
+        Box::new(strip_suffixes)
+    };
+
+    let filter: Box<dyn Fn(&std::path::Path) -> bool + Send + Sync> = if include_ext.is_empty() {
+        Box::new(default_filter)
+    } else {
+        let allow = include_ext.to_vec();
+        Box::new(move |p: &std::path::Path| {
+            default_filter(p)
+                && p.extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| allow.contains(&format!(".{e}")))
+                    .unwrap_or(false)
+        })
+    };
+
+    Ok(Settings {
+        mimetypes_by_ext,
+        key_from_filename,
+        filter,
+        ..Settings::default()
+    })
+}
+
 /// Whether a catalog DB already has its schema (migrations) applied. Used to
 /// mirror upstream `from_uri(init_if_not_exists=False)`: without `--init` an
 /// uninitialized catalog is a hard error. [`crate::catalog::Catalog::connect`]
@@ -875,6 +1004,223 @@ fn build_demo_tree() -> MapAdapter {
     )
 }
 
+/// A running `serve directory` server. The server runs on a background task;
+/// the CLI awaits it via [`Self::serve_forever`], while tests query
+/// [`Self::base_url`] and then call [`Self::shutdown`].
+pub struct RunningDirectoryServer {
+    /// Base URL of the bound server, e.g. `http://127.0.0.1:54321`.
+    pub base_url: String,
+    server: tokio::task::JoinHandle<()>,
+    watch: Option<crate::client::register::WatchHandle>,
+    /// Root of the temp catalog tree, leaked at runtime (upstream parity).
+    /// Owned here so callers (tests) that want cleanup can find it.
+    temp_dir: std::path::PathBuf,
+}
+
+impl RunningDirectoryServer {
+    /// Path to the temporary catalog tree (for test cleanup).
+    pub fn temp_dir(&self) -> &std::path::Path {
+        &self.temp_dir
+    }
+
+    /// Serve until Ctrl-C / SIGTERM (the CLI foreground path). The server task
+    /// installs its own graceful-shutdown signal handler; when it returns, the
+    /// watcher (if any) is stopped.
+    pub async fn serve_forever(self) -> Result<()> {
+        let _ = self.server.await;
+        if let Some(w) = self.watch {
+            w.stop().await;
+        }
+        Ok(())
+    }
+
+    /// Stop the server task and the watcher (test teardown).
+    pub async fn shutdown(self) {
+        self.server.abort();
+        if let Some(w) = self.watch {
+            w.stop().await;
+        }
+    }
+}
+
+/// Orchestrate `tiled serve directory <path>`: create an ephemeral catalog,
+/// start an HTTP server over it, register the directory's contents through the
+/// client (over HTTP, exactly as `tiled register` does), and return with the
+/// server still running. Mirrors upstream `serve_directory` (_serve.py).
+///
+/// Public so an integration test can drive the full orchestration and read a
+/// registered file back over HTTP before shutting the server down.
+pub async fn serve_directory_start(args: ServeDirectoryArgs) -> Result<RunningDirectoryServer> {
+    let ServeDirectoryArgs {
+        directory,
+        host,
+        port,
+        public,
+        api_key,
+        keep_ext,
+        include_ext,
+        ext,
+        watch: watch_mode,
+        // The tracing subscriber is installed in `main`; the register engine
+        // already logs under the `tiled.register` target, so `run` cannot raise
+        // the filter here. Accepted for CLI compatibility, like `tiled register`.
+        verbose: _verbose,
+    } = args;
+
+    // Canonicalize the directory: the read-side `FileLeafResolver` allow-list
+    // and the registered `file://` data_uris must be canonical so the
+    // read-time containment check matches (see register_table_integration).
+    let directory = directory
+        .canonicalize()
+        .map_err(|e| anyhow::anyhow!("resolve serve directory {}: {e}", directory.display()))?;
+    if !directory.is_dir() {
+        anyhow::bail!("{} is not a directory", directory.display());
+    }
+
+    // 1. Ephemeral catalog in a system tempdir (FINDING 1 machinery). Upstream
+    //    `serve directory` serves read-only over the source directory: the
+    //    catalog holds the registered nodes and the directory is READABLE
+    //    storage; no writable storage is configured.
+    let tc = create_temp_catalog()?;
+    eprintln!(
+        "Creating catalog database at {}/catalog.db",
+        tc.dir.display()
+    );
+    let catalog = crate::catalog::Catalog::connect(&tc.catalog_uri)
+        .await
+        .map_err(|e| anyhow::anyhow!("catalog connect: {e}"))?;
+    catalog
+        .migrate()
+        .await
+        .map_err(|e| anyhow::anyhow!("catalog migrate: {e}"))?;
+
+    // 2. Resolve the single-user API key: --api-key > TILED_SINGLE_USER_API_KEY
+    //    > a freshly generated key (upstream _serve.py:208-217). The same key is
+    //    handed to the internal register client so it can POST authenticated.
+    let (api_key, generated) =
+        match api_key.or_else(|| std::env::var("TILED_SINGLE_USER_API_KEY").ok()) {
+            Some(k) => {
+                validate_single_user_api_key(&k)?;
+                (k, false)
+            }
+            None => (generate_single_user_key(), true),
+        };
+
+    // 3. Read resolver allow-listing the served directory, wrapped as the
+    //    catalog root tree.
+    let resolver: Arc<dyn crate::catalog::adapter::LeafResolver> =
+        Arc::new(crate::server::file_resolver::FileLeafResolver::new(vec![
+            directory.clone(),
+        ]));
+    let root_tree: Arc<dyn crate::core::adapters::ContainerAdapter> = Arc::new(
+        crate::catalog::CatalogAdapter::root(catalog.clone(), resolver),
+    );
+
+    // 4. A focused single-user AppState (no auth DB, no config file). Presenting
+    //    the api_key grants `ScopeSet::single_user()` (read + write + register),
+    //    so the internal register client can POST. `--public` additionally
+    //    admits anonymous read-only callers.
+    let state = crate::server::AppState {
+        root_tree,
+        serialization_registry: Arc::new(crate::serialization::default_registry()),
+        query_names: Query::all_query_names()
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        base_url: None,
+        root_path: String::new(),
+        cors_policy: CorsOriginPolicy::AllowList(Vec::new()),
+        trust_forwarded_headers: false,
+        api_key: Some(api_key.clone()),
+        catalog: Some(catalog),
+        auth_db: None,
+        issuer: None,
+        authenticators: vec![],
+        proxied_header_auth: None,
+        external_oidc: None,
+        #[cfg(feature = "saml")]
+        saml_providers: vec![],
+        forwarded_allow_ips: None,
+        max_request_body_bytes: 10 * 1024 * 1024,
+        response_bytesize_limit: config::default_response_bytesize_limit(),
+        streaming_cache: disabled(),
+        access_policy: None,
+        default_login_scopes: crate::server::AppState::default_login_scopes(),
+        enable_web: true,
+        web_assets_dir: None,
+        spec_views: Vec::new(),
+        webhook_config: None,
+        webhook_dispatcher: None,
+        request_timeout_secs: 30,
+        expose_raw_assets: true,
+        exact_count_limit: config::default_exact_count_limit(),
+        allow_anonymous_access: public,
+        background_tasks: crate::server::state::BackgroundTasks::new(),
+    };
+    let app = crate::server::build_app(state);
+
+    // 5. Bind and spawn the server. Binding first means the port is open before
+    //    the register client connects, so its first request never races the
+    //    listener.
+    let host = host.unwrap_or_else(|| "127.0.0.1".to_string());
+    let port = port.unwrap_or(8000);
+    let listener = tokio::net::TcpListener::bind((host.as_str(), port)).await?;
+    let addr = listener.local_addr()?;
+    let base_url = format!("http://{addr}");
+    if generated {
+        eprintln!("Auto-generated single-user API key: {api_key}");
+    }
+    eprintln!("Tiled server listening on {addr}");
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown_signal())
+            .await;
+    });
+
+    // 6. Register the directory through the client, over HTTP — the same engine
+    //    `tiled register` uses. `--watch` keeps the catalog in sync afterwards.
+    let settings = build_register_settings(&ext, keep_ext, &include_ext)?;
+    let options = crate::client::ContextOptions {
+        api_key: Some(api_key),
+        ..Default::default()
+    };
+    let node = crate::client::from_uri_with_options(&base_url, options, false)
+        .await
+        .map_err(|e| anyhow::anyhow!("connect to {base_url}: {e}"))?
+        .into_container()
+        .map_err(|e| anyhow::anyhow!("{base_url} is not a container node: {e}"))?;
+
+    eprintln!("Server is up. Indexing files in {}...", directory.display());
+    let watch = if watch_mode {
+        let handle =
+            crate::client::register::watch(node, directory, "/".to_string(), Arc::new(settings))
+                .await
+                .map_err(|e| anyhow::anyhow!("watch: {e}"))?;
+        eprintln!("Initial indexing complete. Watching for changes...");
+        Some(handle)
+    } else {
+        crate::client::register::register(&node, &directory, "/", &settings, false)
+            .await
+            .map_err(|e| anyhow::anyhow!("register: {e}"))?;
+        eprintln!("Indexing complete.");
+        None
+    };
+
+    Ok(RunningDirectoryServer {
+        base_url,
+        server,
+        watch,
+        temp_dir: tc.dir,
+    })
+}
+
+/// CLI entry for `tiled serve directory`: orchestrate, then serve until
+/// Ctrl-C / SIGTERM.
+async fn serve_directory(args: ServeDirectoryArgs) -> Result<()> {
+    let server = serve_directory_start(args).await?;
+    server.serve_forever().await
+}
+
 async fn shutdown_signal() {
     let ctrl_c = tokio::signal::ctrl_c();
 
@@ -905,6 +1251,7 @@ async fn shutdown_signal() {
 pub async fn run(command: Command) -> Result<()> {
     match command {
         Command::Serve {
+            directory,
             config,
             host,
             port,
@@ -935,6 +1282,14 @@ pub async fn run(command: Command) -> Result<()> {
             webhooks_allow_http,
             webhooks_allow_private_addresses,
         } => {
+            // `serve directory <path>` — a self-contained orchestration
+            // (ephemeral catalog + register + serve). `args_conflicts_with_
+            // subcommands` guarantees the flat flags above are all at their
+            // defaults here, so dispatch before touching them.
+            if let Some(ServeSubcommand::Directory(args)) = directory {
+                return serve_directory(args).await;
+            }
+
             // cli-M6: with no --config flag, fall back to the TILED_CONFIG env
             // var (container/k8s pattern). Unlike Python we do not additionally
             // default to ./config.yml — the Rust `serve` is multi-modal (demo /
@@ -1560,47 +1915,9 @@ pub async fn run(command: Command) -> Result<()> {
             ext,
             api_key,
         } => {
-            use crate::client::register::{
-                Settings, default_filter, register, strip_suffixes, watch,
-            };
+            use crate::client::register::{register, watch};
 
-            // Parse `--ext` items ('.tif=image/tiff') into the mimetype override
-            // map. Mirrors Python `_register.py`'s EXT_PATTERN parse.
-            let mimetypes_by_ext = parse_ext_overrides(&ext)?;
-
-            // `--keep-ext`: serve files under their full name (identity key)
-            // instead of stripping suffixes.
-            let key_from_filename: Box<dyn Fn(&str) -> String + Send + Sync> = if keep_ext {
-                Box::new(|s: &str| s.to_string())
-            } else {
-                Box::new(strip_suffixes)
-            };
-
-            // `--include-ext`: include only files whose last extension is in the
-            // allow-list. The walk applies this filter to files only (it always
-            // descends directories that pass the hidden-name check), mirroring
-            // Python's `default_filter(path) and (path.is_dir() or path.suffix
-            // in include_ext)`.
-            let filter: Box<dyn Fn(&std::path::Path) -> bool + Send + Sync> =
-                if include_ext.is_empty() {
-                    Box::new(default_filter)
-                } else {
-                    let allow = include_ext.clone();
-                    Box::new(move |p: &std::path::Path| {
-                        default_filter(p)
-                            && p.extension()
-                                .and_then(|e| e.to_str())
-                                .map(|e| allow.contains(&format!(".{e}")))
-                                .unwrap_or(false)
-                    })
-                };
-
-            let settings = Settings {
-                mimetypes_by_ext,
-                key_from_filename,
-                filter,
-                ..Settings::default()
-            };
+            let settings = build_register_settings(&ext, keep_ext, &include_ext)?;
 
             // Connect to the server. `--api-key` wins; otherwise the context
             // falls back to `?api_key=` in the URL, then `TILED_API_KEY`.
@@ -2374,6 +2691,56 @@ mod tests {
         // Cleanup: the temp tree is intentionally leaked at runtime (upstream
         // parity), so the test removes it explicitly.
         let _ = std::fs::remove_dir_all(&tc.dir);
+    }
+
+    // cli-w27-P2: `serve directory <path>` parses as a nested subcommand with
+    // its own options, distinct from the flat `serve` flags.
+    #[test]
+    fn serve_directory_subcommand_parses() {
+        let cli = TestCli::parse_from([
+            "tiled",
+            "serve",
+            "directory",
+            "/data/runs",
+            "--host",
+            "0.0.0.0",
+            "--port",
+            "0",
+            "--public",
+            "--api-key",
+            "secret",
+            "--keep-ext",
+            "--include-ext",
+            ".csv",
+            "--ext",
+            ".tif=image/tiff",
+            "--watch",
+        ]);
+        let Command::Serve { directory, .. } = cli.command else {
+            panic!("expected Serve variant");
+        };
+        let Some(ServeSubcommand::Directory(args)) = directory else {
+            panic!("expected the directory subcommand");
+        };
+        assert_eq!(args.directory, std::path::PathBuf::from("/data/runs"));
+        assert_eq!(args.host.as_deref(), Some("0.0.0.0"));
+        assert_eq!(args.port, Some(0));
+        assert!(args.public);
+        assert_eq!(args.api_key.as_deref(), Some("secret"));
+        assert!(args.keep_ext);
+        assert_eq!(args.include_ext, vec![".csv".to_string()]);
+        assert_eq!(args.ext, vec![".tif=image/tiff".to_string()]);
+        assert!(args.watch);
+    }
+
+    // The flat `serve` form leaves the directory subcommand unset.
+    #[test]
+    fn serve_flat_form_has_no_directory_subcommand() {
+        let cli = TestCli::parse_from(["tiled", "serve", "--demo"]);
+        let Command::Serve { directory, .. } = cli.command else {
+            panic!("expected Serve variant");
+        };
+        assert!(directory.is_none());
     }
 
     // cli-L1: an IPv6 `--host` must not be string-concatenated with the port.
