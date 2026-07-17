@@ -2569,15 +2569,26 @@ async fn ragged_export_to_file() {
 // Blosc2 content-encoding tests
 // ---------------------------------------------------------------------------
 
-/// Build a catalog with two large arrays, both over the 500-byte floor:
+/// Build a catalog of arrays exercising the compression floor and ratio gate:
 /// - `big`  : 200 f64 = 1 600 bytes of a smooth ramp — compresses well
 ///   (lz4 ratio ~1.84, blosc2 ~1.29, both above the 1/0.9 gate).
 /// - `noise`: 400 f64 = 3 200 bytes of deterministic high-entropy bits (an LCG
 ///   reinterpreted as f64) — does NOT compress below the ratio gate
 ///   (lz4 ratio ~0.99, blosc2 ~0.99), so it must be served identity.
+/// - `at_floor`   : 125 f64 = 1 000 bytes, exactly at the `MINIMUM_SIZE` floor
+///   and highly compressible (a constant value), so it clears both the floor
+///   and the ratio gate for every encoder — isolating the floor decision.
+/// - `below_floor`: 124 f64 = 992 bytes of the same constant — the largest f64
+///   body strictly below the 1 000-byte floor (f64 granularity is 8 bytes, so
+///   992 is the tightest expressible "just under 1000"), served identity.
 fn build_large_array_catalog() -> MapAdapter {
     let data: Vec<f64> = (0..200).map(|i| i as f64 * 1.5).collect();
     let arr = ArrayAdapter::from_f64_1d(&data, serde_json::json!({}));
+
+    // Floor-boundary arrays: a constant value (max-compressible) sized to
+    // straddle MINIMUM_SIZE, so the pass/fail turns only on the size floor.
+    let at_floor = ArrayAdapter::from_f64_1d(&vec![1.5_f64; 125], serde_json::json!({}));
+    let below_floor = ArrayAdapter::from_f64_1d(&vec![1.5_f64; 124], serde_json::json!({}));
 
     // Deterministic incompressible bytes: an LCG feeding f64::from_bits so all
     // eight bytes of every value vary. (from_f64_1d stores raw little-endian
@@ -2596,6 +2607,11 @@ fn build_large_array_catalog() -> MapAdapter {
     let mut mapping = IndexMap::new();
     mapping.insert("big".into(), AnyAdapter::Array(Arc::new(arr)));
     mapping.insert("noise".into(), AnyAdapter::Array(Arc::new(noise_arr)));
+    mapping.insert("at_floor".into(), AnyAdapter::Array(Arc::new(at_floor)));
+    mapping.insert(
+        "below_floor".into(),
+        AnyAdapter::Array(Arc::new(below_floor)),
+    );
     MapAdapter::new(mapping, serde_json::json!({}), vec![])
 }
 
@@ -2657,7 +2673,7 @@ async fn spawn_blosc2_server() -> String {
 }
 
 /// Key test: round-trip.  Client advertises blosc2, server compresses the
-/// large array (1 600 bytes > 500 minimum), client decompresses, decoded
+/// large array (1 600 bytes > 1000 minimum), client decompresses, decoded
 /// bytes equal the original f64 values.
 #[tokio::test]
 async fn blosc2_round_trip_decoded_bytes_equal_original() {
@@ -2709,7 +2725,7 @@ async fn blosc2_server_sets_content_encoding_for_large_body() {
     assert_eq!(enc, "blosc2", "server must set Content-Encoding: blosc2");
 }
 
-/// Small body (< 500 bytes) must NOT be blosc2-encoded even when the client
+/// Small body (< 1000 bytes) must NOT be blosc2-encoded even when the client
 /// accepts it.  The existing `some_array` with 10 f64 = 80 bytes is used.
 #[tokio::test]
 async fn blosc2_small_body_not_encoded() {
@@ -2732,7 +2748,7 @@ async fn blosc2_small_body_not_encoded() {
         .unwrap_or("none");
     assert_ne!(
         enc, "blosc2",
-        "80-byte body (< 500 minimum) must NOT be blosc2-encoded"
+        "80-byte body (< 1000 minimum) must NOT be blosc2-encoded"
     );
     // Body must still be the raw f64 bytes.
     let bytes = resp.bytes().await.unwrap();
@@ -3063,7 +3079,7 @@ async fn ratio_gate_compressible_lz4_compresses_with_phase() {
     );
 }
 
-/// Incompressible body (`noise`, blosc2 ratio ~0.99, > 500-byte floor) with
+/// Incompressible body (`noise`, blosc2 ratio ~0.99, > 1000-byte floor) with
 /// blosc2 → served identity: no Content-Encoding, no compress phase, but the
 /// app phase is still present and the body is intact.
 #[tokio::test]
@@ -3116,7 +3132,7 @@ async fn ratio_gate_incompressible_lz4_served_identity() {
     assert_eq!(bytes.len(), 400 * 8, "body must be the raw f64 bytes");
 }
 
-/// Just under the 500-byte floor (`some_array`, 80 bytes) with lz4 → the size
+/// Just under the 1000-byte floor (`some_array`, 80 bytes) with lz4 → the size
 /// floor short-circuits before the ratio gate: no Content-Encoding, body
 /// unchanged. (blosc2's under-floor case is covered by
 /// `blosc2_small_body_not_encoded`.)
@@ -3133,10 +3149,90 @@ async fn ratio_gate_under_size_floor_lz4_unchanged() {
     assert_eq!(resp.status(), 200);
     assert!(
         resp.headers().get("content-encoding").is_none(),
-        "80-byte body (< 500 floor) must not be lz4-encoded"
+        "80-byte body (< 1000 floor) must not be lz4-encoded"
     );
     let bytes = resp.bytes().await.unwrap();
     assert_eq!(bytes.len(), 80, "raw 10×f64 body");
+}
+
+/// Floor boundary (Finding 1: `MINIMUM_SIZE` is 1000, matching the running
+/// app's `app.add_middleware(CompressionMiddleware, minimum_size=1000)` at
+/// `tiled/server/app.py:760-764` — not the 500-byte class default). A body of
+/// exactly 1000 bytes (`at_floor`) is eligible and compresses; the 992-byte
+/// body (`below_floor`, the tightest f64 body just under the floor) is served
+/// identity. lz4 arm.
+#[tokio::test]
+async fn floor_boundary_lz4_compresses_at_1000_identity_below() {
+    let base = spawn_blosc2_server().await;
+
+    // At the floor (1000 bytes) → lz4-encoded.
+    let resp = reqwest::Client::new()
+        .get(format!("{base}/api/v1/array/block/at_floor?block=0"))
+        .header("Accept", "application/octet-stream")
+        .header("Accept-Encoding", "lz4")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers()
+            .get("content-encoding")
+            .and_then(|v| v.to_str().ok()),
+        Some("lz4"),
+        "1000-byte body (== floor) must be lz4-encoded"
+    );
+
+    // Just below the floor (992 bytes) → identity, body intact.
+    let resp = reqwest::Client::new()
+        .get(format!("{base}/api/v1/array/block/below_floor?block=0"))
+        .header("Accept", "application/octet-stream")
+        .header("Accept-Encoding", "lz4")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(
+        resp.headers().get("content-encoding").is_none(),
+        "992-byte body (< 1000 floor) must NOT be lz4-encoded"
+    );
+    assert_eq!(resp.bytes().await.unwrap().len(), 992, "raw 124×f64 body");
+}
+
+/// blosc2 counterpart of the floor boundary: an octet-stream body of exactly
+/// 1000 bytes compresses; 992 bytes is served identity.
+#[tokio::test]
+async fn floor_boundary_blosc2_compresses_at_1000_identity_below() {
+    let base = spawn_blosc2_server().await;
+
+    let resp = reqwest::Client::new()
+        .get(format!("{base}/api/v1/array/block/at_floor?block=0"))
+        .header("Accept", "application/octet-stream")
+        .header("Accept-Encoding", "blosc2")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers()
+            .get("content-encoding")
+            .and_then(|v| v.to_str().ok()),
+        Some("blosc2"),
+        "1000-byte body (== floor) must be blosc2-encoded"
+    );
+
+    let resp = reqwest::Client::new()
+        .get(format!("{base}/api/v1/array/block/below_floor?block=0"))
+        .header("Accept", "application/octet-stream")
+        .header("Accept-Encoding", "blosc2")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(
+        resp.headers().get("content-encoding").is_none(),
+        "992-byte body (< 1000 floor) must NOT be blosc2-encoded"
+    );
+    assert_eq!(resp.bytes().await.unwrap().len(), 992, "raw 124×f64 body");
 }
 
 // ---------------------------------------------------------------------------
