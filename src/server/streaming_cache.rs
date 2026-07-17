@@ -304,6 +304,12 @@ struct NodeEntry {
 /// Broadcast channel depth for live sequence notifications.
 const CHANNEL_CAPACITY: usize = 256;
 
+/// Number of `set` mutations between opportunistic slot-reclamation sweeps.
+/// The sweep is lazy (piggybacked on the producer's own housekeeping) rather
+/// than a background timer, so it must be cheap-per-`set` and only occasionally
+/// pay for a full pass.
+const RECLAIM_INTERVAL: u64 = 512;
+
 /// In-process data-streaming cache backed by [`DashMap`], mirroring upstream's
 /// `cachetools.TTLCache` variant (`tiled/streaming.py:346-357`).
 pub struct InMemoryStreamingCache {
@@ -314,6 +320,9 @@ pub struct InMemoryStreamingCache {
     data_ttl: Duration,
     /// Maximum cached events retained per node (upstream `maxsize`, 1000).
     maxsize: usize,
+    /// Mutations since the last reclamation sweep; drives lazy, background-task-
+    /// free reclamation of idle node slots (see [`Self::maybe_reclaim`]).
+    reclaim_counter: AtomicU64,
 }
 
 impl InMemoryStreamingCache {
@@ -326,6 +335,7 @@ impl InMemoryStreamingCache {
             // A cache bound of 0 would drop every event on insert; clamp to at
             // least 1 so a stored event is retrievable at least until its TTL.
             maxsize: maxsize.max(1),
+            reclaim_counter: AtomicU64::new(0),
         }
     }
 
@@ -337,6 +347,67 @@ impl InMemoryStreamingCache {
             data: std::sync::Mutex::new(BTreeMap::new()),
             notify: broadcast::channel(CHANNEL_CAPACITY).0,
         })
+    }
+
+    /// A node slot is reclaimable IFF *all three* terms hold: the sequence
+    /// counter has lapsed (`now >= seq_deadline`), the replay ring is empty
+    /// after purging any TTL-lapsed events, and no live subscriber holds a
+    /// receiver on its channel (`receiver_count() == 0`). Each term guards a
+    /// consumer path — a live receiver may still `get` a just-broadcast seq, a
+    /// non-empty ring may still be replayed, and a fresh counter means the node
+    /// is active — so reclaiming without all three would drop state a consumer
+    /// or replay still needs.
+    fn is_reclaimable(entry: &NodeEntry, now: Instant) -> bool {
+        // A live WS subscriber still holds a receiver: never reclaim, or the
+        // consumer's next `get` after a broadcast would miss the slot.
+        if entry.notify.receiver_count() != 0 {
+            return false;
+        }
+        // The sequence counter is still within its idle TTL: node is active.
+        if now < *entry.seq_deadline.lock().unwrap() {
+            return false;
+        }
+        // Purge lapsed events; a non-empty ring means replay is still possible.
+        let mut data = entry.data.lock().unwrap();
+        data.retain(|_, e| e.deadline > now);
+        data.is_empty()
+    }
+
+    /// Reclaim every node slot that is currently [`Self::is_reclaimable`],
+    /// bounding the `nodes` map so idle nodes do not leak after their counter
+    /// and data both lapse. This mirrors upstream's `TTLCache` auto-eviction
+    /// (`tiled/streaming.py:346-357`), where an idle `sequence:{node_id}` key
+    /// simply expires. `remove_if` re-checks the predicate under the shard
+    /// write lock, so it cannot race a concurrent `entry()` that just
+    /// recreated or refreshed the slot: such a slot fails `is_reclaimable`
+    /// (fresh deadline / non-empty ring / live receiver) and is kept.
+    fn reclaim_expired(&self) {
+        let now = Instant::now();
+        // Snapshot keys first so the shard read locks from iteration are
+        // released before `remove_if` takes shard write locks (no self-deadlock).
+        let candidates: Vec<i64> = self.nodes.iter().map(|r| *r.key()).collect();
+        for id in candidates {
+            self.nodes
+                .remove_if(&id, |_, entry| Self::is_reclaimable(entry, now));
+        }
+    }
+
+    /// Opportunistic, lazy reclamation: every `RECLAIM_INTERVAL`-th mutation
+    /// runs one sweep. There is deliberately no background task — the sweep
+    /// piggybacks on the producer's own `set` housekeeping. The threshold race
+    /// (two callers both crossing it) is benign: it costs at most one extra
+    /// idempotent sweep.
+    fn maybe_reclaim(&self) {
+        if self.reclaim_counter.fetch_add(1, Ordering::Relaxed) + 1 >= RECLAIM_INTERVAL {
+            self.reclaim_counter.store(0, Ordering::Relaxed);
+            self.reclaim_expired();
+        }
+    }
+
+    /// Number of node slots currently held (test-only introspection).
+    #[cfg(test)]
+    fn tracked_nodes(&self) -> usize {
+        self.nodes.len()
     }
 }
 
@@ -372,26 +443,31 @@ impl StreamingCache for InMemoryStreamingCache {
     }
 
     async fn set(&self, node_id: i64, seq: u64, event: StreamEvent) {
-        let entry = self.entry(node_id);
         {
-            let mut data = entry.data.lock().unwrap();
-            let now = Instant::now();
-            // Lazy purge of lapsed events, then insert, then bound the ring.
-            data.retain(|_, e| e.deadline > now);
-            data.insert(
-                seq,
-                DataEntry {
-                    deadline: now + self.data_ttl,
-                    event,
-                },
-            );
-            while data.len() > self.maxsize {
-                let oldest = *data.keys().next().expect("non-empty after insert");
-                data.remove(&oldest);
+            let entry = self.entry(node_id);
+            {
+                let mut data = entry.data.lock().unwrap();
+                let now = Instant::now();
+                // Lazy purge of lapsed events, then insert, then bound the ring.
+                data.retain(|_, e| e.deadline > now);
+                data.insert(
+                    seq,
+                    DataEntry {
+                        deadline: now + self.data_ttl,
+                        event,
+                    },
+                );
+                while data.len() > self.maxsize {
+                    let oldest = *data.keys().next().expect("non-empty after insert");
+                    data.remove(&oldest);
+                }
             }
+            // Notify live subscribers; `Err` just means no receivers are attached.
+            let _ = entry.notify.send(seq);
         }
-        // Notify live subscribers; `Err` just means no receivers are attached.
-        let _ = entry.notify.send(seq);
+        // The `entry` RefMut (shard lock) is dropped above; only now is it safe
+        // to run a reclamation sweep, which takes shard write locks of its own.
+        self.maybe_reclaim();
     }
 
     async fn get(&self, node_id: i64, seq: u64) -> Option<StreamEvent> {
@@ -608,6 +684,146 @@ mod tests {
         assert_eq!(event.metadata["end_of_stream"], true);
         assert!(event.metadata.get("type").is_none(), "EOS carries no type");
         assert!(event.payload.is_none());
+    }
+
+    #[tokio::test]
+    async fn slot_reclaimed_after_seq_deadline_with_no_receivers() {
+        // Both the sequence counter and the cached event lapse almost at once.
+        let cache =
+            InMemoryStreamingCache::new(Duration::from_millis(5), Duration::from_millis(5), 1000);
+        let seq = cache.incr_seq(1).await;
+        cache
+            .set(
+                1,
+                seq,
+                StreamEvent::array_data(
+                    seq,
+                    "application/octet-stream",
+                    &[1],
+                    None,
+                    None,
+                    Bytes::new(),
+                ),
+            )
+            .await;
+        assert_eq!(cache.tracked_nodes(), 1, "slot present right after set");
+
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        cache.reclaim_expired();
+        assert_eq!(
+            cache.tracked_nodes(),
+            0,
+            "an idle slot is reclaimed once its counter and data both lapse with no receivers"
+        );
+    }
+
+    #[tokio::test]
+    async fn slot_not_reclaimed_while_receiver_live() {
+        let cache =
+            InMemoryStreamingCache::new(Duration::from_millis(5), Duration::from_millis(5), 1000);
+        let rx = cache.subscribe(2); // a live subscriber holds a receiver
+        let seq = cache.incr_seq(2).await;
+        cache
+            .set(
+                2,
+                seq,
+                StreamEvent::array_data(
+                    seq,
+                    "application/octet-stream",
+                    &[1],
+                    None,
+                    None,
+                    Bytes::new(),
+                ),
+            )
+            .await;
+
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        cache.reclaim_expired();
+        assert_eq!(
+            cache.tracked_nodes(),
+            1,
+            "a slot with a live subscriber is never reclaimed, even after both TTLs lapse"
+        );
+
+        // Once the last receiver drops, the now-idle slot becomes reclaimable.
+        drop(rx);
+        cache.reclaim_expired();
+        assert_eq!(
+            cache.tracked_nodes(),
+            0,
+            "slot reclaimed after the last receiver drops"
+        );
+    }
+
+    #[tokio::test]
+    async fn slot_not_reclaimed_while_data_nonempty() {
+        // Short seq_ttl so the counter lapses, but a long data_ttl so the replay
+        // ring stays populated — the data-empty term must veto reclamation.
+        let cache =
+            InMemoryStreamingCache::new(Duration::from_millis(5), Duration::from_secs(3600), 1000);
+        let seq = cache.incr_seq(3).await;
+        cache
+            .set(
+                3,
+                seq,
+                StreamEvent::array_data(
+                    seq,
+                    "application/octet-stream",
+                    &[1],
+                    None,
+                    None,
+                    Bytes::new(),
+                ),
+            )
+            .await;
+
+        tokio::time::sleep(Duration::from_millis(40)).await; // counter lapses; data does not
+        cache.reclaim_expired();
+        assert_eq!(
+            cache.tracked_nodes(),
+            1,
+            "a slot whose replay ring still holds a live event is not reclaimed, even with the \
+             counter lapsed and no receivers"
+        );
+    }
+
+    #[tokio::test]
+    async fn node_deleted_then_close_still_delivers_under_reclamation() {
+        // COMMIT-1 invariant regression: a live consumer subscribes, then the
+        // node is deleted (node-deleted event) and the stream closed (EOS). A
+        // reclamation sweep running in between must not evict the slot while the
+        // consumer's receiver is live, so both terminal events stay replayable.
+        let cache =
+            InMemoryStreamingCache::new(Duration::from_secs(3600), Duration::from_secs(3600), 1000);
+        let mut rx = cache.subscribe(4);
+
+        let s1 = cache.incr_seq(4).await;
+        cache.set(4, s1, StreamEvent::node_deleted(s1)).await;
+        // close() must stay a pure appender: incr_seq + EOS, no eviction.
+        cache.close(4).await;
+        let s2 = cache.current_seq(4).await;
+
+        // A sweep while the consumer is still attached must be a no-op here.
+        cache.reclaim_expired();
+        assert_eq!(
+            cache.tracked_nodes(),
+            1,
+            "slot with a live receiver survives the sweep"
+        );
+
+        assert_eq!(rx.recv().await.unwrap(), s1);
+        assert_eq!(rx.recv().await.unwrap(), s2);
+        let deleted = cache
+            .get(4, s1)
+            .await
+            .expect("node-deleted still cached under reclamation");
+        assert_eq!(deleted.metadata["type"], "node-deleted");
+        let eos = cache
+            .get(4, s2)
+            .await
+            .expect("EOS still cached under reclamation");
+        assert_eq!(eos.metadata["end_of_stream"], true);
     }
 
     #[tokio::test]
