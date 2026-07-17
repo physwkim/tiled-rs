@@ -230,7 +230,15 @@ fn serialize_array_csv(
                 u16::from_le_bytes(b).to_string()
             }
             ("u", 1) => u8::from_le_bytes(bytes.try_into().unwrap_or([0u8; 1])).to_string(),
-            ("b", _) => (bytes.iter().any(|&b| b != 0)).to_string(),
+            // numpy `savetxt(fmt="%s")` writes `str(np.bool_)` = "True"/"False"
+            // (array.py:45), not Rust's lowercase bool repr.
+            ("b", _) => {
+                if bytes.iter().any(|&b| b != 0) {
+                    "True".to_string()
+                } else {
+                    "False".to_string()
+                }
+            }
             ("c", _) if itemsize >= 2 => {
                 // Complex float: real then imaginary, each `itemsize/2` bytes.
                 let half = itemsize / 2;
@@ -834,6 +842,33 @@ mod tests {
         assert_ne!(
             cell, "0.1",
             "we print the f32-widened decimal, not numpy's shortest float16 repr"
+        );
+    }
+
+    /// Array CSV bool cells must render as numpy's `str(np.bool_)` —
+    /// `True`/`False` — matching upstream `numpy.savetxt(fmt="%s")`
+    /// (`tiled/serialization/array.py:45`), not Rust's lowercase bool repr.
+    /// Verified against numpy 2.5.1 (`savetxt` of `[True, False]` → "True\nFalse").
+    #[test]
+    fn csv_array_bool_is_title_case_like_numpy_savetxt() {
+        let ser = csv_serializer();
+        // 1-D [3]: one bool per row (column vector), no trailing newline.
+        let out = ser(
+            &[1u8, 0, 1],
+            &serde_json::json!({"itemsize": 1, "kind": "b", "byteorder": "<", "shape": [3]}),
+        )
+        .unwrap();
+        assert_eq!(std::str::from_utf8(&out).unwrap(), "True\nFalse\nTrue");
+
+        // 2-D [2,2]: comma-separated cells per row.
+        let out2 = ser(
+            &[1u8, 0, 0, 1],
+            &serde_json::json!({"itemsize": 1, "kind": "b", "byteorder": "<", "shape": [2, 2]}),
+        )
+        .unwrap();
+        assert_eq!(
+            std::str::from_utf8(&out2).unwrap(),
+            "True,False\nFalse,True"
         );
     }
 
