@@ -30,6 +30,8 @@
 //! - `Vary`: keys by listed request headers.
 //! - `ETag`/`Last-Modified` → `If-None-Match` / `If-Modified-Since` on
 //!   conditional requests.
+//! - Response bodies larger than `max_item_size` (default 500 KB) are not
+//!   cached.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -82,6 +84,11 @@ pub struct CacheEntry {
 /// One year — upper bound on cache freshness so a hostile server can't pin
 /// an entry essentially forever via `max-age=99999999999`.
 const MAX_FRESHNESS_SECS: u64 = 31_536_000;
+
+/// Per-item body-size ceiling: response bodies larger than this are never
+/// cached. Matches upstream `Cache(max_item_size=500_000)`
+/// (`tiled/client/cache.py`).
+const DEFAULT_MAX_ITEM_SIZE: usize = 500_000;
 
 impl CacheEntry {
     pub fn is_fresh(&self) -> bool {
@@ -143,6 +150,9 @@ impl CacheControl {
 pub struct HttpCache {
     backend: Mutex<Backend>,
     capacity_bytes: usize,
+    /// Response bodies larger than this are declined (not cached). See
+    /// [`DEFAULT_MAX_ITEM_SIZE`].
+    max_item_size: usize,
     used_bytes: Mutex<usize>,
 }
 
@@ -190,11 +200,24 @@ fn cache_key(url: &Url, accept: &str) -> String {
 }
 
 impl HttpCache {
-    /// Build an in-memory cache.
+    /// Build an in-memory cache with the default per-item size ceiling
+    /// ([`DEFAULT_MAX_ITEM_SIZE`]).
     pub fn in_memory(capacity_bytes: usize) -> Arc<Self> {
+        Self::in_memory_with_max_item_size(capacity_bytes, DEFAULT_MAX_ITEM_SIZE)
+    }
+
+    /// Build an in-memory cache with an explicit per-item body-size ceiling.
+    /// Bodies larger than `max_item_size` are never cached, matching upstream
+    /// `Cache(max_item_size=...)`.
+    pub fn in_memory_with_max_item_size(capacity_bytes: usize, max_item_size: usize) -> Arc<Self> {
+        debug_assert!(
+            capacity_bytes > max_item_size,
+            "capacity must be greater than max_item_size"
+        );
         Arc::new(Self {
             backend: Mutex::new(Backend::InMemory(HashMap::new())),
             capacity_bytes,
+            max_item_size,
             used_bytes: Mutex::new(0),
         })
     }
@@ -214,6 +237,7 @@ impl HttpCache {
                 in_memory_index: HashMap::new(),
             })),
             capacity_bytes,
+            max_item_size: DEFAULT_MAX_ITEM_SIZE,
             used_bytes: Mutex::new(0),
         })
     }
@@ -235,6 +259,7 @@ impl HttpCache {
                 in_memory_index: entries,
             })),
             capacity_bytes,
+            max_item_size: DEFAULT_MAX_ITEM_SIZE,
             used_bytes: Mutex::new(total),
         });
         Ok(cache)
@@ -390,6 +415,12 @@ impl HttpCache {
         let expires_at = Utc::now() + chrono::Duration::seconds(max_age as i64);
 
         let bytes = resp.bytes().await?;
+        // Per-item ceiling: decline to cache oversized bodies (compared by
+        // body length, matching upstream `get_size`/`Cache.set` in
+        // `tiled/client/cache.py`), but still hand the response back.
+        if bytes.len() > self.max_item_size {
+            return Ok((rebuild_response(status, &headers, bytes.clone())?, bytes));
+        }
         let size = bytes.len()
             + headers
                 .iter()
@@ -911,11 +942,13 @@ mod tests {
 
     #[tokio::test]
     async fn read_refreshes_lru_recency_order() {
-        // Capacity holds two ~100 KB entries but not three, so storing a
-        // third forces exactly one eviction.
-        let cache = HttpCache::in_memory(250_000);
+        // Capacity holds two ~300 KB entries but not three, so storing a
+        // third forces exactly one eviction. Bodies stay under the default
+        // 500 KB item ceiling and capacity stays above it, so the config is
+        // valid for the default `in_memory` constructor.
+        let cache = HttpCache::in_memory(700_000);
         let accept = "application/json";
-        let body = vec![b'x'; 100_000];
+        let body = vec![b'x'; 300_000];
         let url_a = Url::parse("http://test/a").unwrap();
         let url_b = Url::parse("http://test/b").unwrap();
         let url_c = Url::parse("http://test/c").unwrap();
@@ -951,6 +984,49 @@ mod tests {
         assert!(
             cache.try_get(&url_b, accept).await.unwrap().is_none(),
             "B is least-recently-accessed and must be the evicted entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn max_item_size_declines_oversized_bodies() {
+        // Small per-item ceiling; capacity generous so only the ceiling matters.
+        let cache = HttpCache::in_memory_with_max_item_size(10_000_000, 1000);
+        let accept = "application/json";
+
+        // Body exactly at the ceiling is cached (upstream declines only when
+        // strictly over: `incoming_size > max_item_size`).
+        let at = Url::parse("http://test/at").unwrap();
+        cache
+            .store_response(&at, accept, make_response(200, &vec![b'x'; 1000], FRESH))
+            .await
+            .unwrap();
+        assert!(
+            cache.try_get(&at, accept).await.unwrap().is_some(),
+            "a body of exactly max_item_size must be cached"
+        );
+        let used_after_at = cache.used_bytes().await;
+        assert!(used_after_at > 0);
+
+        // One byte over the ceiling: declined, but the caller still receives
+        // the full body and the accounted byte count is unchanged.
+        let over = Url::parse("http://test/over").unwrap();
+        let (_resp, bytes) = cache
+            .store_response(&over, accept, make_response(200, &vec![b'x'; 1001], FRESH))
+            .await
+            .unwrap();
+        assert_eq!(
+            bytes.len(),
+            1001,
+            "caller still receives the oversized body"
+        );
+        assert!(
+            cache.try_get(&over, accept).await.unwrap().is_none(),
+            "a body over max_item_size must not be cached"
+        );
+        assert_eq!(
+            cache.used_bytes().await,
+            used_after_at,
+            "a declined oversized body must not change accounted bytes"
         );
     }
 
