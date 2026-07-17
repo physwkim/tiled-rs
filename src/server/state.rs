@@ -78,6 +78,14 @@ pub struct AppState {
     /// connected to /api/v1/stream/single/{*path} receive matching
     /// updates.
     pub streaming_bus: crate::server::streaming::StreamingBus,
+    /// Per-node *data* streaming cache (upstream `tiled.streaming`), distinct
+    /// from `streaming_bus` (notification-only). Holds the actual event
+    /// payloads keyed by `(node_id, sequence)` so a WebSocket client can
+    /// replay from a requested sequence, then follow live ones. Defaults to a
+    /// [`DisabledStreamingCache`](crate::server::streaming_cache::DisabledStreamingCache)
+    /// no-op unless a `streaming:` config block selects a backend. Constructed
+    /// but not yet consumed — the write-path/WebSocket wiring is Wave-24 PR2+.
+    pub streaming_cache: Arc<dyn crate::server::streaming_cache::StreamingCache>,
     /// Optional AccessPolicy. When set, search/read handlers consult it
     /// for per-node scope decisions (tiled#287). `None` keeps the
     /// scope check entirely on the auth middleware (current default —

@@ -10,6 +10,7 @@ pub mod file_resolver;
 pub mod router;
 pub mod state;
 pub mod streaming;
+pub mod streaming_cache;
 pub mod webhook_dispatch;
 pub mod webhook_router;
 pub mod zarr_router;
