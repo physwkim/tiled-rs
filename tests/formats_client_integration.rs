@@ -70,6 +70,7 @@ async fn spawn_server(root_tree: Arc<dyn ContainerAdapter>) -> String {
             .map(String::from)
             .collect(),
         base_url: None,
+        root_path: String::new(),
         cors_policy: tiled_rs::server::state::CorsOriginPolicy::Permissive,
         trust_forwarded_headers: false,
         api_key: None,

@@ -52,6 +52,7 @@ async fn build_write_app() -> (axum::Router, tempfile::TempDir, tempfile::TempDi
             .map(String::from)
             .collect(),
         base_url: Some("http://localhost:8000".into()),
+        root_path: String::new(),
         cors_policy: tiled_rs::server::state::CorsOriginPolicy::Permissive,
         trust_forwarded_headers: false,
         api_key: None,

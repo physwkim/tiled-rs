@@ -62,6 +62,7 @@ async fn make_state(api_key: Option<String>, with_auth_db: bool) -> (AppState, t
             .map(String::from)
             .collect(),
         base_url: Some("http://localhost:8000".into()),
+        root_path: String::new(),
         cors_policy: tiled_rs::server::state::CorsOriginPolicy::Permissive,
         trust_forwarded_headers: false,
         api_key,

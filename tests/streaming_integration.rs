@@ -48,6 +48,7 @@ fn build_state(
             .map(String::from)
             .collect(),
         base_url: None,
+        root_path: String::new(),
         cors_policy: tiled_rs::server::state::CorsOriginPolicy::Permissive,
         trust_forwarded_headers: false,
         api_key: None,
@@ -1920,6 +1921,7 @@ async fn spawn_auth_stream_server(
             .map(String::from)
             .collect(),
         base_url: None,
+        root_path: String::new(),
         cors_policy: tiled_rs::server::state::CorsOriginPolicy::Permissive,
         trust_forwarded_headers: false,
         api_key: None,
@@ -2194,6 +2196,7 @@ async fn spawn_webhook_stream_server() -> (String, reqwest::Client, Catalog, i64
             .map(String::from)
             .collect(),
         base_url: None,
+        root_path: String::new(),
         cors_policy: tiled_rs::server::state::CorsOriginPolicy::Permissive,
         trust_forwarded_headers: false,
         api_key: None,

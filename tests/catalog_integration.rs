@@ -33,6 +33,7 @@ async fn build_test_app() -> (axum::Router, tempfile::TempDir) {
             .map(String::from)
             .collect(),
         base_url: Some("http://localhost:8000".into()),
+        root_path: String::new(),
         cors_policy: tiled_rs::server::state::CorsOriginPolicy::Permissive,
         trust_forwarded_headers: false,
         api_key: None,
@@ -2011,6 +2012,7 @@ async fn exact_count_limit_caps_meta_count() {
             .map(String::from)
             .collect(),
         base_url: Some("http://localhost:8000".into()),
+        root_path: String::new(),
         cors_policy: tiled_rs::server::state::CorsOriginPolicy::Permissive,
         trust_forwarded_headers: false,
         api_key: None,
@@ -2102,6 +2104,7 @@ async fn exact_count_limit_threads_into_search_page_entry_counts() {
             .map(String::from)
             .collect(),
         base_url: Some("http://localhost:8000".into()),
+        root_path: String::new(),
         cors_policy: tiled_rs::server::state::CorsOriginPolicy::Permissive,
         trust_forwarded_headers: false,
         api_key: None,

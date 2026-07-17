@@ -20,6 +20,21 @@ pub struct AppState {
     pub serialization_registry: Arc<SerializationRegistry>,
     pub query_names: Vec<String>,
     pub base_url: Option<String>,
+    /// Reverse-proxy mount prefix (upstream `uvicorn.root_path`,
+    /// `config.py:411`). When the server is fronted by a proxy under a
+    /// sub-path (e.g. clients see `https://host/instrument1/api/v1/...`), the
+    /// proxy strips the prefix before the request reaches us — so routes stay
+    /// mounted at `/api/v1/...` and only the *generated* absolute links must
+    /// carry the prefix so clients can follow them. This value is prepended to
+    /// the header-derived base URL for exactly that purpose (upstream's
+    /// `get_root_url_low_level`, `utils.py:82-85`). Held in canonical form —
+    /// a single leading `/`, no trailing `/`, or empty for the default
+    /// (non-proxied) case — via [`normalize_root_path`]. Empty string keeps
+    /// generated links byte-identical to a direct deployment. Applied only to
+    /// the derived branch of [`Self::resolve_base_url_with_peer`]: an explicit
+    /// `base_url` override is taken as the complete base and is never further
+    /// prefixed.
+    pub root_path: String,
     pub cors_policy: CorsOriginPolicy,
     pub trust_forwarded_headers: bool,
     /// Single-user API key. `None` = anonymous access allowed.
@@ -252,6 +267,24 @@ pub struct SpecViewEntry {
     pub label: Option<String>,
 }
 
+/// Normalize a reverse-proxy `root_path` (upstream `uvicorn.root_path`) into a
+/// canonical mount prefix: a single leading `/`, no trailing `/`, and empty for
+/// the default (non-proxied) case. Mirrors upstream's trailing-slash trim
+/// (`utils.py:83-84`) and additionally guarantees a leading slash, so an
+/// operator value like `instrument1` or `/instrument1/` both yield the
+/// well-formed prefix `/instrument1`. Empty / whitespace / `/` all collapse to
+/// the empty prefix, which leaves generated links identical to a direct
+/// deployment. Inner slashes are preserved so a multi-segment mount such as
+/// `/a/b/` normalizes to `/a/b`.
+pub fn normalize_root_path(raw: &str) -> String {
+    let trimmed = raw.trim().trim_matches('/');
+    if trimmed.is_empty() {
+        String::new()
+    } else {
+        format!("/{trimmed}")
+    }
+}
+
 impl AppState {
     /// No authentication backend is configured at all — neither a single-user
     /// `api_key` nor a multi-user `auth_db`. This is the single source of the
@@ -357,6 +390,12 @@ impl AppState {
         }
 
         let trust = self.trust_forwarded_headers && self.peer_is_trusted(peer_ip);
+        // `root_path` (already normalized: leading slash, no trailing slash, or
+        // empty) is the reverse-proxy mount prefix. Prepend it to the
+        // header-derived host so every generated link carries the sub-path the
+        // client actually reached us on (upstream `get_root_url_low_level`,
+        // utils.py:82-85). Empty => the format below is byte-identical to a
+        // direct deployment.
         let (host, scheme) = if trust {
             let h = headers
                 .get("x-forwarded-host")
@@ -376,7 +415,7 @@ impl AppState {
             (h, "http")
         };
 
-        format!("{scheme}://{host}")
+        format!("{scheme}://{host}{}", self.root_path)
     }
 
     pub fn peer_is_trusted(&self, peer_ip: Option<std::net::IpAddr>) -> bool {
@@ -389,5 +428,51 @@ impl AppState {
             // Allow-list configured but we don't know the peer → don't trust.
             (Some(_), None) => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_root_path;
+
+    // One case per invariant boundary of the normalized prefix, not per
+    // narrative scenario: the empty/collapse cases, the missing-leading-slash
+    // case, the trailing-slash case, both-ends, and a multi-segment mount whose
+    // inner slash must survive.
+    #[test]
+    fn empty_and_collapse_cases_yield_empty_prefix() {
+        assert_eq!(normalize_root_path(""), "");
+        assert_eq!(normalize_root_path("/"), "");
+        assert_eq!(normalize_root_path("//"), "");
+        assert_eq!(normalize_root_path("   "), "");
+        assert_eq!(normalize_root_path("  /  "), "");
+    }
+
+    #[test]
+    fn adds_missing_leading_slash() {
+        assert_eq!(normalize_root_path("instrument1"), "/instrument1");
+    }
+
+    #[test]
+    fn strips_trailing_slash() {
+        assert_eq!(normalize_root_path("/instrument1/"), "/instrument1");
+        assert_eq!(normalize_root_path("instrument1/"), "/instrument1");
+    }
+
+    #[test]
+    fn leading_slash_preserved_as_single() {
+        assert_eq!(normalize_root_path("/instrument1"), "/instrument1");
+        assert_eq!(normalize_root_path("//instrument1//"), "/instrument1");
+    }
+
+    #[test]
+    fn inner_slashes_of_multi_segment_mount_preserved() {
+        assert_eq!(normalize_root_path("/a/b/"), "/a/b");
+        assert_eq!(normalize_root_path("a/b"), "/a/b");
+    }
+
+    #[test]
+    fn surrounding_whitespace_trimmed() {
+        assert_eq!(normalize_root_path("  /instrument1/  "), "/instrument1");
     }
 }

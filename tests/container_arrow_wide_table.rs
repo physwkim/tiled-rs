@@ -112,6 +112,7 @@ fn app_for_root(root: Arc<dyn ContainerAdapter>) -> axum::Router {
             .map(String::from)
             .collect(),
         base_url: Some("http://localhost:8000".to_string()),
+        root_path: String::new(),
         cors_policy: tiled_rs::server::state::CorsOriginPolicy::Permissive,
         trust_forwarded_headers: false,
         api_key: None,

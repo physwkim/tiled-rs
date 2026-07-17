@@ -48,6 +48,7 @@ async fn spawn_catalog_server() -> (String, Catalog, tempfile::TempDir) {
             .map(String::from)
             .collect(),
         base_url: None,
+        root_path: String::new(),
         cors_policy: tiled_rs::server::state::CorsOriginPolicy::Permissive,
         trust_forwarded_headers: false,
         api_key: None,

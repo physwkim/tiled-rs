@@ -99,6 +99,14 @@ pub enum Command {
         #[arg(long)]
         public_url: Option<String>,
 
+        /// Reverse-proxy mount prefix. Set when the server is served behind a
+        /// proxy under a sub-path (e.g. `/instrument1`) so generated links carry
+        /// the prefix. Mirrors uvicorn's `--root-path` / config
+        /// `uvicorn.root_path`; takes precedence over the config value. Default:
+        /// empty (direct hosting).
+        #[arg(long)]
+        root_path: Option<String>,
+
         /// Allowed CORS origins (repeatable). Use '*' for permissive.
         /// Default: same-origin only.
         #[arg(long = "allow-origin")]
@@ -493,6 +501,7 @@ pub async fn run(command: Command) -> Result<()> {
             port,
             demo,
             public_url,
+            root_path,
             allow_origins,
             trust_proxy,
             api_key,
@@ -888,6 +897,19 @@ pub async fn run(command: Command) -> Result<()> {
                     .map(String::from)
                     .collect(),
                 base_url: public_url,
+                // Reverse-proxy mount prefix: CLI `--root-path` wins over the
+                // config `uvicorn.root_path` (upstream `config.py:411`).
+                // Normalized once here so AppState always holds the canonical
+                // leading-slash / no-trailing-slash form (empty = direct).
+                root_path: crate::server::state::normalize_root_path(
+                    &root_path
+                        .or_else(|| {
+                            file_config
+                                .as_ref()
+                                .and_then(|c| c.root_path().map(String::from))
+                        })
+                        .unwrap_or_default(),
+                ),
                 cors_policy,
                 trust_forwarded_headers,
                 api_key,

@@ -141,6 +141,7 @@ async fn search_respects_tag_based_access_policy() {
             .map(String::from)
             .collect(),
         base_url: Some("http://localhost:8000".into()),
+        root_path: String::new(),
         cors_policy: tiled_rs::server::state::CorsOriginPolicy::Permissive,
         trust_forwarded_headers: false,
         api_key: None,
@@ -268,6 +269,7 @@ async fn admin_search_sees_all_nodes() {
             .map(String::from)
             .collect(),
         base_url: Some("http://localhost:8000".into()),
+        root_path: String::new(),
         cors_policy: tiled_rs::server::state::CorsOriginPolicy::Permissive,
         trust_forwarded_headers: false,
         api_key: None,
@@ -399,6 +401,7 @@ async fn array_append_denied_by_tag_policy_returns_404() {
             .map(String::from)
             .collect(),
         base_url: Some("http://localhost:8000".into()),
+        root_path: String::new(),
         cors_policy: tiled_rs::server::state::CorsOriginPolicy::Permissive,
         trust_forwarded_headers: false,
         api_key: None,
@@ -501,6 +504,7 @@ async fn anonymous_search_shows_only_public_nodes() {
             .map(String::from)
             .collect(),
         base_url: Some("http://localhost:8000".into()),
+        root_path: String::new(),
         cors_policy: tiled_rs::server::state::CorsOriginPolicy::Permissive,
         trust_forwarded_headers: false,
         // No auth backend → middleware's "no_auth_configured" branch →
@@ -606,6 +610,7 @@ async fn public_tagged_node_is_listable_and_readable_by_anonymous() {
             .map(String::from)
             .collect(),
         base_url: Some("http://localhost:8000".into()),
+        root_path: String::new(),
         cors_policy: tiled_rs::server::state::CorsOriginPolicy::Permissive,
         trust_forwarded_headers: false,
         api_key: None,
@@ -721,6 +726,7 @@ async fn anonymous_search_excludes_user_owned_nodes() {
             .map(String::from)
             .collect(),
         base_url: Some("http://localhost:8000".into()),
+        root_path: String::new(),
         cors_policy: tiled_rs::server::state::CorsOriginPolicy::Permissive,
         trust_forwarded_headers: false,
         api_key: None,
@@ -833,6 +839,7 @@ async fn cross_user_search_excludes_other_users_owned_nodes() {
             .map(String::from)
             .collect(),
         base_url: Some("http://localhost:8000".into()),
+        root_path: String::new(),
         cors_policy: tiled_rs::server::state::CorsOriginPolicy::Permissive,
         trust_forwarded_headers: false,
         api_key: None,
@@ -952,6 +959,7 @@ async fn metadata_read_excludes_other_users_owned_node() {
             .map(String::from)
             .collect(),
         base_url: Some("http://localhost:8000".into()),
+        root_path: String::new(),
         cors_policy: tiled_rs::server::state::CorsOriginPolicy::Permissive,
         trust_forwarded_headers: false,
         api_key: None,
@@ -1119,6 +1127,7 @@ async fn zarr_access_app(with_policy: bool) -> (axum::Router, String, tempfile::
             .map(String::from)
             .collect(),
         base_url: Some("http://localhost:8000".into()),
+        root_path: String::new(),
         cors_policy: tiled_rs::server::state::CorsOriginPolicy::Permissive,
         trust_forwarded_headers: false,
         api_key: None,
