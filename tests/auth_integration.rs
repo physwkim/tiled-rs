@@ -1509,6 +1509,113 @@ async fn current_apikey_info_returns_key_metadata() {
     );
 }
 
+/// The singular, spec-advertised `/api/v1/auth/apikey` path (About `links.apikey`)
+/// must serve POST (create) and DELETE (revoke by `?first_eight=` query) as well
+/// as GET, mirroring upstream tiled (authentication.py:1553 POST, :1584 GET,
+/// :1621 DELETE). Before this fix a spec-conformant client (incl. python-tiled)
+/// got 405 on create+revoke because only GET was registered on the singular
+/// path. Regression guard for X1.
+#[tokio::test]
+async fn singular_apikey_path_serves_post_get_delete() {
+    let (app, _dir, _cat, _auth_db) = build_test_app().await;
+
+    let (_, body) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/auth/dummy/login",
+        &[],
+        Some(json!({"username": "alice", "password": "wonderland"})),
+    )
+    .await;
+    let bearer = format!("Bearer {}", body["access_token"].as_str().unwrap());
+
+    // POST to the SINGULAR path — create must succeed, not 405.
+    let (status, body) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/auth/apikey",
+        &[("authorization", &bearer)],
+        Some(json!({"note": "singular", "scopes": ["read:metadata"]})),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "POST /auth/apikey (singular) must create the key, got {status}: {body}"
+    );
+    let secret = body["secret"].as_str().unwrap().to_string();
+    let first_eight = body["first_eight"].as_str().unwrap().to_string();
+    let apikey_header = format!("Apikey {secret}");
+
+    // The created key authorizes a read.
+    let (status, _) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/metadata/",
+        &[("authorization", &apikey_header)],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // GET on the SINGULAR path returns key info (already worked, kept as a guard).
+    let (status, info) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/auth/apikey",
+        &[("authorization", &apikey_header)],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{info}");
+    assert_eq!(info["first_eight"], first_eight);
+
+    // DELETE on the SINGULAR path with ?first_eight= — revoke must succeed, not 405.
+    let (status, _) = json_request(
+        &app,
+        Method::DELETE,
+        &format!("/api/v1/auth/apikey?first_eight={first_eight}"),
+        &[("authorization", &bearer)],
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "DELETE /auth/apikey?first_eight= (singular) must revoke the key"
+    );
+
+    // Revoked key → 401.
+    let (status, _) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/metadata/",
+        &[("authorization", &apikey_header)],
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "revoked key must be rejected"
+    );
+
+    // Revoking a key the caller does not own (none such here) → 404, upstream shape.
+    let (status, _) = json_request(
+        &app,
+        Method::DELETE,
+        "/api/v1/auth/apikey?first_eight=deadbeef",
+        &[("authorization", &bearer)],
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "revoking a non-existent key on the singular path must 404"
+    );
+}
+
 /// `GET /api/v1/auth/principal` (list) requires `read:principals` scope (admin
 /// role only). A user-role caller → 403. An admin caller receives a paginated
 /// list of all principals (Python authentication.py:1247-1286 parity).

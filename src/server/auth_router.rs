@@ -512,6 +512,52 @@ pub async fn api_key_revoke(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Query parameters for the singular `DELETE /auth/apikey` route.
+#[derive(Debug, Deserialize)]
+pub struct ApiKeyRevokeParams {
+    pub first_eight: String,
+}
+
+/// `DELETE /api/v1/auth/apikey?first_eight=...`
+///
+/// Revoke an API key belonging to the currently-authenticated principal,
+/// identified by its `first_eight` prefix passed as a query parameter. This is
+/// the singular, spec-advertised revoke route that mirrors Python's
+/// `revoke_apikey` (`authentication.py:1621`): own-key only — no admin bypass
+/// (revoking another principal's key is the admin principal route's job) — so a
+/// key owned by someone else surfaces as 404, not 403. Only the first eight
+/// characters are matched (upstream's `first_eight[:8]`), so passing a full
+/// secret also works. Returns 204 on success.
+pub async fn current_apikey_revoke(
+    State(state): State<AppState>,
+    auth: AuthContext,
+    Query(params): Query<ApiKeyRevokeParams>,
+) -> Result<impl IntoResponse, ServerError> {
+    auth.require(crate::auth::Scope::RevokeApiKeys)?;
+    let (db, _) = require_auth_db(&state)?;
+    let principal = auth
+        .principal
+        .clone()
+        .ok_or_else(|| ServerError::Unauthorized("login required to revoke an api key".into()))?;
+    let first_eight = params
+        .first_eight
+        .get(..8)
+        .unwrap_or(&params.first_eight)
+        .to_string();
+    // Scope the DELETE to the caller's principal: a key owned by someone else
+    // simply isn't found, so we return upstream's 404 rather than leaking its
+    // existence.
+    db.revoke_api_key(&first_eight, Some(principal.id))
+        .await
+        .map_err(|e| match e {
+            crate::auth::AuthError::NotFound(_) => ServerError::NotFound(
+                "The currently-authenticated principal has no such API key.".into(),
+            ),
+            other => map_auth_err(other),
+        })?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 // ---------------------------------------------------------------------------
 // Session management
 // ---------------------------------------------------------------------------
