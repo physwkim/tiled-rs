@@ -95,6 +95,7 @@ async fn migrate_and_principal_lifecycle() {
             "0007_add_pending_sessions".to_string(),
             "0008_add_oidc_flow_states".to_string(),
             "0009_hash_device_code".to_string(),
+            "0010_access_tags_nullable".to_string(),
         ]
     );
 
