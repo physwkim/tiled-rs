@@ -747,15 +747,20 @@ async fn resolve_auth_inner(
     }
 
     // ---- 4. Anonymous fallback ----
-    // No auth backend configured at all: behaviour matches pre-multi-user
-    // tiled-rs — full access. Operators that want to lock the server down
-    // configure single-user `api_key` or wire the auth DB. `build_app` logs a
-    // loud startup warning for this mode (server-C1); the predicate lives on
-    // AppState so the warning and this grant can never diverge.
-    if state.no_auth_configured() {
+    // No credential was presented. Whether such a request is admitted — and
+    // with what scopes — is owned entirely by `AppState::anonymous_scopes`,
+    // the single reconciler of the two independent admission policies:
+    //   * `no_auth_configured()` — the dev/demo escape hatch, full scope
+    //     (byte-identical to pre-multi-user tiled-rs; `build_app` warns loudly);
+    //   * `allow_anonymous_access` — the operator opt-in, public read scopes.
+    // The principal stays `None` in either case, so the request still flows
+    // through the access policy's anonymous branch (public-vs-private nodes).
+    // `None` → no anonymous admission → 401, exactly as before the flag was
+    // honored.
+    if let Some(scopes) = state.anonymous_scopes() {
         return Ok(AuthContext {
             principal: None,
-            scopes: ScopeSet::full(),
+            scopes,
             kind: AuthKind::Anonymous,
             authn_access_tags: None,
         });

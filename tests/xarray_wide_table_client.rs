@@ -160,6 +160,7 @@ fn app_for_root(root: Arc<dyn ContainerAdapter>) -> axum::Router {
         request_timeout_secs: 30,
         expose_raw_assets: true,
         exact_count_limit: u64::MAX,
+        allow_anonymous_access: false,
         background_tasks: tiled_rs::server::state::BackgroundTasks::new(),
     };
     tiled_rs::server::build_app(state)

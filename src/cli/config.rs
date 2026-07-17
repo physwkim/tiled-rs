@@ -353,10 +353,12 @@ pub struct TiledAdmin {
 /// Authentication configuration.
 #[derive(Debug, Deserialize)]
 pub struct AuthConfig {
-    /// Accepted from Python tiled configs but not yet wired into the
-    /// Rust server's auth middleware (single-user API key is the only
-    /// auth path today).
-    #[allow(dead_code)]
+    /// Admit unauthenticated requests as the public principal with read-only
+    /// scopes (`read:metadata` + `read:data`). Mirrors Python
+    /// `Settings.allow_anonymous_access` (`settings.py:27`, default `false`).
+    /// Wired into `AppState::allow_anonymous_access` and honored by the auth
+    /// middleware / WebSocket handler via `AppState::anonymous_scopes`. Default
+    /// off → an unauthenticated request is rejected with 401.
     #[serde(default)]
     pub allow_anonymous_access: bool,
     pub single_user_api_key: Option<String>,
@@ -405,8 +407,7 @@ pub struct AuthConfig {
     #[serde(default)]
     pub providers: Vec<AuthProviderConfig>,
     /// Catch-all for authentication config keys the Rust port does not yet
-    /// model (e.g. `allow_anonymous_access`).
-    /// Warn-logged at startup.
+    /// model. Warn-logged at startup.
     #[serde(flatten)]
     pub unknown: BTreeMap<String, serde_yaml::Value>,
 }

@@ -137,6 +137,24 @@ impl ScopeSet {
         Self([Scope::ReadMetadata, Scope::ReadData].into_iter().collect())
     }
 
+    /// Scopes granted to an unauthenticated ("public") principal when the
+    /// operator has opted into anonymous access. Mirrors upstream
+    /// `PUBLIC_SCOPES` exactly (`tiled/access_control/scopes.py:31`):
+    /// `read:metadata` + `read:data` and **nothing else** — no write, create,
+    /// register, delete, metrics, webhook, credential- or
+    /// principal-management scope. Upstream returns this set (not the full set)
+    /// for a credential-less request when `allow_anonymous_access` is true
+    /// (`get_current_scopes`, `tiled/server/authentication.py:437`); the `else`
+    /// branch there returns the empty [`Self::new`] (`NO_SCOPES`) → 401.
+    ///
+    /// This is the same two-scope set as [`Self::read_only`]; it is named
+    /// separately because the admission site grants it for a distinct reason
+    /// (the public-principal policy, not a per-operation read gate), so the two
+    /// meanings can drift independently if upstream ever changes one.
+    pub fn public() -> Self {
+        Self::from_iter([Scope::ReadMetadata, Scope::ReadData])
+    }
+
     /// Scopes granted to the single-user API key. Mirrors upstream
     /// `SINGLE_USER_SCOPES` exactly (`tiled/access_control/scopes.py:32-46`):
     /// the node-I/O scopes plus `metrics` and the webhook scopes, but
@@ -404,6 +422,43 @@ mod tests {
         let mut grown = ScopeSet::read_only();
         grown.insert(Scope::Admin);
         assert_eq!(grown, ScopeSet::full());
+    }
+
+    /// `public()` must mirror upstream `PUBLIC_SCOPES`
+    /// (`tiled/access_control/scopes.py:31`) exactly: `read:metadata` +
+    /// `read:data` and NOTHING else. This is the anonymous/public-principal
+    /// grant; a write, create, register, delete, admin, metrics, webhook, or
+    /// credential/principal-management scope leaking in would be a
+    /// privilege-escalation for unauthenticated callers.
+    #[test]
+    fn public_matches_upstream_public_scopes() {
+        let s = ScopeSet::public();
+        assert!(s.contains(Scope::ReadMetadata));
+        assert!(s.contains(Scope::ReadData));
+        // Exactly the two upstream read scopes — nothing extra.
+        assert_eq!(s.iter().count(), 2);
+        for sc in [
+            Scope::WriteMetadata,
+            Scope::WriteData,
+            Scope::CreateNode,
+            Scope::Register,
+            Scope::DeleteNode,
+            Scope::DeleteRevision,
+            Scope::CreateApiKeys,
+            Scope::RevokeApiKeys,
+            Scope::AdminApiKeys,
+            Scope::ReadPrincipals,
+            Scope::WritePrincipals,
+            Scope::Metrics,
+            Scope::ReadWebhooks,
+            Scope::WriteWebhooks,
+            Scope::Admin,
+            Scope::Inherit,
+        ] {
+            assert!(!s.contains(sc), "public() must NOT grant {}", sc.as_str());
+        }
+        // Coincides with the read-gate set today, but is a distinct name.
+        assert_eq!(s, ScopeSet::read_only());
     }
 
     #[test]

@@ -24,6 +24,15 @@ pub struct AppState {
     pub trust_forwarded_headers: bool,
     /// Single-user API key. `None` = anonymous access allowed.
     pub api_key: Option<String>,
+    /// Operator opt-in: admit unauthenticated requests as the **public**
+    /// principal with only the public read scopes (`read:metadata` +
+    /// `read:data`). Mirrors Python `Settings.allow_anonymous_access`
+    /// (`settings.py:27`, default `false`). Distinct from
+    /// [`Self::no_auth_configured`]: that is the dev/demo escape hatch (no
+    /// backend at all → full scope); this is a deliberate operator choice on a
+    /// server that DOES have auth configured. See [`Self::anonymous_scopes`],
+    /// the single owner that reconciles the two.
+    pub allow_anonymous_access: bool,
     /// Optional persistent catalog. When present, write endpoints
     /// (`POST /register`, `PATCH /metadata`, `PUT /data_source`,
     /// `DELETE /metadata`) operate against it; without it those
@@ -253,6 +262,46 @@ impl AppState {
     /// hatch the operator is warned about at startup.
     pub fn no_auth_configured(&self) -> bool {
         self.api_key.is_none() && self.auth_db.is_none()
+    }
+
+    /// The scope grant for an unauthenticated request, or `None` when such a
+    /// request must be rejected (401). This is the **single owner** of the
+    /// anonymous-admission policy: every admission site — the HTTP auth
+    /// middleware, the WebSocket header/handshake paths, and the `about`
+    /// endpoint's `authentication.required` flag — consults this one predicate,
+    /// so "may an anonymous caller in, and with what scopes" has exactly one
+    /// answer that cannot drift between transports.
+    ///
+    /// Two DISTINCT admission policies feed it, each with a single meaning so
+    /// neither overloads the other:
+    ///
+    /// * [`Self::no_auth_configured`] — neither a single-user `api_key` nor an
+    ///   `auth_db`. A dev/demo escape hatch with no upstream parity: the
+    ///   anonymous caller gets the **full** scope set (read AND write).
+    ///   [`crate::server::build_app`] logs a loud startup warning for this mode.
+    /// * [`Self::allow_anonymous_access`] — an operator opt-in (default off) on
+    ///   a server that DOES have auth configured. An unauthenticated request
+    ///   proceeds as the public principal with only the **public** read scopes
+    ///   ([`crate::auth::ScopeSet::public`] = `read:metadata` + `read:data`).
+    ///   Mirrors upstream `get_current_scopes`: `PUBLIC_SCOPES if
+    ///   allow_anonymous_access else NO_SCOPES` (`authentication.py:437`).
+    ///
+    /// `no_auth_configured` is checked first, so the dev escape hatch keeps its
+    /// full-scope grant byte-for-byte. When neither applies, the result is
+    /// `None` → the caller rejects with 401, exactly as before this flag was
+    /// honored. The returned [`crate::auth::ScopeSet`] never contains a write,
+    /// create, delete, admin, or credential-management scope in the
+    /// `allow_anonymous_access` case, and the principal at every admission site
+    /// stays `None` so the access policy's anonymous branch still filters
+    /// public-vs-private nodes.
+    pub fn anonymous_scopes(&self) -> Option<crate::auth::ScopeSet> {
+        if self.no_auth_configured() {
+            Some(crate::auth::ScopeSet::full())
+        } else if self.allow_anonymous_access {
+            Some(crate::auth::ScopeSet::public())
+        } else {
+            None
+        }
     }
 
     /// Enforce single-user / multi-user **mode exclusivity**. A multi-user
