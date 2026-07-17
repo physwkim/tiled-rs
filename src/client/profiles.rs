@@ -349,6 +349,21 @@ pub fn set_default_profile_name(name: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// HTTP client timeouts, in seconds. Mirrors the `timeout` object in Python
+/// tiled's client-profiles schema (`tiled/config_schemas/client_profiles.yml`),
+/// which types `timeout` strictly as an object with `connection`, `read`,
+/// `write`, and `pool` number fields. The upstream schema declares `type:
+/// object`, so a bare scalar is rejected there and is not accepted here either.
+/// Every field is optional; upstream fills the gaps from `DEFAULT_TIMEOUT_PARAMS`
+/// (`tiled/client/constructors.py:241`).
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+pub struct ProfileTimeout {
+    pub connection: Option<f64>,
+    pub read: Option<f64>,
+    pub write: Option<f64>,
+    pub pool: Option<f64>,
+}
+
 /// One profile parsed into a struct.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct Profile {
@@ -356,7 +371,7 @@ pub struct Profile {
     pub api_key: Option<String>,
     pub structure_clients: Option<serde_yaml::Value>,
     pub headers: Option<HashMap<String, String>>,
-    pub timeout: Option<f64>,
+    pub timeout: Option<ProfileTimeout>,
     pub verify: Option<bool>,
     /// Inline server config (used by Python's `direct:` profiles).
     pub direct: Option<serde_yaml::Value>,
@@ -409,6 +424,48 @@ mod tests {
     fn paths_includes_user_config() {
         let ps = paths();
         assert!(!ps.is_empty(), "expected at least one search path");
+    }
+
+    // FINDING 2: an upstream-shaped profile types `timeout` as an object
+    // {connection, read, write, pool}. The prior `Option<f64>` field made such
+    // a profile fail to deserialize entirely; it must now parse.
+    #[test]
+    fn profile_timeout_upstream_object_deserializes() {
+        let yaml = r#"
+uri: http://localhost:8000
+timeout:
+  connection: 5.0
+  read: 30.0
+  write: 30.0
+  pool: 5.0
+"#;
+        let profile: Profile = serde_yaml::from_str(yaml).expect("upstream profile must parse");
+        let t = profile.timeout.expect("timeout object must be present");
+        assert_eq!(t.connection, Some(5.0));
+        assert_eq!(t.read, Some(30.0));
+        assert_eq!(t.write, Some(30.0));
+        assert_eq!(t.pool, Some(5.0));
+    }
+
+    // Boundary: every timeout field is optional. A partial object leaves the
+    // omitted knobs as None (upstream fills them from DEFAULT_TIMEOUT_PARAMS).
+    #[test]
+    fn profile_timeout_partial_object_leaves_missing_none() {
+        let yaml = "timeout:\n  read: 60.0\n";
+        let profile: Profile = serde_yaml::from_str(yaml).expect("partial timeout must parse");
+        let t = profile.timeout.expect("timeout object must be present");
+        assert_eq!(t.read, Some(60.0));
+        assert_eq!(t.connection, None);
+        assert_eq!(t.write, None);
+        assert_eq!(t.pool, None);
+    }
+
+    // Boundary: a profile with no `timeout` key parses with `timeout == None`.
+    #[test]
+    fn profile_without_timeout_is_none() {
+        let profile: Profile =
+            serde_yaml::from_str("uri: http://localhost:8000\n").expect("must parse");
+        assert!(profile.timeout.is_none());
     }
 
     // F4: the OS user-config dir must be the highest-precedence (last) entry,
