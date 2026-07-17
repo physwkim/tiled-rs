@@ -480,15 +480,27 @@ async fn send_seq(
     if event.metadata.get("end_of_stream").and_then(Value::as_bool) == Some(true) {
         return SendOutcome::EndOfStream;
     }
-    // Per-event authorization (D10). A `container-child-*` event is published on
-    // the parent but concerns the named child, so authorize that child;
+    // Per-event authorization (D10), applied to every event EXCEPT the subscribed
+    // node's own lifecycle announcement. A `container-child-*` event is published
+    // on the parent but concerns the named child, so authorize that child;
     // everything else concerns the subscribed node itself.
-    if !delivery_allowed(
-        state,
-        auth_ctx,
-        &event_target_segments(segments, &event.metadata),
-    )
-    .await
+    //
+    // A `node-deleted` event is the subscribed node announcing its OWN removal:
+    // by the time it fires the node's row is already gone, so the
+    // `delivery_allowed` re-lookup would 404 and silently drop it — leaving the
+    // subscriber unaware the node vanished. The subscriber authorized this node
+    // at subscribe-time and the event reveals nothing they do not already know,
+    // so it is exempt from the re-gate (exactly like `end_of_stream` above). The
+    // producer follows it with an `end_of_stream`, so the stream then closes.
+    let is_own_lifecycle =
+        event.metadata.get("type").and_then(Value::as_str) == Some("node-deleted");
+    if !is_own_lifecycle
+        && !delivery_allowed(
+            state,
+            auth_ctx,
+            &event_target_segments(segments, &event.metadata),
+        )
+        .await
     {
         return SendOutcome::Skipped;
     }
