@@ -3196,3 +3196,112 @@ async fn sparse_client_write_block_roundtrips() {
     got.sort_by_key(|a| a.0);
     assert_eq!(got, vec![((0, 1), 5.0), ((3, 0), 9.0)]);
 }
+
+// ---------------------------------------------------------------------------
+// Container navigation: nested-path get (Wave-27 batch-1, FINDING 1).
+// ---------------------------------------------------------------------------
+
+/// `root → a (container) → b (container) → c (array [1,2,3])`. A nested key
+/// `"a/b/c"` must walk three path segments, not collapse into one.
+fn build_nested_root() -> Arc<dyn ContainerAdapter> {
+    let c_arr = ArrayAdapter::from_f64_1d(&[1.0, 2.0, 3.0], serde_json::json!({}));
+    let mut b_map = IndexMap::new();
+    b_map.insert("c".to_string(), AnyAdapter::Array(Arc::new(c_arr)));
+    let b = MapAdapter::new(b_map, serde_json::json!({"depth": 2}), vec![]);
+
+    let mut a_map = IndexMap::new();
+    a_map.insert("b".to_string(), AnyAdapter::Container(Arc::new(b)));
+    let a = MapAdapter::new(a_map, serde_json::json!({"depth": 1}), vec![]);
+
+    let mut root = IndexMap::new();
+    root.insert("a".to_string(), AnyAdapter::Container(Arc::new(a)));
+    Arc::new(MapAdapter::new(root, serde_json::json!({}), vec![]))
+}
+
+fn decode_f64s(bytes: &[u8]) -> Vec<f64> {
+    bytes
+        .chunks_exact(8)
+        .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+        .collect()
+}
+
+/// `get("a/b/c")` resolves as a per-segment path walk (previously the slashes
+/// were percent-encoded into one `a%2Fb%2Fc` segment → 404).
+#[tokio::test]
+async fn nested_get_walks_multi_segment_path() {
+    use tiled_rs::core::ndslice::NDSlice;
+
+    let base = spawn_server_with_root(build_nested_root(), None).await;
+    let root = from_uri(&base).await.unwrap().into_container().unwrap();
+
+    // Slash-containing key resolves the leaf array.
+    let arr = root
+        .get("a/b/c")
+        .await
+        .expect("nested get resolves")
+        .into_array()
+        .expect("leaf is an array");
+    let block = arr.read_slice(&NDSlice::empty()).await.unwrap();
+    assert_eq!(block.shape, vec![3]);
+    assert_eq!(decode_f64s(&block.data), vec![1.0, 2.0, 3.0]);
+
+    // An intermediate segment resolves the container it names.
+    let mid = root
+        .get("a/b")
+        .await
+        .expect("intermediate get resolves")
+        .into_container()
+        .expect("a/b is a container");
+    assert_eq!(mid.keys().await.unwrap(), vec!["c".to_string()]);
+
+    // Step-wise walk is equivalent to the single-request nested walk.
+    let stepwise = root
+        .get("a")
+        .await
+        .unwrap()
+        .into_container()
+        .unwrap()
+        .get("b")
+        .await
+        .unwrap()
+        .into_container()
+        .unwrap()
+        .get("c")
+        .await
+        .unwrap()
+        .into_array()
+        .unwrap();
+    let sblock = stepwise.read_slice(&NDSlice::empty()).await.unwrap();
+    assert_eq!(decode_f64s(&sblock.data), vec![1.0, 2.0, 3.0]);
+}
+
+/// Leading/trailing slashes are trimmed (Python `.strip("/")`), and a missing
+/// nested segment surfaces as an error rather than resolving wrongly.
+#[tokio::test]
+async fn nested_get_trims_slashes_and_reports_missing() {
+    use tiled_rs::core::ndslice::NDSlice;
+
+    let base = spawn_server_with_root(build_nested_root(), None).await;
+    let root = from_uri(&base).await.unwrap().into_container().unwrap();
+
+    // `/a/b/c/` trims to the same three segments as `a/b/c`.
+    let arr = root
+        .get("/a/b/c/")
+        .await
+        .expect("trimmed nested get resolves")
+        .into_array()
+        .unwrap();
+    let block = arr.read_slice(&NDSlice::empty()).await.unwrap();
+    assert_eq!(decode_f64s(&block.data), vec![1.0, 2.0, 3.0]);
+
+    // A missing final segment is an error, not a silent resolve.
+    let err = root.get("a/b/nope").await.unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("not found") || msg.contains("404") || msg.contains("400"),
+        "unexpected error for missing nested key: {msg}"
+    );
+
+    // Single-segment behavior is unchanged: `get("a")` returns the container.
+    assert!(root.get("a").await.unwrap().as_container().is_some());
+}
