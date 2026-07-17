@@ -447,6 +447,106 @@ tags:
 }
 
 #[tokio::test]
+async fn user_role_with_blank_scopes_key_errors() {
+    // A present-but-null `scopes:` beside a real `role:` is "both keys present"
+    // and must be rejected, matching upstream's key-presence check
+    // (`all(k in user for k in ("scopes","role"))`). Before the double-option
+    // fix a blanked `scopes:` deserialized to None (indistinguishable from
+    // absent) and the role silently granted its full scope set.
+    let cfg = r#"
+roles:
+  r:
+    scopes: ["read:metadata"]
+tags:
+  t:
+    users:
+      - name: u
+        role: r
+        scopes:
+"#;
+    let mut c = make(cfg, None).await;
+    let err = c
+        .compile()
+        .await
+        .expect_err("role + blank scopes: must error as 'both'");
+    assert!(
+        err.to_string().contains("both 'scopes' and 'role'"),
+        "got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn user_blank_role_key_with_scopes_errors() {
+    // Symmetric to the above: a present-but-null `role:` beside a real
+    // `scopes:` is also "both keys present" and rejected. Upstream's
+    // `all(k in user ...)` is symmetric in the two keys.
+    let cfg = r#"
+tags:
+  t:
+    users:
+      - name: u
+        role:
+        scopes: ["read:metadata"]
+"#;
+    let mut c = make(cfg, None).await;
+    let err = c
+        .compile()
+        .await
+        .expect_err("blank role: + scopes must error as 'both'");
+    assert!(
+        err.to_string().contains("both 'scopes' and 'role'"),
+        "got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn user_role_only_still_grants_after_double_option() {
+    // Regression guard: with `scopes:` genuinely absent, a `role:`-only member
+    // still resolves through the role. The double-option fix must not disturb
+    // the (unchanged) absent-key grant path.
+    let cfg = r#"
+roles:
+  r:
+    scopes: ["read:metadata"]
+tags:
+  t:
+    users:
+      - name: u
+        role: r
+"#;
+    let mut c = make(cfg, None).await;
+    c.compile().await.expect("role-only member compiles");
+    assert!(tag_has_scope(c.pool(), "t", "u", "read:metadata").await);
+}
+
+#[tokio::test]
+async fn group_role_with_blank_scopes_key_errors() {
+    // The groups arm shares `resolve_member_scopes`, so the same present-null
+    // rejection holds. Validation runs before group expansion, so this errors
+    // even with no group parser configured.
+    let cfg = r#"
+roles:
+  r:
+    scopes: ["read:metadata"]
+tags:
+  t:
+    groups:
+      - name: grp
+        role: r
+        scopes:
+"#;
+    let mut c = make(cfg, None).await;
+    let err = c
+        .compile()
+        .await
+        .expect_err("group role + blank scopes: must error as 'both'");
+    assert!(
+        err.to_string().contains("both 'scopes' and 'role'"),
+        "got: {err}"
+    );
+}
+
+#[tokio::test]
 async fn user_neither_role_nor_scopes_errors() {
     let cfg = "tags:\n  t:\n    users:\n      - name: u\n";
     let mut c = make(cfg, None).await;

@@ -42,7 +42,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use thiserror::Error;
@@ -109,14 +109,36 @@ pub struct TagDef {
 }
 
 /// A user or group entry inside a tag's `users` / `groups` list. Exactly one
-/// of `role` / `scopes` must be set (enforced at compile time).
+/// of the `role` / `scopes` *keys* must be present (enforced at compile time).
+///
+/// `role` and `scopes` are `Option<Option<_>>` so that a *present-but-null* key
+/// (`role:` / `scopes:` with no value) is distinguishable from an *absent* one:
+/// absent → `None`, `key:` → `Some(None)`, `key: value` → `Some(Some(value))`.
+/// Upstream keys the both/neither validation on YAML key *presence*
+/// (`all(k in user for k in ("scopes", "role"))` under a presence-only load),
+/// so a blanked `scopes:` alongside a real `role:` must still count as "both
+/// keys present" and be rejected — see [`AccessTagsCompiler::resolve_member_scopes`].
 #[derive(Debug, Clone, Deserialize)]
 pub struct Member {
     pub name: String,
-    #[serde(default)]
-    pub role: Option<String>,
-    #[serde(default)]
-    pub scopes: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub role: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub scopes: Option<Option<Vec<String>>>,
+}
+
+/// Deserialize an optional field so that an absent key and a present-but-null
+/// key stay distinguishable. serde only calls `deserialize_with` when the key
+/// is present, and `#[serde(default)]` supplies `None` when it is absent; so a
+/// present key deserializes its (possibly null) inner value and wraps it in
+/// `Some`, yielding: absent → `None`, `key:` (null) → `Some(None)`,
+/// `key: value` → `Some(Some(value))`.
+fn double_option<'de, T, D>(de: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: Deserializer<'de>,
+{
+    Deserialize::deserialize(de).map(Some)
 }
 
 /// A nested-tag reference inside `auto_tags`.
@@ -556,6 +578,10 @@ impl AccessTagsCompiler {
         valid_scopes: &BTreeSet<String>,
         kind: &'static str,
     ) -> Result<BTreeSet<String>, AccessTagsError> {
+        // Key *presence* — not value non-nullness — drives the both/neither
+        // gate, matching upstream's `all(k in user for k in ("scopes","role"))`.
+        // A present-but-null `role:`/`scopes:` (`Some(None)`) counts as present,
+        // so e.g. a real `role:` beside a blanked `scopes:` is rejected as "both".
         let has_role = member.role.is_some();
         let has_scopes = member.scopes.is_some();
         if has_role && has_scopes {
@@ -570,14 +596,24 @@ impl AccessTagsCompiler {
                 name: member.name.clone(),
             });
         }
+        // Exactly one key present. Resolve it to a scope set; a present-but-null
+        // value (or a `role:` naming an unknown/undefined role) resolves to the
+        // empty set, which trips the "must not be empty" guard below — matching
+        // upstream, where such cases fall through to `user.get("scopes", [])`.
         let scopes: BTreeSet<String> = match &member.role {
-            Some(role) => match roles.get(role) {
-                Some(def) => def.scopes.clone().unwrap_or_default().into_iter().collect(),
-                None => BTreeSet::new(),
-            },
+            // `role:` key present — resolve via the named role.
+            Some(role) => role
+                .as_deref()
+                .and_then(|name| roles.get(name))
+                .and_then(|def| def.scopes.clone())
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
+            // `role:` key absent — the gate guarantees `scopes:` is present.
             None => member
                 .scopes
                 .clone()
+                .flatten()
                 .unwrap_or_default()
                 .into_iter()
                 .collect(),
