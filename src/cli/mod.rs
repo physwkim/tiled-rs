@@ -10,6 +10,31 @@ use crate::adapters::{ArrayAdapter, MapAdapter};
 use crate::core::adapters::{AnyAdapter, ContainerAdapter};
 use crate::core::queries::Query;
 use crate::server::state::CorsOriginPolicy;
+use crate::server::streaming_cache::{InMemoryStreamingCache, StreamingCache, disabled};
+
+/// Build the per-node data streaming cache from the optional `streaming:`
+/// config block. Absent (`None`) → the disabled no-op cache (the default).
+/// The `redis` backend is Wave-24 PR8; until then it warns and falls back to
+/// the disabled cache rather than failing startup.
+fn build_streaming_cache(cfg: Option<&config::StreamingConfig>) -> Arc<dyn StreamingCache> {
+    match cfg {
+        None => disabled(),
+        Some(c) => match c.backend {
+            config::StreamingBackend::Memory => Arc::new(InMemoryStreamingCache::new(
+                std::time::Duration::from_secs(c.seq_ttl),
+                std::time::Duration::from_secs(c.data_ttl),
+                c.maxsize,
+            )),
+            config::StreamingBackend::Redis => {
+                tracing::warn!(
+                    "streaming.backend: redis is not yet implemented (Wave-24 PR8); \
+                     streaming disabled"
+                );
+                disabled()
+            }
+        },
+    }
+}
 
 // The `Serve` variant carries the full server configuration (~20 CLI flags),
 // so it is far larger than the tiny subcommand variants. That asymmetry is
@@ -844,6 +869,9 @@ pub async fn run(command: Command) -> Result<()> {
                     .map(|c| c.response_bytesize_limit)
                     .unwrap_or_else(config::default_response_bytesize_limit),
                 streaming_bus: crate::server::streaming::StreamingBus::new(),
+                streaming_cache: build_streaming_cache(
+                    file_config.as_ref().and_then(|c| c.streaming.as_ref()),
+                ),
                 access_policy: access_policy_value,
                 default_login_scopes: crate::server::AppState::default_login_scopes(),
                 enable_web: !no_web,

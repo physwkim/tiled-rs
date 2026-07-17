@@ -67,6 +67,11 @@ pub struct TiledConfig {
     /// default 100).
     #[serde(default = "default_exact_count_limit")]
     pub exact_count_limit: u64,
+    /// Optional `streaming:` block selecting and configuring the per-node data
+    /// streaming cache (upstream `tiled.streaming`). Absent → streaming is
+    /// disabled (a no-op cache). See [`StreamingConfig`].
+    #[serde(default)]
+    pub streaming: Option<StreamingConfig>,
     /// Catch-all for config keys the Rust port does not yet model.
     /// Captured keys are warn-logged once at startup (see
     /// [`TiledConfig::warn_unknown_keys`]) so operators know their
@@ -98,6 +103,70 @@ pub fn default_exact_count_limit() -> u64 {
     100
 }
 
+/// `streaming:` block selecting the per-node data streaming cache backend.
+///
+/// Mirrors upstream tiled's streaming configuration (`tiled/streaming.py`): an
+/// in-process `memory` backend (a bounded TTL cache) or a shared `redis`
+/// backend for multi-process deployments. The Redis backend is Wave-24 PR8;
+/// selecting it before then parses but constructs the disabled cache.
+///
+/// ```yaml
+/// streaming:
+///   backend: memory        # memory | redis
+///   uri: redis://localhost  # required for redis
+///   seq_ttl: 3600           # seconds a node's sequence counter lives when idle
+///   data_ttl: 2592000       # seconds a cached event lives (30 days)
+///   maxsize: 1000           # cached events retained per node
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+pub struct StreamingConfig {
+    /// Which backend to use. Defaults to `memory`.
+    #[serde(default)]
+    pub backend: StreamingBackend,
+    /// Connection URI for the `redis` backend (ignored by `memory`).
+    #[serde(default)]
+    pub uri: Option<String>,
+    /// Seconds a node's sequence counter lives when idle (upstream `seq_ttl`).
+    #[serde(default = "default_stream_seq_ttl")]
+    pub seq_ttl: u64,
+    /// Seconds a cached event lives (upstream `data_ttl`, 30 days).
+    #[serde(default = "default_stream_data_ttl")]
+    pub data_ttl: u64,
+    /// Cached events retained per node before the oldest is evicted
+    /// (upstream `maxsize`).
+    #[serde(default = "default_stream_maxsize")]
+    pub maxsize: usize,
+}
+
+/// Streaming cache backend selector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StreamingBackend {
+    /// In-process bounded TTL cache (default).
+    #[default]
+    Memory,
+    /// Shared Redis backend (Wave-24 PR8; disabled until then).
+    Redis,
+}
+
+/// Default for [`StreamingConfig::seq_ttl`] — 3600 s, matching upstream
+/// (`tiled/streaming.py`).
+pub fn default_stream_seq_ttl() -> u64 {
+    3600
+}
+
+/// Default for [`StreamingConfig::data_ttl`] — 2 592 000 s (30 days), matching
+/// upstream (`tiled/streaming.py`).
+pub fn default_stream_data_ttl() -> u64 {
+    2_592_000
+}
+
+/// Default for [`StreamingConfig::maxsize`] — 1000 cached events per node,
+/// matching upstream (`tiled/streaming.py`).
+pub fn default_stream_maxsize() -> usize {
+    1000
+}
+
 // `Default` is hand-written (not derived) so `response_bytesize_limit` agrees
 // with its serde default (300 MB) instead of `usize::default()` (0), which
 // would otherwise make every response "exceed" the limit.
@@ -114,6 +183,7 @@ impl Default for TiledConfig {
             expose_raw_assets: default_expose_raw_assets(),
             allow_origins: Vec::new(),
             exact_count_limit: default_exact_count_limit(),
+            streaming: None,
             unknown: BTreeMap::new(),
         }
     }
