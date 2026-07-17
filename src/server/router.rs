@@ -68,7 +68,7 @@ pub(crate) async fn resolve_entry(
 
 /// Catalog-backed path: call `catalog.lookup` for each prefix of `segments`,
 /// narrow auth at each level (404 when the narrowed scopes lose ReadMetadata).
-async fn resolve_entry_catalog(
+pub(crate) async fn resolve_entry_catalog(
     state: &AppState,
     mut auth: crate::server::AuthContext,
     segments: &[String],

@@ -7,7 +7,12 @@
 //! * `GET    /api/v1/webhooks/history/{webhook_id}` — recent delivery history
 //!
 //! Write endpoints require `write:webhooks`. Read endpoints require
-//! `read:webhooks`. By default both scopes are admin-only.
+//! `read:webhooks`. By default both scopes are admin-only. In addition to that
+//! global scope check, every route resolves the target node through the
+//! per-node access-policy narrow via [`authorize_node`] — mirroring upstream's
+//! `get_entry(path, [scope], access_policy=…)` — so a webhooks-scope holder the
+//! wired `AccessPolicy` restricts from a node cannot manage or read that node's
+//! webhooks.
 
 use axum::Json;
 use axum::extract::{OriginalUri, Path, State};
@@ -68,6 +73,60 @@ fn parse_path_segments(uri: &axum::http::Uri, prefix: &str) -> Vec<String> {
     PathSegments::from_raw_path(uri.path(), prefix).0
 }
 
+/// The single per-node authorization gate every webhook route passes through —
+/// upstream's `get_entry(path, [scope], access_policy=…)`. Resolves `segments`
+/// through the per-node access-policy narrow (`resolve_entry_catalog`, which
+/// narrows at every ancestor and gates `read:metadata`) and requires `scope` on
+/// the fully-narrowed context. A node the caller's `AccessPolicy` forbids fails
+/// the narrow (404 when it strips `read:metadata`) or the final require (403
+/// when it strips only the webhook scope), so no webhook operation can reach an
+/// access-restricted node.
+///
+/// Callers apply the cheap global scope gate — `auth.require(scope)`, upstream's
+/// `Security(check_scopes, [scope])` — first, before resolving anything, so an
+/// authenticated caller lacking the scope is refused before any DB read (and
+/// cannot probe webhook/node existence). Returns the resolved leaf node so the
+/// caller can act on `node.id`.
+async fn authorize_node(
+    state: &AppState,
+    auth: AuthContext,
+    segments: &[String],
+    scope: crate::auth::Scope,
+) -> Result<crate::catalog::orm::Node, ServerError> {
+    let catalog = require_catalog(state)?;
+    let auth = crate::server::router::resolve_entry_catalog(state, auth, segments).await?;
+    auth.require(scope)?;
+    catalog
+        .lookup(segments)
+        .await
+        .map_err(map_err)?
+        .ok_or_else(|| ServerError::NotFound(format!("'{}' not found", segments.join("/"))))
+}
+
+/// Resolve the path segments (`ancestors + key`) of the node a webhook is
+/// attached to, given the webhook id — the entry point for the by-id routes
+/// (delete/history) into `authorize_node`. A missing webhook (or a webhook
+/// whose node is gone) is reported as a 404 on the webhook, matching upstream's
+/// "Webhook not found" before any node access check.
+async fn webhook_node_segments(
+    catalog: &crate::catalog::db::Catalog,
+    webhook_id: i64,
+) -> Result<Vec<String>, ServerError> {
+    let wh = catalog
+        .get_webhook(webhook_id)
+        .await
+        .map_err(map_err)?
+        .ok_or_else(|| ServerError::NotFound(format!("webhook {webhook_id} not found")))?;
+    let node = catalog
+        .get_node_by_id(wh.node_id)
+        .await
+        .map_err(map_err)?
+        .ok_or_else(|| ServerError::NotFound(format!("webhook {webhook_id} not found")))?;
+    let mut segments = node.ancestors;
+    segments.push(node.key);
+    Ok(segments)
+}
+
 pub async fn register(
     State(state): State<AppState>,
     OriginalUri(uri): OriginalUri,
@@ -76,14 +135,10 @@ pub async fn register(
 ) -> Result<impl IntoResponse, ServerError> {
     auth.require(crate::auth::Scope::WriteWebhooks)?;
     let cfg = state.webhook_config.as_ref().cloned().unwrap_or_default();
-    cfg.validate_url(&req.url)?;
     let segments = parse_path_segments(&uri, "/api/v1/webhooks/target/");
+    let node = authorize_node(&state, auth, &segments, crate::auth::Scope::WriteWebhooks).await?;
+    cfg.validate_url(&req.url)?;
     let catalog = require_catalog(&state)?;
-    let node = catalog
-        .lookup(&segments)
-        .await
-        .map_err(map_err)?
-        .ok_or_else(|| ServerError::NotFound(format!("'{}' not found", segments.join("/"))))?;
     let created = catalog
         .create_webhook(WebhookCreate {
             node_id: node.id,
@@ -103,12 +158,8 @@ pub async fn list(
 ) -> Result<impl IntoResponse, ServerError> {
     auth.require(crate::auth::Scope::ReadWebhooks)?;
     let segments = parse_path_segments(&uri, "/api/v1/webhooks/target/");
+    let node = authorize_node(&state, auth, &segments, crate::auth::Scope::ReadWebhooks).await?;
     let catalog = require_catalog(&state)?;
-    let node = catalog
-        .lookup(&segments)
-        .await
-        .map_err(map_err)?
-        .ok_or_else(|| ServerError::NotFound(format!("'{}' not found", segments.join("/"))))?;
     let webhooks = catalog
         .list_webhooks_for_node(node.id)
         .await
@@ -128,6 +179,9 @@ pub async fn delete(
 ) -> Result<impl IntoResponse, ServerError> {
     auth.require(crate::auth::Scope::WriteWebhooks)?;
     let catalog = require_catalog(&state)?;
+    let segments = webhook_node_segments(catalog, id).await?;
+    authorize_node(&state, auth, &segments, crate::auth::Scope::WriteWebhooks).await?;
+    let catalog = require_catalog(&state)?;
     let removed = catalog.delete_webhook(id).await.map_err(map_err)?;
     if !removed {
         return Err(ServerError::NotFound(format!("webhook {id} not found")));
@@ -142,9 +196,9 @@ pub async fn history(
 ) -> Result<impl IntoResponse, ServerError> {
     auth.require(crate::auth::Scope::ReadWebhooks)?;
     let catalog = require_catalog(&state)?;
-    if catalog.get_webhook(id).await.map_err(map_err)?.is_none() {
-        return Err(ServerError::NotFound(format!("webhook {id} not found")));
-    }
+    let segments = webhook_node_segments(catalog, id).await?;
+    authorize_node(&state, auth, &segments, crate::auth::Scope::ReadWebhooks).await?;
+    let catalog = require_catalog(&state)?;
     let deliveries = catalog
         .list_deliveries_for_webhook(id, 100)
         .await
