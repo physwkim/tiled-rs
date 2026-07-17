@@ -99,9 +99,15 @@ impl ContainerClient {
     /// Python server this is 5–10× fewer bytes; the Rust server ignores the
     /// hint and returns full items, from which the id is still read.
     pub async fn keys(&self) -> Result<Vec<String>> {
+        // The eager form of [`keys_view`]: drain the lazy id-only iterator to
+        // the end. Identical requests (page size 100, `fields=""`) and terminal
+        // condition, so results match the previous inline pager exactly.
+        //
+        // [`keys_view`]: Self::keys_view
+        let mut view = self.keys_view();
         let mut out = Vec::new();
-        for entry in self.list_entries_with_fields(None, Some("")).await? {
-            out.push(entry.id);
+        while let Some(id) = view.next().await? {
+            out.push(id);
         }
         Ok(out)
     }
@@ -262,19 +268,10 @@ impl ContainerClient {
         let mut all = Vec::new();
         let mut offset = 0usize;
         let page = limit.unwrap_or(100).min(100);
-        let extra: Vec<(String, String)> = match fields {
-            Some(f) => vec![("fields".to_string(), f.to_string())],
-            None => Vec::new(),
-        };
         loop {
-            let url = self.search_url_with(offset, page, &extra, false)?;
-            let resp: SearchResponse = retry(|| async {
-                let r = self.base.context.get(&url).await?;
-                decode_response::<SearchResponse>(r).await
-            })
-            .await?;
-            let count = resp.data.len();
-            all.extend(resp.data);
+            let (items, has_next) = self.fetch_page(offset, page, fields, false).await?;
+            let count = items.len();
+            all.extend(items);
             if let Some(want) = limit
                 && all.len() >= want
             {
@@ -283,17 +280,79 @@ impl ContainerClient {
             }
             // Stop when the server indicates there is no next page or we got
             // less than a full page back.
-            let has_next = resp
-                .links
-                .as_ref()
-                .and_then(|l| l.next.as_deref())
-                .is_some();
             if !has_next || count == 0 || count < page {
                 break;
             }
             offset += page;
         }
         Ok(all)
+    }
+
+    /// Fetch one page of children at `offset` (up to `limit` rows), projecting
+    /// `fields` and optionally requesting each row's `data_sources`. Returns the
+    /// page plus whether the server advertised a `next` link.
+    ///
+    /// The single page-fetch primitive behind both the eager
+    /// [`list_entries`](Self::list_entries) pager and the lazy
+    /// [`KeysView`]/[`ValuesView`]/[`ItemsView`] iterators, so all of them walk
+    /// the `search` endpoint identically — same active queries, sort, and
+    /// `next`-link terminal condition.
+    async fn fetch_page(
+        &self,
+        offset: usize,
+        limit: usize,
+        fields: Option<&str>,
+        include_data_sources: bool,
+    ) -> Result<(Vec<Item>, bool)> {
+        let extra: Vec<(String, String)> = match fields {
+            Some(f) => vec![("fields".to_string(), f.to_string())],
+            None => Vec::new(),
+        };
+        let url = self.search_url_with(offset, limit, &extra, include_data_sources)?;
+        let resp: SearchResponse = retry(|| async {
+            let r = self.base.context.get(&url).await?;
+            decode_response::<SearchResponse>(r).await
+        })
+        .await?;
+        let has_next = resp
+            .links
+            .as_ref()
+            .and_then(|l| l.next.as_deref())
+            .is_some();
+        Ok((resp.data, has_next))
+    }
+
+    /// A lazy, forward view over this container's child *names*, fetched page by
+    /// page. Mirrors Python `Container.keys()` → `KeysView` (container.py:549,
+    /// iterviews.py:39). Drive it with [`next`](KeysView::next), or grab a
+    /// bounded prefix with [`first`](KeysView::first) / [`head`](KeysView::head).
+    /// Only the pages you consume are fetched; requests `fields=""` for id-only
+    /// rows. The eager [`keys`](Self::keys) is this view collected to the end.
+    pub fn keys_view(&self) -> KeysView {
+        KeysView {
+            iter: PageIter::new(self.clone(), Some(""), false),
+        }
+    }
+
+    /// A lazy, forward view over this container's child *clients* (one
+    /// [`AnyClient`] per child), fetched page by page. Mirrors Python
+    /// `Container.values()` → `ValuesView` (container.py:552). Requests full
+    /// items — and each row's `data_sources` when this client was built with
+    /// `include_data_sources` — so every row parses into a family client.
+    pub fn values_view(&self) -> ValuesView {
+        ValuesView {
+            iter: PageIter::new(self.clone(), None, self.base.include_data_sources),
+        }
+    }
+
+    /// A lazy, forward view over this container's `(name, client)` pairs,
+    /// fetched page by page. Mirrors Python `Container.items()` → `ItemsView`
+    /// (container.py:555). Same full-item projection as
+    /// [`values_view`](Self::values_view).
+    pub fn items_view(&self) -> ItemsView {
+        ItemsView {
+            iter: PageIter::new(self.clone(), None, self.base.include_data_sources),
+        }
     }
 
     /// Apply a typed query filter, returning a new client that returns only
@@ -836,6 +895,182 @@ impl ContainerClient {
             .map_err(|e| ClientError::Invalid(format!("write {}: {e}", dest.display())))
     }
 }
+
+/// Lazy, forward, page-at-a-time iterator over a container's child [`Item`]s.
+/// Reuses the parent's `search` link, active queries, and sort so it walks the
+/// listing exactly as the eager [`ContainerClient::list_entries`] does. A new
+/// page is fetched from the server only when the buffered page is drained.
+/// Backing store for [`KeysView`], [`ValuesView`], and [`ItemsView`].
+#[derive(Debug, Clone)]
+struct PageIter {
+    container: ContainerClient,
+    fields: Option<String>,
+    include_data_sources: bool,
+    page_size: usize,
+    offset: usize,
+    buffer: std::collections::VecDeque<Item>,
+    exhausted: bool,
+}
+
+impl PageIter {
+    fn new(container: ContainerClient, fields: Option<&str>, include_data_sources: bool) -> Self {
+        Self {
+            container,
+            fields: fields.map(str::to_string),
+            include_data_sources,
+            page_size: 100,
+            offset: 0,
+            buffer: std::collections::VecDeque::new(),
+            exhausted: false,
+        }
+    }
+
+    /// Yield the next child item, fetching another page only when the buffer is
+    /// empty. Returns `Ok(None)` once the listing is exhausted. The terminal
+    /// condition matches the eager pager: stop on no `next` link, an empty page,
+    /// or a short page.
+    async fn next_item(&mut self) -> Result<Option<Item>> {
+        loop {
+            if let Some(item) = self.buffer.pop_front() {
+                return Ok(Some(item));
+            }
+            if self.exhausted {
+                return Ok(None);
+            }
+            let (items, has_next) = self
+                .container
+                .fetch_page(
+                    self.offset,
+                    self.page_size,
+                    self.fields.as_deref(),
+                    self.include_data_sources,
+                )
+                .await?;
+            let count = items.len();
+            self.offset += count;
+            self.buffer.extend(items);
+            if !has_next || count == 0 || count < self.page_size {
+                self.exhausted = true;
+            }
+        }
+    }
+
+    /// The parsing context for turning an [`Item`] into an [`AnyClient`].
+    fn context(&self) -> Context {
+        self.container.base.context.clone()
+    }
+}
+
+/// Generate the shared prefix conveniences (`first`, `head`, `page_size`) for a
+/// lazy view. Each view defines its own `next` — the mapping from [`Item`] to
+/// the yielded type differs — while these helpers are identical modulo that
+/// type.
+macro_rules! lazy_view_conveniences {
+    ($View:ty, $Item:ty) => {
+        impl $View {
+            /// The first element, or `None` if the container is empty. Fetches a
+            /// single-row page (Python `first()` → `self[0]`, iterviews.py:17).
+            pub async fn first(mut self) -> Result<Option<$Item>> {
+                self.iter.page_size = 1;
+                self.next().await
+            }
+
+            /// The first `n` elements (fewer if the container has fewer). `n ==
+            /// 0` yields an empty vec without a request. Mirrors Python
+            /// `head(n)` → `self[:n]` (iterviews.py:23).
+            pub async fn head(mut self, n: usize) -> Result<Vec<$Item>> {
+                if n == 0 {
+                    return Ok(Vec::new());
+                }
+                // Bound the first fetch to `n` (Python's `page[limit]=n`); a
+                // larger `n` still paginates at this size.
+                self.iter.page_size = self.iter.page_size.min(n);
+                let mut out = Vec::with_capacity(n);
+                while out.len() < n {
+                    match self.next().await? {
+                        Some(v) => out.push(v),
+                        None => break,
+                    }
+                }
+                Ok(out)
+            }
+
+            /// Set the server page size for subsequent fetches (default 100), to
+            /// tune request granularity. Mirrors Python `KeysView.page_size(n)`
+            /// (iterviews.py:52). `n` is clamped to at least 1.
+            pub fn page_size(mut self, n: usize) -> Self {
+                self.iter.page_size = n.max(1);
+                self
+            }
+        }
+    };
+}
+
+/// A lazy, forward view of a container's child names. See
+/// [`ContainerClient::keys_view`].
+#[derive(Debug, Clone)]
+pub struct KeysView {
+    iter: PageIter,
+}
+
+impl KeysView {
+    /// Advance to the next key, fetching another page from the server only when
+    /// the buffered page is exhausted. Returns `Ok(None)` at the end.
+    pub async fn next(&mut self) -> Result<Option<String>> {
+        Ok(self.iter.next_item().await?.map(|item| item.id))
+    }
+}
+lazy_view_conveniences!(KeysView, String);
+
+/// A lazy, forward view of a container's child clients. See
+/// [`ContainerClient::values_view`].
+#[derive(Debug, Clone)]
+pub struct ValuesView {
+    iter: PageIter,
+}
+
+impl ValuesView {
+    /// Advance to the next child client, fetching another page only when the
+    /// buffered page is exhausted. Returns `Ok(None)` at the end.
+    pub async fn next(&mut self) -> Result<Option<AnyClient>> {
+        match self.iter.next_item().await? {
+            Some(item) => {
+                let ctx = self.iter.context();
+                Ok(Some(AnyClient::from_item(
+                    ctx,
+                    item,
+                    self.iter.include_data_sources,
+                )?))
+            }
+            None => Ok(None),
+        }
+    }
+}
+lazy_view_conveniences!(ValuesView, AnyClient);
+
+/// A lazy, forward view of a container's `(name, client)` pairs. See
+/// [`ContainerClient::items_view`].
+#[derive(Debug, Clone)]
+pub struct ItemsView {
+    iter: PageIter,
+}
+
+impl ItemsView {
+    /// Advance to the next `(name, client)` pair, fetching another page only
+    /// when the buffered page is exhausted. Returns `Ok(None)` at the end.
+    pub async fn next(&mut self) -> Result<Option<(String, AnyClient)>> {
+        match self.iter.next_item().await? {
+            Some(item) => {
+                let ctx = self.iter.context();
+                let key = item.id.clone();
+                let client = AnyClient::from_item(ctx, item, self.iter.include_data_sources)?;
+                Ok(Some((key, client)))
+            }
+            None => Ok(None),
+        }
+    }
+}
+lazy_view_conveniences!(ItemsView, (String, AnyClient));
 
 #[derive(Debug, Deserialize)]
 struct SearchResponse {
