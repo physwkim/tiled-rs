@@ -67,7 +67,13 @@ pub struct CacheEntry {
     pub last_modified: Option<String>,
     /// `Vary` header tokens (lower-cased) the response advertised.
     pub vary: Vec<String>,
-    /// Wall-clock time the entry was stored, used by the LRU and persisted.
+    /// Wall-clock time of the most recent access — set when the entry is
+    /// stored, bumped on every *served* read ([`HttpCache::try_get`]), and
+    /// refreshed on revalidation. This is the LRU eviction key: the
+    /// least-recently-*accessed* entry is evicted first, matching upstream
+    /// `Cache.get`/`Cache.set` (`tiled/client/cache.py`), which bumps
+    /// `time_last_accessed` on read and orders eviction by it. Persisted in
+    /// the `stored_at` column.
     pub stored_at: DateTime<Utc>,
     /// Approximate size in bytes (body + headers).
     pub size_bytes: usize,
@@ -247,12 +253,11 @@ impl HttpCache {
     pub async fn try_get(&self, url: &Url, accept: &str) -> Result<Option<Response>> {
         self.ensure_loaded().await?;
         let key = cache_key(url, accept);
-        let backend = self.backend.lock().await;
+        let mut backend = self.backend.lock().await;
         let entry = match &*backend {
             Backend::InMemory(m) => m.get(&key).cloned(),
             Backend::Sqlite(b) => b.in_memory_index.get(&key).cloned(),
         };
-        drop(backend);
         let Some(entry) = entry else { return Ok(None) };
         if !entry.is_fresh() {
             return Ok(None);
@@ -269,6 +274,31 @@ impl HttpCache {
             if !safe {
                 return Ok(None);
             }
+        }
+        // Served hit: refresh the LRU recency key so eviction is truly
+        // least-recently-*accessed*, not FIFO-by-insertion. Upstream
+        // `Cache.get` bumps `time_last_accessed` on every hit
+        // (`tiled/client/cache.py`); mirror that here and persist it for the
+        // sqlite backend. We still hold the backend lock, so the in-memory
+        // bump and the on-disk UPDATE cannot race a concurrent write.
+        let now = Utc::now();
+        let pool_for_touch = match &mut *backend {
+            Backend::InMemory(m) => {
+                if let Some(e) = m.get_mut(&key) {
+                    e.stored_at = now;
+                }
+                None
+            }
+            Backend::Sqlite(b) => {
+                if let Some(e) = b.in_memory_index.get_mut(&key) {
+                    e.stored_at = now;
+                }
+                b.pool.clone()
+            }
+        };
+        drop(backend);
+        if let Some(pool) = pool_for_touch {
+            touch_entry(&pool, url.as_str(), accept, now).await?;
         }
         let mut builder = http::Response::builder().status(entry.status);
         for (k, v) in &entry.headers {
@@ -736,6 +766,20 @@ async fn upsert_entry(pool: &SqlitePool, entry: &CacheEntry) -> Result<()> {
     Ok(())
 }
 
+/// Persist a bumped LRU recency key for one entry (used by `try_get` on a
+/// served hit). Matches upstream `Cache.get`'s `UPDATE ... SET
+/// time_last_accessed` (`tiled/client/cache.py`).
+async fn touch_entry(pool: &SqlitePool, url: &str, accept: &str, at: DateTime<Utc>) -> Result<()> {
+    sqlx::query("UPDATE entries SET stored_at = ? WHERE url = ? AND accept = ?")
+        .bind(at.to_rfc3339())
+        .bind(url)
+        .bind(accept)
+        .execute(pool)
+        .await
+        .map_err(map_sqlx_err)?;
+    Ok(())
+}
+
 async fn delete_entry(pool: &SqlitePool, url: &str, accept: &str) -> Result<()> {
     sqlx::query("DELETE FROM entries WHERE url = ? AND accept = ?")
         .bind(url)
@@ -838,6 +882,17 @@ mod tests {
         }
     }
 
+    /// Build a `reqwest::Response` for driving `store_response` in tests.
+    fn make_response(status: u16, body: &[u8], headers: &[(&str, &str)]) -> Response {
+        let mut builder = http::Response::builder().status(status);
+        for (k, v) in headers {
+            builder = builder.header(*k, *v);
+        }
+        Response::from(builder.body(Bytes::copy_from_slice(body)).unwrap())
+    }
+
+    const FRESH: &[(&str, &str)] = &[("cache-control", "public, max-age=3600")];
+
     #[test]
     fn parse_cache_control_directives() {
         let cc = CacheControl::parse("public, max-age=3600, must-revalidate");
@@ -852,6 +907,97 @@ mod tests {
         let cc = CacheControl::parse("no-store, no-cache");
         assert!(cc.no_store);
         assert!(cc.no_cache);
+    }
+
+    #[tokio::test]
+    async fn read_refreshes_lru_recency_order() {
+        // Capacity holds two ~100 KB entries but not three, so storing a
+        // third forces exactly one eviction.
+        let cache = HttpCache::in_memory(250_000);
+        let accept = "application/json";
+        let body = vec![b'x'; 100_000];
+        let url_a = Url::parse("http://test/a").unwrap();
+        let url_b = Url::parse("http://test/b").unwrap();
+        let url_c = Url::parse("http://test/c").unwrap();
+
+        cache
+            .store_response(&url_a, accept, make_response(200, &body, FRESH))
+            .await
+            .unwrap();
+        cache
+            .store_response(&url_b, accept, make_response(200, &body, FRESH))
+            .await
+            .unwrap();
+
+        // Read A: this makes A the most-recently-accessed entry, so B is now
+        // the least-recently-accessed. Under FIFO-by-insertion (the bug) A
+        // would still count as older than B and be evicted next.
+        assert!(cache.try_get(&url_a, accept).await.unwrap().is_some());
+
+        // Store C: must evict exactly one entry — the LRU one, which is B.
+        cache
+            .store_response(&url_c, accept, make_response(200, &body, FRESH))
+            .await
+            .unwrap();
+
+        assert!(
+            cache.try_get(&url_a, accept).await.unwrap().is_some(),
+            "A was read after being stored, so it must survive eviction"
+        );
+        assert!(
+            cache.try_get(&url_c, accept).await.unwrap().is_some(),
+            "C was just stored, so it must survive eviction"
+        );
+        assert!(
+            cache.try_get(&url_b, accept).await.unwrap().is_none(),
+            "B is least-recently-accessed and must be the evicted entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_persists_bumped_recency_for_sqlite() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.sqlite");
+        let url = Url::parse("http://test/a").unwrap();
+        let accept = "application/json";
+
+        // Each phase drops its cache/pool before the next opens one, so we
+        // never hold two SQLite pools on the same file at once (avoids the
+        // known cold-start pool contention flake).
+        {
+            let cache = HttpCache::sqlite(&path, 1024 * 1024);
+            cache
+                .store_response(&url, accept, make_response(200, b"hello", FRESH))
+                .await
+                .unwrap();
+        }
+        let before = load_stored_at(&path, "http://test/a", accept).await;
+
+        {
+            let cache = HttpCache::sqlite(&path, 1024 * 1024);
+            assert!(cache.try_get(&url, accept).await.unwrap().is_some());
+        }
+        let after = load_stored_at(&path, "http://test/a", accept).await;
+
+        assert!(
+            after > before,
+            "a served read must persist a later stored_at (before={before:?}, after={after:?})"
+        );
+    }
+
+    async fn load_stored_at(path: &std::path::Path, url: &str, accept: &str) -> DateTime<Utc> {
+        use sqlx::Row;
+        let pool = open_pool(path).await.unwrap();
+        let row = sqlx::query("SELECT stored_at FROM entries WHERE url = ? AND accept = ?")
+            .bind(url)
+            .bind(accept)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let s: String = row.try_get("stored_at").unwrap();
+        DateTime::parse_from_rfc3339(&s)
+            .unwrap()
+            .with_timezone(&Utc)
     }
 
     #[tokio::test]
