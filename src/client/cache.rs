@@ -32,6 +32,7 @@
 //! - `Vary`: keys by listed request headers.
 //! - `ETag`/`Last-Modified` → `If-None-Match` / `If-Modified-Since` on
 //!   conditional requests.
+//! - Only responses with status in {200, 203, 300, 301, 308} are cached.
 //! - Response bodies larger than `max_item_size` (default 500 KB) are not
 //!   cached.
 
@@ -91,6 +92,12 @@ const MAX_FRESHNESS_SECS: u64 = 31_536_000;
 /// cached. Matches upstream `Cache(max_item_size=500_000)`
 /// (`tiled/client/cache.py`).
 const DEFAULT_MAX_ITEM_SIZE: usize = 500_000;
+
+/// Response statuses eligible for caching, matching upstream
+/// `CacheControl.cacheable_status_codes` (`tiled/client/cache_control.py`):
+/// 200 OK, 203 Non-Authoritative Information, 300 Multiple Choices,
+/// 301 Moved Permanently, 308 Permanent Redirect.
+const CACHEABLE_STATUSES: [u16; 5] = [200, 203, 300, 301, 308];
 
 impl CacheEntry {
     pub fn is_fresh(&self) -> bool {
@@ -385,9 +392,11 @@ impl HttpCache {
             .find(|(k, _)| k.eq_ignore_ascii_case("cache-control"))
             .map(|(_, v)| CacheControl::parse(v))
             .unwrap_or_default();
-        // 304 is handled by `revalidate_existing`; never write a 304 body
-        // (it has none) over the cached entry.
-        if cc.no_store || cc.private || status >= 400 || status == 304 {
+        // Cache only the statuses upstream deems cacheable (`CACHEABLE_STATUSES`),
+        // and never a `no-store`/`private` response. 304 has no body and is
+        // handled by `revalidate_existing`; it is not in the cacheable set, so
+        // it is declined here.
+        if cc.no_store || cc.private || !CACHEABLE_STATUSES.contains(&status) {
             let bytes = resp.bytes().await?;
             return Ok((rebuild_response(status, &headers, bytes.clone())?, bytes));
         }
@@ -1022,6 +1031,40 @@ mod tests {
             cache.try_get(&url_b, accept).await.unwrap().is_none(),
             "B is least-recently-accessed and must be the evicted entry"
         );
+    }
+
+    #[tokio::test]
+    async fn only_whitelisted_statuses_are_cached() {
+        let cache = HttpCache::in_memory(1024 * 1024);
+        let accept = "application/json";
+
+        // Every response carries a fresh max-age, so freshness never masks the
+        // whitelist decision.
+        for status in [200u16, 203, 300, 301, 308] {
+            let url = Url::parse(&format!("http://test/ok/{status}")).unwrap();
+            cache
+                .store_response(&url, accept, make_response(status, b"body", FRESH))
+                .await
+                .unwrap();
+            assert!(
+                cache.try_get(&url, accept).await.unwrap().is_some(),
+                "status {status} is in the cacheable set and must be cached"
+            );
+        }
+
+        // 201/202/302/307 are < 400 and were cached before this fix; they are
+        // not in the upstream whitelist and must now be declined.
+        for status in [201u16, 202, 302, 307, 400, 404, 500] {
+            let url = Url::parse(&format!("http://test/no/{status}")).unwrap();
+            cache
+                .store_response(&url, accept, make_response(status, b"body", FRESH))
+                .await
+                .unwrap();
+            assert!(
+                cache.try_get(&url, accept).await.unwrap().is_none(),
+                "status {status} is not in the cacheable set and must not be cached"
+            );
+        }
     }
 
     #[tokio::test]
