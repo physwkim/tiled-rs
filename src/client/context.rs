@@ -785,13 +785,6 @@ impl Context {
             ));
         }
 
-        let token_dir = if remember_me {
-            Some(crate::client::auth::token_directory_for_server(
-                &self.inner.api_uri,
-            ))
-        } else {
-            None
-        };
         let client_id = info
             .authentication
             .providers
@@ -801,7 +794,8 @@ impl Context {
             .and_then(|v| v.as_str())
             .map(String::from);
 
-        let auth = if let Some(dir) = token_dir {
+        let auth = if remember_me {
+            let dir = crate::client::auth::token_directory_for_server(&self.inner.api_uri);
             TiledAuth::new(
                 refresh_url,
                 self.inner.csrf_token.clone(),
@@ -810,6 +804,24 @@ impl Context {
             )
             .await?
         } else {
+            // remember_me = false: drop any tokens a previous remember_me
+            // session cached on disk for this server, so a later
+            // `use_cached_tokens()` cannot resurrect it, then keep the new
+            // tokens in memory only. Upstream clears `access_token` and
+            // `refresh_token` (deliberately not `id_token`) through a throwaway
+            // disk-backed TiledAuth (`context.py:1006-1013`).
+            //
+            // Upstream builds that TiledAuth unconditionally, which also
+            // *creates* the token directory; we touch disk only when the
+            // directory already exists — the sole way cached tokens can be
+            // present — so a memory-only login never leaves an empty token
+            // directory behind.
+            let dir = crate::client::auth::token_directory_for_server(&self.inner.api_uri);
+            if tokio::fs::try_exists(&dir).await.unwrap_or(false) {
+                let disk = crate::client::auth::TokenStore::new(Some(dir)).await?;
+                disk.clear("access_token").await?;
+                disk.clear("refresh_token").await?;
+            }
             TiledAuth::in_memory(refresh_url, self.inner.csrf_token.clone(), client_id)
         };
         auth.save_tokens(&tokens).await?;
