@@ -7128,9 +7128,11 @@ pub async fn delete_metadata(
         .map_err(map_catalog_err)?;
     let path = segments.join("/");
     // Publish `node-deleted` on the deleted node's own stream (tiled-rs
-    // extension, D9 — upstream's `delete()` emits no streaming event). A live
-    // subscriber on this node learns it is gone; the event is then followed by
-    // the stream closing when the node id is dropped.
+    // extension, D9 — upstream's `delete()` emits no streaming event), then close
+    // the stream. A live subscriber on this node receives the `node-deleted`
+    // event and is then disconnected by the following `end_of_stream` (WS close
+    // 1000, "Producer ended stream"), rather than hanging on a node that can
+    // never produce again.
     let seq = state.streaming_cache.incr_seq(node.id).await;
     state
         .streaming_cache
@@ -7140,6 +7142,9 @@ pub async fn delete_metadata(
             crate::server::streaming_cache::StreamEvent::node_deleted(seq),
         )
         .await;
+    // `close` does its own incr_seq + set(end_of_stream); ordering set(node-deleted)
+    // THEN close guarantees the deletion notice reaches the subscriber first.
+    state.streaming_cache.close(node.id).await;
     dispatch_webhook_event(
         &state,
         "node-deleted",

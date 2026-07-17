@@ -2126,3 +2126,99 @@ async fn close_stream_missing_path_is_not_found() {
         "closing a missing node must be 404"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Finding #1: a subscribed node's OWN lifecycle events (node-deleted, then
+// end_of_stream) always reach the subscriber and are followed by the stream
+// closing — regardless of whether an access policy is configured.
+//
+// Invariant: DELETE /metadata/{path} on a live-subscribed node delivers
+// `node-deleted` THEN closes the WS (1000, "Producer ended stream"). The
+// per-event `delivery_allowed` re-gate is exempt for the node's own lifecycle
+// announcement (its row is already gone, so a re-lookup would 404 and drop it),
+// and the delete handler follows the event with `close()` (an end_of_stream) so
+// the subscriber is disconnected rather than left hanging.
+// ---------------------------------------------------------------------------
+
+/// No access policy: deleting a subscribed node delivers `node-deleted` and then
+/// closes the WS with the producer end-of-stream close (1000).
+#[tokio::test]
+async fn delete_node_delivers_node_deleted_then_closes() {
+    let (base, _dir) = spawn_server().await;
+    let client = reqwest::Client::new();
+    register(&client, &base, "", "doomed").await;
+
+    let url = ws_url(&base, "doomed");
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    assert_eq!(
+        next_text_json(&mut ws).await.expect("schema")["type"],
+        "container-schema"
+    );
+    // Let `run_subscription` reach its live loop before the delete publishes.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let resp = client
+        .delete(format!("{base}/api/v1/metadata/doomed"))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "delete: {}", resp.status());
+
+    let ev = next_text_json(&mut ws).await.expect("node-deleted");
+    assert_eq!(ev["type"], "node-deleted", "event: {ev}");
+    let close = next_close_frame(&mut ws).await;
+    assert_eq!(
+        close,
+        Some((1000, "Producer ended stream".to_string())),
+        "the stream must close after node-deleted"
+    );
+}
+
+/// WITH an access policy configured: the same delete must STILL deliver
+/// `node-deleted` (this is the finding). Before the fix, the per-event
+/// `delivery_allowed` re-looked-up the now-deleted node, got a 404, and dropped
+/// the event — so the subscriber never learned of the deletion. The exemption
+/// for the node's own lifecycle events makes delivery uniform (policy or not),
+/// and the stream then closes.
+///
+/// Uses an authenticated `alice` (default `user` role carries
+/// delete:node/delete:revision) against a tag policy that grants untagged nodes
+/// in full: the seeded untagged `arr` is thus both subscribable and deletable,
+/// while the policy is live so `delivery_allowed` does NOT short-circuit.
+#[tokio::test]
+async fn delete_node_delivers_node_deleted_under_access_policy() {
+    let (base, _dir) =
+        spawn_auth_stream_server(ScopeSet::full(), Some(tag_policy(ScopeSet::full()).await)).await;
+    let client = reqwest::Client::new();
+    let token = login_token(&client, &base, "alice", "wonderland").await;
+
+    let mut ws = connect_ws_bearer(&base, "arr", &token).await;
+    assert_eq!(
+        next_text_json(&mut ws).await.expect("array-schema")["type"],
+        "array-schema"
+    );
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let resp = client
+        .delete(format!("{base}/api/v1/metadata/arr"))
+        .header("authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "delete under policy: {}",
+        resp.status()
+    );
+
+    let ev = next_text_json(&mut ws)
+        .await
+        .expect("node-deleted must reach the subscriber even with an access policy");
+    assert_eq!(ev["type"], "node-deleted", "event: {ev}");
+    let close = next_close_frame(&mut ws).await;
+    assert_eq!(
+        close,
+        Some((1000, "Producer ended stream".to_string())),
+        "the stream must close after node-deleted under a policy too"
+    );
+}
