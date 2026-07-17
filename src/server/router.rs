@@ -474,6 +474,17 @@ pub async fn metadata(
         .map(|v| matches!(v.as_str(), "true" | "True" | "1"))
         .unwrap_or(false);
     let select_metadata = params.get("select_metadata").map(String::as_str);
+    // ?root_path=true adds the reverse-proxy mount prefix to the response
+    // `meta`, mirroring Python router.py:463,508
+    // (`meta = {"root_path": request.scope.get("root_path") or "/"}`). Absent
+    // or false leaves `meta` unset (as before). Note the metadata endpoint's
+    // unset default is "/" — distinct from the `/api/v1/` about endpoint's
+    // "/api" (router.py:508 vs :301). `state.root_path` is the normalized mount
+    // prefix (leading slash, no trailing slash, empty when direct).
+    let want_root_path = params
+        .get("root_path")
+        .map(|v| matches!(v.as_str(), "true" | "True" | "1"))
+        .unwrap_or(false);
     // When a SQL catalog is wired, read directly through it: the
     // CatalogAdapter caches children eagerly to satisfy the sync trait,
     // and PATCH/DELETE write past that cache, so a same-request read after
@@ -508,11 +519,21 @@ pub async fn metadata(
         resource.links = crate::core::schemas::NodeLinks::default();
     }
 
+    let meta = want_root_path.then(|| {
+        serde_json::json!({
+            "root_path": if state.root_path.is_empty() {
+                "/"
+            } else {
+                state.root_path.as_str()
+            }
+        })
+    });
+
     Ok(Json(Response {
         data: Some(resource),
         error: None,
         links: None,
-        meta: None,
+        meta,
     }))
 }
 

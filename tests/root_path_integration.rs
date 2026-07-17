@@ -233,3 +233,64 @@ async fn explicit_base_url_override_is_not_further_prefixed() {
         "explicit base_url must not be prefixed with root_path"
     );
 }
+
+// --- Metadata endpoint `?root_path=true` param (upstream router.py:463,508).
+//     When requested, the response `meta.root_path` carries the mount prefix;
+//     unset root_path yields "/" (distinct from the About endpoint's "/api").
+//     Absent/false param leaves `meta` unset entirely.
+
+#[tokio::test]
+async fn metadata_root_path_param_reports_prefix_when_configured() {
+    let app = build_app("/instrument1", None);
+    let (status, item) = get(&app, "/api/v1/metadata/some_array?root_path=true").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        item["meta"]["root_path"].as_str().unwrap(),
+        "/instrument1",
+        "?root_path=true must report the configured mount prefix in meta"
+    );
+}
+
+#[tokio::test]
+async fn metadata_root_path_param_defaults_to_slash_when_unset() {
+    // No proxy configured: upstream router.py:508 is `... or "/"`, so the
+    // metadata endpoint's unset value is "/" — NOT the About endpoint's "/api".
+    let app = build_app("", None);
+    let (status, item) = get(&app, "/api/v1/metadata/some_array?root_path=true").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        item["meta"]["root_path"].as_str().unwrap(),
+        "/",
+        "with no root_path configured, ?root_path=true must report \"/\""
+    );
+}
+
+#[tokio::test]
+async fn metadata_absent_root_path_param_omits_meta() {
+    // Absent param → `meta` unset (serialized as absent, not `{}` or null),
+    // matching the prior behavior. Verified for both a configured prefix and
+    // the direct-deploy case so the param — not the deployment — gates `meta`.
+    for root in ["", "/instrument1"] {
+        let app = build_app(root, None);
+        let (status, item) = get(&app, "/api/v1/metadata/some_array").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            item.get("meta").is_none() || item["meta"].is_null(),
+            "no ?root_path param must leave meta absent (root={root:?}), got: {}",
+            item["meta"]
+        );
+    }
+}
+
+#[tokio::test]
+async fn metadata_root_path_false_omits_meta() {
+    // An explicit false value must behave like absence.
+    let app = build_app("/instrument1", None);
+    let (status, item) = get(&app, "/api/v1/metadata/some_array?root_path=false").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        item.get("meta").is_none() || item["meta"].is_null(),
+        "?root_path=false must leave meta absent, got: {}",
+        item["meta"]
+    );
+}
