@@ -68,9 +68,18 @@ async fn build_app_with_echo_policy(seed_access_blob: serde_json::Value) -> axum
     let cat_uri = format!("sqlite://{}", dir.path().join("catalog.db").display());
     let auth_uri = format!("sqlite://{}", dir.path().join("auth.db").display());
 
-    let catalog = Catalog::connect(&cat_uri).await.unwrap();
+    // Pool size 1 (not the default 8/16) is deliberate: under `cargo nextest`
+    // every test is its own process, and many cold-start their SQLite pools at
+    // once on a small CI runner. A fresh pool that opens a *new* WAL connection
+    // while the box is saturated intermittently gets SQLite error 14 ("unable to
+    // open database file"), which this write-path test surfaces as a spurious
+    // 500/401. With a single connection, migrate()/create_node() below warm it
+    // and every later request reuses it — no connection is opened mid-request,
+    // so the cold-start race cannot fire. The tests issue one request at a time,
+    // so a single connection never contends.
+    let catalog = Catalog::connect_with_pool_size(&cat_uri, 1).await.unwrap();
     catalog.migrate().await.unwrap();
-    let auth_db = AuthDb::connect(&auth_uri).await.unwrap();
+    let auth_db = AuthDb::connect_with_pool_size(&auth_uri, 1).await.unwrap();
     auth_db.migrate().await.unwrap();
     auth_db.ensure_principal("dummy", "alice").await.unwrap();
 

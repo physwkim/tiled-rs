@@ -36,6 +36,16 @@ impl AuthDb {
     }
 
     pub async fn connect(uri: &str) -> Result<Self> {
+        Self::connect_inner(uri, None).await
+    }
+
+    /// Like [`AuthDb::connect`] but sets `PoolOptions::max_connections` to
+    /// `max_connections`, mirroring [`crate::catalog::Catalog::connect_with_pool_size`].
+    pub async fn connect_with_pool_size(uri: &str, max_connections: u32) -> Result<Self> {
+        Self::connect_inner(uri, Some(max_connections)).await
+    }
+
+    async fn connect_inner(uri: &str, max_connections: Option<u32>) -> Result<Self> {
         // Gate SQL statement logging behind an explicit env-var opt-in so
         // session UUIDs and principal rows don't appear in production debug
         // logs by default.
@@ -53,7 +63,7 @@ impl AuthDb {
                 .busy_timeout(Duration::from_secs(5))
                 .log_statements(sql_log);
             let pool = SqlitePoolOptions::new()
-                .max_connections(8)
+                .max_connections(max_connections.unwrap_or(8))
                 .connect_with(opts)
                 .await?;
             AuthPool::Sqlite(pool)
@@ -62,7 +72,7 @@ impl AuthDb {
                 .map_err(AuthError::from)?
                 .log_statements(sql_log);
             let pool = PgPoolOptions::new()
-                .max_connections(16)
+                .max_connections(max_connections.unwrap_or(16))
                 .connect_with(opts)
                 .await?;
             AuthPool::Postgres(pool)
