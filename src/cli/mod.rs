@@ -869,6 +869,17 @@ pub async fn run(command: Command) -> Result<()> {
                     None => None,
                 };
 
+            // Build the SAML 2.0 SP-initiated providers from
+            // `authentication.providers` (SAML family). A parse or provider
+            // construction error fails startup rather than silently disabling
+            // SAML — same fail-fast as external OIDC above.
+            #[cfg(feature = "saml")]
+            let saml_providers_value =
+                match file_config.as_ref().and_then(|c| c.authentication.as_ref()) {
+                    Some(auth) => auth.build_saml_providers()?,
+                    None => Vec::new(),
+                };
+
             let state = crate::server::AppState {
                 root_tree,
                 serialization_registry: registry,
@@ -886,13 +897,11 @@ pub async fn run(command: Command) -> Result<()> {
                 authenticators: authenticators_built,
                 proxied_header_auth: proxied_auth,
                 external_oidc: external_oidc_value,
-                // SAML providers are not modeled in config yet (a `provider`
-                // entry naming SAMLAuthenticator is skipped with a warning, see
-                // config.rs), so none are wired here — matching the pre-merge
-                // behaviour where tiled-cli had no `saml` feature to populate
-                // this field at all.
+                // SAML providers built from `authentication.providers`
+                // (SAML family) by `build_saml_providers`. Feature-gated: the
+                // field only exists under the `saml` build.
                 #[cfg(feature = "saml")]
-                saml_providers: vec![],
+                saml_providers: saml_providers_value,
                 forwarded_allow_ips: None,
                 max_request_body_bytes: 10 * 1024 * 1024,
                 response_bytesize_limit: file_config

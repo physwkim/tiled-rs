@@ -496,6 +496,60 @@ pub struct OidcProviderArgs {
     pub extra_scopes: Vec<String>,
 }
 
+/// `args` for a SAML provider. Mirrors the constructor kwargs of Python's
+/// `SAMLAuthenticator` (`authenticators.py:550`): the python3-saml
+/// `saml_settings` dict plus the `attribute_name` whose first value becomes
+/// the tiled principal id. See `example_configs/saml.yml` upstream for a full
+/// example. Keys the Rust `samael` path does not use (`strict`, `debug`,
+/// `singleLogoutService`, endpoint `binding`, the SP `x509cert`) are ignored.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SamlProviderArgs {
+    /// SAML attribute whose first value is used as the principal identifier.
+    pub attribute_name: String,
+    /// python3-saml settings block (`idp` / `sp` sub-blocks).
+    pub saml_settings: SamlSettings,
+}
+
+/// The `saml_settings` block of [`SamlProviderArgs`] — the IdP and SP halves
+/// of a python3-saml configuration.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SamlSettings {
+    pub idp: SamlIdpSettings,
+    pub sp: SamlSpSettings,
+}
+
+/// IdP half of `saml_settings`. Field names match the python3-saml JSON keys.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SamlIdpSettings {
+    /// IdP `entityID`.
+    #[serde(rename = "entityId")]
+    pub entity_id: String,
+    /// IdP HTTP-Redirect SSO endpoint (`singleSignOnService.url`).
+    #[serde(rename = "singleSignOnService")]
+    pub single_sign_on_service: SamlEndpoint,
+    /// IdP signing certificate (base64 DER or PEM). Must be non-empty —
+    /// signature validation is mandatory (see [`crate::auth::SamlProvider`]).
+    pub x509cert: String,
+}
+
+/// SP half of `saml_settings`. Field names match the python3-saml JSON keys.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SamlSpSettings {
+    /// SP `entityID`.
+    #[serde(rename = "entityId")]
+    pub entity_id: String,
+    /// SP Assertion Consumer Service endpoint (`assertionConsumerService.url`).
+    #[serde(rename = "assertionConsumerService")]
+    pub assertion_consumer_service: SamlEndpoint,
+}
+
+/// A python3-saml service endpoint (`{ url, binding }`); only `url` is used —
+/// the binding is fixed by the Rust `samael` path.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SamlEndpoint {
+    pub url: String,
+}
+
 impl AuthConfig {
     /// Build the external-OIDC validator from `providers` entries in the OIDC
     /// family. Returns `None` when no such providers are configured.
@@ -543,6 +597,13 @@ impl AuthConfig {
                 out.extend(build_ldap_authenticator(entry)?);
             } else if is_pam_authenticator(&entry.authenticator) {
                 out.extend(build_pam_authenticator(entry)?);
+            } else if is_saml_authenticator(&entry.authenticator) {
+                // SAML providers are wired into `AppState.saml_providers` by
+                // `build_saml_providers` (under the `saml` feature), not into
+                // the internal-authenticator list. When the feature is off the
+                // provider cannot be served, so warn (mirrors LDAP/PAM's
+                // feature-off skip).
+                warn_saml_needs_feature(entry);
             } else {
                 tracing::warn!(
                     provider = %entry.provider,
@@ -550,6 +611,51 @@ impl AuthConfig {
                     "authentication.providers: authenticator is not modeled; skipping"
                 );
             }
+        }
+        Ok(out)
+    }
+
+    /// Build the SAML 2.0 SP-initiated providers declared in `providers` (the
+    /// SAML family). Each entry's `saml_settings` block is parsed into a
+    /// [`crate::auth::SamlConfig`] and used to construct a
+    /// [`crate::auth::SamlProvider`], which is served at
+    /// `/api/v1/auth/saml/{provider}/login` and `/acs`. OIDC/LDAP/PAM entries
+    /// are skipped (handled by their own builders). Mirrors Python's
+    /// `SAMLAuthenticator` construction from the config block
+    /// (`config.py:132`, `authenticators.py:550`).
+    ///
+    /// A parse error or a `SamlProvider::new` failure (e.g. an empty
+    /// `x509cert` — signature validation is mandatory) aborts startup rather
+    /// than silently disabling SAML, matching the OIDC builder's fail-fast.
+    #[cfg(feature = "saml")]
+    pub fn build_saml_providers(&self) -> anyhow::Result<Vec<Arc<crate::auth::SamlProvider>>> {
+        let mut out = Vec::new();
+        for entry in &self.providers {
+            if !is_saml_authenticator(&entry.authenticator) {
+                continue;
+            }
+            let args: SamlProviderArgs =
+                deserialize_provider_args(&entry.args).with_context(|| {
+                    format!("authentication.providers '{}': SAML args", entry.provider)
+                })?;
+            let config = crate::auth::SamlConfig {
+                idp_entity_id: args.saml_settings.idp.entity_id,
+                idp_sso_url: args.saml_settings.idp.single_sign_on_service.url,
+                idp_cert_pem: args.saml_settings.idp.x509cert,
+                sp_entity_id: args.saml_settings.sp.entity_id,
+                sp_acs_url: args.saml_settings.sp.assertion_consumer_service.url,
+                attribute_name: args.attribute_name,
+                max_issue_delay: None,
+                max_clock_skew: None,
+            };
+            let provider = crate::auth::SamlProvider::new(entry.provider.as_str(), config)
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "authentication.providers '{}': building SAML provider: {e}",
+                        entry.provider
+                    )
+                })?;
+            out.push(Arc::new(provider));
         }
         Ok(out)
     }
@@ -598,6 +704,31 @@ fn is_pam_authenticator(authenticator: &str) -> bool {
         .next()
         .unwrap_or(authenticator);
     class == "PAMAuthenticator" || authenticator == "pam"
+}
+
+/// True when `authenticator` names the SAML authenticator — a Python import
+/// path ending in `SAMLAuthenticator`, or the short selector `saml`.
+fn is_saml_authenticator(authenticator: &str) -> bool {
+    let class = authenticator
+        .rsplit([':', '.'])
+        .next()
+        .unwrap_or(authenticator);
+    class == "SAMLAuthenticator" || authenticator == "saml"
+}
+
+/// Warn that a configured SAML provider cannot be served because the `saml`
+/// feature is not compiled in. No-op when the feature is on: the provider is
+/// wired by [`AuthConfig::build_saml_providers`]. Mirrors the LDAP/PAM
+/// feature-off skip stubs below.
+#[cfg(feature = "saml")]
+fn warn_saml_needs_feature(_entry: &AuthProviderConfig) {}
+
+#[cfg(not(feature = "saml"))]
+fn warn_saml_needs_feature(entry: &AuthProviderConfig) {
+    tracing::warn!(
+        provider = %entry.provider,
+        "authentication.providers: SAML authenticator requires the 'saml' build feature; skipping"
+    );
 }
 
 /// Build an LDAP authenticator from a provider entry. Compiled only under the
@@ -1593,8 +1724,9 @@ authentication:
 
     #[tokio::test]
     async fn build_oidc_validator_skips_non_oidc_providers() {
-        // A SAML entry in the list is skipped (not yet modeled) without any
-        // network call, so no validator is built.
+        // A SAML entry in the list is not an OIDC provider, so
+        // `build_oidc_validator` skips it (SAML is wired separately by
+        // `build_saml_providers`) without any network call — no validator.
         let cfg: TiledConfig = serde_yaml::from_str(
             "trees: []\n\
              authentication:\n\
@@ -1610,6 +1742,151 @@ authentication:
             validator.is_none(),
             "a non-OIDC provider must be skipped, yielding no validator"
         );
+    }
+
+    #[test]
+    fn is_saml_authenticator_matches_saml_only() {
+        assert!(is_saml_authenticator(
+            "tiled.authenticators:SAMLAuthenticator"
+        ));
+        assert!(is_saml_authenticator("saml"));
+        // Other families are not SAML.
+        assert!(!is_saml_authenticator(
+            "tiled.authenticators:OIDCAuthenticator"
+        ));
+        assert!(!is_saml_authenticator("oidc"));
+        assert!(!is_saml_authenticator(
+            "tiled.authenticators:LDAPAuthenticator"
+        ));
+        assert!(!is_saml_authenticator("ldap"));
+        assert!(!is_saml_authenticator("pam"));
+    }
+
+    #[test]
+    fn saml_provider_args_parse_upstream_shape() {
+        // The upstream `saml_settings` block (example_configs/saml.yml) parses
+        // into SamlProviderArgs with the python3-saml JSON keys renamed to the
+        // Rust fields. Keys the samael path ignores (strict/debug/
+        // singleLogoutService/binding/sp x509cert) are accepted and dropped.
+        // This runs in the default (non-`saml`) build — it exercises the parse
+        // layer without constructing a SamlProvider.
+        let cfg: TiledConfig = serde_yaml::from_str(
+            "trees: []\n\
+             authentication:\n\
+             \x20 providers:\n\
+             \x20   - provider: saml\n\
+             \x20     authenticator: tiled.authenticators:SAMLAuthenticator\n\
+             \x20     args:\n\
+             \x20       attribute_name: email\n\
+             \x20       saml_settings:\n\
+             \x20         strict: false\n\
+             \x20         debug: false\n\
+             \x20         idp:\n\
+             \x20           entityId: https://idp.example/metadata\n\
+             \x20           singleSignOnService:\n\
+             \x20             url: https://idp.example/sso\n\
+             \x20             binding: urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect\n\
+             \x20           singleLogoutService:\n\
+             \x20             url: https://idp.example/slo\n\
+             \x20             binding: urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect\n\
+             \x20           x509cert: CERTBODY\n\
+             \x20         sp:\n\
+             \x20           entityId: https://sp.example/api\n\
+             \x20           assertionConsumerService:\n\
+             \x20             url: https://sp.example/api/auth/provider/saml/code\n\
+             \x20             binding: urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST\n\
+             \x20           x509cert: \"\"\n",
+        )
+        .unwrap();
+        let auth = cfg.authentication.unwrap();
+        let entry = &auth.providers[0];
+        assert!(is_saml_authenticator(&entry.authenticator));
+        let args: SamlProviderArgs = deserialize_provider_args(&entry.args).unwrap();
+        assert_eq!(args.attribute_name, "email");
+        assert_eq!(
+            args.saml_settings.idp.entity_id,
+            "https://idp.example/metadata"
+        );
+        assert_eq!(
+            args.saml_settings.idp.single_sign_on_service.url,
+            "https://idp.example/sso"
+        );
+        assert_eq!(args.saml_settings.idp.x509cert, "CERTBODY");
+        assert_eq!(args.saml_settings.sp.entity_id, "https://sp.example/api");
+        assert_eq!(
+            args.saml_settings.sp.assertion_consumer_service.url,
+            "https://sp.example/api/auth/provider/saml/code"
+        );
+    }
+
+    // A valid self-signed X.509 cert (base64 DER) from python3-saml's own
+    // example config (example_configs/saml.yml upstream) — enough for samael to
+    // build IdP metadata and an SP-initiated redirect.
+    #[cfg(feature = "saml")]
+    const SAML_EXAMPLE_CERT: &str = "MIIDXTCCAkWgAwIBAgIJALmVVuDWu4NYMA0GCSqGSIb3DQEBCwUAMEUxCzAJBgNVBAYTAkFVMRMwEQYDVQQIDApTb21lLVN0YXRlMSEwHwYDVQQKDBhJbnRlcm5ldCBXaWRnaXRzIFB0eSBMdGQwHhcNMTYxMjMxMTQzNDQ3WhcNNDgwNjI1MTQzNDQ3WjBFMQswCQYDVQQGEwJBVTETMBEGA1UECAwKU29tZS1TdGF0ZTEhMB8GA1UECgwYSW50ZXJuZXQgV2lkZ2l0cyBQdHkgTHRkMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAzUCFozgNb1h1M0jzNRSCjhOBnR+uVbVpaWfXYIR+AhWDdEe5ryY+CgavOg8bfLybyzFdehlYdDRgkedEB/GjG8aJw06l0qF4jDOAw0kEygWCu2mcH7XOxRt+YAH3TVHa/Hu1W3WjzkobqqqLQ8gkKWWM27fOgAZ6GieaJBN6VBSMMcPey3HWLBmc+TYJmv1dbaO2jHhKh8pfKw0W12VM8P1PIO8gv4Phu/uuJYieBWKixBEyy0lHjyixYFCR12xdh4CA47q958ZRGnnDUGFVE1QhgRacJCOZ9bd5t9mr8KLaVBYTCJo5ERE8jymab5dPqe5qKfJsCZiqWglbjUo9twIDAQABo1AwTjAdBgNVHQ4EFgQUxpuwcs/CYQOyui+r1G+3KxBNhxkwHwYDVR0jBBgwFoAUxpuwcs/CYQOyui+r1G+3KxBNhxkwDAYDVR0TBAUwAwEB/zANBgkqhkiG9w0BAQsFAAOCAQEAAiWUKs/2x/viNCKi3Y6blEuCtAGhzOOZ9EjrvJ8+COH3Rag3tVBWrcBZ3/uhhPq5gy9lqw4OkvEws99/5jFsX1FJ6MKBgqfuy7yh5s1YfM0ANHYczMmYpZeAcQf2CGAaVfwTTfSlzNLsF2lW/ly7yapFzlYSJLGoVE+OHEu8g5SlNACUEfkXw+5Eghh+KzlIN7R6Q7r2ixWNFBC/jWf7NKUfJyX8qIG5md1YUeT6GBW9Bm2/1/RiO24JTaYlfLdKK9TYb8sG5B+OLab2DImG99CJ25RkAcSobWNF5zD0O6lgOo3cEdB/ksCq3hmtlC/DlLZ/D8CJ+7VuZnS1rR2naQ==";
+
+    #[cfg(feature = "saml")]
+    #[test]
+    fn build_saml_providers_populates_from_config() {
+        // A full upstream-shaped SAML block builds one reachable SamlProvider
+        // mounted under its `provider` name — proving config alone populates
+        // AppState.saml_providers (previously hardcoded empty).
+        let yaml = format!(
+            "trees: []\n\
+             authentication:\n\
+             \x20 providers:\n\
+             \x20   - provider: corp-saml\n\
+             \x20     authenticator: tiled.authenticators:SAMLAuthenticator\n\
+             \x20     args:\n\
+             \x20       attribute_name: email\n\
+             \x20       saml_settings:\n\
+             \x20         idp:\n\
+             \x20           entityId: https://idp.example/metadata\n\
+             \x20           singleSignOnService:\n\
+             \x20             url: https://idp.example/sso\n\
+             \x20             binding: urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect\n\
+             \x20           x509cert: \"{cert}\"\n\
+             \x20         sp:\n\
+             \x20           entityId: https://sp.example/api\n\
+             \x20           assertionConsumerService:\n\
+             \x20             url: https://sp.example/api/auth/provider/saml/code\n\
+             \x20             binding: urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST\n",
+            cert = SAML_EXAMPLE_CERT,
+        );
+        let cfg: TiledConfig = serde_yaml::from_str(&yaml).unwrap();
+        let auth = cfg.authentication.unwrap();
+        let providers = auth.build_saml_providers().unwrap();
+        assert_eq!(providers.len(), 1, "one SAML provider must be built");
+        assert_eq!(providers[0].name, "corp-saml");
+
+        // Reachable: the provider builds an SP-initiated redirect to the
+        // configured IdP SSO endpoint.
+        let (url, _id) = providers[0].build_redirect_url().unwrap();
+        assert!(
+            url.starts_with("https://idp.example/sso"),
+            "redirect must target the configured IdP SSO URL: {url}"
+        );
+    }
+
+    #[cfg(feature = "saml")]
+    #[test]
+    fn build_saml_providers_empty_without_saml_entry() {
+        // A config whose only provider is OIDC (no SAML) yields no SAML
+        // providers — build_saml_providers does not misfire on non-SAML entries.
+        let cfg: TiledConfig = serde_yaml::from_str(
+            "trees: []\n\
+             authentication:\n\
+             \x20 providers:\n\
+             \x20   - provider: keycloak\n\
+             \x20     authenticator: oidc\n\
+             \x20     args:\n\
+             \x20       audience: tiled\n\
+             \x20       issuer: https://idp.test/\n\
+             \x20       jwks_uri: https://idp.test/keys\n",
+        )
+        .unwrap();
+        let auth = cfg.authentication.unwrap();
+        assert!(auth.build_saml_providers().unwrap().is_empty());
     }
 
     #[tokio::test]
