@@ -1221,7 +1221,14 @@ impl TiledConfig {
             // user no way to tell which config file was at fault.
             let content = std::fs::read_to_string(path)
                 .with_context(|| format!("reading config file {path}"))?;
-            serde_yaml::from_str(&content).with_context(|| format!("parsing config file {path}"))?
+            let mut value: serde_yaml::Value = serde_yaml::from_str(&content)
+                .with_context(|| format!("parsing config file {path}"))?;
+            // Expand $VAR / ${VAR} before typed deserialization — upstream
+            // `parse()` (utils.py) runs `expand_environment_variables` over
+            // every loaded config file, so a `${SECRET_KEY}` never reaches the
+            // server literally.
+            crate::env_expand::expand_env_vars(&mut value);
+            serde_yaml::from_value(value).with_context(|| format!("parsing config file {path}"))?
         };
         config.apply_env_overrides()?;
         config
@@ -1293,7 +1300,13 @@ impl TiledConfig {
             }
         }
 
-        serde_yaml::from_value(Value::Mapping(merged))
+        // Expand $VAR / ${VAR} on the merged tree before typed deserialization
+        // (upstream `parse()` runs `expand_environment_variables` per file;
+        // expanding the merged result is equivalent since expansion is
+        // per-string and merge only concatenates/inserts).
+        let mut merged = Value::Mapping(merged);
+        crate::env_expand::expand_env_vars(&mut merged);
+        serde_yaml::from_value(merged)
             .with_context(|| format!("merging config directory {}", dir.display()))
     }
 
@@ -1486,6 +1499,38 @@ impl TiledConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // w28-F3: `from_file` expands $VAR / ${VAR} in loaded config (upstream
+    // utils.expand_environment_variables). Uses the already-set PATH var so
+    // nothing is mutated — mutating process env would race the parallel test
+    // binary.
+    #[test]
+    fn from_file_expands_set_env_var() {
+        let path_val = std::env::var("PATH").expect("PATH is set in the test env");
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config.yml");
+        std::fs::write(&file, "allow_origins:\n  - \"${PATH}\"\n").unwrap();
+        let cfg = TiledConfig::from_file(file.to_str().unwrap()).unwrap();
+        assert_eq!(cfg.allow_origins().first().unwrap(), &path_val);
+    }
+
+    // An unset variable is left literal (matches Python os.path.expandvars),
+    // exercised end-to-end through `from_file`.
+    #[test]
+    fn from_file_leaves_unset_env_var_literal() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config.yml");
+        std::fs::write(
+            &file,
+            "allow_origins:\n  - \"${TILED_RS_DEFINITELY_UNSET_ENV_XYZ}\"\n",
+        )
+        .unwrap();
+        let cfg = TiledConfig::from_file(file.to_str().unwrap()).unwrap();
+        assert_eq!(
+            cfg.allow_origins().first().unwrap(),
+            "${TILED_RS_DEFINITELY_UNSET_ENV_XYZ}"
+        );
+    }
 
     #[test]
     fn uvicorn_root_path_parses_and_is_accessible() {

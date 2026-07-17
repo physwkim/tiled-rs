@@ -173,7 +173,7 @@ fn gather_profiles(
                     continue;
                 }
             };
-            let value: serde_yaml::Value = match serde_yaml::from_str(&body) {
+            let mut value: serde_yaml::Value = match serde_yaml::from_str(&body) {
                 Ok(v) => v,
                 Err(e) => {
                     if strict {
@@ -186,6 +186,10 @@ fn gather_profiles(
                     continue;
                 }
             };
+            // Expand $VAR / ${VAR} so a `${SECRET_KEY}` in a profile resolves
+            // before use — upstream `parse()` (utils.py) runs
+            // `expand_environment_variables` on every loaded profile file.
+            crate::env_expand::expand_env_vars(&mut value);
             if !value.is_mapping() {
                 if strict {
                     return Err(ClientError::Invalid(format!(
@@ -505,6 +509,37 @@ mod tests {
     fn paths_includes_user_config() {
         let ps = paths();
         assert!(!ps.is_empty(), "expected at least one search path");
+    }
+
+    // w28-F3: a loaded profile has $VAR / ${VAR} expanded (upstream
+    // utils.expand_environment_variables, run from `parse()` on every profile
+    // file). Uses the already-set PATH var so nothing is mutated — mutating
+    // process env would race the parallel test binary.
+    #[test]
+    fn gather_profiles_expands_set_env_var() {
+        let path_val = std::env::var("PATH").expect("PATH is set in the test env");
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("p.yml"),
+            "my_profile:\n  uri: \"${PATH}\"\n  api_key: \"$PATH\"\n",
+        )
+        .unwrap();
+
+        let levels = gather_profiles(&[dir.path().to_path_buf()], true).unwrap();
+        let value = levels
+            .iter()
+            .flat_map(|m| m.values())
+            .next()
+            .expect("one profile file parsed");
+        // Both the braced and bare forms in the profile expand.
+        assert_eq!(value["my_profile"]["uri"].as_str().unwrap(), path_val);
+        assert_eq!(value["my_profile"]["api_key"].as_str().unwrap(), path_val);
+
+        // And the expansion survives typed deserialization into a Profile.
+        let profile: Profile =
+            serde_yaml::from_value(value["my_profile"].clone()).expect("profile parse");
+        assert_eq!(profile.uri.as_deref(), Some(path_val.as_str()));
+        assert_eq!(profile.api_key.as_deref(), Some(path_val.as_str()));
     }
 
     // FINDING 1: an upstream-shaped profile must carry every expressible field
