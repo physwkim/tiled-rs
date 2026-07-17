@@ -16,19 +16,22 @@ use tiled_rs::access::{ScopeSet, TagBasedPolicy};
 use tiled_rs::catalog::node::RegisterRequest;
 use tiled_rs::catalog::{Catalog, adapter::UnresolvedLeaf};
 use tiled_rs::core::adapters::ContainerAdapter;
+use tiled_rs::core::dtype::{BuiltinDType, DType, Endianness, Kind};
 use tiled_rs::core::queries::Query;
+use tiled_rs::core::structures::ArrayStructure;
+use tiled_rs::server::file_resolver::FileLeafResolver;
 use tiled_rs::server::streaming_cache::{InMemoryStreamingCache, StreamEvent, StreamingCache};
 
-/// Build a test `AppState` backed by the given catalog, streaming cache, and
-/// optional access policy. No auth backend is configured, so the WS handshake
-/// grants the anonymous principal full scopes (the policy, when present, then
-/// narrows per node).
+/// Build a test `AppState` backed by the given catalog, streaming cache, leaf
+/// resolver, and optional access policy. No auth backend is configured, so the
+/// WS handshake grants the anonymous principal full scopes (the policy, when
+/// present, then narrows per node).
 fn build_state(
     catalog: Catalog,
     cache: Arc<dyn StreamingCache>,
     access_policy: Option<Arc<dyn tiled_rs::access::AccessPolicy>>,
+    resolver: Arc<dyn tiled_rs::catalog::adapter::LeafResolver>,
 ) -> tiled_rs::server::AppState {
-    let resolver: Arc<dyn tiled_rs::catalog::adapter::LeafResolver> = Arc::new(UnresolvedLeaf);
     let root_tree: Arc<dyn ContainerAdapter> = Arc::new(tiled_rs::catalog::CatalogAdapter::root(
         catalog.clone(),
         resolver,
@@ -97,7 +100,8 @@ async fn spawn_server() -> (String, tempfile::TempDir) {
     let uri = format!("sqlite://{}", dir.path().join("catalog.db").display());
     let catalog = Catalog::connect(&uri).await.unwrap();
     catalog.migrate().await.unwrap();
-    let state = build_state(catalog, test_cache(), None);
+    let resolver: Arc<dyn tiled_rs::catalog::adapter::LeafResolver> = Arc::new(UnresolvedLeaf);
+    let state = build_state(catalog, test_cache(), None, resolver);
     (serve(state).await, dir)
 }
 
@@ -326,7 +330,13 @@ async fn spawn_server_with_tag_policy()
     ));
 
     let cache = test_cache();
-    let state = build_state(catalog.clone(), cache.clone(), Some(access_policy));
+    let resolver: Arc<dyn tiled_rs::catalog::adapter::LeafResolver> = Arc::new(UnresolvedLeaf);
+    let state = build_state(
+        catalog.clone(),
+        cache.clone(),
+        Some(access_policy),
+        resolver,
+    );
     (serve(state).await, catalog, cache, dir)
 }
 
@@ -492,4 +502,368 @@ async fn ws_subscriber_does_not_receive_child_created_for_denied_child() {
         next_text_json(&mut ws).await.is_none(),
         "subscriber received child-created for a denied child"
     );
+}
+
+// ---------------------------------------------------------------------------
+// PR3: array-data payload events (Wave-24).
+//
+// A managed writable array node streams an `array-data` event on its OWN node
+// id at each write site (full / block / patch). The json envelope transcodes
+// the raw C-order payload into nested lists identical to the read path; the
+// msgpack envelope embeds the raw bytes as a msgpack **bin** (byte string).
+// These tests need BOTH internally-managed writable storage (to accept array
+// writes) and a live streaming cache, so they use a dedicated server harness.
+// ---------------------------------------------------------------------------
+
+/// Spawn a TCP server whose catalog has `writable_dir` as writable storage and
+/// whose leaf resolver reads/writes only under it, backed by an in-memory
+/// streaming cache. Returns the http base, a reqwest client, and both TempDirs
+/// (keep them alive for the test's duration — the SQLite pool and data files
+/// live inside them).
+async fn spawn_write_server() -> (
+    String,
+    reqwest::Client,
+    tempfile::TempDir,
+    tempfile::TempDir,
+) {
+    let db_dir = tempfile::tempdir().unwrap();
+    let writable_dir = tempfile::tempdir().unwrap();
+    // canonicalize: init_storage builds an absolute file:// URI and the resolver
+    // compares canonical paths.
+    let writable_root = writable_dir.path().canonicalize().unwrap();
+    let uri = format!("sqlite://{}", db_dir.path().join("catalog.db").display());
+    let catalog = Catalog::connect(&uri)
+        .await
+        .unwrap()
+        .with_managed_delete_dirs(vec![writable_root.clone()])
+        .with_writable_storage(vec![writable_root.clone()]);
+    catalog.migrate().await.unwrap();
+    let resolver: Arc<dyn tiled_rs::catalog::adapter::LeafResolver> =
+        Arc::new(FileLeafResolver::new(vec![writable_root]));
+    let state = build_state(catalog, test_cache(), None, resolver);
+    (
+        serve(state).await,
+        reqwest::Client::new(),
+        writable_dir,
+        db_dir,
+    )
+}
+
+/// A 1-D little-endian f64 array structure with the given shape and per-axis
+/// chunk sizes, serialized to the JSON the node-create endpoint expects.
+fn f64_array_structure(shape: usize, chunk_sizes: Vec<usize>) -> Value {
+    let st = ArrayStructure {
+        data_type: DType::Builtin(BuiltinDType::new(Endianness::Little, Kind::Float, 8)),
+        chunks: vec![chunk_sizes],
+        shape: vec![shape],
+        dims: None,
+        resizable: Default::default(),
+    };
+    serde_json::to_value(st).unwrap()
+}
+
+/// POST `/metadata` to create a managed (writable) f64 array node; the server
+/// generates the skeleton under writable storage. `mimetype` selects the
+/// backing store: `application/x-npy` (whole-array writes only) or
+/// `application/x-zarr` (chunked, so it accepts block writes and PATCH).
+async fn create_managed_array(
+    client: &reqwest::Client,
+    base: &str,
+    key: &str,
+    mimetype: &str,
+    structure: Value,
+) {
+    let resp = client
+        .post(format!("{base}/api/v1/metadata/"))
+        .json(&json!({
+            "key": key,
+            "structure_family": "array",
+            "metadata": {},
+            "specs": [],
+            "data_sources": [{
+                "structure_family": "array",
+                "structure": structure,
+                "id": null,
+                "mimetype": mimetype,
+                "parameters": {},
+                "properties": {},
+                "assets": [],
+                "management": "writable",
+            }],
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    assert!(status.is_success(), "create {key}: {status} {text}");
+}
+
+/// Little-endian byte buffer of an f64 slice (the dense array wire form).
+fn f64_bytes(values: &[f64]) -> Vec<u8> {
+    values.iter().flat_map(|v| v.to_le_bytes()).collect()
+}
+
+/// GET `/array/full/{path}` with `Accept: application/json` — the read-path
+/// nested-list serialization the json envelope transcode must match.
+async fn read_array_json(client: &reqwest::Client, base: &str, path: &str) -> Value {
+    client
+        .get(format!("{base}/api/v1/array/full/{path}"))
+        .header("accept", "application/json")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+/// A decoded msgpack `array-data` frame. `payload` is a `serde_bytes::ByteBuf`,
+/// so decoding SUCCEEDS only if the wire payload is a msgpack **bin** — an
+/// array-of-ints (the wrong encoding PR3 fixes) would fail this deserialize.
+#[derive(serde::Deserialize)]
+struct MsgpackArrayData {
+    #[serde(rename = "type")]
+    typ: String,
+    mimetype: String,
+    shape: Vec<usize>,
+    #[serde(default)]
+    offset: Option<Vec<usize>>,
+    #[serde(default)]
+    block: Option<Vec<usize>>,
+    payload: serde_bytes::ByteBuf,
+}
+
+/// Next msgpack binary frame decoded as an `array-data` envelope (payload as a
+/// msgpack bin). Panics on timeout/close/non-binary.
+async fn next_binary_array_data<S>(ws: &mut S) -> MsgpackArrayData
+where
+    S: futures::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+{
+    match tokio::time::timeout(Duration::from_millis(500), ws.next()).await {
+        Ok(Some(Ok(Message::Binary(b)))) => {
+            rmp_serde::from_slice(&b).expect("array-data msgpack (bin payload)")
+        }
+        Ok(Some(Ok(Message::Close(_)))) | Ok(None) | Err(_) => panic!("no array-data frame"),
+        Ok(Some(Ok(other))) => panic!("expected binary frame, got {other:?}"),
+        Ok(Some(Err(e))) => panic!("ws error: {e}"),
+    }
+}
+
+/// A full-array write streams an `array-data` event on the array's own stream
+/// (json envelope): mimetype octet-stream, the whole shape, no offset/block,
+/// and a `payload` of nested lists identical to the read-path serialization.
+#[tokio::test]
+async fn array_full_write_streams_array_data_json() {
+    let (base, client, _wdir, _dbdir) = spawn_write_server().await;
+    create_managed_array(
+        &client,
+        &base,
+        "arr",
+        "application/x-npy",
+        f64_array_structure(4, vec![4]),
+    )
+    .await;
+
+    let url = ws_url(&base, "arr");
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    let schema = next_text_json(&mut ws).await.expect("schema");
+    assert_eq!(schema["type"], "array-schema");
+
+    // Let `run_subscription` reach its live loop before the write publishes.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let values = [1.5f64, 2.5, 3.5, 4.5];
+    let resp = client
+        .put(format!("{base}/api/v1/array/full/arr"))
+        .body(f64_bytes(&values))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "write: {}", resp.status());
+
+    let ev = next_text_json(&mut ws).await.expect("array-data");
+    assert_eq!(ev["type"], "array-data");
+    assert_eq!(ev["mimetype"], "application/octet-stream");
+    assert_eq!(ev["shape"], json!([4]));
+    assert_eq!(ev["offset"], Value::Null);
+    assert_eq!(ev["block"], Value::Null);
+    assert_eq!(ev["content-type"], "application/json");
+    // The transcoded payload is nested lists byte-identical to the read path.
+    let read_json = read_array_json(&client, &base, "arr").await;
+    assert_eq!(ev["payload"], read_json);
+    assert_eq!(ev["payload"], json!([1.5, 2.5, 3.5, 4.5]));
+}
+
+/// The msgpack envelope embeds the same write as a msgpack **bin** payload equal
+/// to the raw C-order bytes written (proves the bin encoding, not array-of-ints).
+#[tokio::test]
+async fn array_full_write_streams_array_data_msgpack_bin() {
+    let (base, client, _wdir, _dbdir) = spawn_write_server().await;
+    create_managed_array(
+        &client,
+        &base,
+        "arr",
+        "application/x-npy",
+        f64_array_structure(4, vec![4]),
+    )
+    .await;
+
+    let url = format!("{}?envelope_format=msgpack", ws_url(&base, "arr"));
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    let schema = next_binary_msgpack(&mut ws).await.expect("schema");
+    assert_eq!(schema["type"], "array-schema");
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let values = [1.5f64, 2.5, 3.5, 4.5];
+    let raw = f64_bytes(&values);
+    let resp = client
+        .put(format!("{base}/api/v1/array/full/arr"))
+        .body(raw.clone())
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "write: {}", resp.status());
+
+    let ev = next_binary_array_data(&mut ws).await;
+    assert_eq!(ev.typ, "array-data");
+    assert_eq!(ev.mimetype, "application/octet-stream");
+    assert_eq!(ev.shape, vec![4]);
+    assert_eq!(ev.offset, None);
+    assert_eq!(ev.block, None);
+    // Payload is a msgpack bin equal to the raw little-endian buffer written.
+    assert_eq!(ev.payload.into_vec(), raw);
+}
+
+/// A single-chunk block write streams `array-data` with the chunk coordinate in
+/// `block`, the chunk's dense shape, and the chunk's transcoded nested lists.
+#[tokio::test]
+async fn array_block_write_streams_array_data_with_block() {
+    let (base, client, _wdir, _dbdir) = spawn_write_server().await;
+    // shape [4] in two chunks of 2 — block index 1 targets the second chunk.
+    // Zarr backs chunked block writes (npy is single-chunk-per-axis).
+    create_managed_array(
+        &client,
+        &base,
+        "arr",
+        "application/x-zarr",
+        f64_array_structure(4, vec![2, 2]),
+    )
+    .await;
+
+    let url = ws_url(&base, "arr");
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    assert_eq!(
+        next_text_json(&mut ws).await.expect("schema")["type"],
+        "array-schema"
+    );
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let resp = client
+        .put(format!("{base}/api/v1/array/block/arr?block=1"))
+        .body(f64_bytes(&[5.5, 6.5]))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "block write: {}", resp.status());
+
+    let ev = next_text_json(&mut ws).await.expect("array-data");
+    assert_eq!(ev["type"], "array-data");
+    assert_eq!(ev["mimetype"], "application/octet-stream");
+    assert_eq!(ev["shape"], json!([2]));
+    assert_eq!(ev["block"], json!([1]));
+    assert_eq!(ev["offset"], Value::Null);
+    assert_eq!(ev["payload"], json!([5.5, 6.5]));
+}
+
+/// A PATCH streams `array-data` carrying the incoming block's `offset`/`shape`
+/// and its transcoded nested-list payload.
+#[tokio::test]
+async fn array_patch_streams_array_data_with_offset() {
+    let (base, client, _wdir, _dbdir) = spawn_write_server().await;
+    // Zarr backs PATCH (npy has no patch face).
+    create_managed_array(
+        &client,
+        &base,
+        "arr",
+        "application/x-zarr",
+        f64_array_structure(4, vec![4]),
+    )
+    .await;
+
+    let url = ws_url(&base, "arr");
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    assert_eq!(
+        next_text_json(&mut ws).await.expect("schema")["type"],
+        "array-schema"
+    );
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    // Place a 2-element block at offset 1 within the length-4 array.
+    let resp = client
+        .patch(format!("{base}/api/v1/array/full/arr?shape=2&offset=1"))
+        .body(f64_bytes(&[7.5, 8.5]))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "patch: {}", resp.status());
+
+    let ev = next_text_json(&mut ws).await.expect("array-data");
+    assert_eq!(ev["type"], "array-data");
+    assert_eq!(ev["mimetype"], "application/octet-stream");
+    assert_eq!(ev["shape"], json!([2]));
+    assert_eq!(ev["offset"], json!([1]));
+    assert_eq!(ev["block"], Value::Null);
+    assert_eq!(ev["payload"], json!([7.5, 8.5]));
+}
+
+/// A PATCH with `persist=false` (stream-only) still streams `array-data`:
+/// upstream `patch` calls `_stream` BEFORE the `if not persist: return`
+/// (catalog/adapter.py:1702-1706), so subscribers see the block regardless.
+#[tokio::test]
+async fn array_patch_persist_false_still_streams() {
+    let (base, client, _wdir, _dbdir) = spawn_write_server().await;
+    // Zarr can actually persist a PATCH, so a zeros read-back below proves the
+    // `persist=false` path streamed but genuinely skipped the write.
+    create_managed_array(
+        &client,
+        &base,
+        "arr",
+        "application/x-zarr",
+        f64_array_structure(4, vec![4]),
+    )
+    .await;
+
+    let url = ws_url(&base, "arr");
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    assert_eq!(
+        next_text_json(&mut ws).await.expect("schema")["type"],
+        "array-schema"
+    );
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let resp = client
+        .patch(format!(
+            "{base}/api/v1/array/full/arr?shape=2&offset=1&persist=false"
+        ))
+        .body(f64_bytes(&[9.5, 10.5]))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "stream-only patch: {}",
+        resp.status()
+    );
+
+    let ev = next_text_json(&mut ws)
+        .await
+        .expect("array-data (persist=false)");
+    assert_eq!(ev["type"], "array-data");
+    assert_eq!(ev["shape"], json!([2]));
+    assert_eq!(ev["offset"], json!([1]));
+    assert_eq!(ev["payload"], json!([9.5, 10.5]));
+
+    // persist=false must NOT have written the data: a read-back stays zeros.
+    let read_json = read_array_json(&client, &base, "arr").await;
+    assert_eq!(read_json, json!([0.0, 0.0, 0.0, 0.0]));
 }
