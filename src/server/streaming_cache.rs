@@ -280,6 +280,14 @@ pub trait StreamingCache: Send + Sync {
     /// Close the node's stream by appending an [`StreamEvent::end_of_stream`]
     /// event at a fresh sequence and notifying subscribers.
     async fn close(&self, node_id: i64);
+
+    /// Number of live subscriber channels currently open across all nodes —
+    /// the value the admin `/metrics` streaming panel reports. Backends with no
+    /// local receiver registry (the disabled no-op, and Redis whose receivers
+    /// live in other processes) inherit the default of 0.
+    fn active_channel_count(&self) -> usize {
+        0
+    }
 }
 
 /// A cached data event plus its expiry deadline (`data_ttl` from insertion).
@@ -491,6 +499,10 @@ impl StreamingCache for InMemoryStreamingCache {
     async fn close(&self, node_id: i64) {
         let seq = self.incr_seq(node_id).await;
         self.set(node_id, seq, StreamEvent::end_of_stream()).await;
+    }
+
+    fn active_channel_count(&self) -> usize {
+        self.nodes.iter().map(|e| e.notify.receiver_count()).sum()
     }
 }
 

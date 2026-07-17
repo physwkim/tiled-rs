@@ -43,10 +43,10 @@ pub struct WebState {
     pub default_login_scopes: ScopeSet,
     /// Provider name shown on the login form (e.g. "dummy", "entra").
     pub login_provider: String,
-    /// Closure that reports the current live streaming channel count. The
-    /// notification bus that once backed this metric was retired in Wave-24
-    /// PR2b; the per-node streaming cache keeps no global channel count, so
-    /// the host wires a closure that reports 0 until a metric is re-added.
+    /// Closure that reports the current live streaming channel count. The host
+    /// wires this to the streaming cache's `active_channel_count()` — the sum
+    /// of per-node broadcast receiver counts. Backends with no local receiver
+    /// registry (disabled, Redis) report 0.
     pub channel_count_fn: Arc<dyn Fn() -> usize + Send + Sync>,
     /// Whether this server may honor a fronting proxy's `X-Forwarded-Proto`
     /// header to decide the session cookie's `Secure` flag. Set by the host
@@ -143,7 +143,12 @@ mod tests {
             issuer: None,
             default_login_scopes: ScopeSet::default(),
             login_provider: login_provider.into(),
-            channel_count_fn: Arc::new(|| 0),
+            // No streaming backend in this fixture: route through the disabled
+            // cache, whose `active_channel_count()` is the trait default of 0.
+            channel_count_fn: {
+                let cache = crate::server::streaming_cache::disabled();
+                Arc::new(move || cache.active_channel_count())
+            },
             trust_forwarded_proto: false,
             assets_dir: None,
             spec_views: Vec::new(),

@@ -412,10 +412,14 @@ pub fn build_app(mut state: AppState) -> Router {
                 issuer: state.issuer.clone(),
                 default_login_scopes: state.default_login_scopes.clone(),
                 login_provider: "dummy".into(),
-                // The notification bus (which exposed a live channel count) was
-                // retired in Wave-24 PR2b; the per-node streaming cache tracks
-                // no global channel total, so the admin metric reads 0.
-                channel_count_fn: std::sync::Arc::new(|| 0),
+                // Live subscriber-channel count for the admin metric: sum the
+                // per-node broadcast receiver counts held by the streaming
+                // cache. Backends with no local receiver registry (disabled,
+                // Redis) report 0 via the trait default.
+                channel_count_fn: {
+                    let cache = state.streaming_cache.clone();
+                    std::sync::Arc::new(move || cache.active_channel_count())
+                },
                 // Honor X-Forwarded-Proto for the cookie Secure flag only when
                 // we trust a fronting proxy's forwarded headers. peer_ip is not
                 // plumbed here (no ConnectInfo), so peer_is_trusted(None) folds
