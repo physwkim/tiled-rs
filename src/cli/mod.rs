@@ -82,14 +82,15 @@ pub enum Command {
         #[arg(short, long)]
         config: Option<String>,
 
-        /// Host to bind to. Defaults to loopback; use 0.0.0.0 to expose on all
-        /// interfaces (explicit opt-in required).
-        #[arg(long, default_value = "127.0.0.1")]
-        host: String,
+        /// Host to bind to. Resolved as flag > config `uvicorn.host` >
+        /// `127.0.0.1` (loopback). Use 0.0.0.0 to expose on all interfaces
+        /// (explicit opt-in required).
+        #[arg(long)]
+        host: Option<String>,
 
-        /// Port to bind to
-        #[arg(short, long, default_value_t = 8000)]
-        port: u16,
+        /// Port to bind to. Resolved as flag > config `uvicorn.port` > 8000.
+        #[arg(short, long)]
+        port: Option<u16>,
 
         /// Start with a demo dataset
         #[arg(long)]
@@ -360,6 +361,21 @@ fn redact_mongo_uri(uri: &str) -> String {
     format!("{scheme}://{user}:***@{host_and_rest}")
 }
 
+/// Resolve the serve bind host: CLI `--host` flag > config `uvicorn.host` >
+/// `127.0.0.1`. Mirrors Python `_serve.py:711`
+/// (`uvicorn_kwargs["host"] = host or uvicorn_kwargs.get("host", "127.0.0.1")`).
+fn resolve_serve_host(flag: Option<String>, config: Option<&str>) -> String {
+    flag.or_else(|| config.map(String::from))
+        .unwrap_or_else(|| "127.0.0.1".to_string())
+}
+
+/// Resolve the serve bind port: CLI `--port` flag > config `uvicorn.port` >
+/// `8000`. Mirrors Python `_serve.py:712-714`
+/// (`if port is None: port = uvicorn_kwargs.get("port", 8000)`).
+fn resolve_serve_port(flag: Option<u16>, config: Option<u16>) -> u16 {
+    flag.or(config).unwrap_or(8000)
+}
+
 /// Generate a 64-character hex string from 32 cryptographically-random bytes.
 /// Mirrors Python's `secrets.token_hex(32)` used in `_serve.py`.
 fn generate_single_user_key() -> String {
@@ -533,6 +549,16 @@ pub async fn run(command: Command) -> Result<()> {
                 .as_deref()
                 .map(config::TiledConfig::from_file)
                 .transpose()?;
+
+            // Resolve bind host/port: CLI flag > config `uvicorn.{host,port}` >
+            // default (127.0.0.1 / 8000). Mirrors Python `_serve.py:711-714`,
+            // where the `--host`/`--port` flags win when given and otherwise
+            // fall back to the config's `uvicorn` block, then the defaults.
+            // Shadows the parsed Option values with the resolved concrete ones.
+            let host =
+                resolve_serve_host(host, file_config.as_ref().and_then(|c| c.uvicorn_host()));
+            let port =
+                resolve_serve_port(port, file_config.as_ref().and_then(|c| c.uvicorn_port()));
 
             // Resolve MongoDB URI: CLI flag > config file.
             let resolved_mongo_uri = mongo_uri.or_else(|| {
@@ -1411,11 +1437,16 @@ mod tests {
 
     #[test]
     fn serve_default_host_is_loopback() {
+        // With no --host flag the parsed value is None; the loopback default is
+        // applied at resolution time (flag > config > default), not at parse.
         let cli = TestCli::parse_from(["tiled", "serve", "--demo"]);
-        let Command::Serve { host, .. } = cli.command else {
+        let Command::Serve { host, port, .. } = cli.command else {
             panic!("expected Serve variant");
         };
-        assert_eq!(host, "127.0.0.1");
+        assert_eq!(host, None);
+        assert_eq!(port, None);
+        assert_eq!(resolve_serve_host(host, None), "127.0.0.1");
+        assert_eq!(resolve_serve_port(port, None), 8000);
     }
 
     #[test]
@@ -1424,7 +1455,49 @@ mod tests {
         let Command::Serve { host, .. } = cli.command else {
             panic!("expected Serve variant");
         };
-        assert_eq!(host, "0.0.0.0");
+        assert_eq!(host.as_deref(), Some("0.0.0.0"));
+        // The flag wins even when the config carries a host.
+        assert_eq!(resolve_serve_host(host, Some("127.0.0.1")), "0.0.0.0");
+    }
+
+    // cli-w27-F1: --host/--port resolve as flag > config uvicorn.{host,port} >
+    // default. Mirrors Python `_serve.py:711-714`.
+    #[test]
+    fn serve_host_resolution_order() {
+        assert_eq!(
+            resolve_serve_host(Some("1.2.3.4".into()), Some("5.6.7.8")),
+            "1.2.3.4",
+            "flag wins over config"
+        );
+        assert_eq!(
+            resolve_serve_host(None, Some("5.6.7.8")),
+            "5.6.7.8",
+            "config used when no flag"
+        );
+        assert_eq!(
+            resolve_serve_host(None, None),
+            "127.0.0.1",
+            "default when neither flag nor config"
+        );
+    }
+
+    #[test]
+    fn serve_port_resolution_order() {
+        assert_eq!(
+            resolve_serve_port(Some(9001), Some(9000)),
+            9001,
+            "flag wins over config"
+        );
+        assert_eq!(
+            resolve_serve_port(None, Some(9000)),
+            9000,
+            "config used when no flag"
+        );
+        assert_eq!(
+            resolve_serve_port(None, None),
+            8000,
+            "default when neither flag nor config"
+        );
     }
 
     // cli-L1: an IPv6 `--host` must not be string-concatenated with the port.
