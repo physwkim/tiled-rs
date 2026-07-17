@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message;
 
-use tiled_rs::access::{ScopeSet, TagBasedPolicy};
+use tiled_rs::access::{Scope, ScopeSet, TagBasedPolicy};
 use tiled_rs::catalog::node::RegisterRequest;
 use tiled_rs::catalog::{Catalog, adapter::UnresolvedLeaf};
 use tiled_rs::core::adapters::ContainerAdapter;
@@ -1585,4 +1585,305 @@ async fn put_data_source_non_array_streams_nothing() {
         next_text_json(&mut ws).await.is_none(),
         "non-array put_data_source must not stream an event"
     );
+}
+
+// ---------------------------------------------------------------------------
+// PR6: /stream/single subscribe requires BOTH read:data AND read:metadata.
+//
+// Upstream resolves the WS stream entry with
+// `get_entry(path, ["read:data", "read:metadata"])` once at subscribe
+// (server/router.py:808-810) — a single gate that is both a token-scope check
+// and a node access-policy check. tiled-rs mirrors it in two layers: a global
+// token-scope gate (both scopes must be on the token) and a subscribe-time node
+// gate (`subscribe_allowed`: the node must grant both under the access policy).
+// The per-event `delivery_allowed` stays read:metadata-only (a metadata-
+// visibility gate exercised by the F4 tests above) and is NOT raised here.
+// ---------------------------------------------------------------------------
+
+/// Seed an external array node `key` with a single f64 data source — enough for
+/// the WS handler to build an `array-schema` first message.
+async fn seed_array_node(catalog: &Catalog, key: &str) {
+    let node = catalog
+        .create_node(
+            None,
+            vec![],
+            RegisterRequest {
+                key: key.to_string(),
+                structure_family: "array".to_string(),
+                metadata: json!({}),
+                specs: json!([]),
+                access_blob: json!({}),
+            },
+        )
+        .await
+        .unwrap();
+    catalog
+        .create_data_source(
+            node.id,
+            tiled_rs::catalog::data_source::DataSourceSpec {
+                structure_family: "array".into(),
+                structure: json!({
+                    "shape": [4],
+                    "data_type": {"endianness": "little", "kind": "f", "itemsize": 8},
+                    "chunks": [[4]],
+                }),
+                mimetype: "application/x-hdf5".into(),
+                parameters: json!({}),
+                management: "external".into(),
+                assets: vec![],
+            },
+        )
+        .await
+        .unwrap();
+}
+
+/// Spawn a live server with a real dummy authenticator (user `alice`, default
+/// `user` role) whose per-login session scopes are capped by
+/// `default_login_scopes`, an optional `access_policy`, and a pre-seeded
+/// external array node `arr`. With `access_policy = None` the global token-scope
+/// gate is the only subscribe check; with a policy the subscribe-time node gate
+/// (`subscribe_allowed`) also runs against the authenticated principal. Returns
+/// the http base and the TempDir holding the SQLite files (keep it alive for the
+/// test's duration).
+async fn spawn_auth_stream_server(
+    default_login_scopes: ScopeSet,
+    access_policy: Option<Arc<dyn tiled_rs::access::AccessPolicy>>,
+) -> (String, tempfile::TempDir) {
+    use tiled_rs::auth::{AuthDb, DummyAuthenticator, Issuer};
+
+    let dir = tempfile::tempdir().unwrap();
+    let cat_uri = format!("sqlite://{}", dir.path().join("catalog.db").display());
+    let auth_uri = format!("sqlite://{}", dir.path().join("auth.db").display());
+
+    // Pool size 1: warm the pool at setup so no connection is opened mid-request
+    // (avoids the SQLite cold-start CANTOPEN flake on small CI runners).
+    let catalog = Catalog::connect_with_pool_size(&cat_uri, 1).await.unwrap();
+    catalog.migrate().await.unwrap();
+    seed_array_node(&catalog, "arr").await;
+
+    let auth_db = AuthDb::connect_with_pool_size(&auth_uri, 1).await.unwrap();
+    auth_db.migrate().await.unwrap();
+    // `alice` keeps the default `user` role (read:metadata + read:data + write).
+    auth_db.ensure_principal("dummy", "alice").await.unwrap();
+
+    let resolver: Arc<dyn tiled_rs::catalog::adapter::LeafResolver> = Arc::new(UnresolvedLeaf);
+    let root_tree: Arc<dyn ContainerAdapter> = Arc::new(tiled_rs::catalog::CatalogAdapter::root(
+        catalog.clone(),
+        resolver,
+    ));
+    let issuer = Issuer::new(b"this-is-a-test-secret-32-bytes-long!!").unwrap();
+    let mut dummy = DummyAuthenticator::new("dummy");
+    dummy.add_user("alice", "wonderland").unwrap();
+
+    let state = tiled_rs::server::AppState {
+        root_tree,
+        serialization_registry: Arc::new(tiled_rs::serialization::default_registry()),
+        query_names: Query::all_query_names()
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        base_url: None,
+        cors_policy: tiled_rs::server::state::CorsOriginPolicy::Permissive,
+        trust_forwarded_headers: false,
+        api_key: None,
+        catalog: Some(catalog),
+        auth_db: Some(auth_db),
+        issuer: Some(issuer),
+        authenticators: vec![Arc::new(dummy)],
+        proxied_header_auth: None,
+        external_oidc: None,
+        #[cfg(feature = "saml")]
+        saml_providers: vec![],
+        forwarded_allow_ips: None,
+        max_request_body_bytes: 10 * 1024 * 1024,
+        response_bytesize_limit: 300_000_000,
+        streaming_cache: test_cache(),
+        access_policy,
+        default_login_scopes,
+        enable_web: true,
+        web_assets_dir: None,
+        spec_views: Vec::new(),
+        webhook_config: None,
+        webhook_dispatcher: None,
+        request_timeout_secs: 30,
+        expose_raw_assets: true,
+        exact_count_limit: u64::MAX,
+        background_tasks: tiled_rs::server::state::BackgroundTasks::new(),
+    };
+    (serve(state).await, dir)
+}
+
+/// A `TagBasedPolicy` whose untagged-node grant to an authenticated principal is
+/// `default_scopes` (intersected with the principal's session scopes). The node
+/// `arr` seeded by [`spawn_auth_stream_server`] is untagged, so this is exactly
+/// what the subscribe-time node gate resolves the node's scopes to. The policy's
+/// own auth backend is a throwaway in-memory DB — untagged nodes never consult
+/// per-principal tags, so its contents are irrelevant.
+async fn tag_policy(default_scopes: ScopeSet) -> Arc<dyn tiled_rs::access::AccessPolicy> {
+    let policy_auth_db = tiled_rs::auth::AuthDb::connect("sqlite::memory:")
+        .await
+        .unwrap();
+    policy_auth_db.migrate().await.unwrap();
+    Arc::new(TagBasedPolicy::new(
+        Arc::new(policy_auth_db),
+        default_scopes,
+    ))
+}
+
+/// Log in over HTTP and return the raw access token (no `Bearer ` prefix).
+async fn login_token(client: &reqwest::Client, base: &str, user: &str, pw: &str) -> String {
+    let body: Value = client
+        .post(format!("{base}/api/v1/auth/dummy/login"))
+        .json(&json!({"username": user, "password": pw}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    body["access_token"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no access_token in login response: {body}"))
+        .to_string()
+}
+
+/// Connect a WS subscription to `path` presenting `Bearer {token}` in the
+/// Authorization header (the non-browser auth path `resolve_header_auth` reads
+/// before the upgrade). The upgrade itself always succeeds (HTTP 101); any
+/// authorization denial arrives as a text frame after the upgrade.
+async fn connect_ws_bearer(
+    base: &str,
+    path: &str,
+    token: &str,
+) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
+    let mut req = ws_url(base, path).as_str().into_client_request().unwrap();
+    req.headers_mut().insert(
+        HeaderName::from_static("authorization"),
+        HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+    );
+    let (ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+    ws
+}
+
+/// Read the next frame as raw text (no JSON parse), or `None` on close/timeout.
+/// Used for the plain-text `forbidden:` / `subscription denied:` rejection
+/// frames the handler sends before closing (which `next_text_json` would panic
+/// on, as they are not JSON).
+async fn next_frame_text<S>(ws: &mut S) -> Option<String>
+where
+    S: futures::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+{
+    match tokio::time::timeout(Duration::from_millis(500), ws.next()).await {
+        Ok(Some(Ok(Message::Text(t)))) => Some(t.to_string()),
+        _ => None,
+    }
+}
+
+/// (a) A token carrying `read:metadata` but NOT `read:data` is REJECTED at the
+/// global token-scope gate (before PR6 it was allowed on read:metadata alone).
+/// The first frame is the plain-text forbidden notice, not a schema.
+#[tokio::test]
+async fn subscribe_without_read_data_scope_is_rejected() {
+    let (base, _dir) =
+        spawn_auth_stream_server(ScopeSet::from_iter([Scope::ReadMetadata]), None).await;
+    let client = reqwest::Client::new();
+    let token = login_token(&client, &base, "alice", "wonderland").await;
+
+    let mut ws = connect_ws_bearer(&base, "arr", &token).await;
+    let frame = next_frame_text(&mut ws)
+        .await
+        .expect("a forbidden text frame before close");
+    assert!(
+        frame.contains("forbidden") && frame.contains("read:data"),
+        "expected the read:data/read:metadata forbidden frame, got: {frame:?}"
+    );
+}
+
+/// (b) A token carrying BOTH read:data AND read:metadata subscribes normally:
+/// the array-schema first message arrives (no regression on the legitimate
+/// path).
+#[tokio::test]
+async fn subscribe_with_both_read_scopes_proceeds() {
+    let (base, _dir) = spawn_auth_stream_server(ScopeSet::read_only(), None).await;
+    let client = reqwest::Client::new();
+    let token = login_token(&client, &base, "alice", "wonderland").await;
+
+    let mut ws = connect_ws_bearer(&base, "arr", &token).await;
+    let schema = next_text_json(&mut ws)
+        .await
+        .expect("array-schema first message");
+    assert_eq!(schema["type"], "array-schema", "schema: {schema}");
+}
+
+/// (c) A subscriber whose TOKEN carries BOTH read scopes (so the global gate
+/// passes) but who is narrowed to read:metadata-only on the node by the access
+/// policy is REJECTED at the subscribe-time node gate (`subscribe_allowed`). The
+/// authenticated `user` principal resolves the untagged node through
+/// `principal_decision`, whose grant is `session_scopes ∩ default_scopes` =
+/// `{read:metadata}` — so the node's read:data requirement fails.
+#[tokio::test]
+async fn subscribe_node_denied_read_data_is_rejected() {
+    let (base, _dir) = spawn_auth_stream_server(
+        ScopeSet::read_only(),
+        Some(tag_policy(ScopeSet::from_iter([Scope::ReadMetadata])).await),
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let token = login_token(&client, &base, "alice", "wonderland").await;
+
+    let mut ws = connect_ws_bearer(&base, "arr", &token).await;
+    let frame = next_frame_text(&mut ws)
+        .await
+        .expect("a subscription-denied text frame before close");
+    assert!(
+        frame.contains("subscription denied"),
+        "expected the node-gate denial frame, got: {frame:?}"
+    );
+}
+
+/// (c, positive control) The SAME seeded node and token, but the policy grants
+/// read:data on untagged nodes → subscribe proceeds and the schema arrives. This
+/// proves the rejection above is specifically the node's read:data denial (the
+/// node exists and resolves for the same principal), not a missing/invisible
+/// node or the global token gate.
+#[tokio::test]
+async fn subscribe_node_grants_read_data_proceeds() {
+    let (base, _dir) = spawn_auth_stream_server(
+        ScopeSet::read_only(),
+        Some(tag_policy(ScopeSet::read_only()).await),
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let token = login_token(&client, &base, "alice", "wonderland").await;
+
+    let mut ws = connect_ws_bearer(&base, "arr", &token).await;
+    let schema = next_text_json(&mut ws)
+        .await
+        .expect("array-schema first message");
+    assert_eq!(schema["type"], "array-schema", "schema: {schema}");
+}
+
+/// (d) The no-access-policy path is unchanged: with no policy and no auth
+/// backend, the anonymous principal gets full scopes (both read scopes), so both
+/// gates pass and the schema arrives.
+#[tokio::test]
+async fn subscribe_no_policy_anonymous_receives_schema() {
+    let (base, client, _wdir, _dbdir) = spawn_write_server().await;
+    create_managed_array(
+        &client,
+        &base,
+        "arr",
+        "application/x-npy",
+        f64_array_structure(4, vec![4]),
+    )
+    .await;
+
+    let url = ws_url(&base, "arr");
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    let schema = next_text_json(&mut ws)
+        .await
+        .expect("array-schema first message");
+    assert_eq!(schema["type"], "array-schema", "schema: {schema}");
 }
