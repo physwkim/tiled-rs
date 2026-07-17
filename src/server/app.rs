@@ -407,6 +407,13 @@ pub fn build_app(mut state: AppState) -> Router {
             }),
         )
         .layer(cors)
+        // Outermost: stamp the Server-Timing header on every response and
+        // measure total application time. Mirrors the always-on capture_metrics
+        // middleware (tiled/server/app.py:855-888). Installs the request-scoped
+        // metrics accumulator that the compression middlewares record into.
+        .layer(axum::middleware::from_fn(
+            crate::server::server_timing::server_timing_middleware,
+        ))
         .with_state(state.clone());
 
     // Browser surface (SPA shell + admin pages). Mounted alongside the

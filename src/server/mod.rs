@@ -8,6 +8,7 @@ pub mod etag;
 pub mod extractors;
 pub mod file_resolver;
 pub mod router;
+pub mod server_timing;
 pub mod state;
 pub mod streaming;
 pub mod streaming_cache;

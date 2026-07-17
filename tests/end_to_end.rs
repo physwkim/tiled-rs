@@ -2746,6 +2746,108 @@ async fn blosc2_not_requested_gets_uncompressed_body() {
     assert_eq!(bytes.len(), 200 * 8);
 }
 
+// ===========================================================================
+// Server-Timing response header (upstream capture_metrics, app.py:855-888).
+// Reuses `spawn_blosc2_server` which serves a 1 600-byte octet-stream array
+// ("big"), so the compress phase can be exercised via blosc2.
+// ===========================================================================
+
+/// The `app` phase is always emitted; assert the header is present and its
+/// `app` entry matches the Server-Timing `name;dur=<ms>` format on a metadata
+/// GET (application/json, no compression).
+#[tokio::test]
+async fn server_timing_header_present_on_metadata_get() {
+    let base = spawn_server(None).await;
+
+    let resp = reqwest::Client::new()
+        .get(format!("{base}/api/v1/metadata/"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let header = resp
+        .headers()
+        .get("server-timing")
+        .and_then(|v| v.to_str().ok())
+        .expect("Server-Timing header must be present")
+        .to_string();
+
+    // Find the `app` phase and assert it is `app;dur=<number with one decimal>`.
+    let app_phase = header
+        .split(", ")
+        .find(|p| p.starts_with("app;"))
+        .unwrap_or_else(|| panic!("no app phase in Server-Timing: {header:?}"));
+    let dur = app_phase
+        .strip_prefix("app;dur=")
+        .unwrap_or_else(|| panic!("app phase not `app;dur=<ms>`: {app_phase:?}"));
+    // dur is a fixed one-decimal float, e.g. "1.2" or "0.0".
+    let (whole, frac) = dur.split_once('.').expect("dur must have a decimal point");
+    assert!(!whole.is_empty() && whole.chars().all(|c| c.is_ascii_digit()));
+    assert_eq!(frac.len(), 1, "dur must render with one decimal: {dur:?}");
+    assert!(frac.chars().all(|c| c.is_ascii_digit()));
+}
+
+/// The header must also be stamped on a binary array-block GET.
+#[tokio::test]
+async fn server_timing_header_present_on_array_get() {
+    let base = spawn_blosc2_server().await;
+
+    let resp = reqwest::Client::new()
+        .get(format!("{base}/api/v1/array/block/big?block=0"))
+        .header("Accept", "application/octet-stream")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let header = resp
+        .headers()
+        .get("server-timing")
+        .and_then(|v| v.to_str().ok())
+        .expect("Server-Timing header must be present on array GET");
+    assert!(
+        header.split(", ").any(|p| p.starts_with("app;dur=")),
+        "array GET Server-Timing must contain an app phase: {header:?}"
+    );
+}
+
+/// When compression is negotiated (blosc2 here), the `compress` phase —
+/// recorded in the compression middleware with `dur` and `ratio` — must appear.
+#[tokio::test]
+async fn server_timing_compress_phase_when_encoding_negotiated() {
+    let base = spawn_blosc2_server().await;
+
+    let resp = reqwest::Client::new()
+        .get(format!("{base}/api/v1/array/block/big?block=0"))
+        .header("Accept", "application/octet-stream")
+        .header("Accept-Encoding", "blosc2")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers().get("content-encoding").unwrap(),
+        "blosc2",
+        "precondition: blosc2 must be negotiated"
+    );
+
+    let header = resp
+        .headers()
+        .get("server-timing")
+        .and_then(|v| v.to_str().ok())
+        .expect("Server-Timing header must be present");
+    let compress_phase = header
+        .split(", ")
+        .find(|p| p.starts_with("compress;"))
+        .unwrap_or_else(|| panic!("no compress phase in Server-Timing: {header:?}"));
+    // Upstream emits `compress;dur=<ms>;ratio=<n>`.
+    assert!(
+        compress_phase.contains("dur=") && compress_phase.contains("ratio="),
+        "compress phase must carry dur and ratio: {compress_phase:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Server-level sparse managed create + resolve: create a sparse node over a
 // catalog (exercising default_creation_mimetype(Sparse) +
