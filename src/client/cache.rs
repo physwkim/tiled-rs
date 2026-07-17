@@ -26,6 +26,8 @@
 //! - `private`/`public`: respected — we only persist `public` or
 //!   no-directive responses.
 //! - `max-age=N` / `s-maxage=N`: store freshness lifetime.
+//! - `Expires`: freshness lifetime when no `max-age`/`s-maxage` is present
+//!   (honored only alongside a valid `Date` header).
 //! - `must-revalidate`: store and force revalidate after expiry.
 //! - `Vary`: keys by listed request headers.
 //! - `ETag`/`Last-Modified` → `If-None-Match` / `If-Modified-Since` on
@@ -407,12 +409,29 @@ impl HttpCache {
             })
             .unwrap_or_default();
 
-        let max_age = cc
-            .max_age
-            .or(cc.s_maxage)
-            .unwrap_or(0)
-            .min(MAX_FRESHNESS_SECS);
-        let expires_at = Utc::now() + chrono::Duration::seconds(max_age as i64);
+        let now = Utc::now();
+        let max_freshness = now + chrono::Duration::seconds(MAX_FRESHNESS_SECS as i64);
+        let expires_at = match cc.max_age.or(cc.s_maxage) {
+            Some(secs) => now + chrono::Duration::seconds(secs.min(MAX_FRESHNESS_SECS) as i64),
+            None => match header_value(&headers, "expires") {
+                // No `max-age`/`s-maxage`: honor an `Expires` header, but only
+                // when a valid `Date` header is also present. Upstream
+                // `is_response_fresh` (`tiled/client/cache_control.py`) returns
+                // "not fresh" for an `Expires` without a parseable `Date`; with
+                // both present, freshness reduces to `now <= Expires` (the Date
+                // terms cancel). Clamp to the same one-year ceiling as max-age.
+                Some(exp_raw) => match (
+                    header_value(&headers, "date").and_then(parse_http_date),
+                    parse_http_date(exp_raw),
+                ) {
+                    (Some(_date), Some(exp)) => exp.min(max_freshness),
+                    _ => now,
+                },
+                // No freshness directive at all → immediately stale; the entry
+                // is still stored so it can drive conditional revalidation.
+                None => now,
+            },
+        };
 
         let bytes = resp.bytes().await?;
         // Per-item ceiling: decline to cache oversized bodies (compared by
@@ -714,6 +733,24 @@ fn rebuild_response(status: u16, headers: &[(String, String)], body: Bytes) -> R
     Ok(Response::from(resp))
 }
 
+/// Case-insensitive header lookup over the stored `(name, value)` pairs.
+fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.as_str())
+}
+
+/// Parse an HTTP-date header value (`Date`, `Expires`) into UTC. HTTP dates
+/// use the RFC 7231 / RFC 1123 format (`Wed, 21 Oct 2015 07:28:00 GMT`), which
+/// chrono accepts via its RFC 2822 parser (including the `GMT` zone). Returns
+/// `None` for anything unparseable, mirroring upstream `parse_headers_date`.
+fn parse_http_date(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc2822(value.trim())
+        .ok()
+        .map(|d| d.with_timezone(&Utc))
+}
+
 // ---------------------------------------------------------------------------
 // SQLite helpers
 // ---------------------------------------------------------------------------
@@ -984,6 +1021,53 @@ mod tests {
         assert!(
             cache.try_get(&url_b, accept).await.unwrap().is_none(),
             "B is least-recently-accessed and must be the evicted entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn expires_header_drives_freshness() {
+        let cache = HttpCache::in_memory(1024 * 1024);
+        let accept = "application/json";
+
+        let now = Utc::now();
+        let date_hdr = now.to_rfc2822();
+        let future = (now + chrono::Duration::seconds(3600)).to_rfc2822();
+        let past = (now - chrono::Duration::seconds(3600)).to_rfc2822();
+
+        // Future Expires + valid Date, no max-age → fresh.
+        let fresh = Url::parse("http://test/fresh").unwrap();
+        let fresh_hdrs = [("date", date_hdr.as_str()), ("expires", future.as_str())];
+        cache
+            .store_response(&fresh, accept, make_response(200, b"body", &fresh_hdrs))
+            .await
+            .unwrap();
+        assert!(
+            cache.try_get(&fresh, accept).await.unwrap().is_some(),
+            "a future Expires with a valid Date must be served fresh"
+        );
+
+        // Past Expires → stale.
+        let stale = Url::parse("http://test/stale").unwrap();
+        let stale_hdrs = [("date", date_hdr.as_str()), ("expires", past.as_str())];
+        cache
+            .store_response(&stale, accept, make_response(200, b"body", &stale_hdrs))
+            .await
+            .unwrap();
+        assert!(
+            cache.try_get(&stale, accept).await.unwrap().is_none(),
+            "a past Expires must be treated as stale"
+        );
+
+        // Expires present but no Date header → not fresh (upstream gate).
+        let nodate = Url::parse("http://test/nodate").unwrap();
+        let nodate_hdrs = [("expires", future.as_str())];
+        cache
+            .store_response(&nodate, accept, make_response(200, b"body", &nodate_hdrs))
+            .await
+            .unwrap();
+        assert!(
+            cache.try_get(&nodate, accept).await.unwrap().is_none(),
+            "an Expires without a valid Date header must not be fresh"
         );
     }
 
