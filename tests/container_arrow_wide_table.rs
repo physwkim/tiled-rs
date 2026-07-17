@@ -1,12 +1,19 @@
-//! Wide-table Arrow export for `xarray_dataset` containers — the server
-//! `/container/full` `?format=arrow` route and its POST field-list fallback.
+//! Wide-table export for `xarray_dataset` containers — the server
+//! `/container/full` route and its POST field-list fallback, across every format
+//! the wide table can be encoded as: arrow, csv, and parquet.
 //!
-//! Upstream serves a Container as Arrow via a *spec*-keyed serializer
-//! (`serialization/xarray.py:68`, registered under the `xarray_dataset` spec);
-//! the Rust serialization registry keys on `StructureFamily` only, so the route
-//! mirrors that serializer's logic inline, gated on the spec. `field=` (repeated
-//! GET query, upstream `router.py:1352`) / a JSON-array POST body (upstream
-//! `router.py:1396`) select the column projection.
+//! Upstream serves a Container in these formats via *spec*-keyed serializers
+//! (`serialization/xarray.py:68/73/80`, registered under the `xarray_dataset`
+//! spec, each deriving from one `to_dataframe()`); the Rust serialization registry
+//! keys on `StructureFamily` only, so the route mirrors that logic inline, gated on
+//! the spec, and delegates the per-format encode to the TABLE-family serializer.
+//! `field=` (repeated GET query, upstream `router.py:1352`) / a JSON-array POST
+//! body (upstream `router.py:1396`) select the column projection.
+//!
+//! `application/json`/`text/html` are NOT covered here: the Container family
+//! already serves those, so honoring the `xarray_dataset` json/html serializers
+//! would override the container default — the spec-before-family dispatch (P8),
+//! blocked on sign-off.
 //!
 //! These cases drive the HTTP surface directly (tower `oneshot`). The client
 //! `DatasetClient` path that drives this route end to end lives in
@@ -366,9 +373,208 @@ async fn non_arrow_container_full_still_lists_children() {
         .unwrap();
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     // `application/json` is the `{contents, metadata}` tree, one entry per child.
+    // This is the P8 boundary: `application/json` is NOT intercepted for the
+    // wide-table export (the Container family owns it), so it still lists children.
     assert_eq!(
         v["contents"].as_object().map(|o| o.len()),
         Some(3),
         "3 child entries in the container listing"
     );
+}
+
+// ---------------------------------------------------------------------------
+// csv / parquet wide-table export (additive `xarray_dataset` formats)
+// ---------------------------------------------------------------------------
+
+/// GET with an explicit `Accept` header (empty string sends none), so the
+/// `?format=` vs `Accept` resolution can be exercised for non-arrow formats.
+#[cfg(any(feature = "csv", feature = "parquet"))]
+async fn get_accept(app: &axum::Router, uri: &str, accept: &str) -> (StatusCode, Vec<u8>) {
+    let mut builder = Request::builder().method(Method::GET).uri(uri);
+    if !accept.is_empty() {
+        builder = builder.header("accept", accept);
+    }
+    let resp = app
+        .clone()
+        .oneshot(builder.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, bytes.to_vec())
+}
+
+#[cfg(feature = "csv")]
+mod csv_export {
+    use super::*;
+
+    /// `?format=csv` flattens the dataset to one CSV table (upstream
+    /// `serialize_dataset_csv`, xarray.py:80 → `to_dataframe()` → table
+    /// `serialize_csv`). f64 renders as `N.0`, i64 bare, header + one row per index.
+    #[tokio::test]
+    async fn get_csv_flattens_wide_table() {
+        let app = app_for_root(root_with(vec![("weather", weather())]));
+        let (status, body) =
+            get_accept(&app, "/api/v1/container/full/weather?format=csv", "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            String::from_utf8(body).unwrap(),
+            "time,temp,pressure\n10.0,1.5,100\n20.0,2.5,200\n30.0,3.5,300\n",
+            "csv is the flattened wide table"
+        );
+    }
+
+    /// The `field=` projection restricts and orders the CSV columns.
+    #[tokio::test]
+    async fn get_csv_field_projection() {
+        let app = app_for_root(root_with(vec![("weather", weather())]));
+        let (status, body) = get_accept(
+            &app,
+            "/api/v1/container/full/weather?format=csv&field=time&field=pressure",
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            String::from_utf8(body).unwrap(),
+            "time,pressure\n10.0,100\n20.0,200\n30.0,300\n",
+            "only the projected columns, in requested order"
+        );
+    }
+
+    /// With no `?format=`, an `Accept: text/csv` header drives the interception.
+    #[tokio::test]
+    async fn csv_via_accept_header() {
+        let app = app_for_root(root_with(vec![("weather", weather())]));
+        let (status, body) = get_accept(&app, "/api/v1/container/full/weather", "text/csv").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            String::from_utf8(body)
+                .unwrap()
+                .starts_with("time,temp,pressure\n"),
+            "Accept: text/csv serves the flattened wide table"
+        );
+    }
+
+    /// A plain container has no csv serializer (neither spec nor family) → 406,
+    /// exactly as negotiation answers, and matching the arrow gate.
+    #[tokio::test]
+    async fn csv_on_non_xarray_container_is_406() {
+        let plain = container(
+            vec![("a", f64_var(&[1.0, 2.0], "xarray_data_var", json!({})))],
+            vec![], // no xarray_dataset spec
+        );
+        let app = app_for_root(root_with(vec![("plain", plain)]));
+        let (status, _) = get_accept(&app, "/api/v1/container/full/plain?format=csv", "").await;
+        assert_eq!(status, StatusCode::NOT_ACCEPTABLE);
+    }
+
+    /// The POST field-list body (the client's >2000-char fallback) also reaches the
+    /// csv interception; columns follow the requested order (temp before time).
+    #[tokio::test]
+    async fn post_csv_field_list_body() {
+        let app = app_for_root(root_with(vec![("weather", weather())]));
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/v1/container/full/weather?format=csv")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!(["temp", "time"])).unwrap(),
+            ))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(bytes.to_vec()).unwrap(),
+            "temp,time\n1.5,10.0\n2.5,20.0\n3.5,30.0\n",
+            "POST body projects columns in requested order"
+        );
+    }
+}
+
+#[cfg(feature = "parquet")]
+mod parquet_export {
+    use super::*;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    fn parquet_batches(bytes: &[u8]) -> Vec<arrow::record_batch::RecordBatch> {
+        let reader = ParquetRecordBatchReaderBuilder::try_new(Bytes::copy_from_slice(bytes))
+            .unwrap()
+            .build()
+            .unwrap();
+        reader.map(|b| b.unwrap()).collect()
+    }
+
+    fn column_names(batch: &arrow::record_batch::RecordBatch) -> Vec<String> {
+        batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect()
+    }
+
+    /// `?format=parquet` encodes the same wide table as parquet (upstream
+    /// `serialize_dataset_parquet`, xarray.py:73); it round-trips back to the
+    /// original columns/values through the parquet reader.
+    #[tokio::test]
+    async fn get_parquet_flattens_wide_table() {
+        let app = app_for_root(root_with(vec![("weather", weather())]));
+        let (status, body) =
+            get_accept(&app, "/api/v1/container/full/weather?format=parquet", "").await;
+        assert_eq!(status, StatusCode::OK);
+        let batches = parquet_batches(&body);
+        assert_eq!(batches.len(), 1);
+        assert_eq!(column_names(&batches[0]), vec!["time", "temp", "pressure"]);
+        let time = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert_eq!(time.values(), &[10.0, 20.0, 30.0]);
+        let temp = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap();
+        assert_eq!(temp.values(), &[1.5, 2.5, 3.5]);
+        let pressure = batches[0]
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(pressure.values(), &[100, 200, 300]);
+    }
+
+    /// `Accept: application/x-parquet` (no `?format=`) drives the interception.
+    #[tokio::test]
+    async fn parquet_via_accept_header() {
+        let app = app_for_root(root_with(vec![("weather", weather())]));
+        let (status, body) = get_accept(
+            &app,
+            "/api/v1/container/full/weather",
+            "application/x-parquet",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let batches = parquet_batches(&body);
+        assert_eq!(column_names(&batches[0]), vec!["time", "temp", "pressure"]);
+    }
+
+    /// A plain container has no parquet serializer → 406.
+    #[tokio::test]
+    async fn parquet_on_non_xarray_container_is_406() {
+        let plain = container(
+            vec![("a", f64_var(&[1.0, 2.0], "xarray_data_var", json!({})))],
+            vec![],
+        );
+        let app = app_for_root(root_with(vec![("plain", plain)]));
+        let (status, _) = get_accept(&app, "/api/v1/container/full/plain?format=parquet", "").await;
+        assert_eq!(status, StatusCode::NOT_ACCEPTABLE);
+    }
 }
