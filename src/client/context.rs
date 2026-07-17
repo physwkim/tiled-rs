@@ -199,6 +199,12 @@ impl Context {
         base_url.set_query(None);
         base_url.set_fragment(None);
 
+        // Mirrors upstream `max_connections`, which sizes both the HTTP pool
+        // and the concurrency semaphore (`tiled/client/context.py:296`).
+        let max_connections = options
+            .max_connections
+            .unwrap_or(MAX_CONCURRENT_CONNECTIONS);
+
         let http = match options.http_client {
             Some(c) => {
                 // We can't introspect whether the user-supplied Client has
@@ -211,21 +217,30 @@ impl Context {
                 );
                 c
             }
-            None => Client::builder()
-                .user_agent(crate::client::utils::USER_AGENT_VALUE)
-                .cookie_store(true)
-                .pool_max_idle_per_host(MAX_CONCURRENT_CONNECTIONS)
-                // Mirror httpx.Timeout(connect=5, read=30, write=30, pool=5)
-                // from Python tiled's DEFAULT_TIMEOUT_PARAMS. reqwest's
-                // ClientBuilder exposes only connect and per-read timeouts; it
-                // has no per-request `write` timeout and no `pool`
-                // (connection-acquire) timeout knob, so those two parameters
-                // have no analogue and are not applied. No total request
-                // deadline is set — upstream sets none, and one would abort
-                // large slow downloads mid-stream.
-                .connect_timeout(DEFAULT_CONNECT_TIMEOUT)
-                .read_timeout(DEFAULT_READ_TIMEOUT)
-                .build()?,
+            None => {
+                let timeout = options.timeout.clone().unwrap_or_default();
+                let mut builder = Client::builder()
+                    .user_agent(crate::client::utils::USER_AGENT_VALUE)
+                    .cookie_store(true)
+                    .pool_max_idle_per_host(max_connections)
+                    // Mirror httpx.Timeout(connect=5, read=30, write=30,
+                    // pool=5) from Python tiled's DEFAULT_TIMEOUT_PARAMS.
+                    // reqwest's ClientBuilder exposes only connect and per-read
+                    // timeouts; it has no per-request `write` timeout and no
+                    // `pool` (connection-acquire) timeout knob, so those two
+                    // parameters have no analogue and are not applied. No total
+                    // request deadline is set — upstream sets none, and one
+                    // would abort large slow downloads mid-stream.
+                    .connect_timeout(timeout.connect.unwrap_or(DEFAULT_CONNECT_TIMEOUT))
+                    .read_timeout(timeout.read.unwrap_or(DEFAULT_READ_TIMEOUT))
+                    // verify=false disables TLS certificate validation. Mirrors
+                    // upstream `Context(verify=...)` → `httpx.Client(verify=...)`.
+                    .danger_accept_invalid_certs(!options.verify.unwrap_or(true));
+                if let Some(headers) = options.headers.clone() {
+                    builder = builder.default_headers(headers);
+                }
+                builder.build()?
+            }
         };
 
         let ctx = Self {
@@ -240,9 +255,7 @@ impl Context {
                 refresh_lock: Mutex::new(()),
                 cache: options.cache,
                 resolver: options.resolver,
-                data_fetch_semaphore: Arc::new(tokio::sync::Semaphore::new(
-                    MAX_CONCURRENT_CONNECTIONS,
-                )),
+                data_fetch_semaphore: Arc::new(tokio::sync::Semaphore::new(max_connections)),
             }),
         };
         Ok((ctx, node_path_parts))
@@ -1090,13 +1103,47 @@ pub struct ApiKeyInfo {
     pub latest_activity: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// Transport timeouts for the reqwest client. Mirrors the honoured subset of
+/// Python tiled's `httpx.Timeout` (`DEFAULT_TIMEOUT_PARAMS`): reqwest exposes
+/// only connect and per-read timeouts, so the upstream `write`/`pool`
+/// parameters have no analogue and are intentionally absent. A `None` knob
+/// falls back to its module default, so an unset [`ClientTimeout`] reproduces
+/// the bare-client behaviour exactly.
+#[derive(Debug, Default, Clone)]
+pub struct ClientTimeout {
+    /// Connection-establishment timeout. `None` → [`DEFAULT_CONNECT_TIMEOUT`].
+    pub connect: Option<Duration>,
+    /// Per-read (socket inactivity) timeout. `None` → [`DEFAULT_READ_TIMEOUT`].
+    pub read: Option<Duration>,
+}
+
 /// Optional inputs for `Context::from_uri_with_options`.
+///
+/// The transport fields (`timeout`, `verify`, `headers`) are honoured only on
+/// the builder path — i.e. when `http_client` is left unset. A caller-supplied
+/// `http_client` is used as-is, since a constructed reqwest `Client` cannot be
+/// reconfigured. `max_connections` is honoured on both paths because it also
+/// sizes the application-level data-fetch semaphore.
 #[derive(Default, Clone)]
 pub struct ContextOptions {
     pub api_key: Option<String>,
     pub http_client: Option<Client>,
     pub cache: Option<Arc<HttpCache>>,
     pub resolver: Option<Arc<dyn ClientResolver>>,
+    /// Transport timeouts. `None` reproduces the
+    /// [`DEFAULT_CONNECT_TIMEOUT`]/[`DEFAULT_READ_TIMEOUT`] defaults.
+    pub timeout: Option<ClientTimeout>,
+    /// TLS certificate verification. `None`/`Some(true)` verify (default);
+    /// `Some(false)` disables verification (insecure). Mirrors upstream
+    /// `Context(verify=...)`.
+    pub verify: Option<bool>,
+    /// Extra default headers merged into every request. Mirrors upstream
+    /// `Context(headers=...)`.
+    pub headers: Option<HeaderMap>,
+    /// Hard ceiling on concurrent bulk-data fetches, and reqwest's idle-pool
+    /// size. `None` → [`MAX_CONCURRENT_CONNECTIONS`] (16). Mirrors upstream
+    /// `max_connections`, which feeds both `httpx.Limits` and the semaphore.
+    pub max_connections: Option<usize>,
 }
 
 impl std::fmt::Debug for ContextOptions {
@@ -1106,6 +1153,10 @@ impl std::fmt::Debug for ContextOptions {
             .field("http_client", &self.http_client.as_ref().map(|_| "<set>"))
             .field("cache", &self.cache.as_ref().map(|_| "<set>"))
             .field("resolver", &self.resolver.as_ref().map(|_| "<set>"))
+            .field("timeout", &self.timeout)
+            .field("verify", &self.verify)
+            .field("headers", &self.headers.as_ref().map(|h| h.len()))
+            .field("max_connections", &self.max_connections)
             .finish()
     }
 }
@@ -1128,6 +1179,26 @@ impl ContextOptions {
 
     pub fn resolver(mut self, resolver: Arc<dyn ClientResolver>) -> Self {
         self.resolver = Some(resolver);
+        self
+    }
+
+    pub fn timeout(mut self, timeout: ClientTimeout) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
+
+    pub fn verify(mut self, verify: bool) -> Self {
+        self.verify = Some(verify);
+        self
+    }
+
+    pub fn headers(mut self, headers: HeaderMap) -> Self {
+        self.headers = Some(headers);
+        self
+    }
+
+    pub fn max_connections(mut self, max_connections: usize) -> Self {
+        self.max_connections = Some(max_connections);
         self
     }
 }
@@ -1195,5 +1266,62 @@ mod tests {
             ctx.inner.data_fetch_semaphore.available_permits(),
             MAX_CONCURRENT_CONNECTIONS
         );
+    }
+
+    // FINDING 3: max_connections must size the data-fetch semaphore (the real
+    // hard cap), not just the reqwest idle pool.
+    #[test]
+    fn options_max_connections_sizes_semaphore() {
+        let opts = ContextOptions::default().max_connections(4);
+        let (ctx, _) = Context::from_uri_with_options("http://localhost:8000", opts).unwrap();
+        assert_eq!(ctx.inner.data_fetch_semaphore.available_permits(), 4);
+    }
+
+    // Boundary: with no override, the semaphore falls back to the upstream
+    // default ceiling — behaviour is identical to a bare client.
+    #[test]
+    fn options_default_semaphore_matches_constant() {
+        let (ctx, _) =
+            Context::from_uri_with_options("http://localhost:8000", ContextOptions::default())
+                .unwrap();
+        assert_eq!(
+            ctx.inner.data_fetch_semaphore.available_permits(),
+            MAX_CONCURRENT_CONNECTIONS
+        );
+    }
+
+    // The builder path must succeed with every transport override set,
+    // including the insecure verify=false certificate path.
+    #[test]
+    fn options_transport_overrides_build_client() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            reqwest::header::ACCEPT,
+            HeaderValue::from_static("application/json"),
+        );
+        let opts = ContextOptions::default()
+            .timeout(ClientTimeout {
+                connect: Some(Duration::from_secs(1)),
+                read: Some(Duration::from_secs(2)),
+            })
+            .verify(false)
+            .headers(headers)
+            .max_connections(8);
+        // Builder methods populate the option fields.
+        assert_eq!(
+            opts.timeout.as_ref().unwrap().connect,
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(
+            opts.timeout.as_ref().unwrap().read,
+            Some(Duration::from_secs(2))
+        );
+        assert_eq!(opts.verify, Some(false));
+        assert_eq!(opts.headers.as_ref().unwrap().len(), 1);
+        assert_eq!(opts.max_connections, Some(8));
+        // The client builds successfully with all overrides applied, and the
+        // semaphore reflects the override.
+        let (ctx, _) = Context::from_uri_with_options("http://localhost:8000", opts).unwrap();
+        assert_eq!(ctx.inner.data_fetch_semaphore.available_permits(), 8);
     }
 }
