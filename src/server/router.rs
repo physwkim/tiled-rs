@@ -2446,7 +2446,7 @@ pub async fn post_container_full(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    if wants_arrow(format_param.as_deref(), accept) {
+    if let Some(target) = wants_xarray_wide_table(format_param.as_deref(), accept) {
         // H2: per-node policy check (parity with the GET path's resolve_entry).
         if !segments.is_empty() {
             let _ = resolve_entry(
@@ -2458,15 +2458,23 @@ pub async fn post_container_full(
             .await?;
         }
         let fields = fields.map(|Json(f)| f).filter(|f| !f.is_empty());
-        return serve_container_arrow(&state, &segments, fields, filename_param, &headers).await;
+        return serve_xarray_wide_table(
+            &state,
+            &segments,
+            target,
+            fields,
+            filename_param,
+            &headers,
+        )
+        .await;
     }
 
-    // Non-arrow POST: delegate to the shared GET logic. The bare-list body is the
-    // column projection (upstream `container_full(field=field)` is shared by GET
+    // Non-wide-table POST: delegate to the shared GET logic. The bare-list body is
+    // the column projection (upstream `container_full(field=field)` is shared by GET
     // and POST, router.py:1428); forward it as repeated `field=` query keys so the
     // GET path resolves the projection through the same `repeated_query_values`
     // call — one projection resolution for both entry points, applied uniformly to
-    // every non-arrow format. format/filename ride the `Query` map as before.
+    // every remaining format. format/filename ride the `Query` map as before.
     let mut query: HashMap<String, String> = HashMap::new();
     if let Some(f) = format_param {
         query.insert("format".to_string(), f);
@@ -2491,17 +2499,42 @@ pub async fn post_container_full(
     .map(IntoResponse::into_response)
 }
 
-/// Whether the caller requested the Apache Arrow representation, honouring the
-/// same `?format=` hard priority as [`crate::serialization::negotiate_media_type`]:
-/// a `format` param settles it (the client sends the full MIME type), otherwise
-/// the `Accept` header is consulted.
-fn wants_arrow(format_param: Option<&str>, accept: &str) -> bool {
+/// Resolve a `/container/full` request to the wide-table export media type for an
+/// `xarray_dataset` container, or `None` when no such format is requested.
+///
+/// Only the ADDITIVE `xarray_dataset` spec formats are recognised — arrow (Arrow
+/// IPC), parquet, csv — which the Container family has no serializer for, so
+/// intercepting them here is not the spec-over-family override gated by P8 (that
+/// would be `application/json` / `text/html`, which the Container family already
+/// serves; see [`serve_xarray_wide_table`]). `?format=` wins over `Accept` (same
+/// hard priority as [`crate::serialization::negotiate_media_type`]); the format
+/// aliases mirror upstream (`arrow`/`feather` → Arrow, `parquet` →
+/// application/x-parquet, `csv` → text/csv). The returned media type is the
+/// TABLE-family key the wide table is encoded through.
+fn wants_xarray_wide_table(format_param: Option<&str>, accept: &str) -> Option<&'static str> {
+    use crate::core::media_type::mime;
     if let Some(fmt) = format_param {
-        return matches!(fmt, "arrow" | "feather" | "ipc")
-            || fmt == crate::core::media_type::mime::ARROW_FILE;
+        return match fmt {
+            "arrow" | "feather" | "ipc" => Some(mime::ARROW_FILE),
+            "parquet" | "pq" => Some(mime::PARQUET),
+            "csv" => Some(mime::CSV),
+            _ if fmt == mime::ARROW_FILE => Some(mime::ARROW_FILE),
+            _ if fmt == mime::PARQUET => Some(mime::PARQUET),
+            _ if fmt == mime::CSV => Some(mime::CSV),
+            _ => None,
+        };
     }
-    accept.split(',').any(|part| {
-        part.split(';').next().map(str::trim) == Some(crate::core::media_type::mime::ARROW_FILE)
+    accept.split(',').find_map(|part| {
+        let base = part.split(';').next().unwrap_or("").trim();
+        if base == mime::ARROW_FILE {
+            Some(mime::ARROW_FILE)
+        } else if base == mime::PARQUET {
+            Some(mime::PARQUET)
+        } else if base == mime::CSV {
+            Some(mime::CSV)
+        } else {
+            None
+        }
     })
 }
 
@@ -2580,16 +2613,40 @@ fn append_field_query(
         .map_err(|e| ServerError::Internal(format!("uri rebuild: {e}")))
 }
 
-/// Serialize an `xarray_dataset` container's array children as a single Arrow IPC
-/// FILE — one column per variable. This mirrors upstream `serialize_dataset_arrow`
-/// (serialization/xarray.py:68 → `as_dataset(node).to_dataframe()`), adapted to run
-/// inline because the Rust serialization registry is keyed on `StructureFamily`,
-/// not on the `xarray_dataset` spec upstream dispatches on. `fields` is the column
-/// projection (a subset of child keys in request order, upstream
-/// `MapAdapter.read(fields=…)`, mapping.py:280); `None` reads every child.
-async fn serve_container_arrow(
+/// Serialize an `xarray_dataset` container's array children as a single flattened
+/// wide table, then encode it as `target_media_type`. Mirrors upstream's
+/// `xarray_dataset` *spec* serializers (serialization/xarray.py), which every one
+/// derive from a single `as_dataset(node).to_dataframe()`: arrow (:68), parquet
+/// (:73), csv (:80). The Rust serialization registry keys on `StructureFamily`,
+/// not on the spec, so the flatten + spec gate run inline here; the per-format
+/// encode is then delegated to the existing TABLE-family serializer for
+/// `target_media_type` (the wide table *is* an Arrow table), exactly as upstream
+/// reuses `serialize_arrow`/`serialize_parquet`/`serialize_csv` from
+/// serialization/table.py on the flattened frame.
+///
+/// Only the ADDITIVE xarray_dataset formats reach this function — arrow, parquet,
+/// csv — which the Container family has no serializer for, so intercepting them
+/// introduces no spec-over-family override. The xarray_dataset `application/json`
+/// (:100) and `text/html` (:87) serializers are deliberately NOT honored: the
+/// Container family already serves those media types (the recursive tree / the
+/// HTML index), so dispatching to the spec serializer would OVERRIDE the container
+/// default — the spec-before-family dispatch (upstream core.py:407) tracked as P8
+/// and blocked on sign-off (`docs/UPSTREAM_AUDIT.md`). See
+/// [`wants_xarray_wide_table`] for the request → media-type resolution.
+///
+/// `fields` is the column projection (a subset of child keys in request order,
+/// upstream `MapAdapter.read(fields=…)`, mapping.py:280); `None` reads every child.
+///
+/// Note: this wide table (all coord + data-var children as equal-length columns,
+/// in container order) is the established Rust representation the arrow export and
+/// its client decoder already agreed on; it diverges from xarray's
+/// `to_dataframe()` (which indexes on dimension coords) by design and pre-dates
+/// this change. csv/parquet reuse the *same* IPC, so every format shares one
+/// schema.
+async fn serve_xarray_wide_table(
     state: &AppState,
     segments: &[String],
+    target_media_type: &str,
     fields: Option<Vec<String>>,
     filename: Option<String>,
     headers: &HeaderMap,
@@ -2604,13 +2661,13 @@ async fn serve_container_arrow(
         })?
     };
 
-    // Parity gate: only an `xarray_dataset` container has an arrow serializer
-    // upstream. A plain container → 406, exactly as the family-keyed
+    // Parity gate: only an `xarray_dataset` container has these wide-table
+    // serializers upstream. A plain container → 406, exactly as the family-keyed
     // `negotiate_media_type` answers for every other unsupported format.
     if !container.specs().iter().any(|s| s.name == "xarray_dataset") {
         return Err(unsupported_media_type(
             crate::core::structures::StructureFamily::Container,
-            crate::core::media_type::mime::ARROW_FILE,
+            target_media_type,
             &state.serialization_registry,
         ));
     }
@@ -2658,10 +2715,46 @@ async fn serve_container_arrow(
         .await
         .map_err(|e| ServerError::Internal(format!("arrow build task failed: {e}")))??;
 
+    // Arrow: the wide table already *is* Arrow IPC — serve those bytes verbatim.
+    if target_media_type == crate::core::media_type::mime::ARROW_FILE {
+        return Ok(serve_with_range(
+            headers,
+            crate::core::media_type::mime::ARROW_FILE,
+            bytes::Bytes::from(ipc),
+            filename.as_deref(),
+        ));
+    }
+
+    // csv/parquet: the wide table is an Arrow table, so delegate to the existing
+    // TABLE-family serializer for this media type (each consumes Arrow IPC bytes),
+    // exactly as upstream's dataset csv/parquet serializers call the table
+    // `serialize_csv`/`serialize_parquet` on `to_dataframe()`. A serializer absent
+    // from the registry (its cargo feature is off) → 406, matching what
+    // negotiation answers for an unavailable format.
+    let serializer = state
+        .serialization_registry
+        .dispatch(
+            crate::core::structures::StructureFamily::Table,
+            target_media_type,
+        )
+        .ok_or_else(|| {
+            unsupported_media_type(
+                crate::core::structures::StructureFamily::Container,
+                target_media_type,
+                &state.serialization_registry,
+            )
+        })?;
+    // The table serializers ignore metadata; pass an empty object.
+    let meta = serde_json::json!({});
+    let body = tokio::task::spawn_blocking(move || serializer(&ipc, &meta))
+        .await
+        .map_err(|e| ServerError::Internal(format!("serialize task failed: {e}")))?
+        .map_err(map_serialize_error)?;
+
     Ok(serve_with_range(
         headers,
-        crate::core::media_type::mime::ARROW_FILE,
-        bytes::Bytes::from(ipc),
+        target_media_type,
+        body,
         filename.as_deref(),
     ))
 }
@@ -2827,19 +2920,24 @@ pub async fn container_full(
     let format_str = params.get("format").map(|s| s.to_string());
     let filename_str = params.get("filename").map(|s| s.to_string());
 
-    // Wide-table arrow export. Upstream registers the Container→arrow serializer
-    // under the `xarray_dataset` *spec* (serialization/xarray.py:68); the Rust
-    // serialization registry keys on `StructureFamily` only, so a spec-keyed
-    // serializer is unrepresentable and `negotiate_media_type` below (family-
-    // keyed) would answer 406. Intercept the arrow request here and mirror the
-    // serializer's logic inline in `serve_container_arrow`, which still 406s for
-    // a non-`xarray_dataset` container — exactly what negotiation would do. The
-    // repeated `field`/`column` query keys are the column projection (upstream
-    // `field` query param, router.py:1352); `Query<HashMap>` collapses repeated
-    // keys, so read them straight off the raw URI.
-    if wants_arrow(format_str.as_deref(), accept) {
+    // Wide-table export (arrow / parquet / csv). Upstream registers these
+    // Container serializers under the `xarray_dataset` *spec*
+    // (serialization/xarray.py:68/73/80); the Rust serialization registry keys on
+    // `StructureFamily` only, so a spec-keyed serializer is unrepresentable and
+    // `negotiate_media_type` below (family-keyed) would answer 406. Intercept the
+    // request here and mirror the serializers' shared logic inline in
+    // `serve_xarray_wide_table`, which still 406s for a non-`xarray_dataset`
+    // container — exactly what negotiation would do. Only these additive formats
+    // are intercepted; the `xarray_dataset` json/html serializers would override a
+    // Container-family default (the P8 spec-before-family dispatch, blocked on
+    // sign-off), so they are left to the container path below. The repeated
+    // `field`/`column` query keys are the column projection (upstream `field` query
+    // param, router.py:1352); `Query<HashMap>` collapses repeated keys, so read
+    // them straight off the raw URI.
+    if let Some(target) = wants_xarray_wide_table(format_str.as_deref(), accept) {
         let fields = repeated_query_values(&uri, &["field", "column"]);
-        return serve_container_arrow(&state, &segments, fields, filename_str, &headers).await;
+        return serve_xarray_wide_table(&state, &segments, target, fields, filename_str, &headers)
+            .await;
     }
 
     // Column projection — resolved ONCE here, before the format dispatch below, so
