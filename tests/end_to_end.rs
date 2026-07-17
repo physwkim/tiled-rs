@@ -2747,9 +2747,9 @@ async fn blosc2_not_requested_gets_uncompressed_body() {
 }
 
 // ===========================================================================
-// Server-Timing response header (upstream capture_metrics, app.py:855-888).
-// Reuses `spawn_blosc2_server` which serves a 1 600-byte octet-stream array
-// ("big"), so the compress phase can be exercised via blosc2.
+// Server-Timing response header (upstream capture_metrics, app.py:855-888) and
+// the lz4 content-encoding arm (media_type_registration.py:289-343). Reuses
+// `spawn_blosc2_server` which serves a 1 600-byte octet-stream array ("big").
 // ===========================================================================
 
 /// The `app` phase is always emitted; assert the header is present and its
@@ -2846,6 +2846,132 @@ async fn server_timing_compress_phase_when_encoding_negotiated() {
         compress_phase.contains("dur=") && compress_phase.contains("ratio="),
         "compress phase must carry dur and ratio: {compress_phase:?}"
     );
+}
+
+/// Round-trip: the client advertises lz4, the server compresses the 1 600-byte
+/// array, and the same lz4 crate (block format with 4-byte LE size prefix,
+/// matching python-lz4's `lz4.block.compress`) decodes it back to the original
+/// f64 bytes.
+#[tokio::test]
+async fn lz4_round_trip_decode_with_same_crate() {
+    let base = spawn_blosc2_server().await;
+
+    let resp = reqwest::Client::new()
+        .get(format!("{base}/api/v1/array/block/big?block=0"))
+        .header("Accept", "application/octet-stream")
+        .header("Accept-Encoding", "lz4")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers().get("content-encoding").unwrap(), "lz4");
+
+    // reqwest does not know lz4, so the body arrives compressed.
+    let compressed = resp.bytes().await.unwrap();
+    let decoded = tiled_rs::server::lz4::decompress(&compressed).expect("lz4 decode");
+
+    assert_eq!(decoded.len(), 200 * 8, "decoded length must match original");
+    let values: Vec<f64> = decoded
+        .chunks_exact(8)
+        .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    let expected: Vec<f64> = (0..200).map(|i| i as f64 * 1.5).collect();
+    assert_eq!(values, expected, "decoded values must equal originals");
+}
+
+/// The lz4 middleware records its compression time into the Server-Timing
+/// accumulator, so an lz4-negotiated response carries a `compress` phase.
+#[tokio::test]
+async fn lz4_emits_compress_server_timing_phase() {
+    let base = spawn_blosc2_server().await;
+
+    let resp = reqwest::Client::new()
+        .get(format!("{base}/api/v1/array/block/big?block=0"))
+        .header("Accept", "application/octet-stream")
+        .header("Accept-Encoding", "lz4")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers().get("content-encoding").unwrap(), "lz4");
+
+    let header = resp
+        .headers()
+        .get("server-timing")
+        .and_then(|v| v.to_str().ok())
+        .expect("Server-Timing header must be present");
+    let compress_phase = header
+        .split(", ")
+        .find(|p| p.starts_with("compress;"))
+        .unwrap_or_else(|| panic!("no compress phase in Server-Timing: {header:?}"));
+    assert!(
+        compress_phase.contains("dur=") && compress_phase.contains("ratio="),
+        "lz4 compress phase must carry dur and ratio: {compress_phase:?}"
+    );
+}
+
+/// Negotiation priority: upstream registers lz4 after gzip and zstd, so lz4 is
+/// preferred over both. A client accepting all three must get lz4.
+#[tokio::test]
+async fn lz4_negotiation_priority_beats_gzip_and_zstd() {
+    let base = spawn_blosc2_server().await;
+
+    let resp = reqwest::Client::new()
+        .get(format!("{base}/api/v1/array/block/big?block=0"))
+        .header("Accept", "application/octet-stream")
+        .header("Accept-Encoding", "gzip, zstd, lz4")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers().get("content-encoding").unwrap(),
+        "lz4",
+        "lz4 must win over gzip/zstd (registered later → preferred)"
+    );
+}
+
+/// Negotiation priority: blosc2 is registered after lz4, so for octet-stream it
+/// outranks lz4. A client accepting both must get blosc2, not lz4.
+#[tokio::test]
+async fn lz4_yields_to_blosc2_for_octet_stream() {
+    let base = spawn_blosc2_server().await;
+
+    let resp = reqwest::Client::new()
+        .get(format!("{base}/api/v1/array/block/big?block=0"))
+        .header("Accept", "application/octet-stream")
+        .header("Accept-Encoding", "lz4, blosc2")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers().get("content-encoding").unwrap(),
+        "blosc2",
+        "blosc2 must outrank lz4 for octet-stream"
+    );
+}
+
+/// An encoding the server does not support must fall through to an
+/// uncompressed, unencoded body (identity) — not lz4.
+#[tokio::test]
+async fn lz4_unsupported_encoding_falls_through() {
+    let base = spawn_blosc2_server().await;
+
+    let resp = reqwest::Client::new()
+        .get(format!("{base}/api/v1/array/block/big?block=0"))
+        .header("Accept", "application/octet-stream")
+        .header("Accept-Encoding", "made-up-encoding")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(
+        resp.headers().get("content-encoding").is_none(),
+        "unsupported encoding must not be compressed"
+    );
+    let bytes = resp.bytes().await.unwrap();
+    assert_eq!(bytes.len(), 200 * 8, "body must be the raw f64 bytes");
 }
 
 // ---------------------------------------------------------------------------

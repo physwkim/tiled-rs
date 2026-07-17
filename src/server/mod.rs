@@ -7,6 +7,7 @@ pub mod error;
 pub mod etag;
 pub mod extractors;
 pub mod file_resolver;
+pub mod lz4;
 pub mod router;
 pub mod server_timing;
 pub mod state;
