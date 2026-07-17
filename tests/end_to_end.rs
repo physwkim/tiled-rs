@@ -2567,13 +2567,33 @@ async fn ragged_export_to_file() {
 // Blosc2 content-encoding tests
 // ---------------------------------------------------------------------------
 
-/// Build a catalog containing one large array (200 f64 = 1 600 bytes) that
-/// exceeds the 500-byte minimum for blosc2 compression.
+/// Build a catalog with two large arrays, both over the 500-byte floor:
+/// - `big`  : 200 f64 = 1 600 bytes of a smooth ramp — compresses well
+///            (lz4 ratio ~1.84, blosc2 ~1.29, both above the 1/0.9 gate).
+/// - `noise`: 400 f64 = 3 200 bytes of deterministic high-entropy bits (an LCG
+///            reinterpreted as f64) — does NOT compress below the ratio gate
+///            (lz4 ratio ~0.99, blosc2 ~0.99), so it must be served identity.
 fn build_large_array_catalog() -> MapAdapter {
     let data: Vec<f64> = (0..200).map(|i| i as f64 * 1.5).collect();
     let arr = ArrayAdapter::from_f64_1d(&data, serde_json::json!({}));
+
+    // Deterministic incompressible bytes: an LCG feeding f64::from_bits so all
+    // eight bytes of every value vary. (from_f64_1d stores raw little-endian
+    // bytes without interpreting them, so non-finite bit patterns are fine.)
+    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+    let noise: Vec<f64> = (0..400)
+        .map(|_| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            f64::from_bits(state)
+        })
+        .collect();
+    let noise_arr = ArrayAdapter::from_f64_1d(&noise, serde_json::json!({}));
+
     let mut mapping = IndexMap::new();
     mapping.insert("big".into(), AnyAdapter::Array(Arc::new(arr)));
+    mapping.insert("noise".into(), AnyAdapter::Array(Arc::new(noise_arr)));
     MapAdapter::new(mapping, serde_json::json!({}), vec![])
 }
 
@@ -2972,6 +2992,148 @@ async fn lz4_unsupported_encoding_falls_through() {
     );
     let bytes = resp.bytes().await.unwrap();
     assert_eq!(bytes.len(), 200 * 8, "body must be the raw f64 bytes");
+}
+
+// ===========================================================================
+// Compression-ratio threshold gate (upstream compression.py:87-93): compress
+// first, then keep the result only if original/compressed > 1/0.9, applied
+// UNIFORMLY to both the blosc2 and lz4 encoders. Boundary matrix below.
+// ===========================================================================
+
+/// Helper: does the Server-Timing header contain a `compress` phase?
+fn has_compress_phase(resp: &reqwest::Response) -> bool {
+    resp.headers()
+        .get("server-timing")
+        .and_then(|v| v.to_str().ok())
+        .map(|h| h.split(", ").any(|p| p.starts_with("compress;")))
+        .unwrap_or(false)
+}
+
+/// Helper: does the Server-Timing header contain the always-present `app` phase?
+fn has_app_phase(resp: &reqwest::Response) -> bool {
+    resp.headers()
+        .get("server-timing")
+        .and_then(|v| v.to_str().ok())
+        .map(|h| h.split(", ").any(|p| p.starts_with("app;dur=")))
+        .unwrap_or(false)
+}
+
+/// Compressible body (the ramp `big`, ratio ~1.29) with blosc2 → compressed,
+/// Content-Encoding set, compress phase present.
+#[tokio::test]
+async fn ratio_gate_compressible_blosc2_compresses_with_phase() {
+    let base = spawn_blosc2_server().await;
+    let resp = reqwest::Client::new()
+        .get(format!("{base}/api/v1/array/block/big?block=0"))
+        .header("Accept", "application/octet-stream")
+        .header("Accept-Encoding", "blosc2")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers().get("content-encoding").unwrap(), "blosc2");
+    assert!(has_app_phase(&resp), "app phase must always be present");
+    assert!(
+        has_compress_phase(&resp),
+        "compressed response must carry a compress phase"
+    );
+}
+
+/// Compressible body (`big`, lz4 ratio ~1.84) with lz4 → compressed,
+/// Content-Encoding set, compress phase present.
+#[tokio::test]
+async fn ratio_gate_compressible_lz4_compresses_with_phase() {
+    let base = spawn_blosc2_server().await;
+    let resp = reqwest::Client::new()
+        .get(format!("{base}/api/v1/array/block/big?block=0"))
+        .header("Accept", "application/octet-stream")
+        .header("Accept-Encoding", "lz4")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers().get("content-encoding").unwrap(), "lz4");
+    assert!(has_app_phase(&resp), "app phase must always be present");
+    assert!(
+        has_compress_phase(&resp),
+        "compressed response must carry a compress phase"
+    );
+}
+
+/// Incompressible body (`noise`, blosc2 ratio ~0.99, > 500-byte floor) with
+/// blosc2 → served identity: no Content-Encoding, no compress phase, but the
+/// app phase is still present and the body is intact.
+#[tokio::test]
+async fn ratio_gate_incompressible_blosc2_served_identity() {
+    let base = spawn_blosc2_server().await;
+    let resp = reqwest::Client::new()
+        .get(format!("{base}/api/v1/array/block/noise?block=0"))
+        .header("Accept", "application/octet-stream")
+        .header("Accept-Encoding", "blosc2")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(
+        resp.headers().get("content-encoding").is_none(),
+        "below-threshold compression must not set Content-Encoding"
+    );
+    assert!(has_app_phase(&resp), "app phase must still be present");
+    assert!(
+        !has_compress_phase(&resp),
+        "skipped compression must NOT record a compress phase"
+    );
+    let bytes = resp.bytes().await.unwrap();
+    assert_eq!(bytes.len(), 400 * 8, "body must be the raw f64 bytes");
+}
+
+/// Incompressible body (`noise`, lz4 ratio ~0.99) with lz4 → served identity:
+/// no Content-Encoding, no compress phase, app phase present, body intact.
+#[tokio::test]
+async fn ratio_gate_incompressible_lz4_served_identity() {
+    let base = spawn_blosc2_server().await;
+    let resp = reqwest::Client::new()
+        .get(format!("{base}/api/v1/array/block/noise?block=0"))
+        .header("Accept", "application/octet-stream")
+        .header("Accept-Encoding", "lz4")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(
+        resp.headers().get("content-encoding").is_none(),
+        "below-threshold compression must not set Content-Encoding"
+    );
+    assert!(has_app_phase(&resp), "app phase must still be present");
+    assert!(
+        !has_compress_phase(&resp),
+        "skipped compression must NOT record a compress phase"
+    );
+    let bytes = resp.bytes().await.unwrap();
+    assert_eq!(bytes.len(), 400 * 8, "body must be the raw f64 bytes");
+}
+
+/// Just under the 500-byte floor (`some_array`, 80 bytes) with lz4 → the size
+/// floor short-circuits before the ratio gate: no Content-Encoding, body
+/// unchanged. (blosc2's under-floor case is covered by
+/// `blosc2_small_body_not_encoded`.)
+#[tokio::test]
+async fn ratio_gate_under_size_floor_lz4_unchanged() {
+    let base = spawn_server(None).await;
+    let resp = reqwest::Client::new()
+        .get(format!("{base}/api/v1/array/block/some_array?block=0"))
+        .header("Accept", "application/octet-stream")
+        .header("Accept-Encoding", "lz4")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(
+        resp.headers().get("content-encoding").is_none(),
+        "80-byte body (< 500 floor) must not be lz4-encoded"
+    );
+    let bytes = resp.bytes().await.unwrap();
+    assert_eq!(bytes.len(), 80, "raw 10×f64 body");
 }
 
 // ---------------------------------------------------------------------------
