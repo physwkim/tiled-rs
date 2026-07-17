@@ -3219,3 +3219,254 @@ async fn oidc_device_flow_entra_embeds_obo() {
         Some("entra-upstream-refresh"),
     );
 }
+
+/// Finding 2 (wave-29): a full-length pasted key on the path route
+/// `DELETE /apikeys/{first_eight}` must be truncated to its 8-char prefix and
+/// revoke the key, matching upstream `revoke_apikey` (`authentication.py:1640`,
+/// `first_eight[:8]`). Exercised through the non-admin ownership path: the
+/// revoking credential is a key holding `revoke:apikeys` but not
+/// `admin:apikeys`, so the handler compares the (truncated) prefix in the
+/// ownership check rather than taking the admin bypass. Pre-fix this returned
+/// 403 (the 64-char key never equalled the stored 8-char `first_eight`).
+#[tokio::test]
+async fn revoke_accepts_full_pasted_key_owner_nonadmin() {
+    let (app, _dir, _cat, _auth_db) = build_test_app().await;
+
+    // Alice's full-scope bearer, used only to mint keys.
+    let (_, body) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/auth/dummy/login",
+        &[],
+        Some(json!({"username": "alice", "password": "wonderland"})),
+    )
+    .await;
+    let bearer = format!("Bearer {}", body["access_token"].as_str().unwrap());
+
+    // A non-admin credential key: it may revoke, but is not admin, so the
+    // handler takes the ownership-check path rather than the admin bypass.
+    let (status, body) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/auth/apikeys",
+        &[("authorization", &bearer)],
+        Some(json!({"note": "cred", "scopes": ["read:metadata", "revoke:apikeys"]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let cred_apikey = format!("Apikey {}", body["secret"].as_str().unwrap());
+
+    // The target key to revoke (owned by the same principal, alice).
+    let (status, body) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/auth/apikeys",
+        &[("authorization", &bearer)],
+        Some(json!({"note": "target", "scopes": ["read:metadata"]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let target_secret = body["secret"].as_str().unwrap().to_string();
+    let target_apikey = format!("Apikey {target_secret}");
+
+    // Revoke the target by pasting its FULL 64-char key into the path route,
+    // authenticated by the non-admin credential key.
+    let (status, _) = json_request(
+        &app,
+        Method::DELETE,
+        &format!("/api/v1/auth/apikeys/{target_secret}"),
+        &[("authorization", &cred_apikey)],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // The target key no longer authenticates; the credential key still does.
+    let (status, _) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/metadata/",
+        &[("authorization", &target_apikey)],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/metadata/",
+        &[("authorization", &cred_apikey)],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+/// Finding 2 (wave-29): the admin principal route
+/// `DELETE /principal/{uuid}/apikey?first_eight=...` must truncate a full pasted
+/// key to its 8-char prefix, matching upstream `revoke_apikey_for_principal`
+/// (`authentication.py:1381`, `first_eight[:8]`). Pre-fix the 64-char value
+/// matched no stored `first_eight`, yielding a spurious 404.
+#[tokio::test]
+async fn admin_revoke_principal_accepts_full_pasted_key() {
+    let (app, _dir, _cat, auth_db) = build_test_app().await;
+
+    let (_, body) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/auth/dummy/login",
+        &[],
+        Some(json!({"username": "alice", "password": "wonderland"})),
+    )
+    .await;
+    let alice_sub = body["identity"]["id"].as_str().unwrap().to_string();
+    let (alice, _) = auth_db.ensure_principal("dummy", &alice_sub).await.unwrap();
+    // The admin principal route requires `admin:apikeys`; a login's scopes are
+    // capped by the principal's role, so promote alice to admin and re-login.
+    auth_db
+        .update_principal_role(alice.id, "admin")
+        .await
+        .unwrap();
+    let (_, body) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/auth/dummy/login",
+        &[],
+        Some(json!({"username": "alice", "password": "wonderland"})),
+    )
+    .await;
+    let bearer = format!("Bearer {}", body["access_token"].as_str().unwrap());
+
+    // Mint a key owned by alice.
+    let (status, body) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/auth/apikeys",
+        &[("authorization", &bearer)],
+        Some(json!({"note": "target", "scopes": ["read:metadata"]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let target_secret = body["secret"].as_str().unwrap().to_string();
+    let target_apikey = format!("Apikey {target_secret}");
+
+    // Admin-revoke it via the full pasted key on the principal route.
+    let (status, _) = json_request(
+        &app,
+        Method::DELETE,
+        &format!(
+            "/api/v1/auth/principal/{}/apikey?first_eight={target_secret}",
+            alice.uuid
+        ),
+        &[("authorization", &bearer)],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // The revoked key no longer authenticates.
+    let (status, _) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/metadata/",
+        &[("authorization", &target_apikey)],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+/// Finding 2 (wave-29) regression: the 8-char prefix (the canonical value all
+/// shipped clients send) must keep revoking on all three routes — the plural
+/// path route, the singular own-key route, and the admin principal route.
+#[tokio::test]
+async fn revoke_eight_char_prefix_works_on_all_routes() {
+    let (app, _dir, _cat, auth_db) = build_test_app().await;
+
+    let (_, body) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/auth/dummy/login",
+        &[],
+        Some(json!({"username": "alice", "password": "wonderland"})),
+    )
+    .await;
+    let alice_sub = body["identity"]["id"].as_str().unwrap().to_string();
+    let (alice, _) = auth_db.ensure_principal("dummy", &alice_sub).await.unwrap();
+    // Route 3 (admin principal) requires `admin:apikeys`; promote alice to admin
+    // and re-login so one bearer can drive all three routes.
+    auth_db
+        .update_principal_role(alice.id, "admin")
+        .await
+        .unwrap();
+    let (_, body) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/auth/dummy/login",
+        &[],
+        Some(json!({"username": "alice", "password": "wonderland"})),
+    )
+    .await;
+    let bearer = format!("Bearer {}", body["access_token"].as_str().unwrap());
+
+    // Mint a key and return its stored 8-char prefix.
+    async fn mint(app: &axum::Router, bearer: &str) -> String {
+        let (status, body) = json_request(
+            app,
+            Method::POST,
+            "/api/v1/auth/apikeys",
+            &[("authorization", bearer)],
+            Some(json!({"note": "k", "scopes": ["read:metadata"]})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        body["first_eight"].as_str().unwrap().to_string()
+    }
+
+    // Route 1: plural path route.
+    let fe1 = mint(&app, &bearer).await;
+    let (status, _) = json_request(
+        &app,
+        Method::DELETE,
+        &format!("/api/v1/auth/apikeys/{fe1}"),
+        &[("authorization", &bearer)],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "path route, 8-char prefix");
+
+    // Route 2: singular own-key query route.
+    let fe2 = mint(&app, &bearer).await;
+    let (status, _) = json_request(
+        &app,
+        Method::DELETE,
+        &format!("/api/v1/auth/apikey?first_eight={fe2}"),
+        &[("authorization", &bearer)],
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "singular route, 8-char prefix"
+    );
+
+    // Route 3: admin principal query route.
+    let fe3 = mint(&app, &bearer).await;
+    let (status, _) = json_request(
+        &app,
+        Method::DELETE,
+        &format!(
+            "/api/v1/auth/principal/{}/apikey?first_eight={fe3}",
+            alice.uuid
+        ),
+        &[("authorization", &bearer)],
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "admin principal route, 8-char prefix"
+    );
+}
