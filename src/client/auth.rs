@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
@@ -515,10 +515,27 @@ pub fn default_token_cache_dir() -> PathBuf {
         .join("tokens")
 }
 
-/// Per-server token directory. Mirrors `Context._token_directory`.
+/// Character set matching Python `urllib.parse.quote_plus`: every byte is
+/// percent-encoded except ASCII alphanumerics and the unreserved marks
+/// `_ . - ~` (`urllib`'s `_ALWAYS_SAFE`). `quote_plus` additionally maps a
+/// literal space to `+`, but a URL string never carries a raw space, so that
+/// case is unreachable for the api_uri encoded here.
+const TOKEN_DIR_ENCODE: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'_')
+    .remove(b'.')
+    .remove(b'-')
+    .remove(b'~');
+
+/// Per-server token directory. Mirrors `Context._token_directory`
+/// (`context.py:1042-1047`), which keys the directory by
+/// `quote_plus(str(api_uri))`. Using the same encoding — rather than the
+/// stricter `NON_ALPHANUMERIC` scheme, which also escapes `. - _ ~` — makes the
+/// Rust- and Python-tiled token caches interoperable: a session cached by one
+/// is found by the other. (Tokens written under the previous encoding are
+/// orphaned by this change; there is no migration shim, matching upstream.)
 pub fn token_directory_for_server(api_uri: &Url) -> PathBuf {
-    let host = utf8_percent_encode(api_uri.as_str(), NON_ALPHANUMERIC).to_string();
-    default_token_cache_dir().join(host)
+    let encoded = utf8_percent_encode(api_uri.as_str(), TOKEN_DIR_ENCODE).to_string();
+    default_token_cache_dir().join(encoded)
 }
 
 /// Read a username from stdin.
@@ -787,12 +804,25 @@ mod tests {
     }
 
     #[test]
-    fn token_directory_per_server() {
-        let url = Url::parse("http://example.com:8000/api/v1/").unwrap();
-        let p = token_directory_for_server(&url);
+    fn token_directory_matches_python_quote_plus_encoding() {
+        // The per-server directory name must equal Python
+        // `quote_plus(str(api_uri))` so a token cache written by python-tiled is
+        // found by tiled-rs and vice versa. The host carries both `-` and `.`,
+        // the characters that distinguish quote_plus (leaves them literal) from
+        // the old NON_ALPHANUMERIC scheme (escaped them to %2D/%2E). Asserting on
+        // the final path component keeps the check independent of the cache root.
+        let url = Url::parse("http://my-host.example.com:8000/api/v1/").unwrap();
+        let dir = token_directory_for_server(&url);
+        let name = dir.file_name().unwrap().to_str().unwrap();
+        assert_eq!(
+            name, "http%3A%2F%2Fmy-host.example.com%3A8000%2Fapi%2Fv1%2F",
+            "token dir must be quote_plus-encoded (`. - _ ~` stay literal)"
+        );
+        // Regression guard against the old NON_ALPHANUMERIC scheme, which
+        // percent-encoded `.` and `-` and so made the caches mutually invisible.
         assert!(
-            p.to_string_lossy().contains("example"),
-            "path should contain encoded host: {p:?}"
+            name.contains("my-host.example.com"),
+            "`.` and `-` must not be percent-encoded: {name}"
         );
     }
 }
