@@ -20,7 +20,20 @@ use crate::server::router;
 use crate::server::state::{AppState, CorsOriginPolicy};
 
 /// Build the Axum application with all routes attached.
-pub fn build_app(state: AppState) -> Router {
+pub fn build_app(mut state: AppState) -> Router {
+    // Single-user / multi-user mode exclusivity (upstream
+    // `tiled/server/authentication.py:350`): the single-user API key is inert
+    // once an auth DB is configured. Drop it here — the single funnel every
+    // server passes through — so `auth_db.is_some() ⟹ api_key.is_none()` holds
+    // by construction and the middleware single-user fall-through
+    // (`resolve_auth_inner`) cannot grant scopes against a multi-user server.
+    if state.enforce_auth_mode_exclusivity() {
+        tracing::warn!(
+            target: "tiled.auth",
+            "single-user API key ignored: an auth database is configured (multi-user mode)"
+        );
+    }
+
     // server-C1: warn loudly, once at startup, when the server is fully open.
     // With neither a single-user api_key nor an auth_db, the auth middleware
     // grants anonymous callers FULL scope (read AND write). Python always mints
@@ -617,7 +630,7 @@ pub async fn validate_apikey(state: &AppState, key: &str) -> Result<AuthContext,
         if key.as_bytes().ct_eq(expected.as_bytes()).into() {
             return Ok(AuthContext {
                 principal: None,
-                scopes: ScopeSet::full(),
+                scopes: ScopeSet::single_user(),
                 kind: AuthKind::SingleUserKey,
                 authn_access_tags: None,
             });
@@ -675,7 +688,7 @@ async fn resolve_auth_inner(
             if key.as_bytes().ct_eq(expected.as_bytes()).into() {
                 return Ok(AuthContext {
                     principal: None,
-                    scopes: ScopeSet::full(),
+                    scopes: ScopeSet::single_user(),
                     kind: AuthKind::SingleUserKey,
                     authn_access_tags: None,
                 });

@@ -242,6 +242,28 @@ impl AppState {
         self.api_key.is_none() && self.auth_db.is_none()
     }
 
+    /// Enforce single-user / multi-user **mode exclusivity**. A multi-user
+    /// auth database and a single-user API key are mutually exclusive auth
+    /// backends. Upstream consults the single-user key *only* when no
+    /// authenticators are configured (`if not authenticated`,
+    /// `tiled/server/authentication.py:350`); once an auth DB is present the
+    /// single-user key is never compared. This drops the single-user key when
+    /// an auth DB is configured, so `auth_db.is_some() ⟹ api_key.is_none()`
+    /// holds for the running app and the auth-middleware single-user
+    /// fall-through cannot grant scopes against a multi-user server. Returns
+    /// `true` iff a key was dropped, so the caller can warn. Called once, from
+    /// [`crate::server::build_app`] — the single funnel every server (CLI and
+    /// tests) passes through — so the illegal both-set state is unrepresentable
+    /// in any built app rather than guarded by a per-request runtime branch.
+    pub(crate) fn enforce_auth_mode_exclusivity(&mut self) -> bool {
+        if self.auth_db.is_some() && self.api_key.is_some() {
+            self.api_key = None;
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn resolve_base_url(&self, headers: &axum::http::HeaderMap) -> String {
         self.resolve_base_url_with_peer(headers, None)
     }
