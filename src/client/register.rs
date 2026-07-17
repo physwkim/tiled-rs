@@ -193,8 +193,69 @@ impl RegistrationAdapter for PassthroughAdapter {
     }
 }
 
-/// CSV adapter — reads the header, sniffs the first ~10 rows for column
-/// types, and emits a `table` structure spec.
+/// Build the table `structure` JSON — carrying a real base64-encoded Arrow
+/// schema — for a table file being registered.
+///
+/// The registered structure is produced by the **same** server-side adapter
+/// (`CsvAdapter` / `ParquetAdapter`) that will later serve the node, so it is
+/// byte-identical to what a read re-derives. This mirrors upstream
+/// `register_single_item`, which serializes `adapter.structure()` from the very
+/// adapter class the server uses (`tiled/client/register.py:334-336`); the
+/// adapter's `structure()` carries the Arrow schema the family-authoritative
+/// `TableStructure` parse requires (`tiled/structures/table.py`).
+///
+/// This is the single owner of register-time table-structure inference: every
+/// table-family adapter in the engine routes here rather than hand-rolling a
+/// second bespoke schema inference. `from_path` reads the file (CSV: whole file
+/// for schema inference + null-column promotion; Parquet: footer only), so the
+/// call is dispatched onto a blocking thread.
+async fn table_structure_from_file(mimetype: &str, path: PathBuf) -> Result<serde_json::Value> {
+    let mimetype = mimetype.to_string();
+    tokio::task::spawn_blocking(move || match mimetype.as_str() {
+        "text/csv" => csv_table_structure_json(path),
+        "application/x-parquet" => parquet_table_structure_json(path),
+        other => Err(ClientError::Invalid(format!(
+            "no register-time table-structure builder for mimetype '{other}'"
+        ))),
+    })
+    .await
+    .map_err(|e| ClientError::Invalid(format!("register inspect join: {e}")))?
+}
+
+#[cfg(feature = "csv-adapter")]
+fn csv_table_structure_json(path: PathBuf) -> Result<serde_json::Value> {
+    use crate::core::adapters::TableAdapterRead;
+    let adapter = crate::adapters::CsvAdapter::from_path(path, serde_json::json!({}))
+        .map_err(|e| ClientError::Invalid(format!("csv inspect: {e}")))?;
+    serde_json::to_value(adapter.structure())
+        .map_err(|e| ClientError::Invalid(format!("serialize csv table structure: {e}")))
+}
+
+#[cfg(not(feature = "csv-adapter"))]
+fn csv_table_structure_json(_path: PathBuf) -> Result<serde_json::Value> {
+    Err(ClientError::Invalid(
+        "CSV registration requires the `csv-adapter` feature".into(),
+    ))
+}
+
+#[cfg(feature = "parquet-adapter")]
+fn parquet_table_structure_json(path: PathBuf) -> Result<serde_json::Value> {
+    use crate::core::adapters::TableAdapterRead;
+    let adapter = crate::adapters::ParquetAdapter::from_path(path, serde_json::json!({}))
+        .map_err(|e| ClientError::Invalid(format!("parquet inspect: {e}")))?;
+    serde_json::to_value(adapter.structure())
+        .map_err(|e| ClientError::Invalid(format!("serialize parquet table structure: {e}")))
+}
+
+#[cfg(not(feature = "parquet-adapter"))]
+fn parquet_table_structure_json(_path: PathBuf) -> Result<serde_json::Value> {
+    Err(ClientError::Invalid(
+        "Parquet registration requires the `parquet-adapter` feature".into(),
+    ))
+}
+
+/// CSV adapter — delegates to the server-side `CsvAdapter` to infer a full
+/// `table` structure (columns + partition count + base64 Arrow schema).
 pub struct CsvAdapter;
 
 #[async_trait]
@@ -209,28 +270,11 @@ impl RegistrationAdapter for CsvAdapter {
         let path = uri
             .to_file_path()
             .map_err(|_| ClientError::Invalid("CSV adapter expects a file:// URI".into()))?;
-        let path_for_io = path.clone();
-        let columns: Vec<String> = tokio::task::spawn_blocking(move || -> Result<Vec<String>> {
-            let file = std::fs::File::open(&path_for_io).map_err(|e| {
-                ClientError::Invalid(format!("open {}: {e}", path_for_io.display()))
-            })?;
-            let mut reader = csv::Reader::from_reader(file);
-            Ok(reader
-                .headers()
-                .map_err(|e| ClientError::Invalid(format!("csv headers: {e}")))?
-                .iter()
-                .map(String::from)
-                .collect())
-        })
-        .await
-        .map_err(|e| ClientError::Invalid(format!("csv inspect join: {e}")))??;
+        let structure = table_structure_from_file("text/csv", path).await?;
         Ok(DataSourceSpec {
             structure_family: StructureFamily::Table,
             mimetype: "text/csv".into(),
-            structure: Some(serde_json::json!({
-                "columns": columns,
-                "npartitions": 1,
-            })),
+            structure: Some(structure),
             parameters: serde_json::json!({}),
             assets: vec![AssetSpec {
                 data_uri: uri.to_string(),
@@ -244,7 +288,9 @@ impl RegistrationAdapter for CsvAdapter {
     }
 }
 
-/// Parquet adapter — reads the schema header.
+/// Parquet adapter — delegates to the server-side `ParquetAdapter` to infer a
+/// full `table` structure (columns + row-group partition count + base64 Arrow
+/// schema) from the file's own footer metadata.
 pub struct ParquetAdapter;
 
 #[async_trait]
@@ -259,32 +305,11 @@ impl RegistrationAdapter for ParquetAdapter {
         let path = uri
             .to_file_path()
             .map_err(|_| ClientError::Invalid("Parquet adapter expects file:// URI".into()))?;
-        let path_for_io = path.clone();
-        let columns: Vec<String> = tokio::task::spawn_blocking(move || -> Result<Vec<String>> {
-            use parquet::file::reader::FileReader;
-            let file = std::fs::File::open(&path_for_io).map_err(|e| {
-                ClientError::Invalid(format!("open {}: {e}", path_for_io.display()))
-            })?;
-            let reader = parquet::file::reader::SerializedFileReader::new(file)
-                .map_err(|e| ClientError::Invalid(format!("parquet read: {e}")))?;
-            Ok(reader
-                .metadata()
-                .file_metadata()
-                .schema()
-                .get_fields()
-                .iter()
-                .map(|f| f.name().to_string())
-                .collect())
-        })
-        .await
-        .map_err(|e| ClientError::Invalid(format!("parquet inspect join: {e}")))??;
+        let structure = table_structure_from_file("application/x-parquet", path).await?;
         Ok(DataSourceSpec {
             structure_family: StructureFamily::Table,
             mimetype: "application/x-parquet".into(),
-            structure: Some(serde_json::json!({
-                "columns": columns,
-                "npartitions": 1,
-            })),
+            structure: Some(structure),
             parameters: serde_json::json!({}),
             assets: vec![AssetSpec {
                 data_uri: uri.to_string(),
