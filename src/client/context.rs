@@ -871,13 +871,18 @@ impl Context {
                 ClientError::Invalid("server does not advertise authentication.links.whoami".into())
             })?;
         let url = self.resolve_link(url)?;
-        let resp = self.get(&url).await?;
-        decode_response::<crate::core::schemas::Response<crate::client::auth::WhoAmI>>(resp)
-            .await
-            .and_then(|env| {
-                env.data
-                    .ok_or_else(|| ClientError::Invalid("whoami missing data".into()))
-            })
+        // Wrapped in `retry` to match upstream `Context.whoami`, which issues the
+        // GET inside `retry_context` (`context.py:1137-1144`).
+        retry(|| async {
+            let resp = self.get(&url).await?;
+            decode_response::<crate::core::schemas::Response<crate::client::auth::WhoAmI>>(resp)
+                .await
+                .and_then(|env| {
+                    env.data
+                        .ok_or_else(|| ClientError::Invalid("whoami missing data".into()))
+                })
+        })
+        .await
     }
 
     /// Log out: revoke the session server-side and clear local tokens.
@@ -909,11 +914,15 @@ impl Context {
             id_token.as_ref(),
         ) {
             // OIDC client-id flow: GET logout endpoint with id_token_hint.
+            // Wrapped in `retry` to match upstream `Context.logout`, which issues
+            // the revoke request inside `retry_context` (`context.py:1159-1182`).
+            // The result stays best-effort (`let _`): tokens are cleared below
+            // regardless, matching this client's pre-existing logout semantics.
             if let Ok(mut url) = self.resolve_link(logout_url) {
                 url.query_pairs_mut()
                     .append_pair("id_token_hint", id_tok)
                     .append_pair("client_id", &client_id);
-                let _ = self.get(&url).await;
+                let _ = retry(|| async { self.get(&url).await }).await;
             }
         } else if let Some(rt) = refresh_token {
             // Tiled-native: POST refresh_token to revoke endpoint.
@@ -924,7 +933,7 @@ impl Context {
                 Url::parse(&s)?
             };
             let body = serde_json::json!({"refresh_token": rt});
-            let _ = self.post_json(&url, &body).await;
+            let _ = retry(|| async { self.post_json(&url, &body).await }).await;
         }
 
         auth.tokens().clear("access_token").await?;
@@ -967,14 +976,19 @@ impl Context {
     /// was not authenticated with an API key.
     pub async fn which_api_key(&self) -> Result<ApiKeyInfo> {
         let url = self.inner.api_uri.join("auth/apikey")?;
-        let req = self.request(Method::GET, &url).await?.header(
-            reqwest::header::ACCEPT,
-            crate::client::utils::JSON_MIME_TYPE,
-        );
-        let resp = self.send_with_auth(req).await?;
-        self.maybe_capture_csrf(&resp).await;
-        let resp = handle_error(resp).await?;
-        decode_response::<ApiKeyInfo>(resp).await
+        // Wrapped in `retry` to match upstream `Context.which_api_key`, which
+        // issues the GET inside `retry_context` (`context.py:831-838`).
+        retry(|| async {
+            let req = self.request(Method::GET, &url).await?.header(
+                reqwest::header::ACCEPT,
+                crate::client::utils::JSON_MIME_TYPE,
+            );
+            let resp = self.send_with_auth(req).await?;
+            self.maybe_capture_csrf(&resp).await;
+            let resp = handle_error(resp).await?;
+            decode_response::<ApiKeyInfo>(resp).await
+        })
+        .await
     }
 
     /// Generate a new API key (`POST /api/v1/auth/apikeys`).
@@ -997,12 +1011,18 @@ impl Context {
             "expires_in_seconds": expires_in_seconds,
             "note": note,
         });
-        let req = self.request(Method::POST, &url).await?.json(&body);
-        let req = self.add_csrf(req).await;
-        let resp = self.send_with_auth(req).await?;
-        self.maybe_capture_csrf(&resp).await;
-        let resp = handle_error(resp).await?;
-        decode_response::<ApiKeyCreated>(resp).await
+        // Wrapped in `retry` to match upstream `Context.create_api_key`, which
+        // issues the POST inside `retry_context` (`context.py:874-887`). Upstream
+        // retries this non-idempotent create, so parity requires we do too.
+        retry(|| async {
+            let req = self.request(Method::POST, &url).await?.json(&body);
+            let req = self.add_csrf(req).await;
+            let resp = self.send_with_auth(req).await?;
+            self.maybe_capture_csrf(&resp).await;
+            let resp = handle_error(resp).await?;
+            decode_response::<ApiKeyCreated>(resp).await
+        })
+        .await
     }
 
     /// Revoke an API key by its first eight characters
@@ -1019,12 +1039,17 @@ impl Context {
             .inner
             .api_uri
             .join(&format!("auth/apikeys/{first_eight}"))?;
-        let req = self.request(Method::DELETE, &url).await?;
-        let req = self.add_csrf(req).await;
-        let resp = self.send_with_auth(req).await?;
-        self.maybe_capture_csrf(&resp).await;
-        handle_error(resp).await?;
-        Ok(())
+        // Wrapped in `retry` to match upstream `Context.revoke_api_key`, which
+        // issues the DELETE inside `retry_context` (`context.py:904-915`).
+        retry(|| async {
+            let req = self.request(Method::DELETE, &url).await?;
+            let req = self.add_csrf(req).await;
+            let resp = self.send_with_auth(req).await?;
+            self.maybe_capture_csrf(&resp).await;
+            handle_error(resp).await?;
+            Ok(())
+        })
+        .await
     }
 
     // ---------------- Session management ----------------
@@ -1043,12 +1068,17 @@ impl Context {
             .inner
             .api_uri
             .join(&format!("auth/session/revoke/{session_id}"))?;
-        let req = self.request(Method::DELETE, &url).await?;
-        let req = self.add_csrf(req).await;
-        let resp = self.send_with_auth(req).await?;
-        self.maybe_capture_csrf(&resp).await;
-        handle_error(resp).await?;
-        Ok(())
+        // Wrapped in `retry` to match upstream `Context.revoke_session`, which
+        // issues the DELETE inside `retry_context` (`context.py:1199-1208`).
+        retry(|| async {
+            let req = self.request(Method::DELETE, &url).await?;
+            let req = self.add_csrf(req).await;
+            let resp = self.send_with_auth(req).await?;
+            self.maybe_capture_csrf(&resp).await;
+            handle_error(resp).await?;
+            Ok(())
+        })
+        .await
     }
 
     // ---------------- Administrative accessor ----------------
