@@ -244,8 +244,9 @@ async fn cyclic_reference_is_safe_not_infinite() {
     let mut c = make(CYCLE, None).await;
     c.compile().await.expect("a cycle must compile, not hang");
     let pool = c.pool();
-    // a is compiled first (BTreeMap order): a sees b's ub (b's recursion into a
-    // hits the seen-guard and contributes nothing), then adds its own ua.
+    // a is compiled first (config-insertion order; a precedes b in the config):
+    // a sees b's ub (b's recursion into a hits the seen-guard and contributes
+    // nothing), then adds its own ua.
     assert!(tag_has_user(pool, "a", "ua").await);
     assert!(tag_has_user(pool, "a", "ub").await);
     // b, memoized after a, holds only its own ub (a was on the seen path).
@@ -253,6 +254,48 @@ async fn cyclic_reference_is_safe_not_infinite() {
     assert!(
         !tag_has_user(pool, "b", "ua").await,
         "the cycle back-edge contributes nothing"
+    );
+}
+
+// `zeta` is defined before `alpha` in the config but sorts AFTER it, so
+// config-insertion order and sorted order disagree on which tag the DFS enters
+// first. This pins the tie-break to config order (upstream `for tag in
+// adjacent_tags`).
+const CYCLE_ORDER: &str = r#"
+tags:
+  zeta:
+    users:
+      - name: uz
+        scopes: ["read:metadata"]
+    auto_tags:
+      - name: alpha
+  alpha:
+    users:
+      - name: ua
+        scopes: ["read:data"]
+    auto_tags:
+      - name: zeta
+"#;
+
+#[tokio::test]
+async fn cyclic_entry_order_is_config_insertion_not_sorted() {
+    // The compiler must enter the DFS in config-insertion order, so `zeta`
+    // (defined first) is resolved first: it inherits `alpha`'s user because the
+    // back-edge alpha->zeta hits the seen-guard, while `alpha`, memoized on
+    // zeta's seen-path, keeps only its own user. Sorted order would enter
+    // `alpha` first and invert this — so this fails on a BTreeMap entry loop.
+    let mut c = make(CYCLE_ORDER, None).await;
+    c.compile().await.expect("cycle compiles");
+    let pool = c.pool();
+    assert!(tag_has_user(pool, "zeta", "uz").await);
+    assert!(
+        tag_has_user(pool, "zeta", "ua").await,
+        "zeta resolved first (config order) inherits alpha's user"
+    );
+    assert!(tag_has_user(pool, "alpha", "ua").await);
+    assert!(
+        !tag_has_user(pool, "alpha", "uz").await,
+        "alpha, memoized on zeta's seen-path, gets nothing from the back-edge"
     );
 }
 
