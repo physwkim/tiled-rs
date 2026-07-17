@@ -118,6 +118,27 @@ pub async fn ws_subscribe(
     // the client needs to interpret subsequent events.
     let schema = build_schema_payload(&state, &segments).await;
 
+    // The node's `.../api/v1/array/full/{path}` URL, from which an `array-ref`
+    // event's deliverable `?slice=` URI is built at send time (upstream
+    // router.py:829-833). Uses the request base (honouring `base_url` /
+    // forwarded headers) plus the raw, still-percent-encoded path segments so
+    // the URI carries the same encoding the client used.
+    let path_str = path
+        .find(PREFIX)
+        .map(|idx| {
+            path[idx + PREFIX.len()..]
+                .split('/')
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join("/")
+        })
+        .unwrap_or_default();
+    let base_uri = format!(
+        "{}/api/v1/array/full/{}",
+        state.resolve_base_url(&headers),
+        path_str
+    );
+
     let start = q.start;
     let envelope_format = q.envelope_format;
     let state_for_handshake = state.clone();
@@ -130,6 +151,7 @@ pub async fn ws_subscribe(
             start,
             envelope_format,
             header_auth,
+            base_uri,
         )
     }))
 }
@@ -229,6 +251,7 @@ async fn run_subscription(
     start: Option<u64>,
     format: EnvelopeFormat,
     header_auth: Option<AuthContext>,
+    base_uri: String,
 ) {
     let (mut tx, mut rx) = futures::StreamExt::split(socket);
     use futures::SinkExt;
@@ -339,6 +362,7 @@ async fn run_subscription(
                 seq,
                 format,
                 &payload_ctx,
+                &base_uri,
             )
             .await
             {
@@ -374,6 +398,7 @@ async fn run_subscription(
                                 seq,
                                 format,
                                 &payload_ctx,
+                                &base_uri,
                             )
                             .await
                             {
@@ -433,6 +458,7 @@ async fn send_seq(
     seq: u64,
     format: EnvelopeFormat,
     payload_ctx: &PayloadCtx,
+    base_uri: &str,
 ) -> SendOutcome {
     use futures::SinkExt;
     let event = match state.streaming_cache.get(node_id, seq).await {
@@ -456,7 +482,19 @@ async fn send_seq(
     {
         return SendOutcome::Skipped;
     }
-    match encode(&event.metadata, event.payload.as_ref(), format, payload_ctx) {
+    // `array-ref` events ship no payload; the deliverable `?slice=` URI is built
+    // at send time from the event's patch/shape (upstream `stream_data`,
+    // streaming.py:248-259). Only these events need the base URI, so clone the
+    // metadata to inject `uri` and leave every other event untouched.
+    let metadata: std::borrow::Cow<'_, Value> =
+        if event.metadata.get("type").and_then(Value::as_str) == Some("array-ref") {
+            let mut m = event.metadata.clone();
+            inject_array_ref_slice_uri(&mut m, base_uri);
+            std::borrow::Cow::Owned(m)
+        } else {
+            std::borrow::Cow::Borrowed(&event.metadata)
+        };
+    match encode(&metadata, event.payload.as_ref(), format, payload_ctx) {
         Some(msg) => {
             if tx.send(msg).await.is_err() {
                 SendOutcome::ClientGone
@@ -468,6 +506,57 @@ async fn send_seq(
             tracing::warn!(target: "tiled.streaming", "encode event failed (seq {seq})");
             SendOutcome::Skipped
         }
+    }
+}
+
+/// Set an `array-ref` event's deliverable `uri` (`{base_uri}?slice={s}`),
+/// mirroring upstream `stream_data` (streaming.py:248-259). With a patch, each
+/// axis is `offset:offset+shape` over `patch.offset`/`patch.shape`; without one,
+/// each full dimension is `:dim` over the event `shape`. `base_uri` is the
+/// node's `.../array/full/{path}` URL. A malformed patch/shape leaves `uri`
+/// unset rather than emitting a truncated slice.
+fn inject_array_ref_slice_uri(metadata: &mut Value, base_uri: &str) {
+    let slice = match metadata.get("patch") {
+        // A patch descriptor `{shape, offset}` -> per-axis `offset:offset+shape`.
+        Some(patch) if patch.is_object() => {
+            let (Some(offsets), Some(shapes)) = (
+                patch.get("offset").and_then(Value::as_array),
+                patch.get("shape").and_then(Value::as_array),
+            ) else {
+                return;
+            };
+            if offsets.len() != shapes.len() {
+                return;
+            }
+            let mut parts = Vec::with_capacity(offsets.len());
+            for (o, s) in offsets.iter().zip(shapes.iter()) {
+                let (Some(o), Some(s)) = (o.as_u64(), s.as_u64()) else {
+                    return;
+                };
+                parts.push(format!("{o}:{}", o + s));
+            }
+            parts.join(",")
+        }
+        // No patch -> the full array, each dimension as `:dim`.
+        _ => {
+            let Some(dims) = metadata.get("shape").and_then(Value::as_array) else {
+                return;
+            };
+            let mut parts = Vec::with_capacity(dims.len());
+            for d in dims {
+                let Some(d) = d.as_u64() else {
+                    return;
+                };
+                parts.push(format!(":{d}"));
+            }
+            parts.join(",")
+        }
+    };
+    if let Some(obj) = metadata.as_object_mut() {
+        obj.insert(
+            "uri".into(),
+            Value::from(format!("{base_uri}?slice={slice}")),
+        );
     }
 }
 

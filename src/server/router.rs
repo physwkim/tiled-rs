@@ -1730,6 +1730,32 @@ async fn stream_array_data(
         .await;
 }
 
+/// Publish an `array-ref` streaming event on the array node's OWN stream
+/// (upstream `CatalogNodeAdapter.put_data_source`, catalog/adapter.py:973-992):
+/// a metadata-only reference to a (re)registered array data source. `data_source`
+/// is the request's data-source object, `patch` the optional `{shape, offset}`
+/// descriptor, `shape` the registered array shape; the WS sender derives the
+/// `?slice=` URI from these at send time. No payload. The caller
+/// (`put_data_source`) is catalog-only and already holds the node id, so this
+/// takes it directly; the streaming cache is a no-op in non-streaming builds.
+async fn stream_array_ref(
+    state: &AppState,
+    node_id: i64,
+    data_source: serde_json::Value,
+    patch: Option<serde_json::Value>,
+    shape: &[usize],
+) {
+    let seq = state.streaming_cache.incr_seq(node_id).await;
+    state
+        .streaming_cache
+        .set(
+            node_id,
+            seq,
+            crate::server::streaming_cache::StreamEvent::array_ref(seq, data_source, patch, shape),
+        )
+        .await;
+}
+
 /// Publish a `table-data` streaming event on the table node's OWN stream
 /// (upstream `CatalogTableAdapter._stream`, catalog/adapter.py:1858-1871).
 /// `partition` is `None` for a whole-table write, the partition index otherwise;
@@ -6908,6 +6934,7 @@ fn collect_manifest(dir: &std::path::Path) -> Result<Vec<String>, ServerError> {
 pub async fn put_data_source(
     State(state): State<AppState>,
     OriginalUri(uri): OriginalUri,
+    Query(params): Query<HashMap<String, String>>,
     auth: crate::server::AuthContext,
     Json(req): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, ServerError> {
@@ -6934,6 +6961,32 @@ pub async fn put_data_source(
         .await
         .map_err(map_catalog_err)?
         .ok_or_else(|| ServerError::NotFound(format!("'{}' not found", segments.join("/"))))?;
+    // `?patch_shape=`/`?patch_offset=` are comma-separated index tuples that go
+    // together: both present -> an `ArrayPatch`-shaped `{shape, offset}` patch
+    // descriptor; both absent -> no patch; exactly one -> 400. Upstream checks
+    // this right after resolving the node and before the data-source
+    // existence/ownership check (router.py:1946-1973 -> adapter.py rowcount), so
+    // a one-sided patch 400s regardless of the target id.
+    let patch_shape = params.get("patch_shape").filter(|s| !s.is_empty());
+    let patch_offset = params.get("patch_offset").filter(|s| !s.is_empty());
+    let patch: Option<serde_json::Value> = match (patch_shape, patch_offset) {
+        (None, None) => None,
+        (Some(sh), Some(off)) => Some(serde_json::json!({
+            "shape": parse_csv_usize(sh)?,
+            "offset": parse_csv_usize(off)?,
+        })),
+        _ => {
+            // Upstream concatenates two adjacent string literals with no
+            // separating space ("patch_offset" + "go together"), so the wire
+            // detail reads "patch_offsetgo together"; reproduced verbatim
+            // (router.py:1969-1972).
+            return Err(ServerError::BadRequest(
+                "The query parameters patch_shape and patch_offsetgo together; \
+                 either all or none must be specified."
+                    .into(),
+            ));
+        }
+    };
     let body = req
         .get("data_source")
         .ok_or_else(|| ServerError::Validation("body missing 'data_source'".into()))?;
@@ -6952,12 +7005,36 @@ pub async fn put_data_source(
             segments.join("/")
         )));
     }
+
     let structure = body.get("structure").cloned().unwrap_or_default();
     let parameters = body.get("parameters").cloned().unwrap_or_default();
+    // Snapshot the array shape and the request data-source object before
+    // `structure`/`body` are consumed, so the post-write `array-ref` emit can
+    // reuse them (upstream metadata uses the request `data_source`/`structure`).
+    let array_shape: Option<Vec<usize>> = structure
+        .get("shape")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|arr| {
+            arr.iter()
+                .map(|v| v.as_u64().map(|n| n as usize))
+                .collect::<Option<Vec<usize>>>()
+        });
+    let data_source_json = body.clone();
     let updated = catalog
         .update_data_source(id, structure, parameters)
         .await
         .map_err(map_catalog_err)?;
+
+    // Live-streaming: upstream emits an `array-ref` event AFTER the commit, but
+    // ONLY for array-family data sources — the event carries a shape so a
+    // subscriber can build a slice URI (catalog/adapter.py:973-992). Metadata
+    // only, no payload. Best-effort; the cache is a no-op in non-streaming builds.
+    if updated.structure_family == "array"
+        && let Some(shape) = array_shape.as_deref()
+    {
+        stream_array_ref(&state, node.id, data_source_json, patch, shape).await;
+    }
+
     Ok(Json(serde_json::json!({"data_source": {
         "id": updated.id,
         "structure_family": updated.structure_family,
