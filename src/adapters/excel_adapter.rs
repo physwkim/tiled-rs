@@ -1,14 +1,22 @@
-//! Excel (.xlsx) table read adapter.
+//! Excel (.xlsx) workbook read adapter.
 //!
-//! Reads the first worksheet of an `.xlsx` file as a table family.
-//! Schema is inferred from the data: columns containing only integers
-//! become Int64, columns containing only numbers (int or float) become
-//! Float64, everything else becomes Utf8 (including mixed and error cells).
-//! Empty cells become Arrow nulls.  The first non-empty row is used as
+//! A workbook is exposed as a **container** of per-sheet tables — one child
+//! table per worksheet, keyed by sheet name — mirroring upstream
+//! `ExcelAdapter(MapAdapter[TableAdapter])` (`tiled/adapters/excel.py:14`,
+//! `:52`), which loops every `sheet_name` in the workbook and maps each onto a
+//! `DataFrameAdapter`. The mapping is unconditional: even a single-sheet
+//! workbook is a one-child container, never a bare table. (The former port
+//! read only the first worksheet and served it as a lone table, silently
+//! dropping every other sheet.)
+//!
+//! Each per-sheet table infers its schema from the data: columns containing
+//! only integers become Int64, columns containing only numbers (int or float)
+//! become Float64, everything else becomes Utf8 (including mixed and error
+//! cells). Empty cells become Arrow nulls. The first non-empty row is used as
 //! column headers.
 //!
-//! Read-only.  Write is handled by the `tiled-serialization` Excel
-//! serializer (hand-rolled XLSX zipper).
+//! Read-only. Write is handled by the `tiled-serialization` Excel serializer
+//! (hand-rolled XLSX zipper).
 
 #![cfg(feature = "excel-adapter")]
 
@@ -19,9 +27,13 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, Float64Builder, Int64Builder, StringBuilder};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
-use calamine::{Data, Reader, Xlsx, open_workbook_from_rs};
+use calamine::{Data, Range, Reader, Xlsx, open_workbook_from_rs};
+use indexmap::IndexMap;
 
-use crate::core::adapters::{BaseAdapter, BoxFuture, TableAdapterRead, TableAdapterWrite};
+use crate::adapters::MapAdapter;
+use crate::core::adapters::{
+    AnyAdapter, BaseAdapter, BoxFuture, TableAdapterRead, TableAdapterWrite,
+};
 use crate::core::dtype::ArrowTable;
 use crate::core::error::{Result, TiledError};
 use crate::core::structures::{B64_ENCODED_PREFIX, Spec, StructureFamily, TableStructure};
@@ -35,8 +47,38 @@ enum CellKind {
     Null,
 }
 
+/// Entry point: open an `.xlsx` workbook as a container of per-sheet tables.
+pub struct ExcelAdapter;
+
+impl ExcelAdapter {
+    /// Open every worksheet of `path` as a [`MapAdapter`] container of per-sheet
+    /// tables (child key = sheet name).
+    ///
+    /// Parity with upstream `ExcelAdapter(MapAdapter[TableAdapter])`
+    /// (`excel.py:14`, `:52-57`): the workbook maps unconditionally onto a
+    /// container with one table child per sheet — a single-sheet workbook is a
+    /// one-child container, not a bare table. `metadata` is the catalog node's
+    /// metadata; it lands on the container (upstream passes `metadata=node`),
+    /// while each per-sheet table carries no metadata/specs of its own (upstream
+    /// builds each child as a bare `DataFrameAdapter.from_dask_dataframe`).
+    pub fn from_path(path: PathBuf, metadata: serde_json::Value) -> Result<MapAdapter> {
+        let sheets = read_workbook(&path)?;
+        let mut mapping: IndexMap<String, AnyAdapter> = IndexMap::with_capacity(sheets.len());
+        for (name, schema, rows) in sheets {
+            let sheet = ExcelSheetAdapter::new(schema, rows);
+            mapping.insert(name, AnyAdapter::Table(Arc::new(sheet)));
+        }
+        // The `xlsx` spec identifies the container as an Excel-file node; the
+        // per-sheet tables are plain tables.
+        Ok(MapAdapter::new(mapping, metadata, vec![Spec::new("xlsx")]))
+    }
+}
+
+/// A single worksheet exposed as a table (one partition). One of these is
+/// synthesized per sheet by [`ExcelAdapter::from_path`]; it is the
+/// `TableAdapter`-equivalent child upstream builds with `DataFrameAdapter`.
 #[derive(Debug)]
-pub struct ExcelAdapter {
+pub struct ExcelSheetAdapter {
     schema: SchemaRef,
     /// Pre-loaded data rows (calamine reads the whole file eagerly anyway).
     rows: Vec<Vec<CellKind>>,
@@ -45,10 +87,9 @@ pub struct ExcelAdapter {
     specs: Vec<Spec>,
 }
 
-impl ExcelAdapter {
-    /// Open the first worksheet of `path` and build the adapter.
-    pub fn from_path(path: PathBuf, metadata: serde_json::Value) -> Result<Self> {
-        let (schema, rows) = read_xlsx(&path)?;
+impl ExcelSheetAdapter {
+    /// Build a per-sheet table adapter from an already-parsed schema + rows.
+    fn new(schema: SchemaRef, rows: Vec<Vec<CellKind>>) -> Self {
         let columns: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
         let structure = TableStructure {
             arrow_schema: encode_schema(schema.as_ref()),
@@ -56,17 +97,19 @@ impl ExcelAdapter {
             columns,
             resizable: Default::default(),
         };
-        Ok(Self {
+        Self {
             schema,
             rows,
             structure,
-            metadata,
-            specs: vec![Spec::new("xlsx")],
-        })
+            // A per-sheet child carries no user metadata/specs, matching
+            // upstream's bare `DataFrameAdapter.from_dask_dataframe(ddf)`.
+            metadata: serde_json::json!({}),
+            specs: vec![],
+        }
     }
 }
 
-impl BaseAdapter for ExcelAdapter {
+impl BaseAdapter for ExcelSheetAdapter {
     fn structure_family(&self) -> StructureFamily {
         StructureFamily::Table
     }
@@ -78,7 +121,7 @@ impl BaseAdapter for ExcelAdapter {
     }
 }
 
-impl TableAdapterRead for ExcelAdapter {
+impl TableAdapterRead for ExcelSheetAdapter {
     fn structure(&self) -> &TableStructure {
         &self.structure
     }
@@ -111,24 +154,37 @@ impl TableAdapterRead for ExcelAdapter {
     }
 }
 
-/// Open `path` as an xlsx workbook, read the first sheet, and return
-/// the inferred Arrow schema + all data rows as `CellKind` values.
-fn read_xlsx(path: &std::path::Path) -> Result<(SchemaRef, Vec<Vec<CellKind>>)> {
+/// One parsed worksheet: its name, inferred Arrow schema, and data rows.
+type SheetData = (String, SchemaRef, Vec<Vec<CellKind>>);
+
+/// Open `path` as an xlsx workbook and parse **every** worksheet, in workbook
+/// order, into `(sheet_name, inferred Arrow schema, data rows)`.
+fn read_workbook(path: &std::path::Path) -> Result<Vec<SheetData>> {
     let file = std::fs::File::open(path)
         .map_err(|e| TiledError::Internal(format!("open {}: {e}", path.display())))?;
     let buf = BufReader::new(file);
     let mut workbook: Xlsx<_> = open_workbook_from_rs(buf)
         .map_err(|e| TiledError::Internal(format!("xlsx open {}: {e}", path.display())))?;
 
-    let sheet_name = workbook
-        .sheet_names()
-        .into_iter()
-        .next()
-        .ok_or_else(|| TiledError::Validation("xlsx file has no sheets".into()))?;
-    let range = workbook
-        .worksheet_range(&sheet_name)
-        .map_err(|e| TiledError::Internal(format!("xlsx read sheet: {e}")))?;
+    // `sheet_names()` yields names in workbook-definition order; a zero-sheet
+    // workbook (structurally invalid, but handled) yields an empty container,
+    // matching upstream's `for sheet_name in excel_file.sheet_names` over an
+    // empty list.
+    let names = workbook.sheet_names().to_vec();
+    let mut sheets = Vec::with_capacity(names.len());
+    for name in names {
+        let range = workbook
+            .worksheet_range(&name)
+            .map_err(|e| TiledError::Internal(format!("xlsx read sheet {name}: {e}")))?;
+        let (schema, rows) = parse_range(&range);
+        sheets.push((name, schema, rows));
+    }
+    Ok(sheets)
+}
 
+/// Parse one worksheet range into an inferred Arrow schema + all data rows as
+/// `CellKind` values (first non-empty row = headers).
+fn parse_range(range: &Range<Data>) -> (SchemaRef, Vec<Vec<CellKind>>) {
     let mut iter = range.rows();
     // First row = headers.
     let headers: Vec<String> = match iter.next() {
@@ -143,7 +199,7 @@ fn read_xlsx(path: &std::path::Path) -> Result<(SchemaRef, Vec<Vec<CellKind>>)> 
                 other => format!("{other:?}"),
             })
             .collect(),
-        None => return Ok((Arc::new(Schema::empty()), vec![])),
+        None => return (Arc::new(Schema::empty()), vec![]),
     };
     let ncols = headers.len();
 
@@ -181,7 +237,7 @@ fn read_xlsx(path: &std::path::Path) -> Result<(SchemaRef, Vec<Vec<CellKind>>)> 
         })
         .collect();
     let schema = Arc::new(Schema::new(fields));
-    Ok((schema, data_rows))
+    (schema, data_rows)
 }
 
 fn cell_to_kind(cell: &Data) -> CellKind {
@@ -343,29 +399,41 @@ mod tests {
     use zip::ZipWriter;
     use zip::write::SimpleFileOptions;
 
-    use crate::core::adapters::{BaseAdapter, TableAdapterRead};
+    use crate::core::adapters::{AnyAdapter, BaseAdapter, ContainerAdapter, TableAdapterRead};
     use crate::core::error::TiledError;
+    use crate::core::structures::StructureFamily;
 
     use super::ExcelAdapter;
 
-    /// Write a minimal valid xlsx file with the given header row and data rows.
-    ///
-    /// Uses the same hand-rolled xlsx structure as the excel serializer in
-    /// tiled-serialization so we can test against real xlsx bytes without
-    /// pulling a separate writer.
-    fn write_xlsx(path: &std::path::Path, headers: &[&str], rows: &[Vec<&str>]) {
+    /// One sheet for the test writer: `(name, headers, rows)`.
+    type SheetSpec<'a> = (&'a str, Vec<&'a str>, Vec<Vec<&'a str>>);
+
+    /// Write a minimal valid xlsx file with the given sheets. Uses the same
+    /// hand-rolled xlsx structure as the excel serializer in tiled-serialization
+    /// so we can test against real xlsx bytes without pulling a separate writer.
+    fn write_xlsx_sheets(path: &std::path::Path, sheets: &[SheetSpec]) {
         let f = std::fs::File::create(path).unwrap();
         let mut zip = ZipWriter::new(f);
         let opts = SimpleFileOptions::default();
 
-        zip.start_file("[Content_Types].xml", opts).unwrap();
-        zip.write_all(br#"<?xml version="1.0" encoding="UTF-8"?>
+        // [Content_Types].xml — one worksheet override per sheet.
+        let mut content_types = String::from(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
   <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
   <Default Extension="xml"  ContentType="application/xml"/>
   <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
-  <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
-</Types>"#).unwrap();
+"#,
+        );
+        for i in 0..sheets.len() {
+            content_types.push_str(&format!(
+                "  <Override PartName=\"/xl/worksheets/sheet{}.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/>\n",
+                i + 1
+            ));
+        }
+        content_types.push_str("</Types>");
+        zip.start_file("[Content_Types].xml", opts).unwrap();
+        zip.write_all(content_types.as_bytes()).unwrap();
 
         zip.start_file("_rels/.rels", opts).unwrap();
         zip.write_all(br#"<?xml version="1.0" encoding="UTF-8"?>
@@ -373,55 +441,156 @@ mod tests {
   <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
 </Relationships>"#).unwrap();
 
-        zip.start_file("xl/workbook.xml", opts).unwrap();
-        zip.write_all(
-            br#"<?xml version="1.0" encoding="UTF-8"?>
+        // workbook.xml — list every sheet, each pointing at its own relationship.
+        let mut workbook = String::from(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
 <workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/ml/2006/main"
           xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
   <sheets>
-    <sheet name="Sheet1" sheetId="1" r:id="rId1"/>
-  </sheets>
-</workbook>"#,
-        )
-        .unwrap();
-
-        zip.start_file("xl/_rels/workbook.xml.rels", opts).unwrap();
-        zip.write_all(br#"<?xml version="1.0" encoding="UTF-8"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
-</Relationships>"#).unwrap();
-
-        zip.start_file("xl/worksheets/sheet1.xml", opts).unwrap();
-        let mut sheet = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
-        sheet.push_str("<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/ml/2006/main\"><sheetData>");
-        // header row
-        sheet.push_str("<row r=\"1\">");
-        for (c, h) in headers.iter().enumerate() {
-            sheet.push_str(&format!(
-                "<c r=\"{}1\" t=\"inlineStr\"><is><t>{h}</t></is></c>",
-                col_letter(c)
+"#,
+        );
+        for (i, (name, _, _)) in sheets.iter().enumerate() {
+            workbook.push_str(&format!(
+                "    <sheet name=\"{name}\" sheetId=\"{}\" r:id=\"rId{}\"/>\n",
+                i + 1,
+                i + 1
             ));
         }
-        sheet.push_str("</row>");
-        // data rows
-        for (r, row) in rows.iter().enumerate() {
-            let rn = r + 2;
-            sheet.push_str(&format!("<row r=\"{rn}\">"));
-            for (c, val) in row.iter().enumerate() {
+        workbook.push_str("  </sheets>\n</workbook>");
+        zip.start_file("xl/workbook.xml", opts).unwrap();
+        zip.write_all(workbook.as_bytes()).unwrap();
+
+        // workbook.xml.rels — one relationship per worksheet part.
+        let mut rels = String::from(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+"#,
+        );
+        for i in 0..sheets.len() {
+            rels.push_str(&format!(
+                "  <Relationship Id=\"rId{}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet{}.xml\"/>\n",
+                i + 1,
+                i + 1
+            ));
+        }
+        rels.push_str("</Relationships>");
+        zip.start_file("xl/_rels/workbook.xml.rels", opts).unwrap();
+        zip.write_all(rels.as_bytes()).unwrap();
+
+        // One worksheet part per sheet.
+        for (i, (_, headers, rows)) in sheets.iter().enumerate() {
+            zip.start_file(format!("xl/worksheets/sheet{}.xml", i + 1), opts)
+                .unwrap();
+            let mut sheet = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+            sheet.push_str("<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/ml/2006/main\"><sheetData>");
+            // header row
+            sheet.push_str("<row r=\"1\">");
+            for (c, h) in headers.iter().enumerate() {
                 sheet.push_str(&format!(
-                    "<c r=\"{}{rn}\" t=\"inlineStr\"><is><t>{val}</t></is></c>",
+                    "<c r=\"{}1\" t=\"inlineStr\"><is><t>{h}</t></is></c>",
                     col_letter(c)
                 ));
             }
             sheet.push_str("</row>");
+            // data rows
+            for (r, row) in rows.iter().enumerate() {
+                let rn = r + 2;
+                sheet.push_str(&format!("<row r=\"{rn}\">"));
+                for (c, val) in row.iter().enumerate() {
+                    sheet.push_str(&format!(
+                        "<c r=\"{}{rn}\" t=\"inlineStr\"><is><t>{val}</t></is></c>",
+                        col_letter(c)
+                    ));
+                }
+                sheet.push_str("</row>");
+            }
+            sheet.push_str("</sheetData></worksheet>");
+            zip.write_all(sheet.as_bytes()).unwrap();
         }
-        sheet.push_str("</sheetData></worksheet>");
-        zip.write_all(sheet.as_bytes()).unwrap();
         zip.finish().unwrap();
     }
 
     fn col_letter(n: usize) -> char {
         (b'A' + n as u8) as char
+    }
+
+    /// Single-sheet convenience over [`write_xlsx_sheets`] ("Sheet1").
+    fn write_xlsx(path: &std::path::Path, headers: &[&str], rows: &[Vec<&str>]) {
+        write_xlsx_sheets(path, &[("Sheet1", headers.to_vec(), rows.to_vec())]);
+    }
+
+    /// Pull one sheet out of the workbook container as a table adapter.
+    async fn sheet(
+        container: &super::MapAdapter,
+        key: &str,
+    ) -> std::sync::Arc<dyn TableAdapterRead> {
+        match container.get(key).await.unwrap().unwrap() {
+            AnyAdapter::Table(t) => t,
+            other => panic!(
+                "sheet {key} is {:?}, expected a table",
+                other.structure_family()
+            ),
+        }
+    }
+
+    /// A multi-sheet workbook is a container with one table child per sheet, and
+    /// each sheet is reachable as its own table with its own data — the core of
+    /// the data-loss fix (former port dropped every sheet but the first).
+    #[tokio::test]
+    async fn multi_sheet_is_container_of_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("multi.xlsx");
+        write_xlsx_sheets(
+            &path,
+            &[
+                (
+                    "People",
+                    vec!["name", "city"],
+                    vec![vec!["Alice", "Seoul"], vec!["Bob", "Busan"]],
+                ),
+                (
+                    "Scores",
+                    vec!["subject", "value"],
+                    vec![vec!["math", "90"], vec!["sci", "85"], vec!["art", "70"]],
+                ),
+            ],
+        );
+
+        let container = ExcelAdapter::from_path(path, serde_json::json!({})).unwrap();
+        // Family is container (matches upstream MapAdapter), not table.
+        assert_eq!(container.structure_family(), StructureFamily::Container);
+        // Both sheets are present, in workbook order, keyed by sheet name.
+        assert_eq!(container.keys().await.unwrap(), vec!["People", "Scores"]);
+        assert_eq!(container.len().await.unwrap(), 2);
+
+        // Sheet 1: its own columns + rows.
+        let people = sheet(&container, "People").await;
+        assert_eq!(people.structure().columns, vec!["name", "city"]);
+        let t = people.read(None).await.unwrap();
+        assert_eq!(t.batches.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+
+        // Sheet 2 — the one the old adapter dropped — is reachable with its own
+        // distinct schema and row count.
+        let scores = sheet(&container, "Scores").await;
+        assert_eq!(scores.structure().columns, vec!["subject", "value"]);
+        let t = scores.read(None).await.unwrap();
+        assert_eq!(t.batches.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
+
+        // An absent sheet name is a miss, not a panic.
+        assert!(container.get("Nope").await.unwrap().is_none());
+    }
+
+    /// A single-sheet workbook is still a one-child container (upstream's
+    /// unconditional mapping), not a bare table.
+    #[tokio::test]
+    async fn single_sheet_is_one_child_container() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("one.xlsx");
+        write_xlsx(&path, &["a"], &[vec!["1"]]);
+
+        let container = ExcelAdapter::from_path(path, serde_json::json!({})).unwrap();
+        assert_eq!(container.structure_family(), StructureFamily::Container);
+        assert_eq!(container.keys().await.unwrap(), vec!["Sheet1"]);
     }
 
     /// A valid xlsx with string columns: structure, full read, partition read.
@@ -439,7 +608,8 @@ mod tests {
             ],
         );
 
-        let adapter = ExcelAdapter::from_path(path, serde_json::json!({})).unwrap();
+        let container = ExcelAdapter::from_path(path, serde_json::json!({})).unwrap();
+        let adapter = sheet(&container, "Sheet1").await;
         let s = adapter.structure();
         assert_eq!(s.npartitions, 1);
         assert_eq!(s.columns, vec!["name", "city"]);
@@ -458,7 +628,8 @@ mod tests {
         let path = dir.path().join("proj.xlsx");
         write_xlsx(&path, &["x", "y"], &[vec!["1", "a"], vec!["2", "b"]]);
 
-        let adapter = ExcelAdapter::from_path(path, serde_json::json!({})).unwrap();
+        let container = ExcelAdapter::from_path(path, serde_json::json!({})).unwrap();
+        let adapter = sheet(&container, "Sheet1").await;
         let table = adapter.read(Some(&["x".into()])).await.unwrap();
         assert_eq!(table.schema.fields().len(), 1);
         assert_eq!(table.schema.field(0).name(), "x");
@@ -470,7 +641,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("unk.xlsx");
         write_xlsx(&path, &["a"], &[vec!["1"]]);
-        let adapter = ExcelAdapter::from_path(path, serde_json::json!({})).unwrap();
+        let container = ExcelAdapter::from_path(path, serde_json::json!({})).unwrap();
+        let adapter = sheet(&container, "Sheet1").await;
         let err = adapter.read(Some(&["z".into()])).await.unwrap_err();
         assert!(matches!(err, TiledError::Validation(_)));
     }
@@ -481,38 +653,42 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("oor.xlsx");
         write_xlsx(&path, &["a"], &[vec!["1"]]);
-        let adapter = ExcelAdapter::from_path(path, serde_json::json!({})).unwrap();
+        let container = ExcelAdapter::from_path(path, serde_json::json!({})).unwrap();
+        let adapter = sheet(&container, "Sheet1").await;
         assert!(adapter.read_partition(1, None).await.is_err());
     }
 
     /// Read-only: as_table_writable returns None.
-    #[test]
-    fn is_read_only() {
+    #[tokio::test]
+    async fn is_read_only() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ro.xlsx");
         write_xlsx(&path, &["a"], &[vec!["1"]]);
-        let adapter = ExcelAdapter::from_path(path, serde_json::json!({})).unwrap();
+        let container = ExcelAdapter::from_path(path, serde_json::json!({})).unwrap();
+        let adapter = sheet(&container, "Sheet1").await;
         assert!(adapter.as_table_writable().is_none());
     }
 
-    /// spec name is "xlsx".
-    #[test]
-    fn spec_name_is_xlsx() {
+    /// The container carries the `xlsx` spec; per-sheet tables carry none.
+    #[tokio::test]
+    async fn container_spec_is_xlsx() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("s.xlsx");
         write_xlsx(&path, &["a"], &[vec!["1"]]);
-        let adapter = ExcelAdapter::from_path(path, serde_json::json!({})).unwrap();
-        assert_eq!(adapter.specs()[0].name, "xlsx");
+        let container = ExcelAdapter::from_path(path, serde_json::json!({})).unwrap();
+        assert_eq!(container.specs()[0].name, "xlsx");
+        let adapter = sheet(&container, "Sheet1").await;
+        assert!(adapter.specs().is_empty());
     }
 
-    /// Missing file is an Internal error.
+    /// Missing file is an Internal error. (`MapAdapter` is not `Debug`, so match
+    /// the `Result` rather than `unwrap_err`-ing the `Ok` variant.)
     #[test]
     fn missing_file_is_error() {
-        let err = ExcelAdapter::from_path(
+        let result = ExcelAdapter::from_path(
             std::path::PathBuf::from("/no/such/file.xlsx"),
             serde_json::json!({}),
-        )
-        .unwrap_err();
-        assert!(matches!(err, TiledError::Internal(_)));
+        );
+        assert!(matches!(result, Err(TiledError::Internal(_))));
     }
 }

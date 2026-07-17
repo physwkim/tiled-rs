@@ -354,9 +354,15 @@ fn build_leaf_adapter(
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => {
             #[cfg(feature = "excel-adapter")]
             {
-                let adapter = crate::adapters::ExcelAdapter::from_path(path, metadata)
+                // A workbook resolves to a container of per-sheet tables (keyed
+                // by sheet name), matching upstream `ExcelAdapter(MapAdapter[
+                // TableAdapter])` (adapters/excel.py:14) — the former single-Table
+                // resolution dropped every sheet but the first. Each sheet is a
+                // `TableAdapterRead` child served through the standard container
+                // `get()` / `walk_tree` path.
+                let container = crate::adapters::ExcelAdapter::from_path(path, metadata)
                     .map_err(|e| CatalogError::Validation(e.to_string()))?;
-                AnyAdapter::Table(Arc::new(adapter))
+                AnyAdapter::Container(Arc::new(container))
             }
             #[cfg(not(feature = "excel-adapter"))]
             {
