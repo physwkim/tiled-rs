@@ -54,7 +54,7 @@ use axum::extract::{OriginalUri, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 
-use crate::core::adapters::{AnyAdapter, ArrayAdapterRead, SparseAdapterRead};
+use crate::core::adapters::{AnyAdapter, ArrayAdapterRead, ContainerAdapter, SparseAdapterRead};
 use crate::core::dtype::{BuiltinDType, DType, DynNDArray, Kind};
 use crate::core::ndslice::NDSlice;
 use crate::core::structures::{SparseStructure, StructureFamily};
@@ -420,17 +420,50 @@ fn node_family(node: &Option<AnyAdapter>) -> StructureFamily {
     }
 }
 
+/// Enumerate a container's child keys — the single owner for a caller-facing
+/// zarr group listing. When an access policy is configured its `list_filter`
+/// result is injected as an `AccessBlobFilter` query so a principal never
+/// receives the names of children they may not read. The listing scope is
+/// `read:metadata`, matching upstream `filter_for_access(..., ["read:metadata"],
+/// ...)` (dependencies.py:78) and the `/search` path (router.rs). With no policy
+/// (`access_policy: None`) the raw key set is returned unchanged.
+async fn filtered_child_keys(
+    state: &AppState,
+    auth: &AuthContext,
+    container: &dyn ContainerAdapter,
+) -> Result<Vec<String>, ServerError> {
+    if let Some(ref policy) = state.access_policy {
+        let requested = crate::auth::ScopeSet::from_iter([crate::auth::Scope::ReadMetadata]);
+        if let Some(f) = policy
+            .list_filter(
+                auth.principal.as_deref(),
+                &auth.scopes,
+                &requested,
+                auth.authn_access_tags.as_deref(),
+            )
+            .await
+        {
+            return container
+                .search(&[crate::core::queries::Query::AccessBlobFilter(f)])
+                .await
+                .map_err(ServerError::from);
+        }
+    }
+    container.keys().await.map_err(ServerError::from)
+}
+
 /// Build the JSON array of child URLs for a group listing: container children
-/// (keys) or, for a table, its column names. `base` is the full request URL
-/// with any trailing slash removed.
+/// (keys, access-filtered via [`filtered_child_keys`]) or, for a table, its
+/// column names. `base` is the full request URL with any trailing slash removed.
 async fn group_listing(
     state: &AppState,
+    auth: &AuthContext,
     node: &Option<AnyAdapter>,
     base: &str,
 ) -> Result<Vec<String>, ServerError> {
     let keys: Vec<String> = match node {
-        None => state.root_tree.keys().await.map_err(ServerError::from)?,
-        Some(AnyAdapter::Container(c)) => c.keys().await.map_err(ServerError::from)?,
+        None => filtered_child_keys(state, auth, state.root_tree.as_ref()).await?,
+        Some(AnyAdapter::Container(c)) => filtered_child_keys(state, auth, c.as_ref()).await?,
         Some(AnyAdapter::Table(t)) => t.structure().columns.clone(),
         _ => {
             return Err(ServerError::WrongType(
@@ -518,12 +551,12 @@ pub async fn zarr_v2(
             match &node {
                 Some(AnyAdapter::Container(_)) | None => {
                     let base = request_base(&base_url, &uri);
-                    let urls = group_listing(&state, &node, &base).await?;
+                    let urls = group_listing(&state, &auth, &node, &base).await?;
                     Ok(json_response(&serde_json::json!(urls)))
                 }
                 Some(AnyAdapter::Table(_)) => {
                     let base = request_base(&base_url, &uri);
-                    let urls = group_listing(&state, &node, &base).await?;
+                    let urls = group_listing(&state, &auth, &node, &base).await?;
                     Ok(json_response(&serde_json::json!(urls)))
                 }
                 Some(AnyAdapter::Array(a)) => match block {
@@ -640,7 +673,7 @@ pub async fn zarr_v3(
     match &node {
         Some(AnyAdapter::Container(_)) | None | Some(AnyAdapter::Table(_)) => {
             let base = request_base(&base_url, &uri);
-            let urls = group_listing(&state, &node, &base).await?;
+            let urls = group_listing(&state, &auth, &node, &base).await?;
             Ok(json_response(&serde_json::json!(urls)))
         }
         Some(_) => zarr_v3_metadata(&state, &node, &segments).await,
