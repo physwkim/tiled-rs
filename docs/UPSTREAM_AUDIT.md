@@ -230,6 +230,96 @@ Reclassified after wave-23 verification (not landed — not silent divergences):
   directly and chains `require(…)`; a generic scope-set abstraction for a
   single call site failed the senior-reviewer self-test.
 
+## Wave-24: live-data streaming parity
+
+Ports upstream's **live-DATA** WebSocket stream (payload events backed by a
+`StreamingCache`, upstream's `StreamingCache` / Redis substrate) in place of
+the port's earlier notification-only bus — the
+`streaming-full-data-parity` decision. Landed over ten commits, all merged
+to main (`be3871b` high-water); the two envelope/gate changes are
+**wire-breaking** and flagged inline.
+
+Landed work:
+
+* **`StreamingCache` trait + in-memory backend + config** (`53caa89`, PR1) —
+  the `StreamingCache` trait plus `InMemoryStreamingCache`
+  (`server/streaming_cache.rs`): a per-node `DashMap` state map, each node
+  holding a bounded event ring for replay and a `tokio::sync::broadcast`
+  channel for live fan-out, plus the `[streaming]` config block.
+* **Webhook direct-dispatch decoupling** (`59c81aa`, PR2a) — webhook delivery
+  is lifted off the shared streaming bus into a standalone direct-dispatch
+  service, so webhooks and the WS stream no longer share one channel.
+* **WS onto per-node cache + envelope negotiation + tree/container events**
+  (`30faa0c`, PR2) — **[WIRE-BREAKING]** the WS stream is rebuilt on the
+  per-node cache and the old notification bus is dropped. Frames carry a
+  negotiated envelope: JSON by default, msgpack via
+  `?envelope_format=msgpack`. Adds tree/container lifecycle events.
+* **Array-data payload events** (`dd4e388`, PR3) — array writes now stream the
+  written array bytes as a payload event, not just a notification.
+* **Feature-gated Redis backend** (`f3dfdfc`, PR8) — `RedisStreamingCache`
+  (`server/streaming_cache_redis.rs`) behind the default-OFF `streaming-redis`
+  Cargo feature; the in-memory backend stays the default.
+* **Table-data + ragged-data payload events** (`500821e`, PR4).
+* **Array-ref slice-URI events** (`fb38b9d`, PR5) — `array-ref` events ship no
+  inline payload; they carry a deliverable `?slice=` URI the subscriber fetches.
+* **Subscribe gated to `read:data` + `read:metadata`** (`6267465`, PR6) —
+  **[WIRE-BREAKING]** subscribing now requires **both** scopes on the token
+  and under the per-node access policy, matching upstream's
+  `get_entry(path, ["read:data", "read:metadata"])`; the port's earlier
+  metadata-only stream required only `read:metadata`.
+* **`DELETE /stream/close` + `end_of_stream`** (`3b993e1`, PR7) — a producer
+  ends a node's stream via `DELETE /api/v1/stream/close/{path}`, which emits an
+  `end_of_stream` marker to subscribers.
+* **Review fixes** — node-deleted delivered **then** the stream closed
+  (deliver-then-close invariant, `5127ffe`); `container-child-created` carries
+  the DB-assigned `data_source` ids (`be3871b`); `NodeEntry` TTL slot
+  reclamation closing a retention leak (PR #79); a live admin channel-count
+  metric (PR #79).
+
+Intentional divergences / parity notes (recorded explicitly):
+
+1. **Per-event auth is a hardening over upstream.** tiled-rs re-checks
+   `read:metadata` on **every delivered event** (`delivery_allowed`,
+   `server/streaming.rs:841`) and retargets `container-child-*` events to the
+   **child** path before the check, so a restricted child never leaks to a
+   parent subscriber. Upstream does the access check once at subscribe time and
+   does **no** per-event re-check → tiled-rs is strictly more restrictive.
+2. **`node-deleted` is a tiled-rs extension** (no upstream analogue). It is the
+   subscribed node announcing its own removal, so it is **exempt** from the
+   per-event `read:metadata` re-gate (the node row is already gone and the
+   re-lookup would 404 and silently drop it) and is delivered uniformly with or
+   without an access policy — then the stream closes (the deliver-then-close
+   invariant above).
+3. **Sparse array-data over JSON is metadata-only, not an error.** For a sparse
+   node whose Arrow payload cannot travel in a JSON envelope, tiled-rs sends a
+   metadata-only frame (no payload) and keeps the stream alive; upstream raises
+   `ValueError` (no `(array, arrow)` deserializer registered) and tears the
+   subscription down. msgpack carries the Arrow payload on both. tiled-rs is
+   the safer behaviour.
+4. **No catch-all root webhook.** Upstream's `node_id=0` row "catches
+   everything"; tiled-rs has no such row — the root is implicit
+   (`parent_id IS NULL`), so registering a webhook on `/` 404s. A missing
+   feature, not a mis-fire.
+5. **Event timestamps are UTC RFC-3339** (`+00:00`) vs upstream's naive-local
+   `datetime.now().isoformat()`.
+6. **Redis `set` / `incr_seq` swallow errors so the write still succeeds** (more
+   robust); upstream propagates the Redis error → 500s the write, and since
+   `_stream` runs before persist, upstream writes no data in that case.
+7. **EOS-mid-replay stops at the marker.** tiled-rs halts replay at the
+   `end_of_stream` marker; upstream finishes the in-range replay then closes.
+8. **`NodeEntry` reclamation is TTL-based**, matching upstream cachetools
+   `TTLCache` ttl — predicate `receiver_count() == 0 ∧ seq_deadline lapsed ∧
+   event-ring empty` (`seq_deadline` / `seq_ttl`, `server/streaming_cache.rs`).
+   The `maxsize` **node-count** cap is a documented follow-up: the port's
+   existing `maxsize` knob means per-node retained events, not a node cap, so
+   repurposing it needs operator sign-off.
+9. **Bounded broadcast (256) drops live events on lag** (`Lagged → continue`)
+   where upstream uses an unbounded `asyncio.Queue`; documented as acceptable.
+10. **Webhook envelope is a tiled-rs shape** —
+    `{event_id, event_type, sequence, timestamp, path, data}` rather than
+    upstream `event.model_dump()`, and `path` is a joined string vs upstream's
+    `list[str]`.
+
 ## N/A (Python-specific or feature not in our port)
 
 A non-exhaustive sample of PRs that don't apply because the corresponding
