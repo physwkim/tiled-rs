@@ -9,6 +9,7 @@ pub mod etag;
 pub mod extractors;
 pub mod file_resolver;
 pub mod lz4;
+pub mod resource_cache;
 pub mod router;
 pub mod server_timing;
 pub mod state;

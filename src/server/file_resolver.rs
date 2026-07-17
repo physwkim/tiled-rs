@@ -15,6 +15,7 @@ use crate::catalog::adapter::LeafResolver;
 use crate::catalog::error::CatalogError;
 use crate::catalog::orm::Node;
 use crate::core::adapters::{AnyAdapter, BoxFuture};
+use crate::server::resource_cache::{AdapterCache, CacheKey};
 
 /// Resolver that decodes `file://` URIs and dispatches to the right
 /// `tiled-adapters` implementation.
@@ -29,6 +30,12 @@ use crate::core::adapters::{AnyAdapter, BoxFuture};
 /// explicit [`unrestricted`](Self::unrestricted) opt-out.
 pub struct FileLeafResolver {
     scope: ReadScope,
+    /// TLRU cache of already-built read-only leaf adapters (upstream tiled's
+    /// `adapters/resource_cache.py`). Shared as a single owner: the server
+    /// wraps one `FileLeafResolver` in an `Arc`, so this cache is
+    /// process-wide. Writable adapters are never inserted (see
+    /// [`crate::server::resource_cache`]).
+    cache: Arc<AdapterCache>,
 }
 
 /// What a [`FileLeafResolver`] may read off disk.
@@ -65,6 +72,7 @@ impl FileLeafResolver {
         }
         Self {
             scope: ReadScope::Restricted(allowed_data_dirs),
+            cache: Arc::new(AdapterCache::from_env()),
         }
     }
 
@@ -81,7 +89,18 @@ impl FileLeafResolver {
         );
         Self {
             scope: ReadScope::Unrestricted,
+            cache: Arc::new(AdapterCache::from_env()),
         }
+    }
+
+    /// Replace the resource cache — the injection seam mirroring upstream's
+    /// `set_resource_cache`. Used by tests to drive a deterministic
+    /// (manual-clock or capacity-bounded) cache; production always uses the
+    /// env-configured cache from the constructors above.
+    #[cfg(test)]
+    fn with_resource_cache(mut self, cache: Arc<AdapterCache>) -> Self {
+        self.cache = cache;
+        self
     }
 }
 
@@ -247,6 +266,20 @@ impl LeafResolver for FileLeafResolver {
             // through the same path — but its structure (form + length) is not
             // stored on disk, so it travels from the catalog data_source here.
             let structure = ds.structure.clone();
+
+            // Resource-cache fast path (upstream `with_resource_cache`): a
+            // previously built *read-only* adapter for this exact
+            // (mimetype, path, recipe) is returned without touching the
+            // filesystem — no re-open, no re-parse, and not even the
+            // containment `canonicalize`, since a cached entry only exists
+            // because `check_allowed` already passed when it was built and the
+            // scope is fixed for this resolver's lifetime.
+            let cache_key = CacheKey::new(&mimetype, &path, &parameters, &structure, &metadata);
+            if let Some(cached) = self.cache.get(&cache_key) {
+                return Ok(cached);
+            }
+            let cache = self.cache.clone();
+
             // The allow-list check (`canonicalize`) and adapter construction
             // (`from_path` reads the data file's header) are blocking
             // filesystem work — offload to the blocking pool so the async
@@ -254,7 +287,26 @@ impl LeafResolver for FileLeafResolver {
             tokio::task::spawn_blocking(move || {
                 check_allowed(&scope, &path)?;
                 let writable = is_writable_path(&writable_storage, &path);
-                build_leaf_adapter(&mimetype, path, &parameters, structure, metadata, writable)
+                let adapter = build_leaf_adapter(
+                    &mimetype,
+                    path,
+                    &parameters,
+                    structure,
+                    metadata,
+                    writable,
+                )?;
+                // Cache only read-only adapters. A writable adapter's in-memory
+                // snapshot goes stale after a write (it writes the file but
+                // cannot refresh its own `&self`), so writable paths must
+                // rebuild fresh every request — matching upstream, which caches
+                // only its read-only npy/jpeg/tiff adapters. The lock is not
+                // held across the build above, so two concurrent misses may
+                // both build and both insert (benign last-write-wins race,
+                // exactly as upstream's `with_resource_cache`).
+                if !writable {
+                    cache.insert(cache_key, adapter.clone());
+                }
+                Ok(adapter)
             })
             .await
             .map_err(|e| CatalogError::Validation(format!("leaf resolve task failed: {e}")))?
@@ -764,5 +816,152 @@ mod tests {
             FileLeafResolver::new(vec![PathBuf::from("/data")]).scope,
             ReadScope::Restricted(ref d) if d == &[PathBuf::from("/data")]
         ));
+    }
+}
+
+/// Resolve-level integration of the resource cache: proves a read-only leaf is
+/// served from cache (built once), a writable leaf bypasses it (rebuilt every
+/// request so writes are visible), and a disabled cache rebuilds like today.
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+    use crate::adapters::npy_bytes;
+    use crate::catalog::data_source::{AssetSpec, DataSourceSpec};
+    use crate::catalog::{Catalog, RegisterRequest};
+    use crate::core::dtype::{BuiltinDType, DynNDArray, Endianness, Kind};
+    use crate::server::resource_cache::AdapterCache;
+    use serde_json::json;
+
+    /// A SQLite-backed catalog with the given writable-storage roots. A path
+    /// under one of these resolves to a *writable* adapter (cache-bypassed);
+    /// an empty list makes every adapter read-only (cacheable).
+    async fn catalog_with(dbdir: &Path, writable: Vec<PathBuf>) -> Catalog {
+        let uri = format!("sqlite://{}", dbdir.join("cat.db").display());
+        let cat = Catalog::connect(&uri).await.unwrap();
+        cat.migrate().await.unwrap();
+        cat.with_writable_storage(writable)
+    }
+
+    /// Write a real `n`-element float64 `.npy` file (zeros) at `path`.
+    fn write_npy(path: &Path, n: usize) {
+        let dt = BuiltinDType::new(Endianness::Little, Kind::Float, 8);
+        let arr = DynNDArray::new(bytes::Bytes::from(vec![0u8; 8 * n]), dt, vec![n]);
+        std::fs::write(path, npy_bytes(&arr)).unwrap();
+    }
+
+    /// Register a root array node keyed `key` backed by the npy file at `path`.
+    async fn register_npy(cat: &Catalog, key: &str, path: &Path) -> Node {
+        let node = cat
+            .create_node(
+                None,
+                vec![],
+                RegisterRequest {
+                    key: key.into(),
+                    structure_family: "array".into(),
+                    metadata: json!({}),
+                    specs: json!([]),
+                    access_blob: json!({}),
+                },
+            )
+            .await
+            .unwrap();
+        let data_uri = crate::core::file_uri::path_to_file_uri(path).unwrap();
+        cat.create_data_source(
+            node.id,
+            DataSourceSpec {
+                structure_family: "array".into(),
+                structure: json!({}),
+                mimetype: "application/x-npy".into(),
+                parameters: json!({}),
+                management: "external".into(),
+                assets: vec![AssetSpec {
+                    data_uri,
+                    is_directory: false,
+                    parameter: "data_uri".into(),
+                    num: None,
+                }],
+            },
+        )
+        .await
+        .unwrap();
+        node
+    }
+
+    /// True iff the two adapters share the same underlying `Arc` (a cache hit
+    /// hands back a clone of the exact same built adapter).
+    fn same_arc(a: &AnyAdapter, b: &AnyAdapter) -> bool {
+        match (a, b) {
+            (AnyAdapter::Array(x), AnyAdapter::Array(y)) => Arc::ptr_eq(x, y),
+            _ => false,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resolve_caches_read_only_adapter() {
+        let data = tempfile::tempdir().unwrap();
+        let dbdir = tempfile::tempdir().unwrap();
+        let npy = data.path().join("a.npy");
+        write_npy(&npy, 3);
+        // No writable storage -> the adapter is read-only -> cacheable.
+        let cat = catalog_with(dbdir.path(), vec![]).await;
+        let node = register_npy(&cat, "a", &npy).await;
+
+        let resolver = FileLeafResolver::unrestricted()
+            .with_resource_cache(Arc::new(AdapterCache::new(1024, 60.0)));
+
+        let a1 = resolver.resolve(&cat, &node).await.unwrap();
+        let a2 = resolver.resolve(&cat, &node).await.unwrap();
+        assert!(
+            same_arc(&a1, &a2),
+            "read-only adapter must be served from cache (same Arc, built once)"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resolve_bypasses_cache_for_writable_adapter() {
+        let data = tempfile::tempdir().unwrap();
+        let dbdir = tempfile::tempdir().unwrap();
+        let npy = data.path().join("w.npy");
+        write_npy(&npy, 3);
+        // The npy's dir is writable storage -> the adapter is writable ->
+        // never cached, so a write is always visible to the next read.
+        let cat = catalog_with(dbdir.path(), vec![data.path().to_path_buf()]).await;
+        let node = register_npy(&cat, "w", &npy).await;
+
+        let resolver = FileLeafResolver::unrestricted()
+            .with_resource_cache(Arc::new(AdapterCache::new(1024, 60.0)));
+
+        let a1 = resolver.resolve(&cat, &node).await.unwrap();
+        let a2 = resolver.resolve(&cat, &node).await.unwrap();
+        assert!(
+            !same_arc(&a1, &a2),
+            "writable adapter must rebuild every request (not cached)"
+        );
+        // Sanity: it really is the writable variant.
+        match &a1 {
+            AnyAdapter::Array(a) => assert!(a.as_writable().is_some(), "expected writable adapter"),
+            _ => panic!("expected an array adapter"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resolve_with_disabled_cache_rebuilds() {
+        let data = tempfile::tempdir().unwrap();
+        let dbdir = tempfile::tempdir().unwrap();
+        let npy = data.path().join("d.npy");
+        write_npy(&npy, 3);
+        let cat = catalog_with(dbdir.path(), vec![]).await;
+        let node = register_npy(&cat, "d", &npy).await;
+
+        // max_size 0 == the disable env setting == today's behaviour.
+        let resolver = FileLeafResolver::unrestricted()
+            .with_resource_cache(Arc::new(AdapterCache::new(0, 60.0)));
+
+        let a1 = resolver.resolve(&cat, &node).await.unwrap();
+        let a2 = resolver.resolve(&cat, &node).await.unwrap();
+        assert!(
+            !same_arc(&a1, &a2),
+            "disabled cache must rebuild every request (like today)"
+        );
     }
 }
