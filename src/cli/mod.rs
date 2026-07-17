@@ -2307,8 +2307,11 @@ pub async fn run(command: Command) -> Result<()> {
                 db.migrate()
                     .await
                     .map_err(|e| anyhow::anyhow!("auth migrate: {e}"))?;
+                // Truncate to the stored 8-char prefix so pasting the whole key
+                // still revokes (upstream `first_eight[:8]`), matching the admin
+                // path below.
                 let removed = db
-                    .revoke_api_key(&first_eight, None)
+                    .revoke_api_key(&api_key_search_prefix(&first_eight), None)
                     .await
                     .map_err(|e| anyhow::anyhow!("revoke: {e}"))?;
                 println!(
@@ -2382,11 +2385,10 @@ pub async fn run(command: Command) -> Result<()> {
                         .await?
                         .ok_or_else(|| anyhow::anyhow!("principal {principal_uuid} not found"))?;
                     // Scope the revoke to this principal's keys (upstream admin
-                    // api-key revoke takes the principal_uuid). `first_eight[:8]`
-                    // matches upstream's truncation of a full key to its prefix.
-                    let prefix: String = first_eight.chars().take(8).collect();
+                    // api-key revoke takes the principal_uuid). The shared prefix
+                    // helper truncates a pasted full key to its stored 8 chars.
                     let removed = db
-                        .revoke_api_key(&prefix, Some(principal_id))
+                        .revoke_api_key(&api_key_search_prefix(&first_eight), Some(principal_id))
                         .await
                         .map_err(|e| anyhow::anyhow!("revoke: {e}"))?;
                     println!(
@@ -2670,6 +2672,15 @@ fn print_api_keys_table(keys: &[crate::auth::ApiKeyRecord]) {
             k.first_eight, k.id, scopes, note, exp
         );
     }
+}
+
+/// Truncate a pasted API-key argument to the 8-character prefix stored in the
+/// `api_keys.first_eight` column, so `revoke` matches whether the operator
+/// pastes the whole secret or only its first eight characters. Mirrors upstream
+/// `_api_key.py` (`first_eight[:8]`). Single owner for the pasted-key →
+/// search-prefix transform, shared by the top-level and `admin` revoke paths.
+fn api_key_search_prefix(pasted: &str) -> String {
+    pasted.chars().take(8).collect()
 }
 
 async fn find_principal_by_uuid(
@@ -3557,6 +3568,57 @@ mod tests {
         assert!(
             keys.is_empty(),
             "the rejected create must not persist a key"
+        );
+    }
+
+    // w28-F1: the stored `first_eight` column is only 8 chars, but `tiled
+    // api-key revoke` accepts either the prefix or the whole key. The prefix
+    // helper truncates a pasted full key to the stored 8 chars so it still
+    // matches; the raw (untruncated) full key does not.
+    #[tokio::test]
+    async fn revoke_truncates_pasted_full_key_to_prefix() {
+        let db = crate::auth::AuthDb::connect("sqlite::memory:")
+            .await
+            .expect("in-memory auth db");
+        db.migrate().await.expect("auth migrate");
+        let p = db.create_principal("user").await.expect("principal");
+
+        let material = db
+            .create_api_key(crate::auth::ApiKeyCreate {
+                principal_id: p.id,
+                note: None,
+                scopes: crate::auth::ScopeSet::full(),
+                expiration_time: None,
+                access_tags: None,
+            })
+            .await
+            .expect("create api key");
+        let full_key = material.secret.clone();
+        assert!(
+            full_key.len() > 8,
+            "a real secret is longer than its 8-char prefix"
+        );
+
+        // The helper reduces the pasted full key to exactly the stored prefix.
+        let prefix = api_key_search_prefix(&full_key);
+        assert_eq!(prefix, material.record.first_eight);
+
+        // The untruncated full key must NOT match the stored 8-char column —
+        // this is the bug the truncation fixes.
+        assert!(
+            db.revoke_api_key(&full_key, None).await.is_err(),
+            "a raw full key must not match the 8-char first_eight column"
+        );
+
+        // Pasting the full key (truncated by the helper, as the CLI does) revokes.
+        let removed = db
+            .revoke_api_key(&prefix, None)
+            .await
+            .expect("truncated full key revokes the matching row");
+        assert_eq!(removed.id, material.record.id);
+        assert!(
+            db.list_api_keys(Some(p.id)).await.expect("list").is_empty(),
+            "the key is gone after revoke"
         );
     }
 }
