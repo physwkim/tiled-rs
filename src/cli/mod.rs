@@ -661,6 +661,29 @@ pub enum AdminCommand {
         /// UUID identifying the principal of interest.
         uuid: String,
     },
+    /// Compile a tag-based access-control config into a compiled-tags SQLite
+    /// database, offline. Mirrors upstream's standalone
+    /// `example_configs/access_tags/compile_tags.py`: it reads the tag config
+    /// (roles / tags / tag_owners), resolves roles, nested `auto_tags`, group
+    /// membership, and ownership, and writes the per-(user, tag, scope) ACL DB
+    /// a tag-based access policy reads. Offline tool only — no server is
+    /// started and no access policy is touched.
+    CompileAccessTags {
+        /// Path to the tag config YAML (roles / tags / tag_owners).
+        config_path: String,
+        /// Output compiled-tags DB URI (e.g.
+        /// `sqlite:///var/lib/tiled/compiled-tags.db`). Mirrors upstream
+        /// `tags_db["uri"]`.
+        #[arg(long)]
+        tags_db_uri: String,
+        /// Optional YAML file mapping each group name to its member usernames
+        /// (`group_name: [alice, bob]`). Upstream supplies a live `group_parser`
+        /// callable; offline, membership is read from this static file. A group
+        /// not listed here — or when this flag is omitted entirely — is skipped
+        /// with a warning, matching the compiler's missing-group behavior.
+        #[arg(long)]
+        groups: Option<String>,
+    },
 }
 
 /// `tiled admin api-key` subcommands. Per-principal API-key management,
@@ -2449,6 +2472,50 @@ pub async fn run(command: Command) -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&detail)?);
                 Ok(())
             }
+            AdminCommand::CompileAccessTags {
+                config_path,
+                tags_db_uri,
+                groups,
+            } => {
+                // Build the optional static group parser from a
+                // `group_name: [members]` YAML file. Upstream passes a live
+                // `group_parser` callable; offline the membership is fixed by
+                // this file. A group absent from the map resolves to `None`
+                // (skip with a warning) — the compiler's missing-group path.
+                let group_parser: Option<crate::access::GroupParser> = match groups {
+                    Some(path) => {
+                        let text = std::fs::read_to_string(&path)
+                            .with_context(|| format!("reading groups file {path}"))?;
+                        let map: std::collections::BTreeMap<String, Vec<String>> =
+                            serde_yaml::from_str(&text)
+                                .with_context(|| format!("parsing groups file {path}"))?;
+                        Some(std::sync::Arc::new(move |name: &str| {
+                            map.get(name).cloned()
+                        }))
+                    }
+                    None => None,
+                };
+                // The compiler owns its own error text; surface it verbatim so
+                // an invalid config exits non-zero with the compiler's message
+                // (main prints the anyhow error and returns a non-zero code).
+                let mut compiler = crate::access::AccessTagsCompiler::connect(
+                    crate::access::all_scope_names(),
+                    crate::access::TagConfigSource::File(std::path::PathBuf::from(&config_path)),
+                    &tags_db_uri,
+                    group_parser,
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+                compiler
+                    .load_tag_config()
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                compiler
+                    .compile()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                println!("Compiled access tags from {config_path} into {tags_db_uri}.");
+                Ok(())
+            }
         },
     }
 }
@@ -3604,6 +3671,173 @@ mod tests {
         assert!(
             db.list_api_keys(Some(p.id)).await.expect("list").is_empty(),
             "the key is gone after revoke"
+        );
+    }
+
+    // ---- `tiled admin compile-access-tags` (offline tag-config compiler) ----
+
+    /// A config exercising roles, group expansion (in both `groups:` and
+    /// `tag_owners`), nested `auto_tags` inheritance, and the public flag.
+    const CLI_TAG_CONFIG: &str = r#"
+roles:
+  reader:
+    scopes: ["read:data", "read:metadata"]
+tags:
+  team:
+    groups:
+      - name: grp
+        role: reader
+    auto_tags:
+      - name: admins_tag
+  admins_tag:
+    users:
+      - name: cara
+        scopes: ["read:data", "read:metadata", "write:data"]
+  open:
+    auto_tags:
+      - name: public
+tag_owners:
+  admins_tag:
+    users:
+      - name: cara
+    groups:
+      - name: grp
+"#;
+
+    async fn view_acl(pool: &sqlx::SqlitePool) -> Vec<(String, String, String)> {
+        let mut rows: Vec<(String, String, String)> =
+            sqlx::query_as("SELECT user_name, tag_name, scope_name FROM user_tag_scopes")
+                .fetch_all(pool)
+                .await
+                .unwrap();
+        rows.sort();
+        rows
+    }
+
+    async fn view_public(pool: &sqlx::SqlitePool) -> Vec<String> {
+        let mut rows: Vec<String> = sqlx::query_scalar("SELECT name FROM public_tags")
+            .fetch_all(pool)
+            .await
+            .unwrap();
+        rows.sort();
+        rows
+    }
+
+    async fn view_owners(pool: &sqlx::SqlitePool) -> Vec<(String, String)> {
+        let mut rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT user_name, tag_name FROM user_tag_owners")
+                .fetch_all(pool)
+                .await
+                .unwrap();
+        rows.sort();
+        rows
+    }
+
+    /// The CLI subcommand produces a DB whose ACL / public / owner rows are
+    /// byte-for-byte the same as invoking `AccessTagsCompiler` directly with an
+    /// equivalent group parser — i.e. the CLI is a faithful thin wrapper.
+    #[tokio::test]
+    async fn compile_access_tags_cli_matches_direct_compiler() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("tags.yml");
+        std::fs::write(&config, CLI_TAG_CONFIG).unwrap();
+        let groups = dir.path().join("groups.yml");
+        std::fs::write(&groups, "grp: [alice, bob]\n").unwrap();
+
+        let cli_uri = format!("sqlite://{}", dir.path().join("cli.db").display());
+        run(Command::Admin {
+            command: AdminCommand::CompileAccessTags {
+                config_path: config.display().to_string(),
+                tags_db_uri: cli_uri.clone(),
+                groups: Some(groups.display().to_string()),
+            },
+        })
+        .await
+        .expect("a valid config must compile via the CLI");
+
+        // Direct compiler over the same config + an equivalent group parser.
+        let direct_uri = format!("sqlite://{}", dir.path().join("direct.db").display());
+        let map: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::from([(
+                "grp".to_string(),
+                vec!["alice".to_string(), "bob".to_string()],
+            )]);
+        let parser: crate::access::GroupParser =
+            std::sync::Arc::new(move |n: &str| map.get(n).cloned());
+        let mut direct = crate::access::AccessTagsCompiler::connect(
+            crate::access::all_scope_names(),
+            crate::access::TagConfigSource::File(config.clone()),
+            &direct_uri,
+            Some(parser),
+        )
+        .await
+        .unwrap();
+        direct.load_tag_config().unwrap();
+        direct.compile().await.unwrap();
+
+        let cli_pool = sqlx::SqlitePool::connect(&cli_uri).await.unwrap();
+
+        let cli_acl = view_acl(&cli_pool).await;
+        assert!(!cli_acl.is_empty(), "the compilation must produce ACL rows");
+        assert_eq!(
+            cli_acl,
+            view_acl(direct.pool()).await,
+            "CLI ACL rows must match the direct compiler"
+        );
+        assert_eq!(
+            view_public(&cli_pool).await,
+            view_public(direct.pool()).await,
+            "CLI public tags must match the direct compiler"
+        );
+        assert_eq!(
+            view_owners(&cli_pool).await,
+            view_owners(direct.pool()).await,
+            "CLI owners must match the direct compiler"
+        );
+    }
+
+    /// An invalid config (an `auto_tags` reference with no definition) exits
+    /// non-zero, and the compiler's own error text surfaces through the CLI.
+    #[tokio::test]
+    async fn compile_access_tags_cli_invalid_config_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("bad.yml");
+        std::fs::write(&config, "tags:\n  x:\n    auto_tags:\n      - name: nope\n").unwrap();
+        let uri = format!("sqlite://{}", dir.path().join("out.db").display());
+        let err = run(Command::Admin {
+            command: AdminCommand::CompileAccessTags {
+                config_path: config.display().to_string(),
+                tags_db_uri: uri,
+                groups: None,
+            },
+        })
+        .await
+        .expect_err("an invalid config must exit non-zero");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("no definition") || text.contains("nope"),
+            "the compiler's error text must surface through the CLI: {text}"
+        );
+    }
+
+    /// A missing config file errors cleanly (the compiler's "doesn't exist").
+    #[tokio::test]
+    async fn compile_access_tags_cli_missing_config_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = format!("sqlite://{}", dir.path().join("out.db").display());
+        let missing = dir.path().join("does-not-exist.yml");
+        let err = run(Command::Admin {
+            command: AdminCommand::CompileAccessTags {
+                config_path: missing.display().to_string(),
+                tags_db_uri: uri,
+                groups: None,
+            },
+        })
+        .await
+        .expect_err("a missing config file must error");
+        assert!(
+            format!("{err:#}").contains("doesn't exist"),
+            "error must name the missing file: {err:#}"
         );
     }
 }
