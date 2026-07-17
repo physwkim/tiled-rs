@@ -987,3 +987,243 @@ async fn metadata_read_excludes_other_users_owned_node() {
     let public = get_status(&app, "/api/v1/metadata/public_node", Some(&bearer)).await;
     assert_eq!(public, StatusCode::OK, "public node must be readable");
 }
+
+/// GET a zarr group-listing URL and return `(status, child_keys)`, where each
+/// child key is the last path segment of a URL in the returned JSON array.
+async fn zarr_children(
+    app: &axum::Router,
+    uri: &str,
+    bearer: Option<&str>,
+) -> (StatusCode, Vec<String>) {
+    let mut builder = Request::builder().method(Method::GET).uri(uri);
+    if let Some(b) = bearer {
+        builder = builder.header("authorization", b);
+    }
+    let req = builder.body(Body::empty()).unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let urls: Vec<String> = serde_json::from_slice(&bytes).unwrap_or_default();
+    let keys = urls
+        .iter()
+        .filter_map(|u| u.rsplit('/').next().map(String::from))
+        .collect();
+    (status, keys)
+}
+
+/// Seed a catalog + auth DB with a public container `C` holding a public child
+/// `visible` and a `team-b`-tagged child `secret`, plus a top-level
+/// `team-b`-tagged `restricted_top`. Principal `alice` is granted `team-a`, so
+/// she may read `C` and `C/visible` but neither `team-b` node. Returns the built
+/// app, alice's bearer header, and the `TempDir` that must outlive the app.
+async fn zarr_access_app(with_policy: bool) -> (axum::Router, String, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let cat_uri = format!("sqlite://{}", dir.path().join("catalog.db").display());
+    let auth_uri = format!("sqlite://{}", dir.path().join("auth.db").display());
+
+    let catalog = Catalog::connect(&cat_uri).await.unwrap();
+    catalog.migrate().await.unwrap();
+
+    let auth_db = AuthDb::connect(&auth_uri).await.unwrap();
+    auth_db.migrate().await.unwrap();
+
+    let (alice, _) = auth_db.ensure_principal("dummy", "alice").await.unwrap();
+
+    let make_node = |key: &str, access_blob: serde_json::Value| RegisterRequest {
+        key: key.to_string(),
+        structure_family: "container".to_string(),
+        metadata: json!({}),
+        specs: json!([]),
+        access_blob,
+    };
+    // Top-level: C (public/untagged) and restricted_top (team-b).
+    let c = catalog
+        .create_node(None, vec![], make_node("C", json!({})))
+        .await
+        .unwrap();
+    catalog
+        .create_node(
+            None,
+            vec![],
+            make_node("restricted_top", json!({"tags": ["team-b"]})),
+        )
+        .await
+        .unwrap();
+    // Children of C: visible (public/untagged) and secret (team-b).
+    catalog
+        .create_node(
+            Some(c.id),
+            vec!["C".to_string()],
+            make_node("visible", json!({})),
+        )
+        .await
+        .unwrap();
+    catalog
+        .create_node(
+            Some(c.id),
+            vec!["C".to_string()],
+            make_node("secret", json!({"tags": ["team-b"]})),
+        )
+        .await
+        .unwrap();
+
+    // alice is granted team-a only — team-b nodes are invisible to her.
+    auth_db
+        .set_principal_tags(alice.id, &["team-a".to_string()])
+        .await
+        .unwrap();
+
+    let access_policy: Option<Arc<dyn tiled_rs::access::AccessPolicy>> = if with_policy {
+        Some(Arc::new(TagBasedPolicy::new(
+            Arc::new(auth_db.clone()),
+            ScopeSet::full(),
+        )))
+    } else {
+        None
+    };
+
+    let resolver: Arc<dyn tiled_rs::catalog::adapter::LeafResolver> =
+        Arc::new(tiled_rs::catalog::adapter::UnresolvedLeaf);
+    let root_tree: Arc<dyn ContainerAdapter> = Arc::new(tiled_rs::catalog::CatalogAdapter::root(
+        catalog.clone(),
+        resolver,
+    ));
+    let registry = Arc::new(tiled_rs::serialization::default_registry());
+    let issuer = Issuer::new(b"this-is-a-test-secret-32-bytes-long!!").unwrap();
+    let mut dummy = DummyAuthenticator::new("dummy");
+    dummy.add_user("alice", "wonderland").unwrap();
+
+    let state = tiled_rs::server::AppState {
+        root_tree,
+        serialization_registry: registry,
+        query_names: Query::all_query_names()
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        base_url: Some("http://localhost:8000".into()),
+        cors_policy: tiled_rs::server::state::CorsOriginPolicy::Permissive,
+        trust_forwarded_headers: false,
+        api_key: None,
+        catalog: Some(catalog),
+        auth_db: Some(auth_db),
+        issuer: Some(issuer),
+        authenticators: vec![Arc::new(dummy)],
+        proxied_header_auth: None,
+        external_oidc: None,
+        #[cfg(feature = "saml")]
+        saml_providers: vec![],
+        forwarded_allow_ips: None,
+        max_request_body_bytes: 10 * 1024 * 1024,
+        response_bytesize_limit: 300_000_000,
+        streaming_bus: tiled_rs::server::streaming::StreamingBus::new(),
+        access_policy,
+        default_login_scopes: tiled_rs::auth::ScopeSet::full(),
+        enable_web: true,
+        web_assets_dir: None,
+        spec_views: Vec::new(),
+        webhook_config: None,
+        request_timeout_secs: 30,
+        expose_raw_assets: true,
+        exact_count_limit: u64::MAX,
+        background_tasks: tiled_rs::server::state::BackgroundTasks::new(),
+    };
+    let app = tiled_rs::server::build_app(state);
+    let token = login(&app, "alice", "wonderland").await;
+    (app, format!("Bearer {token}"), dir)
+}
+
+/// C3 regression: a zarr group listing must omit access-restricted children.
+///
+/// Pre-fix `group_listing` enumerated the raw `keys()` of the container/root
+/// with no access filter, so `GET /zarr/v2/C` (and v3) leaked the name of
+/// `C/secret` and the root listing leaked `restricted_top`, even though the
+/// principal cannot read them. The fix routes child enumeration through the same
+/// `list_filter(read:metadata)` path `/search` and `/container/full` use.
+#[tokio::test]
+async fn zarr_listing_omits_access_restricted_children() {
+    let (app, bearer, _dir) = zarr_access_app(true).await;
+
+    // Container listing (v2): visible present, secret filtered out.
+    let (s2, v2) = zarr_children(&app, "/zarr/v2/C", Some(&bearer)).await;
+    assert_eq!(s2, StatusCode::OK, "v2 C listing status: {v2:?}");
+    assert!(
+        v2.contains(&"visible".to_string()),
+        "v2: alice must see C/visible, got {v2:?}"
+    );
+    assert!(
+        !v2.contains(&"secret".to_string()),
+        "v2: C/secret must be filtered out, got {v2:?}"
+    );
+
+    // Container listing (v3): identical filtering.
+    let (s3, v3) = zarr_children(&app, "/zarr/v3/C", Some(&bearer)).await;
+    assert_eq!(s3, StatusCode::OK, "v3 C listing status: {v3:?}");
+    assert!(
+        v3.contains(&"visible".to_string()),
+        "v3: alice must see C/visible, got {v3:?}"
+    );
+    assert!(
+        !v3.contains(&"secret".to_string()),
+        "v3: C/secret must be filtered out, got {v3:?}"
+    );
+
+    // Root listing (v2): C present, restricted_top filtered out.
+    let (sr2, r2) = zarr_children(&app, "/zarr/v2/", Some(&bearer)).await;
+    assert_eq!(sr2, StatusCode::OK, "v2 root listing status: {r2:?}");
+    assert!(
+        r2.contains(&"C".to_string()),
+        "v2 root: alice must see C, got {r2:?}"
+    );
+    assert!(
+        !r2.contains(&"restricted_top".to_string()),
+        "v2 root: restricted_top must be filtered out, got {r2:?}"
+    );
+
+    // Root listing (v3): identical filtering.
+    let (sr3, r3) = zarr_children(&app, "/zarr/v3/", Some(&bearer)).await;
+    assert_eq!(sr3, StatusCode::OK, "v3 root listing status: {r3:?}");
+    assert!(
+        r3.contains(&"C".to_string()),
+        "v3 root: alice must see C, got {r3:?}"
+    );
+    assert!(
+        !r3.contains(&"restricted_top".to_string()),
+        "v3 root: restricted_top must be filtered out, got {r3:?}"
+    );
+
+    // Independent of listing: directly fetching the restricted child's own zarr
+    // metadata still 404s (resolve_zarr_node already gates this; unchanged).
+    assert_eq!(
+        get_status(&app, "/zarr/v2/C/secret/.zgroup", Some(&bearer)).await,
+        StatusCode::NOT_FOUND,
+        "C/secret .zgroup must 404 for alice"
+    );
+    assert_eq!(
+        get_status(&app, "/zarr/v3/C/secret/zarr.json", Some(&bearer)).await,
+        StatusCode::NOT_FOUND,
+        "C/secret zarr.json must 404 for alice"
+    );
+}
+
+/// With no access policy configured, the zarr listing is unfiltered — every
+/// child is enumerated (no regression on the `access_policy: None` path).
+#[tokio::test]
+async fn zarr_listing_unfiltered_when_no_access_policy() {
+    let (app, bearer, _dir) = zarr_access_app(false).await;
+
+    let (s2, v2) = zarr_children(&app, "/zarr/v2/C", Some(&bearer)).await;
+    assert_eq!(s2, StatusCode::OK, "v2 C listing status: {v2:?}");
+    assert!(
+        v2.contains(&"visible".to_string()) && v2.contains(&"secret".to_string()),
+        "no policy: both C children listed, got {v2:?}"
+    );
+
+    let (sr, root) = zarr_children(&app, "/zarr/v2/", Some(&bearer)).await;
+    assert_eq!(sr, StatusCode::OK, "v2 root listing status: {root:?}");
+    assert!(
+        root.contains(&"C".to_string()) && root.contains(&"restricted_top".to_string()),
+        "no policy: all top-level nodes listed, got {root:?}"
+    );
+}
