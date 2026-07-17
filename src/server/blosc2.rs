@@ -6,23 +6,17 @@
 //! body is eligible (>= 1000 bytes, media type in the blosc2-eligible set),
 //! the body is compressed and `Content-Encoding: blosc2` is set.
 //!
-//! This layer must sit **inside** (closer to the handler than) tower-http's
-//! `CompressionLayer`.  When blosc2 compression is applied the `CompressionLayer`
-//! sees `Content-Encoding: blosc2` already present and skips its gzip/zstd
-//! pass, preventing double-encoding.
+//! This layer is the innermost (closest to the handler) of the four
+//! content-encoding middlewares, so it gets first crack at the response — blosc2
+//! is the highest-priority encoding (`blosc2 > lz4 > zstd > gzip`). The lz4,
+//! zstd, and gzip middlewares each yield to a `Content-Encoding` blosc2 already
+//! set, preventing double-encoding.
 
-use axum::body::Body;
 use axum::extract::Request;
 use axum::http::header;
 use axum::middleware::Next;
 use axum::response::Response;
 use blosc2_pure_rs::{BLOSC_NOSHUFFLE, BLOSC2_MAX_OVERHEAD, blosc1_compress, blosc1_decompress};
-
-/// Minimum response body size (bytes) to trigger blosc2 compression.
-/// The running app overrides `CompressionMiddleware`'s 500-byte class default
-/// (`compression.py:11`) with `minimum_size=1000` in `app.add_middleware(...)`
-/// (`tiled/server/app.py:760-764`), so the effective floor is 1000, not 500.
-pub const MINIMUM_SIZE: usize = 1000;
 
 /// Media types for which blosc2 is offered.  Python's `media_type_registration.py`
 /// registers blosc2 only for `application/octet-stream` and the Arrow file
@@ -101,44 +95,8 @@ pub async fn blosc2_compress_middleware(request: Request, next: Next) -> Respons
         return response;
     }
 
-    let (mut parts, body) = response.into_parts();
-    let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
-        Ok(b) => b,
-        Err(_) => return Response::from_parts(parts, Body::empty()),
-    };
-
-    if body_bytes.len() < MINIMUM_SIZE {
-        return Response::from_parts(parts, Body::from(body_bytes));
-    }
-
-    let t0 = std::time::Instant::now();
-    let compressed = compress(&body_bytes);
-    let dur = t0.elapsed().as_secs_f64();
-    match compressed {
-        Some(compressed) => {
-            let n = compressed.len();
-            // Only keep the compression if it saves enough to be worth the
-            // client's decompression cost (upstream compression.py:87-93).
-            // Otherwise send the original body identity-encoded, with no
-            // Content-Encoding and no compress Server-Timing phase recorded.
-            if !crate::server::compression::worth_compressing(body_bytes.len(), n) {
-                return Response::from_parts(parts, Body::from(body_bytes));
-            }
-            if let Some(timing) = &timing {
-                let ratio = body_bytes.len() as f64 / n as f64;
-                timing.record("compress", &[("dur", dur), ("ratio", ratio)]);
-            }
-            parts
-                .headers
-                .insert(header::CONTENT_ENCODING, "blosc2".parse().unwrap());
-            parts
-                .headers
-                .insert(header::CONTENT_LENGTH, n.to_string().parse().unwrap());
-            if let Ok(v) = "Accept-Encoding".parse() {
-                parts.headers.append(header::VARY, v);
-            }
-            Response::from_parts(parts, Body::from(compressed))
-        }
-        None => Response::from_parts(parts, Body::from(body_bytes)),
-    }
+    // Floor, ratio gate, compress timing, and header emission all live in the
+    // shared owner. `compress` returns None if blosc2's C path fails, in which
+    // case the body is sent identity-encoded.
+    crate::server::compression::apply_encoding(response, timing, "blosc2", compress).await
 }

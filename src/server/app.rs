@@ -8,7 +8,6 @@ use axum::extract::State;
 use axum::http::{HeaderValue, Method, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, patch, post, put};
-use tower_http::compression::CompressionLayer;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
@@ -387,17 +386,28 @@ pub fn build_app(mut state: AppState) -> Router {
             state.clone(),
             timeout_middleware,
         ))
+        // The four content-encoding middlewares are layered so the response
+        // passes through them in priority order blosc2 > lz4 > zstd > gzip
+        // (upstream's reversed registration order,
+        // tiled/media_type_registration.py). Each yields to a Content-Encoding
+        // an earlier one already set, so the highest-priority accepted encoding
+        // wins. All four share one MINIMUM_SIZE floor, worth_compressing ratio
+        // gate, and `compress` Server-Timing phase via
+        // compression::apply_encoding — replacing tower-http's CompressionLayer,
+        // which floored at 32 bytes, had no ratio gate, recorded no compress
+        // metric, and compressed a broader content-type set than upstream.
         .layer(axum::middleware::from_fn(
             crate::server::blosc2::blosc2_compress_middleware,
         ))
-        // lz4 runs on the response after blosc2 (which handles octet-stream/
-        // arrow first) and before tower-http's gzip/zstd CompressionLayer,
-        // reproducing upstream's blosc2 > lz4 > zstd > gzip negotiation order
-        // (tiled/media_type_registration.py registration order, reversed).
         .layer(axum::middleware::from_fn(
             crate::server::lz4::lz4_compress_middleware,
         ))
-        .layer(CompressionLayer::new())
+        .layer(axum::middleware::from_fn(
+            crate::server::zstd::zstd_compress_middleware,
+        ))
+        .layer(axum::middleware::from_fn(
+            crate::server::gzip::gzip_compress_middleware,
+        ))
         // L2: the default request span records the full URI, including the
         // query string — so a credential passed as `?api_key=...` (a supported
         // auth form, see resolve_auth) would land in the trace/logs. Record

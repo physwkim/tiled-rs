@@ -8,6 +8,7 @@ pub mod error;
 pub mod etag;
 pub mod extractors;
 pub mod file_resolver;
+pub mod gzip;
 pub mod lz4;
 pub mod resource_cache;
 pub mod router;
@@ -20,6 +21,7 @@ pub mod streaming_cache_redis;
 pub mod webhook_dispatch;
 pub mod webhook_router;
 pub mod zarr_router;
+pub mod zstd;
 
 pub use app::build_app;
 pub use auth_context::{AuthContext, AuthKind};
