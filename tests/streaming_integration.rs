@@ -76,6 +76,7 @@ fn build_state(
         exact_count_limit: u64::MAX,
         allow_anonymous_access: false,
         background_tasks: tiled_rs::server::state::BackgroundTasks::new(),
+        validation: Default::default(),
     }
 }
 
@@ -1949,6 +1950,7 @@ async fn spawn_auth_stream_server(
         exact_count_limit: u64::MAX,
         allow_anonymous_access: false,
         background_tasks: tiled_rs::server::state::BackgroundTasks::new(),
+        validation: Default::default(),
     };
     (serve(state).await, dir)
 }
@@ -2224,6 +2226,7 @@ async fn spawn_webhook_stream_server() -> (String, reqwest::Client, Catalog, i64
         exact_count_limit: u64::MAX,
         allow_anonymous_access: false,
         background_tasks: background,
+        validation: Default::default(),
     };
     (
         serve(state).await,

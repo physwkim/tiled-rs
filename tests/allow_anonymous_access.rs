@@ -88,6 +88,7 @@ async fn build_multi_user_app(flag: bool) -> (axum::Router, tempfile::TempDir) {
         expose_raw_assets: true,
         exact_count_limit: u64::MAX,
         background_tasks: tiled_rs::server::state::BackgroundTasks::new(),
+        validation: Default::default(),
     };
     (tiled_rs::server::build_app(state), dir)
 }
@@ -147,6 +148,7 @@ async fn build_no_auth_app() -> (axum::Router, tempfile::TempDir) {
         expose_raw_assets: true,
         exact_count_limit: u64::MAX,
         background_tasks: tiled_rs::server::state::BackgroundTasks::new(),
+        validation: Default::default(),
     };
     (tiled_rs::server::build_app(state), dir)
 }

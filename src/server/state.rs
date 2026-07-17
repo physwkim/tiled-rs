@@ -171,6 +171,14 @@ pub struct AppState {
     /// path can signal and await them exactly once. See
     /// [`BackgroundTasks::shutdown`].
     pub background_tasks: BackgroundTasks,
+    /// Server-side spec validation policy (upstream
+    /// `tiled/validation_registration.py` + `router.py::validate_specs`): the
+    /// per-spec validator registry plus the `reject_undeclared_specs` toggle.
+    /// Consulted on node create and metadata update. Default = empty registry +
+    /// reject off (permissive), matching upstream, so behavior is unchanged
+    /// unless an operator opts in. Behind `Arc` so per-request `AppState` clones
+    /// stay cheap.
+    pub validation: Arc<crate::server::validation::ValidationConfig>,
 }
 
 /// Owner for background tasks meant to live for the process's lifetime,

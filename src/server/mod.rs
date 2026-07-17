@@ -17,6 +17,7 @@ pub mod streaming;
 pub mod streaming_cache;
 #[cfg(feature = "streaming-redis")]
 pub mod streaming_cache_redis;
+pub mod validation;
 pub mod webhook_dispatch;
 pub mod webhook_router;
 pub mod zarr_router;

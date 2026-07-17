@@ -5678,6 +5678,35 @@ async fn create_node_core(
     }
     .to_string();
 
+    // Validate the node's specs against the server's validation registry before
+    // creating it (upstream `_create_node` → `validate_specs`, router.py:1876;
+    // `entry=None` because the node does not exist yet). A registered validator
+    // may reject the node (→ 400) or return a normalized metadata document; an
+    // undeclared spec is rejected only when `reject_undeclared_specs` is set.
+    // Runs on both the catalog and the no-catalog fallback paths, exactly as
+    // upstream validates before either branch.
+    let create_structure = if matches!(
+        req.structure_family,
+        crate::core::structures::StructureFamily::Container
+    ) {
+        None
+    } else {
+        req.data_sources
+            .first()
+            .and_then(|ds| ds.structure.as_ref())
+            .and_then(|s| serde_json::to_value(s).ok())
+    };
+    let (_meta_modified, metadata) = crate::server::validation::validate_specs(
+        &state.validation.registry,
+        state.validation.reject_undeclared_specs,
+        &req.specs,
+        req.metadata.clone(),
+        crate::server::validation::ValidationTarget::Create {
+            structure_family: req.structure_family,
+            structure: create_structure.as_ref(),
+        },
+    )?;
+
     if let Some(ref catalog) = state.catalog {
         // Per-ancestor auth gate on the parent container path.
         let auth = if !segments.is_empty() {
@@ -5731,7 +5760,7 @@ async fn create_node_core(
                 crate::catalog::node::RegisterRequest {
                     key: id.clone(),
                     structure_family: structure_family.clone(),
-                    metadata: req.metadata.clone(),
+                    metadata: metadata.clone(),
                     specs: serde_json::to_value(&req.specs).unwrap_or_default(),
                     access_blob: final_access_blob,
                 },
@@ -5896,7 +5925,7 @@ async fn create_node_core(
     let resp = crate::core::schemas::PostMetadataResponse {
         id,
         links: Some(serde_json::to_value(&links).unwrap_or_default()),
-        metadata: Some(req.metadata),
+        metadata: Some(metadata),
         data_sources: Some(req.data_sources),
         access_blob: None,
     };
@@ -6454,6 +6483,26 @@ pub async fn patch_metadata(
         }
     }
 
+    // Validate the FINAL specs against the server's validation registry
+    // (upstream `patch_metadata` → `validate_specs`, router.py:2386; the entry
+    // is the existing node). A registered validator may reject (→ 400) or
+    // return a normalized metadata document; an undeclared spec is rejected only
+    // when `reject_undeclared_specs` is set. A `specs` array that does not parse
+    // as `Vec<Spec>` yields no specs to validate (it is stored as-is; validators
+    // apply only to well-formed specs).
+    let spec_list: Vec<crate::core::structures::Spec> =
+        serde_json::from_value(specs.clone()).unwrap_or_default();
+    let entry_family = parse_structure_family(&node.structure_family)?;
+    let (_meta_modified, metadata) = crate::server::validation::validate_specs(
+        &state.validation.registry,
+        state.validation.reject_undeclared_specs,
+        &spec_list,
+        metadata,
+        crate::server::validation::ValidationTarget::Update {
+            structure_family: entry_family,
+        },
+    )?;
+
     // access_blob patch: apply the SAME json-patch / merge-patch step to the
     // stored access_blob that `metadata` and `specs` already get above (see the
     // `match mode` block), then hand the RESULT — not the raw patch document —
@@ -6619,6 +6668,25 @@ pub async fn put_metadata(
             seen.push(identity);
         }
     }
+
+    // Validate the FINAL specs against the server's validation registry
+    // (upstream `put_metadata` → `validate_specs`, router.py:2462; the entry is
+    // the existing node). A registered validator may reject (→ 400) or return a
+    // normalized metadata document; an undeclared spec is rejected only when
+    // `reject_undeclared_specs` is set. A `specs` array that does not parse as
+    // `Vec<Spec>` yields no specs to validate.
+    let spec_list: Vec<crate::core::structures::Spec> =
+        serde_json::from_value(specs.clone()).unwrap_or_default();
+    let entry_family = parse_structure_family(&node.structure_family)?;
+    let (_meta_modified, metadata) = crate::server::validation::validate_specs(
+        &state.validation.registry,
+        state.validation.reject_undeclared_specs,
+        &spec_list,
+        metadata,
+        crate::server::validation::ValidationTarget::Update {
+            structure_family: entry_family,
+        },
+    )?;
 
     // access_blob: run the proposed blob through policy.modify_node.
     // Mirrors Python router.py:2484-2487: when modify_node signals a change

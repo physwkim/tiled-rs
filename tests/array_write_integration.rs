@@ -82,6 +82,7 @@ async fn build_write_app() -> (axum::Router, tempfile::TempDir, tempfile::TempDi
         exact_count_limit: u64::MAX,
         allow_anonymous_access: false,
         background_tasks: tiled_rs::server::state::BackgroundTasks::new(),
+        validation: Default::default(),
     };
     (tiled_rs::server::build_app(state), writable_dir, db_dir)
 }
@@ -303,6 +304,7 @@ async fn managed_create_without_writable_storage_makes_metadata_only_node() {
         exact_count_limit: u64::MAX,
         allow_anonymous_access: false,
         background_tasks: tiled_rs::server::state::BackgroundTasks::new(),
+        validation: Default::default(),
     };
     let app = tiled_rs::server::build_app(state);
 

@@ -101,6 +101,7 @@ fn build_app_for_root(
         exact_count_limit: u64::MAX,
         allow_anonymous_access: false,
         background_tasks: tiled_rs::server::state::BackgroundTasks::new(),
+        validation: Default::default(),
     };
 
     tiled_rs::server::build_app(state)
@@ -148,6 +149,7 @@ fn build_app_dynamic(trust_forwarded: bool) -> axum::Router {
         exact_count_limit: u64::MAX,
         allow_anonymous_access: false,
         background_tasks: tiled_rs::server::state::BackgroundTasks::new(),
+        validation: Default::default(),
     };
 
     tiled_rs::server::build_app(state)
@@ -197,6 +199,7 @@ fn build_app_with_cors_origin(origin: &str) -> axum::Router {
         exact_count_limit: u64::MAX,
         allow_anonymous_access: false,
         background_tasks: tiled_rs::server::state::BackgroundTasks::new(),
+        validation: Default::default(),
     };
 
     tiled_rs::server::build_app(state)
@@ -686,6 +689,7 @@ async fn test_empty_container() {
         exact_count_limit: u64::MAX,
         allow_anonymous_access: false,
         background_tasks: tiled_rs::server::state::BackgroundTasks::new(),
+        validation: Default::default(),
     };
     let app = tiled_rs::server::build_app(state);
 
@@ -821,6 +825,7 @@ fn build_app_with_api_key(key: &str) -> axum::Router {
         exact_count_limit: u64::MAX,
         allow_anonymous_access: false,
         background_tasks: tiled_rs::server::state::BackgroundTasks::new(),
+        validation: Default::default(),
     };
 
     tiled_rs::server::build_app(state)
@@ -1031,6 +1036,7 @@ async fn test_metadata_handles_percent_encoded_slash_in_key() {
         exact_count_limit: u64::MAX,
         allow_anonymous_access: false,
         background_tasks: tiled_rs::server::state::BackgroundTasks::new(),
+        validation: Default::default(),
     };
     let app = tiled_rs::server::build_app(state);
 
@@ -1124,6 +1130,7 @@ async fn array_full_returns_all_chunks_not_just_first() {
         exact_count_limit: u64::MAX,
         allow_anonymous_access: false,
         background_tasks: tiled_rs::server::state::BackgroundTasks::new(),
+        validation: Default::default(),
     };
     let app = tiled_rs::server::build_app(state);
 
@@ -1602,6 +1609,7 @@ fn build_table_app(csv_path: std::path::PathBuf, response_bytesize_limit: usize)
         exact_count_limit: u64::MAX,
         allow_anonymous_access: false,
         background_tasks: tiled_rs::server::state::BackgroundTasks::new(),
+        validation: Default::default(),
     };
     tiled_rs::server::build_app(state)
 }

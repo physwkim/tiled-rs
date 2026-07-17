@@ -159,6 +159,7 @@ async fn build_catalog_app() -> (axum::Router, tempfile::TempDir) {
         exact_count_limit: u64::MAX,
         allow_anonymous_access: false,
         background_tasks: tiled_rs::server::state::BackgroundTasks::new(),
+        validation: Default::default(),
     };
     (tiled_rs::server::build_app(state), dir)
 }
