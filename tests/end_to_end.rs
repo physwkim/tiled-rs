@@ -3198,7 +3198,8 @@ async fn sparse_client_write_block_roundtrips() {
 }
 
 // ---------------------------------------------------------------------------
-// Container navigation: nested-path get (Wave-27 batch-1, FINDING 1).
+// Container navigation: nested-path get + lazy paginated keys/values/items
+// (Wave-27 batch-1). Both drive the real server via `spawn_server_with_root`.
 // ---------------------------------------------------------------------------
 
 /// `root → a (container) → b (container) → c (array [1,2,3])`. A nested key
@@ -3218,6 +3219,17 @@ fn build_nested_root() -> Arc<dyn ContainerAdapter> {
     Arc::new(MapAdapter::new(root, serde_json::json!({}), vec![]))
 }
 
+/// A wide container of `n` array children named `k0..k{n-1}`, in insertion
+/// order, for exercising paginated listing.
+fn build_wide_root(n: usize) -> Arc<dyn ContainerAdapter> {
+    let mut root = IndexMap::new();
+    for i in 0..n {
+        let arr = ArrayAdapter::from_f64_1d(&[i as f64], serde_json::json!({ "i": i }));
+        root.insert(format!("k{i}"), AnyAdapter::Array(Arc::new(arr)));
+    }
+    Arc::new(MapAdapter::new(root, serde_json::json!({}), vec![]))
+}
+
 fn decode_f64s(bytes: &[u8]) -> Vec<f64> {
     bytes
         .chunks_exact(8)
@@ -3225,8 +3237,8 @@ fn decode_f64s(bytes: &[u8]) -> Vec<f64> {
         .collect()
 }
 
-/// `get("a/b/c")` resolves as a per-segment path walk (previously the slashes
-/// were percent-encoded into one `a%2Fb%2Fc` segment → 404).
+/// FINDING 1: `get("a/b/c")` resolves as a per-segment path walk (previously the
+/// slashes were percent-encoded into one `a%2Fb%2Fc` segment → 404).
 #[tokio::test]
 async fn nested_get_walks_multi_segment_path() {
     use tiled_rs::core::ndslice::NDSlice;
@@ -3275,8 +3287,8 @@ async fn nested_get_walks_multi_segment_path() {
     assert_eq!(decode_f64s(&sblock.data), vec![1.0, 2.0, 3.0]);
 }
 
-/// Leading/trailing slashes are trimmed (Python `.strip("/")`), and a missing
-/// nested segment surfaces as an error rather than resolving wrongly.
+/// FINDING 1: leading/trailing slashes are trimmed (Python `.strip("/")`), and a
+/// missing nested segment surfaces as an error rather than resolving wrongly.
 #[tokio::test]
 async fn nested_get_trims_slashes_and_reports_missing() {
     use tiled_rs::core::ndslice::NDSlice;
@@ -3304,4 +3316,70 @@ async fn nested_get_trims_slashes_and_reports_missing() {
 
     // Single-segment behavior is unchanged: `get("a")` returns the container.
     assert!(root.get("a").await.unwrap().as_container().is_some());
+}
+
+/// FINDING 2: `keys_view()` fetches page by page; the lazy sequence equals the
+/// eager `keys()`, and `first`/`head` grab bounded prefixes.
+#[tokio::test]
+async fn keys_view_lazy_paginates_all_children() {
+    let base = spawn_server_with_root(build_wide_root(7), None).await;
+    let root = from_uri(&base).await.unwrap().into_container().unwrap();
+
+    let eager = root.keys().await.unwrap();
+    assert_eq!(eager.len(), 7, "wide root has 7 children");
+
+    // A small page size forces multiple fetches; the lazy view must yield the
+    // exact same sequence as the eager keys().
+    let mut view = root.keys_view().page_size(3);
+    let mut lazy = Vec::new();
+    while let Some(k) = view.next().await.unwrap() {
+        lazy.push(k);
+    }
+    assert_eq!(lazy, eager, "lazy pagination == eager listing");
+
+    // first() → the first key.
+    let first = root.keys_view().first().await.unwrap();
+    assert_eq!(first.as_deref(), eager.first().map(String::as_str));
+
+    // head(n) → the first n keys, even when the page size is smaller than n.
+    let head = root.keys_view().page_size(2).head(4).await.unwrap();
+    assert_eq!(head.as_slice(), &eager[..4]);
+
+    // head past the end clamps to what exists; head(0) does no work.
+    assert_eq!(root.keys_view().head(100).await.unwrap(), eager);
+    assert!(root.keys_view().head(0).await.unwrap().is_empty());
+}
+
+/// FINDING 2: `values_view()` / `items_view()` lazily yield child clients and
+/// `(name, client)` pairs, in the same order as `keys()`.
+#[tokio::test]
+async fn values_and_items_views_yield_children_lazily() {
+    let base = spawn_server_with_root(build_wide_root(5), None).await;
+    let root = from_uri(&base).await.unwrap().into_container().unwrap();
+    let eager = root.keys().await.unwrap();
+    assert_eq!(eager.len(), 5);
+
+    // values(): AnyClients, each an array child.
+    let mut vview = root.values_view().page_size(2);
+    let mut vcount = 0;
+    while let Some(v) = vview.next().await.unwrap() {
+        assert!(v.as_array().is_some(), "each child is an array");
+        vcount += 1;
+    }
+    assert_eq!(vcount, 5);
+
+    // items(): (name, client) pairs whose names match keys() order.
+    let mut iview = root.items_view().page_size(2);
+    let mut names = Vec::new();
+    while let Some((name, client)) = iview.next().await.unwrap() {
+        assert!(client.as_array().is_some());
+        names.push(name);
+    }
+    assert_eq!(names, eager, "items() names match keys() order");
+
+    // Conveniences on the value/item views.
+    let (fname, fclient) = root.items_view().first().await.unwrap().unwrap();
+    assert_eq!(Some(fname), eager.first().cloned());
+    assert!(fclient.as_array().is_some());
+    assert_eq!(root.values_view().head(2).await.unwrap().len(), 2);
 }
