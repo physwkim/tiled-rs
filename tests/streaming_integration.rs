@@ -7,6 +7,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use arrow::array::{Int64Array, RecordBatch};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use futures::StreamExt;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
@@ -18,7 +20,7 @@ use tiled_rs::catalog::{Catalog, adapter::UnresolvedLeaf};
 use tiled_rs::core::adapters::ContainerAdapter;
 use tiled_rs::core::dtype::{BuiltinDType, DType, Endianness, Kind};
 use tiled_rs::core::queries::Query;
-use tiled_rs::core::structures::ArrayStructure;
+use tiled_rs::core::structures::{ArrayStructure, RaggedStructure};
 use tiled_rs::server::file_resolver::FileLeafResolver;
 use tiled_rs::server::streaming_cache::{InMemoryStreamingCache, StreamEvent, StreamingCache};
 
@@ -866,4 +868,506 @@ async fn array_patch_persist_false_still_streams() {
     // persist=false must NOT have written the data: a read-back stays zeros.
     let read_json = read_array_json(&client, &base, "arr").await;
     assert_eq!(read_json, json!([0.0, 0.0, 0.0, 0.0]));
+}
+
+// ---------------------------------------------------------------------------
+// PR4: table-data + ragged-data payload events (Wave-24).
+//
+// A managed writable table node streams `table-data` at each write site (full /
+// partition-put / partition-patch); a managed writable ragged node streams
+// `ragged-data` (full / block / patch). The json envelope transcodes the payload
+// via the read-path serializer — a table becomes a column-name→values map, a
+// ragged array a nested list; the msgpack envelope embeds the raw wire bytes as
+// a msgpack **bin**. Reuses the PR3 `spawn_write_server` harness.
+// ---------------------------------------------------------------------------
+
+/// Two-Int64-column (`x`, `y`) Arrow schema for the table tests.
+fn xy_int_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("x", DataType::Int64, false),
+        Field::new("y", DataType::Int64, false),
+    ]))
+}
+
+/// Encode `(x, y)` column vectors as an Arrow IPC FILE stream — the table write
+/// wire form.
+fn xy_arrow_ipc(x: Vec<i64>, y: Vec<i64>) -> Vec<u8> {
+    let schema = xy_int_schema();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int64Array::from(x)), Arc::new(Int64Array::from(y))],
+    )
+    .unwrap();
+    let mut buf = Vec::new();
+    let mut w = arrow::ipc::writer::FileWriter::try_new(&mut buf, schema.as_ref()).unwrap();
+    w.write(&batch).unwrap();
+    w.finish().unwrap();
+    buf
+}
+
+/// POST `/metadata` to create a managed (writable) CSV-backed table node with
+/// columns `x`, `y` and one partition.
+async fn create_managed_table(client: &reqwest::Client, base: &str, key: &str) {
+    let resp = client
+        .post(format!("{base}/api/v1/metadata/"))
+        .json(&json!({
+            "key": key,
+            "structure_family": "table",
+            "metadata": {},
+            "specs": [],
+            "data_sources": [{
+                "structure_family": "table",
+                "structure": {
+                    "arrow_schema": "",
+                    "npartitions": 1,
+                    "columns": ["x", "y"],
+                },
+                "id": null,
+                "mimetype": "text/csv",
+                "parameters": {},
+                "properties": {},
+                "assets": [],
+                "management": "writable",
+            }],
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    assert!(status.is_success(), "create table {key}: {status} {text}");
+}
+
+/// A float64 ragged structure with axis-0 chunk sizes `chunk_rows` (summing to
+/// the row count) and total leaf-element count `size`, as the create-endpoint
+/// JSON.
+fn ragged_f64_structure(chunk_rows: Vec<usize>, size: usize) -> Value {
+    let rows: usize = chunk_rows.iter().sum();
+    let st = RaggedStructure {
+        data_type: DType::Builtin(BuiltinDType::new(Endianness::Little, Kind::Float, 8)),
+        shape: vec![Some(rows), None],
+        size,
+        chunks: vec![Some(chunk_rows), None],
+        dims: None,
+        resizable: Default::default(),
+    };
+    serde_json::to_value(st).unwrap()
+}
+
+/// POST `/metadata` to create a managed (writable) SQL-backed ragged node.
+async fn create_managed_ragged(client: &reqwest::Client, base: &str, key: &str, structure: Value) {
+    let resp = client
+        .post(format!("{base}/api/v1/metadata/"))
+        .json(&json!({
+            "key": key,
+            "structure_family": "ragged",
+            "metadata": {},
+            "specs": [],
+            "data_sources": [{
+                "structure_family": "ragged",
+                "structure": structure,
+                "id": null,
+                "mimetype": "application/x-ragged+sql",
+                "parameters": {},
+                "properties": {},
+                "assets": [],
+                "management": "writable",
+            }],
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    assert!(status.is_success(), "create ragged {key}: {status} {text}");
+}
+
+/// GET `/table/partition/{path}?partition=N` as JSON — the read-path columns
+/// dict the json envelope transcode must match.
+async fn read_table_partition_json(
+    client: &reqwest::Client,
+    base: &str,
+    path: &str,
+    partition: usize,
+) -> Value {
+    client
+        .get(format!(
+            "{base}/api/v1/table/partition/{path}?partition={partition}"
+        ))
+        .header("accept", "application/json")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+/// GET `/ragged/full/{path}` as JSON — the read-path nested list.
+async fn read_ragged_json(client: &reqwest::Client, base: &str, path: &str) -> Value {
+    client
+        .get(format!("{base}/api/v1/ragged/full/{path}"))
+        .header("accept", "application/json")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+/// Decode the next msgpack binary frame into `T`. `serde_bytes::ByteBuf` payload
+/// fields succeed only if the wire payload is a msgpack **bin**.
+async fn next_binary_typed<S, T>(ws: &mut S) -> T
+where
+    S: futures::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+    T: serde::de::DeserializeOwned,
+{
+    match tokio::time::timeout(Duration::from_millis(500), ws.next()).await {
+        Ok(Some(Ok(Message::Binary(b)))) => rmp_serde::from_slice(&b).expect("msgpack bin frame"),
+        Ok(Some(Ok(Message::Close(_)))) | Ok(None) | Err(_) => panic!("no data frame"),
+        Ok(Some(Ok(other))) => panic!("expected binary frame, got {other:?}"),
+        Ok(Some(Err(e))) => panic!("ws error: {e}"),
+    }
+}
+
+/// A decoded msgpack `table-data` frame (payload as a msgpack bin).
+#[derive(serde::Deserialize)]
+struct MsgpackTableData {
+    #[serde(rename = "type")]
+    typ: String,
+    mimetype: String,
+    #[serde(default)]
+    partition: Option<usize>,
+    append: bool,
+    payload: serde_bytes::ByteBuf,
+}
+
+/// A decoded msgpack `ragged-data` frame (payload as a msgpack bin).
+#[derive(serde::Deserialize)]
+struct MsgpackRaggedData {
+    #[serde(rename = "type")]
+    typ: String,
+    mimetype: String,
+    shape: Vec<Option<usize>>,
+    #[serde(default)]
+    offset: Option<Vec<usize>>,
+    #[serde(default)]
+    block: Option<Vec<usize>>,
+    payload: serde_bytes::ByteBuf,
+}
+
+/// A whole-table write streams `table-data` (json): partition null, append
+/// false, Arrow mimetype, and a `payload` columns dict matching the read path.
+#[tokio::test]
+async fn table_full_write_streams_table_data_json() {
+    let (base, client, _wdir, _dbdir) = spawn_write_server().await;
+    create_managed_table(&client, &base, "t").await;
+
+    let url = ws_url(&base, "t");
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    assert_eq!(
+        next_text_json(&mut ws).await.expect("schema")["type"],
+        "table-schema"
+    );
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let resp = client
+        .put(format!("{base}/api/v1/table/full/t"))
+        .body(xy_arrow_ipc(vec![10, 20, 30], vec![1, 2, 3]))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "table write: {}", resp.status());
+
+    let ev = next_text_json(&mut ws).await.expect("table-data");
+    assert_eq!(ev["type"], "table-data");
+    assert_eq!(ev["mimetype"], "application/vnd.apache.arrow.file");
+    assert_eq!(ev["partition"], Value::Null);
+    assert_eq!(ev["append"], json!(false));
+    assert_eq!(ev["content-type"], "application/json");
+    // The transcoded payload is the read-path column-dict for partition 0.
+    let read_json = read_table_partition_json(&client, &base, "t", 0).await;
+    assert_eq!(ev["payload"], read_json);
+    assert_eq!(ev["payload"], json!({"x": [10, 20, 30], "y": [1, 2, 3]}));
+}
+
+/// The msgpack envelope ships the same table write as a msgpack **bin** payload
+/// equal to the raw Arrow IPC bytes written.
+#[tokio::test]
+async fn table_full_write_streams_table_data_msgpack_bin() {
+    let (base, client, _wdir, _dbdir) = spawn_write_server().await;
+    create_managed_table(&client, &base, "t").await;
+
+    let url = format!("{}?envelope_format=msgpack", ws_url(&base, "t"));
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    assert_eq!(
+        next_binary_msgpack(&mut ws).await.expect("schema")["type"],
+        "table-schema"
+    );
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let arrow = xy_arrow_ipc(vec![10, 20, 30], vec![1, 2, 3]);
+    let resp = client
+        .put(format!("{base}/api/v1/table/full/t"))
+        .body(arrow.clone())
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "table write: {}", resp.status());
+
+    let ev: MsgpackTableData = next_binary_typed(&mut ws).await;
+    assert_eq!(ev.typ, "table-data");
+    assert_eq!(ev.mimetype, "application/vnd.apache.arrow.file");
+    assert_eq!(ev.partition, None);
+    assert!(!ev.append);
+    assert_eq!(ev.payload.into_vec(), arrow);
+}
+
+/// PUT `/table/partition?partition=0` streams `table-data` with the partition
+/// index and `append=false`.
+#[tokio::test]
+async fn table_partition_put_streams_table_data() {
+    let (base, client, _wdir, _dbdir) = spawn_write_server().await;
+    create_managed_table(&client, &base, "t").await;
+
+    let url = ws_url(&base, "t");
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    assert_eq!(
+        next_text_json(&mut ws).await.expect("schema")["type"],
+        "table-schema"
+    );
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let resp = client
+        .put(format!("{base}/api/v1/table/partition/t?partition=0"))
+        .body(xy_arrow_ipc(vec![7, 8], vec![70, 80]))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "partition put: {}",
+        resp.status()
+    );
+
+    let ev = next_text_json(&mut ws).await.expect("table-data");
+    assert_eq!(ev["type"], "table-data");
+    assert_eq!(ev["partition"], json!(0));
+    assert_eq!(ev["append"], json!(false));
+    assert_eq!(ev["payload"], json!({"x": [7, 8], "y": [70, 80]}));
+}
+
+/// PATCH `/table/partition?partition=0` streams `table-data` with `append=true`
+/// — the append flag is set ONLY on the patch path — and a payload of just the
+/// appended rows (not the accumulated partition).
+#[tokio::test]
+async fn table_partition_patch_streams_append_true() {
+    let (base, client, _wdir, _dbdir) = spawn_write_server().await;
+    create_managed_table(&client, &base, "t").await;
+
+    // Seed partition 0 so the append has something to extend.
+    let seed = client
+        .put(format!("{base}/api/v1/table/full/t"))
+        .body(xy_arrow_ipc(vec![1, 2], vec![10, 20]))
+        .send()
+        .await
+        .unwrap();
+    assert!(seed.status().is_success(), "seed: {}", seed.status());
+
+    let url = ws_url(&base, "t");
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    assert_eq!(
+        next_text_json(&mut ws).await.expect("schema")["type"],
+        "table-schema"
+    );
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let resp = client
+        .patch(format!("{base}/api/v1/table/partition/t?partition=0"))
+        .body(xy_arrow_ipc(vec![3, 4], vec![30, 40]))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "partition patch: {}",
+        resp.status()
+    );
+
+    let ev = next_text_json(&mut ws).await.expect("table-data");
+    assert_eq!(ev["type"], "table-data");
+    assert_eq!(ev["partition"], json!(0));
+    assert_eq!(
+        ev["append"],
+        json!(true),
+        "append must be true on the patch path"
+    );
+    // The payload is the appended rows only, not the accumulated partition.
+    assert_eq!(ev["payload"], json!({"x": [3, 4], "y": [30, 40]}));
+}
+
+/// A whole-ragged write streams `ragged-data` (json): the structure shape (with
+/// its variable axis as `null`), no offset/block, and a `payload` nested list
+/// matching the read path.
+#[tokio::test]
+async fn ragged_full_write_streams_ragged_data_json() {
+    let (base, client, _wdir, _dbdir) = spawn_write_server().await;
+    // 2 rows, one chunk of 2 rows, 3 total leaf elements.
+    create_managed_ragged(&client, &base, "rag", ragged_f64_structure(vec![2], 3)).await;
+
+    let url = ws_url(&base, "rag");
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    assert_eq!(
+        next_text_json(&mut ws).await.expect("schema")["type"],
+        "ragged-schema"
+    );
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let resp = client
+        .put(format!("{base}/api/v1/ragged/full/rag"))
+        .json(&json!([[1.5, 2.5], [3.5]]))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "ragged write: {}",
+        resp.status()
+    );
+
+    let ev = next_text_json(&mut ws).await.expect("ragged-data");
+    assert_eq!(ev["type"], "ragged-data");
+    assert_eq!(ev["mimetype"], "application/json");
+    // Structure shape: 2 rows, variable inner axis (null).
+    assert_eq!(ev["shape"], json!([2, null]));
+    assert_eq!(ev["offset"], Value::Null);
+    assert_eq!(ev["block"], Value::Null);
+    // The write body was already `application/json`, so upstream adds no
+    // `content-type` transcode signal (core.py:782-787).
+    assert!(
+        ev.get("content-type").is_none(),
+        "content-type must be absent for a JSON-bodied ragged write, got {:?}",
+        ev.get("content-type")
+    );
+    let read_json = read_ragged_json(&client, &base, "rag").await;
+    assert_eq!(ev["payload"], read_json);
+    assert_eq!(ev["payload"], json!([[1.5, 2.5], [3.5]]));
+}
+
+/// The msgpack envelope ships the ragged write as a msgpack **bin** payload equal
+/// to the raw JSON list-of-lists bytes written.
+#[tokio::test]
+async fn ragged_full_write_streams_ragged_data_msgpack_bin() {
+    let (base, client, _wdir, _dbdir) = spawn_write_server().await;
+    create_managed_ragged(&client, &base, "rag", ragged_f64_structure(vec![2], 3)).await;
+
+    let url = format!("{}?envelope_format=msgpack", ws_url(&base, "rag"));
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    assert_eq!(
+        next_binary_msgpack(&mut ws).await.expect("schema")["type"],
+        "ragged-schema"
+    );
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let raw = serde_json::to_vec(&json!([[1.5, 2.5], [3.5]])).unwrap();
+    let resp = client
+        .put(format!("{base}/api/v1/ragged/full/rag"))
+        .header("content-type", "application/json")
+        .body(raw.clone())
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "ragged write: {}",
+        resp.status()
+    );
+
+    let ev: MsgpackRaggedData = next_binary_typed(&mut ws).await;
+    assert_eq!(ev.typ, "ragged-data");
+    assert_eq!(ev.mimetype, "application/json");
+    assert_eq!(ev.shape, vec![Some(2), None]);
+    assert_eq!(ev.offset, None);
+    assert_eq!(ev.block, None);
+    assert_eq!(ev.payload.into_vec(), raw);
+}
+
+/// A ragged block write streams `ragged-data` with the block coordinate and the
+/// full structure shape.
+#[tokio::test]
+async fn ragged_block_write_streams_ragged_data_with_block() {
+    let (base, client, _wdir, _dbdir) = spawn_write_server().await;
+    // 3 rows in two chunks (2 rows + 1 row), 6 total leaf elements.
+    create_managed_ragged(&client, &base, "rag", ragged_f64_structure(vec![2, 1], 6)).await;
+
+    let url = ws_url(&base, "rag");
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    assert_eq!(
+        next_text_json(&mut ws).await.expect("schema")["type"],
+        "ragged-schema"
+    );
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    // Write chunk 1 (its single row of length 3).
+    let resp = client
+        .put(format!("{base}/api/v1/ragged/block/rag?block=1"))
+        .json(&json!([[4.5, 5.5, 6.5]]))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "ragged block: {}",
+        resp.status()
+    );
+
+    let ev = next_text_json(&mut ws).await.expect("ragged-data");
+    assert_eq!(ev["type"], "ragged-data");
+    // The event carries the full structure shape (3 rows, variable inner axis).
+    assert_eq!(ev["shape"], json!([3, null]));
+    assert_eq!(ev["block"], json!([1]));
+    assert_eq!(ev["offset"], Value::Null);
+    assert_eq!(ev["payload"], json!([[4.5, 5.5, 6.5]]));
+}
+
+/// A ragged PATCH with `persist=false` still streams `ragged-data` (upstream
+/// `patch` calls `_stream` before `if not persist: return`), carrying the
+/// incoming block's `?shape=`/`?offset=`.
+#[tokio::test]
+async fn ragged_patch_persist_false_still_streams() {
+    let (base, client, _wdir, _dbdir) = spawn_write_server().await;
+    create_managed_ragged(&client, &base, "rag", ragged_f64_structure(vec![2], 3)).await;
+
+    let url = ws_url(&base, "rag");
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    assert_eq!(
+        next_text_json(&mut ws).await.expect("schema")["type"],
+        "ragged-schema"
+    );
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let resp = client
+        .patch(format!(
+            "{base}/api/v1/ragged/full/rag?shape=1&offset=2&persist=false"
+        ))
+        .json(&json!([[7.5]]))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "stream-only ragged patch: {}",
+        resp.status()
+    );
+
+    let ev = next_text_json(&mut ws)
+        .await
+        .expect("ragged-data (persist=false)");
+    assert_eq!(ev["type"], "ragged-data");
+    // `?shape=` axes are concrete (query-param ints), `?offset=` where it lands.
+    assert_eq!(ev["shape"], json!([1]));
+    assert_eq!(ev["offset"], json!([2]));
+    assert_eq!(ev["block"], Value::Null);
+    assert_eq!(ev["payload"], json!([[7.5]]));
 }

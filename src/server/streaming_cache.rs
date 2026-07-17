@@ -90,11 +90,14 @@ impl StreamEvent {
     }
 
     /// `ragged-data` event (`tiled/catalog/adapter.py:1770-1783`): a written
-    /// awkward/ragged block. Same shape as `array-data`.
+    /// ragged block. Same field set as `array-data`, but a ragged structure's
+    /// `shape` has variable dimensions (upstream `entry.structure().shape`),
+    /// so each axis is `Option<usize>` and a `None` axis serializes as JSON
+    /// `null` (e.g. `[3, null]`).
     pub fn ragged_data(
         sequence: u64,
         mimetype: &str,
-        shape: &[usize],
+        shape: &[Option<usize>],
         offset: Option<&[usize]>,
         block: Option<&[usize]>,
         payload: Bytes,

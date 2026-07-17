@@ -509,7 +509,21 @@ fn encode(
                         && let Some(obj) = m.as_object_mut()
                     {
                         obj.insert("payload".into(), json_payload);
-                        obj.insert("content-type".into(), Value::from("application/json"));
+                        // Mark `content-type: application/json` only when the
+                        // source mimetype was NOT already JSON — upstream sets it
+                        // as a transcode signal and skips it for a JSON-bodied
+                        // event (core.py:782-787). Array/table bodies are never
+                        // JSON, so this only spares the JSON-bodied ragged path.
+                        let already_json = obj
+                            .get("mimetype")
+                            .and_then(Value::as_str)
+                            .map(|mt| {
+                                mt.split(';').next().unwrap_or(mt).trim() == "application/json"
+                            })
+                            .unwrap_or(false);
+                        if !already_json {
+                            obj.insert("content-type".into(), Value::from("application/json"));
+                        }
                     }
                     serde_json::to_string(&m)
                 }
@@ -572,13 +586,16 @@ impl Serialize for MsgpackEnvelope<'_> {
 }
 
 /// Transcode a data event's raw `payload` into a JSON-native value, dispatched
-/// by the event `type` (upstream `stream_json`, core.py:772-816). PR3 wires the
-/// array arm; the table/ragged arms land in PR4/PR5. Returns `None` when the
-/// event carries no transcodable payload for this build (e.g. a sparse Arrow
-/// body, or a family not yet wired) — the caller then omits `payload`.
+/// by the event `type` (upstream `stream_json`, core.py:772-816): `array-data` →
+/// nested lists, `table-data` → column-name→values map, `ragged-data` → nested
+/// list. Returns `None` when the event carries no transcodable payload for this
+/// build (e.g. a sparse Arrow body, or a non-Arrow/-JSON wire form) — the caller
+/// then omits `payload` (msgpack still ships the raw bin).
 fn transcode_payload_to_json(metadata: &Value, payload: &Bytes, ctx: &PayloadCtx) -> Option<Value> {
     match metadata.get("type").and_then(Value::as_str) {
         Some("array-data") => transcode_array_payload_to_json(metadata, payload, ctx),
+        Some("table-data") => transcode_table_payload_to_json(metadata, payload, ctx),
+        Some("ragged-data") => transcode_ragged_payload_to_json(metadata, payload, ctx),
         _ => None,
     }
 }
@@ -623,6 +640,82 @@ fn transcode_array_payload_to_json(
         }
     };
     serde_json::from_slice(&json_bytes).ok()
+}
+
+/// Transcode a table partition's Arrow IPC payload into a column-name → values
+/// map (upstream `stream_json` table arm, core.py:789-794:
+/// `{col: df[col].tolist() for col in df}`), REUSING the read-path table→JSON
+/// serializer so the output is identical to `GET /table/partition` with
+/// `Accept: application/json`. Table writes always travel as Arrow IPC; a
+/// non-Arrow body has no table JSON serializer, so this returns `None`.
+fn transcode_table_payload_to_json(
+    metadata: &Value,
+    payload: &Bytes,
+    ctx: &PayloadCtx,
+) -> Option<Value> {
+    if metadata.get("mimetype").and_then(Value::as_str)
+        != Some(crate::core::media_type::mime::ARROW_FILE)
+    {
+        return None;
+    }
+    // The table JSON serializer decodes the Arrow IPC body itself and ignores
+    // its metadata argument, so no per-subscription context is needed.
+    let serializer = ctx
+        .registry
+        .dispatch(StructureFamily::Table, crate::core::media_type::mime::JSON)?;
+    let json_bytes = match serializer(payload, &Value::Null) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(target: "tiled.streaming", "table-data json transcode: {e}");
+            return None;
+        }
+    };
+    serde_json::from_slice(&json_bytes).ok()
+}
+
+/// Transcode a ragged write's payload into a nested JSON list (upstream
+/// `stream_json` ragged arm, core.py:795-801: `deserializer(body, structure)
+/// .tolist()`). The wire body is the raw request encoding — a JSON list-of-lists
+/// (`application/json`) or zipped Awkward buffers (`application/zip`); decode it
+/// to the canonical JSON list, then route through the read-path ragged JSON
+/// serializer (a pass-through) so the output matches `GET /ragged/full`. Any
+/// other wire form returns `None`.
+fn transcode_ragged_payload_to_json(
+    metadata: &Value,
+    payload: &Bytes,
+    ctx: &PayloadCtx,
+) -> Option<Value> {
+    let media = metadata
+        .get("mimetype")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    // Strip Content-Type parameters (`application/json; charset=utf-8`), as the
+    // write path's `deserialize_ragged_body` does.
+    let media = media.split(';').next().unwrap_or(media).trim();
+    let json_bytes: Bytes = match media {
+        "" | crate::core::media_type::mime::JSON => payload.clone(),
+        crate::core::media_type::mime::ZIP => {
+            match crate::serialization::ragged::from_zipped_buffers(payload) {
+                Ok(list) => serde_json::to_vec(&list).ok()?.into(),
+                Err(e) => {
+                    tracing::warn!(target: "tiled.streaming", "ragged-data zip decode: {e}");
+                    return None;
+                }
+            }
+        }
+        _ => return None,
+    };
+    let serializer = ctx
+        .registry
+        .dispatch(StructureFamily::Ragged, crate::core::media_type::mime::JSON)?;
+    let out = match serializer(&json_bytes, &Value::Null) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(target: "tiled.streaming", "ragged-data json transcode: {e}");
+            return None;
+        }
+    };
+    serde_json::from_slice(&out).ok()
 }
 
 /// Per-message delivery authorization.
