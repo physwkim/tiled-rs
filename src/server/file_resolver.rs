@@ -30,10 +30,12 @@ use crate::server::resource_cache::{AdapterCache, CacheKey};
 /// explicit [`unrestricted`](Self::unrestricted) opt-out.
 pub struct FileLeafResolver {
     scope: ReadScope,
-    /// TLRU cache of already-built read-only leaf adapters (upstream tiled's
+    /// TLRU cache of already-built leaf adapters (upstream tiled's
     /// `adapters/resource_cache.py`). Shared as a single owner: the server
     /// wraps one `FileLeafResolver` in an `Arc`, so this cache is
-    /// process-wide. Writable adapters are never inserted (see
+    /// process-wide. Only read-only adapters whose format upstream opts into
+    /// caching are inserted — the npy/tiff/jpeg set (see [`caches_resource`]);
+    /// writable adapters and non-opt-in formats are never inserted (see
     /// [`crate::server::resource_cache`]).
     cache: Arc<AdapterCache>,
 }
@@ -295,15 +297,19 @@ impl LeafResolver for FileLeafResolver {
                     metadata,
                     writable,
                 )?;
-                // Cache only read-only adapters. A writable adapter's in-memory
-                // snapshot goes stale after a write (it writes the file but
-                // cannot refresh its own `&self`), so writable paths must
-                // rebuild fresh every request — matching upstream, which caches
-                // only its read-only npy/jpeg/tiff adapters. The lock is not
-                // held across the build above, so two concurrent misses may
-                // both build and both insert (benign last-write-wins race,
-                // exactly as upstream's `with_resource_cache`).
-                if !writable {
+                // Cache only a read-only adapter whose format upstream opts
+                // into caching (npy/tiff/jpeg — see `caches_resource`). Two
+                // independent reasons to skip: (1) a writable adapter's
+                // in-memory snapshot goes stale after a write (it writes the
+                // file but cannot refresh its own `&self`), so writable paths
+                // must rebuild fresh every request; (2) a format upstream never
+                // caches (csv, parquet, zarr, hdf5, …) must not be cached here
+                // either, or an externally-changed file would serve a stale
+                // snapshot upstream would have re-read. The lock is not held
+                // across the build above, so two concurrent misses may both
+                // build and both insert (benign last-write-wins race, exactly
+                // as upstream's `with_resource_cache`).
+                if !writable && caches_resource(&mimetype) {
                     cache.insert(cache_key, adapter.clone());
                 }
                 Ok(adapter)
@@ -516,6 +522,38 @@ fn build_leaf_adapter(
         }
     };
     Ok(any_adapter)
+}
+
+/// Whether a leaf adapter for `mimetype` opts into the resource cache.
+///
+/// Mirrors upstream tiled's opt-in exactly: only the npy, tiff, and jpeg
+/// adapters wrap their file open in `with_resource_cache`
+/// (`adapters/npy.py:71`, `adapters/tiff.py:43`, `adapters/jpeg.py:51`). Every
+/// other format's adapter re-opens and re-parses on every build upstream, so
+/// caching one here would diverge — an externally-registered csv / parquet /
+/// zarr / hdf5 file changed on disk would keep serving a stale in-memory
+/// snapshot for up to `ttu` seconds, which upstream never does for those
+/// formats. Read-only-ness alone is therefore not sufficient to cache; the
+/// format must also be one upstream opts in.
+///
+/// The mimetype aliases (`application/x-numpy`, `npy`, `image/x-tiff`, `tiff`)
+/// resolve to those same npy / tiff adapters in [`build_leaf_adapter`], so they
+/// share the opt-in. `image/png` is deliberately excluded: upstream registers
+/// no read adapter for PNG (`mimetypes.py` has no `image/png` entry — PNG is a
+/// serialization-only format there), so there is no upstream opt-in to mirror,
+/// even though the Rust `image/png` read path reuses the same `ImageAdapter` as
+/// `image/jpeg`.
+fn caches_resource(mimetype: &str) -> bool {
+    matches!(
+        mimetype,
+        "application/x-npy"
+            | "application/x-numpy"
+            | "npy"
+            | "image/tiff"
+            | "image/x-tiff"
+            | "tiff"
+            | "image/jpeg"
+    )
 }
 
 /// Build a ragged-SQL leaf adapter from a `sqlite://` data_uri and the SQL
@@ -888,12 +926,53 @@ mod cache_tests {
     }
 
     /// True iff the two adapters share the same underlying `Arc` (a cache hit
-    /// hands back a clone of the exact same built adapter).
+    /// hands back a clone of the exact same built adapter). Covers the two
+    /// variants these tests exercise — `Array` (npy) and `Table` (csv); any
+    /// other pairing is treated as distinct so a miss is never masked as a hit.
     fn same_arc(a: &AnyAdapter, b: &AnyAdapter) -> bool {
         match (a, b) {
             (AnyAdapter::Array(x), AnyAdapter::Array(y)) => Arc::ptr_eq(x, y),
+            (AnyAdapter::Table(x), AnyAdapter::Table(y)) => Arc::ptr_eq(x, y),
             _ => false,
         }
+    }
+
+    /// Register a root table node keyed `key` backed by the CSV file at `path`.
+    async fn register_csv(cat: &Catalog, key: &str, path: &Path) -> Node {
+        let node = cat
+            .create_node(
+                None,
+                vec![],
+                RegisterRequest {
+                    key: key.into(),
+                    structure_family: "table".into(),
+                    metadata: json!({}),
+                    specs: json!([]),
+                    access_blob: json!({}),
+                },
+            )
+            .await
+            .unwrap();
+        let data_uri = crate::core::file_uri::path_to_file_uri(path).unwrap();
+        cat.create_data_source(
+            node.id,
+            DataSourceSpec {
+                structure_family: "table".into(),
+                structure: json!({}),
+                mimetype: "text/csv".into(),
+                parameters: json!({}),
+                management: "external".into(),
+                assets: vec![AssetSpec {
+                    data_uri,
+                    is_directory: false,
+                    parameter: "data_uri".into(),
+                    num: None,
+                }],
+            },
+        )
+        .await
+        .unwrap();
+        node
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -914,6 +993,32 @@ mod cache_tests {
         assert!(
             same_arc(&a1, &a2),
             "read-only adapter must be served from cache (same Arc, built once)"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resolve_does_not_cache_non_opt_in_read_only_adapter() {
+        // A read-only CSV is *not* in upstream's resource-cache opt-in set
+        // (only npy/tiff/jpeg call `with_resource_cache`), so even with a live
+        // cache and read-only backing it must rebuild every request — matching
+        // upstream, which re-opens csv on every build.
+        let data = tempfile::tempdir().unwrap();
+        let dbdir = tempfile::tempdir().unwrap();
+        let csv = data.path().join("a.csv");
+        std::fs::write(&csv, b"x,y\n1,2\n3,4\n").unwrap();
+        // No writable storage -> read-only, so only the format gate can exclude it.
+        let cat = catalog_with(dbdir.path(), vec![]).await;
+        let node = register_csv(&cat, "a", &csv).await;
+
+        let resolver = FileLeafResolver::unrestricted()
+            .with_resource_cache(Arc::new(AdapterCache::new(1024, 60.0)));
+
+        let a1 = resolver.resolve(&cat, &node).await.unwrap();
+        let a2 = resolver.resolve(&cat, &node).await.unwrap();
+        assert!(
+            !same_arc(&a1, &a2),
+            "read-only csv is not in the npy/tiff/jpeg opt-in set, so it must \
+             rebuild every request (not cached)"
         );
     }
 

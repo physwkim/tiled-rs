@@ -5,8 +5,13 @@
 //! caches the *raw* opened resource (`numpy.load(path)`, `Image.open(path)`,
 //! `tifffile.TiffFile(path)`) keyed by `(factory, path)`, so a burst of
 //! requests for the same file does not repeatedly re-open and re-parse it.
-//! Only the read-only npy / jpeg / tiff adapters opt in upstream; the writable
-//! adapters (csv, parquet, zarr, hdf5, sql, awkward) never touch it.
+//! Only the npy / jpeg / tiff adapters opt in upstream (they call
+//! `with_resource_cache`); every other adapter (csv, parquet, zarr, hdf5, sql,
+//! awkward, arrow, excel, netcdf, bytes) re-opens on every build and never
+//! touches it. This port mirrors that opt-in exactly — the resolver only
+//! inserts an entry for a read-only adapter whose mimetype is in the npy /
+//! tiff / jpeg set (see [`crate::server::file_resolver`]'s `caches_resource`),
+//! so read-only csv / parquet / … adapters are rebuilt every request here too.
 //!
 //! ## What this port caches
 //!
