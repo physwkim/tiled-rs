@@ -272,24 +272,34 @@ async fn run_subscription(
             }
         },
     };
-    // The base principal must hold read:metadata at all. With no access
-    // policy this is the only gate — subscriptions to non-existent paths
-    // are still allowed (they simply never receive anything). The base gate
-    // rises to read:data in a later wave (PR6).
-    if !auth_ctx.scopes.contains(crate::auth::Scope::ReadMetadata) {
+    // Subscribing requires BOTH read:data AND read:metadata on the token,
+    // matching upstream's single subscribe-time
+    // `get_entry(path, ["read:data", "read:metadata"])` (router.py:808-810).
+    // This is the only token-scope gate; once subscribed on both, every event
+    // (data and metadata) flows. With no access policy this is the only gate —
+    // subscriptions to non-existent paths are still allowed (they simply never
+    // receive anything).
+    if !auth_ctx.scopes.contains(crate::auth::Scope::ReadMetadata)
+        || !auth_ctx.scopes.contains(crate::auth::Scope::ReadData)
+    {
         let _ = tx
-            .send(Message::Text("forbidden: missing read:metadata".into()))
+            .send(Message::Text(
+                "forbidden: missing read:data and/or read:metadata".into(),
+            ))
             .await;
         let _ = tx.send(Message::Close(None)).await;
         return;
     }
 
-    // Authorize the subscription node itself — the same per-message delivery
-    // rule applied to every event below. Root and non-root resolve uniformly
+    // Authorize the subscription node itself against BOTH read:data AND
+    // read:metadata, matching upstream's subscribe-time
+    // `get_entry([read:data, read:metadata])` access-policy check
+    // (router.py:808-810). Distinct from the per-event `delivery_allowed`
+    // (read:metadata only) applied below. Root and non-root resolve uniformly
     // here (an empty path folds to the base scope check inside `resolve_entry`).
-    // With no access policy `delivery_allowed` is a single `is_none` check, so
+    // With no access policy `subscribe_allowed` is a single `is_none` check, so
     // behavior is unchanged (including subscriptions to missing paths).
-    if !delivery_allowed(&state, &auth_ctx, &segments).await {
+    if !subscribe_allowed(&state, &auth_ctx, &segments).await {
         let _ = tx
             .send(Message::Text(
                 "subscription denied: node not found or access denied".into(),
@@ -828,6 +838,34 @@ async fn delivery_allowed(state: &AppState, auth_ctx: &AuthContext, segments: &[
     )
     .await
     .is_ok()
+}
+
+/// Subscribe-time node authorization: the subscribed node must grant BOTH
+/// read:data AND read:metadata under the access policy, matching upstream's
+/// single `get_entry(path, ["read:data", "read:metadata"])` at subscribe
+/// (router.py:808-810). Distinct from [`delivery_allowed`], which authorizes
+/// each delivered event on read:metadata only — a metadata-visibility gate that
+/// must not require read:data (a `container-child-created` announcement is
+/// metadata). With no access policy every node is allowed (the token-scope gate
+/// already ran).
+async fn subscribe_allowed(state: &AppState, auth_ctx: &AuthContext, segments: &[String]) -> bool {
+    if state.access_policy.is_none() {
+        return true;
+    }
+    // `resolve_entry(.., ReadMetadata)` narrows per node and requires
+    // read:metadata (404 when the node is invisible); require read:data on the
+    // same narrowed context to enforce BOTH scopes at the node.
+    match crate::server::router::resolve_entry(
+        state,
+        auth_ctx.clone(),
+        segments,
+        crate::auth::Scope::ReadMetadata,
+    )
+    .await
+    {
+        Ok(narrowed) => narrowed.require(crate::auth::Scope::ReadData).is_ok(),
+        Err(_) => false,
+    }
 }
 
 /// The node an event concerns, used as the authorization target. A
