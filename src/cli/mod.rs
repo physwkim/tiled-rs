@@ -938,16 +938,6 @@ fn build_register_settings(
     })
 }
 
-/// Whether a catalog DB already has its schema (migrations) applied. Used to
-/// mirror upstream `from_uri(init_if_not_exists=False)`: without `--init` an
-/// uninitialized catalog is a hard error. [`crate::catalog::Catalog::connect`]
-/// uses `create_if_missing`, so a fresh `--catalog-uri` connects to an EMPTY
-/// DB whose `_tiled_migrations` table does not exist yet — `applied_migrations`
-/// then errs, which we read as "not initialized".
-async fn catalog_is_initialized(cat: &crate::catalog::Catalog) -> bool {
-    matches!(cat.applied_migrations().await, Ok(names) if !names.is_empty())
-}
-
 /// Build a streaming-cache [`config::StreamingConfig`] from the `serve --cache*`
 /// flags. Mirrors upstream `StreamingCacheConfig(uri=…, data_ttl=…, seq_ttl=…)`
 /// (_serve.py): `memory` selects the in-process TTL cache; a `redis…` URI
@@ -1551,23 +1541,6 @@ pub async fn run(command: Command) -> Result<()> {
                                 .await
                                 .map_err(|e| anyhow::anyhow!("catalog connect: {e}"))?,
                         };
-                        // Mirror upstream `from_uri(init_if_not_exists=…)`: only
-                        // `--init` (or `--temp`, which always makes a fresh DB)
-                        // may create the schema. Without it, an uninitialized
-                        // catalog is a hard error rather than being silently
-                        // initialized — the operator must run `tiled catalog
-                        // init` first. (`connect` uses `create_if_missing`, so a
-                        // brand-new `--catalog-uri` path connects to an empty,
-                        // un-migrated DB, which this gate rejects.)
-                        let may_initialize = init || temp;
-                        if !may_initialize && !catalog_is_initialized(&cat).await {
-                            anyhow::bail!(
-                                "Catalog database at {} is not initialized. \
-                                 Initialize it with `tiled catalog init` (or pass \
-                                 --init to create it now).",
-                                redact_mongo_uri(uri)
-                            );
-                        }
                         // Contain managed-asset physical deletion to the same
                         // directories the read-side resolver allows. A client can
                         // register an internally-managed data source with an
@@ -1583,9 +1556,15 @@ pub async fn run(command: Command) -> Result<()> {
                         // Where the server may create internally-managed
                         // storage (independent of the read-containment opt-out).
                         let cat = cat.with_writable_storage(writable_abs.clone());
-                        cat.migrate()
+                        // Schema-version gate (mirrors upstream
+                        // `check_catalog_database`): no silent auto-migrate on
+                        // serve. An uninitialized DB is created only with
+                        // `--init`/`--temp`; a behind DB is refused (naming
+                        // `tiled catalog upgrade-database`); an ahead/unknown DB
+                        // written by a newer tiled-rs is a version-mismatch error.
+                        cat.ensure_serveable(&redact_mongo_uri(uri), init || temp)
                             .await
-                            .map_err(|e| anyhow::anyhow!("catalog migrate: {e}"))?;
+                            .map_err(|e| anyhow::anyhow!("{e}"))?;
                         Some(cat)
                     }
                 };
@@ -2865,7 +2844,7 @@ mod tests {
 
     // `create_temp_catalog` yields a real directory and a well-formed
     // `sqlite://` URI; a `Catalog::connect` + `migrate` on it initializes the
-    // schema (so `catalog_is_initialized` flips true).
+    // schema (so `schema_state` flips Uninitialized → Current).
     #[tokio::test]
     async fn temp_catalog_connect_initializes() {
         let tc = create_temp_catalog().unwrap();
@@ -2875,11 +2854,17 @@ mod tests {
         let cat = crate::catalog::Catalog::connect(&tc.catalog_uri)
             .await
             .unwrap();
-        // Fresh, un-migrated DB → not initialized (mirrors upstream's
+        // Fresh, un-migrated DB → uninitialized (mirrors upstream's
         // uninitialized-without-`--init` error path).
-        assert!(!catalog_is_initialized(&cat).await);
+        assert_eq!(
+            cat.schema_state().await.unwrap(),
+            crate::catalog::SchemaState::Uninitialized
+        );
         cat.migrate().await.unwrap();
-        assert!(catalog_is_initialized(&cat).await);
+        assert_eq!(
+            cat.schema_state().await.unwrap(),
+            crate::catalog::SchemaState::Current
+        );
 
         // Cleanup: the temp tree is intentionally leaked at runtime (upstream
         // parity), so the test removes it explicitly.
