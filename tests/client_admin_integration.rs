@@ -83,6 +83,7 @@ async fn spawn_auth_server() -> (String, AuthDb, tempfile::TempDir) {
         exact_count_limit: u64::MAX,
         allow_anonymous_access: false,
         background_tasks: tiled_rs::server::state::BackgroundTasks::new(),
+        validation: Default::default(),
     };
 
     let app = tiled_rs::server::build_app(state);

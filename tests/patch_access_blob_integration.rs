@@ -146,6 +146,7 @@ async fn build_app_with_echo_policy(seed_access_blob: serde_json::Value) -> axum
         exact_count_limit: u64::MAX,
         allow_anonymous_access: false,
         background_tasks: tiled_rs::server::state::BackgroundTasks::new(),
+        validation: Default::default(),
     };
     tiled_rs::server::build_app(state)
 }

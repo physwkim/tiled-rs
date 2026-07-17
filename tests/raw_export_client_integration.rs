@@ -78,6 +78,7 @@ async fn spawn_catalog_server() -> (String, Catalog, tempfile::TempDir) {
         exact_count_limit: u64::MAX,
         allow_anonymous_access: false,
         background_tasks: tiled_rs::server::state::BackgroundTasks::new(),
+        validation: Default::default(),
     };
     let app = tiled_rs::server::build_app(state);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -67,6 +67,13 @@ pub struct TiledConfig {
     /// default 100).
     #[serde(default = "default_exact_count_limit")]
     pub exact_count_limit: u64,
+    /// If true, a node uploaded with a `spec` that has no registered validator
+    /// on this server is rejected (HTTP 400). Default false (permissive).
+    /// Mirrors Python `Settings.reject_undeclared_specs` (`settings.py:45`,
+    /// config schema `reject_undeclared_specs`). Wired into
+    /// [`crate::server::validation::ValidationConfig`].
+    #[serde(default)]
+    pub reject_undeclared_specs: bool,
     /// Optional `streaming:` block selecting and configuring the per-node data
     /// streaming cache (upstream `tiled.streaming`). Absent → streaming is
     /// disabled (a no-op cache). See [`StreamingConfig`].
@@ -304,6 +311,7 @@ impl Default for TiledConfig {
             expose_raw_assets: default_expose_raw_assets(),
             allow_origins: Vec::new(),
             exact_count_limit: default_exact_count_limit(),
+            reject_undeclared_specs: false,
             streaming: None,
             uvicorn: None,
             database: None,

@@ -61,6 +61,7 @@ async fn build_test_app() -> (axum::Router, tempfile::TempDir) {
         exact_count_limit: u64::MAX,
         allow_anonymous_access: false,
         background_tasks: tiled_rs::server::state::BackgroundTasks::new(),
+        validation: Default::default(),
     };
     (tiled_rs::server::build_app(state), dir)
 }
@@ -2074,6 +2075,7 @@ async fn exact_count_limit_caps_meta_count() {
         exact_count_limit: 2,
         allow_anonymous_access: false,
         background_tasks: tiled_rs::server::state::BackgroundTasks::new(),
+        validation: Default::default(),
     };
     let app = tiled_rs::server::build_app(state);
 
@@ -2166,6 +2168,7 @@ async fn exact_count_limit_threads_into_search_page_entry_counts() {
         exact_count_limit: 1,
         allow_anonymous_access: false,
         background_tasks: tiled_rs::server::state::BackgroundTasks::new(),
+        validation: Default::default(),
     };
     let app = tiled_rs::server::build_app(state);
 

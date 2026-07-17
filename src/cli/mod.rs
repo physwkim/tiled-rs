@@ -1236,6 +1236,9 @@ pub async fn serve_directory_start(args: ServeDirectoryArgs) -> Result<RunningDi
         exact_count_limit: config::default_exact_count_limit(),
         allow_anonymous_access: public,
         background_tasks: crate::server::state::BackgroundTasks::new(),
+        // Directory-serve has no config file; default validation policy
+        // (empty registry, reject off).
+        validation: Default::default(),
     };
     let app = crate::server::build_app(state);
 
@@ -1933,6 +1936,17 @@ pub async fn run(command: Command) -> Result<()> {
                     .unwrap_or(true),
                 exact_count_limit,
                 background_tasks: crate::server::state::BackgroundTasks::new(),
+                // Spec validation policy: `reject_undeclared_specs` from the
+                // config file (default false); the validator registry has no
+                // YAML wiring (import-path callables have no Rust analogue) so
+                // it starts empty. See `crate::server::validation`.
+                validation: std::sync::Arc::new(crate::server::validation::ValidationConfig {
+                    registry: Default::default(),
+                    reject_undeclared_specs: file_config
+                        .as_ref()
+                        .map(|c| c.reject_undeclared_specs)
+                        .unwrap_or(false),
+                }),
             };
 
             // Keep a handle to the background-task owner before `state` is
