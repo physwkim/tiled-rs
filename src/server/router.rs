@@ -6711,9 +6711,15 @@ pub async fn delete_metadata(
             "cannot DELETE the catalog root".into(),
         ));
     }
-    // Per-ancestor auth gate: narrows at every prefix and requires
-    // DeleteNode on the narrowed set — same invariant as the read gate.
-    resolve_entry(&state, auth, &segments, crate::auth::Scope::DeleteNode).await?;
+    // Per-ancestor auth gate: narrow at every prefix, require DeleteNode on the
+    // fully-narrowed set, then DeleteRevision on that same context. Deleting a
+    // node cascade-destroys its revision history, so upstream gates this route
+    // with BOTH delete:node AND delete:revision (router.py:1995 global Security +
+    // :1999 get_entry, both scopes, both layers). The built-in roles bundle the
+    // two (for_role), so this only tightens a custom AccessPolicy that grants
+    // delete:node without delete:revision.
+    let auth = resolve_entry(&state, auth, &segments, crate::auth::Scope::DeleteNode).await?;
+    auth.require(crate::auth::Scope::DeleteRevision)?;
     let node = catalog
         .lookup(&segments)
         .await
