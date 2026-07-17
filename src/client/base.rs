@@ -215,12 +215,19 @@ impl BaseClient {
 
     /// Delete this node via `DELETE /api/v1/metadata/{path}`.
     ///
-    /// `external_only`: when `true` (default) the server refuses to delete a
-    /// node that has internally-managed storage. Pass `false` to also remove
-    /// managed storage files. Mirrors Python `BaseClient.delete`.
-    pub async fn delete(&self, external_only: bool) -> Result<()> {
+    /// `recursive`: when `false` (default) the server refuses to delete a
+    /// non-empty container; pass `true` to delete the node and its whole
+    /// subtree in one call. `external_only`: when `true` (default) the server
+    /// refuses to delete a node that has internally-managed storage anywhere in
+    /// the affected subtree; pass `false` to also remove managed storage files.
+    /// Parameter order mirrors Python `BaseClient.delete(recursive=False,
+    /// external_only=True)` (base.py:918-936).
+    pub async fn delete(&self, recursive: bool, external_only: bool) -> Result<()> {
         let self_link = self.require_link("self")?;
         let mut url = Url::parse(self_link)?;
+        if recursive {
+            url.query_pairs_mut().append_pair("recursive", "true");
+        }
         if !external_only {
             url.query_pairs_mut().append_pair("external_only", "false");
         }

@@ -684,15 +684,18 @@ impl ContainerClient {
     }
 
     /// Delete every immediate child of this container (to empty it before
-    /// deleting the container itself). Children that are themselves containers
-    /// must already be empty or have their own children deleted first, since
-    /// the server refuses to delete non-empty containers.
-    pub async fn delete_contents(&self, external_only: bool) -> Result<()> {
+    /// deleting the container itself). With `recursive=false` a child that is
+    /// itself a non-empty container is refused by the server (409); pass
+    /// `recursive=true` to delete such children and their subtrees too.
+    /// `recursive` is forwarded to each child delete, mirroring Python
+    /// `Container.delete_contents(recursive=False, external_only=True)`
+    /// (container.py:389-424).
+    pub async fn delete_contents(&self, recursive: bool, external_only: bool) -> Result<()> {
         let keys = self.keys().await?;
         for key in keys {
             let child = self.get(&key).await?;
             if let Some(b) = child.base() {
-                b.delete(external_only).await?;
+                b.delete(recursive, external_only).await?;
             }
         }
         Ok(())

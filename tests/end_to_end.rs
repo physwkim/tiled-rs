@@ -1430,12 +1430,61 @@ async fn container_create_and_delete_contents() {
     let keys = sub.keys().await.unwrap();
     assert_eq!(keys.len(), 2);
 
-    // Delete all grandchildren.
-    sub.delete_contents(false).await.expect("delete_contents");
+    // Delete all grandchildren (both empty leaf containers → non-recursive).
+    sub.delete_contents(false, false)
+        .await
+        .expect("delete_contents");
     let keys_after = sub.keys().await.unwrap();
     assert!(
         keys_after.is_empty(),
         "delete_contents must empty container"
+    );
+}
+
+/// Client recursive delete: `delete(recursive=true)` removes a non-empty
+/// container's whole subtree in one call, where the non-recursive path 409s.
+/// Mirrors Python `BaseClient.delete(recursive=True)` (base.py:918-936).
+#[tokio::test]
+async fn base_delete_recursive_removes_subtree() {
+    let (base, _wd, _db) = spawn_write_server().await;
+    let client = from_uri(&base).await.unwrap();
+    let root = client.into_container().unwrap();
+
+    // sub / sub/a / sub/a/deep  — `sub` is a non-empty container.
+    let sub = root
+        .create_container(Some("sub"), serde_json::json!({}))
+        .await
+        .expect("create sub");
+    let a = sub
+        .create_container(Some("a"), serde_json::json!({}))
+        .await
+        .expect("create a");
+    a.create_container(Some("deep"), serde_json::json!({}))
+        .await
+        .expect("create deep");
+
+    // Non-recursive delete of the non-empty container is refused (409 → Err).
+    let node = root.get("sub").await.unwrap();
+    let err = node
+        .base()
+        .expect("base")
+        .delete(false, false)
+        .await
+        .expect_err("non-recursive delete of a non-empty container must fail");
+    let _ = err;
+
+    // Recursive delete succeeds and removes the whole subtree.
+    let node = root.get("sub").await.unwrap();
+    node.base()
+        .expect("base")
+        .delete(true, false)
+        .await
+        .expect("recursive delete");
+
+    let keys_after = root.keys().await.unwrap();
+    assert!(
+        !keys_after.contains(&"sub".to_string()),
+        "recursive delete must remove the subtree root: {keys_after:?}"
     );
 }
 
@@ -1527,7 +1576,7 @@ async fn base_delete_removes_node() {
     let node = root.get("to_delete").await.unwrap();
     node.base()
         .expect("base")
-        .delete(false)
+        .delete(false, false)
         .await
         .expect("delete");
 
