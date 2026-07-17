@@ -11,9 +11,12 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 
+use crate::client::context::{ClientTimeout, ContextOptions};
 use crate::client::error::{ClientError, Result};
 
 /// Search path. Listed lowest-precedence to highest. The user-config dir is
@@ -373,6 +376,13 @@ pub struct Profile {
     pub headers: Option<HashMap<String, String>>,
     pub timeout: Option<ProfileTimeout>,
     pub verify: Option<bool>,
+    /// Hard ceiling on concurrent connections. Mirrors the schema's
+    /// `max_connections`; feeds `ContextOptions::max_connections`.
+    pub max_connections: Option<usize>,
+    /// Filepath to the token cache directory. Modeled for schema fidelity but
+    /// not wired: the Rust client derives the per-server token directory from
+    /// the API URI and cannot override it per construction.
+    pub token_cache: Option<String>,
     /// Inline server config (used by Python's `direct:` profiles).
     pub direct: Option<serde_yaml::Value>,
     /// Cache config sub-doc.
@@ -397,18 +407,89 @@ impl Profile {
     }
 }
 
-/// Build a `Context` from a profile name. Mirrors `from_profile()` in Python
-/// (just the `from_uri` arm — `direct:` profiles aren't supported because
-/// they require an in-process server).
-pub async fn from_profile(name: &str) -> Result<crate::client::any_client::AnyClient> {
-    let (_path, profile) = Profile::lookup(name)?;
+/// Convert a seconds value into a [`Duration`], rejecting the inputs
+/// [`Duration::from_secs_f64`] would panic on (negative, non-finite, overflow)
+/// so a malformed profile surfaces an error instead of aborting construction.
+fn timeout_secs_to_duration(field: &str, secs: f64) -> Result<Duration> {
+    if !secs.is_finite() || secs < 0.0 {
+        return Err(ClientError::Invalid(format!(
+            "profile timeout.{field} must be a non-negative number of seconds, got {secs}"
+        )));
+    }
+    Ok(Duration::from_secs_f64(secs))
+}
+
+/// Map a parsed [`Profile`] onto the resolved URI plus the transport
+/// [`ContextOptions`] the Rust client can express. Split out from
+/// [`from_profile`] so the field mapping is unit-testable without a live
+/// server.
+///
+/// Mirrors the merge in `tiled/client/constructors.py::from_profile`, honouring
+/// every profile field `ContextOptions` can carry: `uri`, `api_key`, `headers`,
+/// `verify`, `timeout` (`connection`→connect, `read`→read), `max_connections`.
+///
+/// Fields the Rust client cannot express are intentionally dropped:
+/// - `timeout.write` / `timeout.pool`: reqwest exposes no per-request write or
+///   pool-acquire timeout ([`ClientTimeout`] carries neither).
+/// - `cache`: `ContextOptions::cache` is an `HttpCache` that cannot express the
+///   schema's `readonly` / `max_item_size`, so honouring the config partially
+///   would silently ignore a safety setting.
+/// - `structure_clients`: the Rust client has no numpy/dask or import-path
+///   client dispatch to bind these to.
+/// - `token_cache`: the token-cache directory is derived from the API URI and
+///   is not overridable per construction.
+/// - `direct`: requires an in-process ASGI server the Rust client has no
+///   analogue for.
+/// - `username` / `auth_provider`: deprecated and ignored upstream too.
+fn profile_to_options(name: &str, profile: Profile) -> Result<(String, ContextOptions)> {
     let uri = profile
         .uri
         .ok_or_else(|| ClientError::Invalid(format!("profile '{name}' has no 'uri' field")))?;
-    let mut opts = crate::client::context::ContextOptions::default();
+    let mut opts = ContextOptions::default();
     if let Some(k) = profile.api_key {
         opts = opts.api_key(k);
     }
+    if let Some(headers) = profile.headers {
+        let mut map = HeaderMap::with_capacity(headers.len());
+        for (k, v) in headers {
+            let header_name = HeaderName::from_bytes(k.as_bytes())
+                .map_err(|e| ClientError::Invalid(format!("invalid header name '{k}': {e}")))?;
+            let value = HeaderValue::from_str(&v).map_err(|e| {
+                ClientError::Invalid(format!("invalid value for header '{k}': {e}"))
+            })?;
+            map.insert(header_name, value);
+        }
+        opts = opts.headers(map);
+    }
+    if let Some(verify) = profile.verify {
+        opts = opts.verify(verify);
+    }
+    if let Some(t) = profile.timeout {
+        // connection→connect, read→read; write/pool have no reqwest analogue.
+        opts = opts.timeout(ClientTimeout {
+            connect: t
+                .connection
+                .map(|s| timeout_secs_to_duration("connection", s))
+                .transpose()?,
+            read: t
+                .read
+                .map(|s| timeout_secs_to_duration("read", s))
+                .transpose()?,
+        });
+    }
+    if let Some(mc) = profile.max_connections {
+        opts = opts.max_connections(mc);
+    }
+    Ok((uri, opts))
+}
+
+/// Build a `Context` from a profile name. Mirrors `from_profile()` in Python
+/// (just the `from_uri` arm — `direct:` profiles aren't supported because
+/// they require an in-process server). Every profile field the Rust client can
+/// express is wired through [`profile_to_options`].
+pub async fn from_profile(name: &str) -> Result<crate::client::any_client::AnyClient> {
+    let (_path, profile) = Profile::lookup(name)?;
+    let (uri, opts) = profile_to_options(name, profile)?;
     crate::client::constructors::from_uri_with_options(&uri, opts, false).await
 }
 
@@ -424,6 +505,98 @@ mod tests {
     fn paths_includes_user_config() {
         let ps = paths();
         assert!(!ps.is_empty(), "expected at least one search path");
+    }
+
+    // FINDING 1: an upstream-shaped profile must carry every expressible field
+    // (uri, api_key, headers, verify, timeout, max_connections) into the
+    // ContextOptions the client is built from — not just uri + api_key.
+    #[test]
+    fn profile_to_options_maps_all_expressible_fields() {
+        let yaml = r#"
+uri: https://tiled.example.com/api/v1
+api_key: secret-key
+verify: false
+max_connections: 4
+headers:
+  X-Custom: hello
+  X-Extra: world
+timeout:
+  connection: 5.0
+  read: 30.0
+  write: 30.0
+  pool: 5.0
+"#;
+        let profile: Profile = serde_yaml::from_str(yaml).expect("profile parses");
+        let (uri, opts) = profile_to_options("demo", profile).expect("maps");
+        assert_eq!(uri, "https://tiled.example.com/api/v1");
+        assert_eq!(opts.api_key.as_deref(), Some("secret-key"));
+        assert_eq!(opts.verify, Some(false));
+        assert_eq!(opts.max_connections, Some(4));
+        let headers = opts.headers.expect("headers mapped");
+        assert_eq!(headers.get("X-Custom").unwrap().to_str().unwrap(), "hello");
+        assert_eq!(headers.get("X-Extra").unwrap().to_str().unwrap(), "world");
+        let t = opts.timeout.expect("timeout mapped");
+        // connection→connect, read→read; write/pool are dropped (no field).
+        assert_eq!(t.connect, Some(Duration::from_secs(5)));
+        assert_eq!(t.read, Some(Duration::from_secs(30)));
+    }
+
+    // Boundary: a partial timeout leaves the omitted knob None so the client
+    // builder falls back to its module default (parity with upstream's
+    // merge-over-DEFAULT_TIMEOUT_PARAMS).
+    #[test]
+    fn profile_to_options_partial_timeout_leaves_connect_none() {
+        let yaml = "uri: http://localhost:8000\ntimeout:\n  read: 60.0\n";
+        let profile: Profile = serde_yaml::from_str(yaml).unwrap();
+        let (_uri, opts) = profile_to_options("p", profile).unwrap();
+        let t = opts.timeout.expect("timeout set");
+        assert_eq!(t.read, Some(Duration::from_secs(60)));
+        assert_eq!(t.connect, None);
+    }
+
+    // Boundary: a uri-only profile sets no transport overrides — the resulting
+    // client is byte-for-byte the bare-client default.
+    #[test]
+    fn profile_to_options_uri_only_has_no_overrides() {
+        let profile: Profile = serde_yaml::from_str("uri: http://localhost:8000\n").unwrap();
+        let (uri, opts) = profile_to_options("p", profile).unwrap();
+        assert_eq!(uri, "http://localhost:8000");
+        assert!(opts.api_key.is_none());
+        assert!(opts.headers.is_none());
+        assert!(opts.verify.is_none());
+        assert!(opts.timeout.is_none());
+        assert!(opts.max_connections.is_none());
+    }
+
+    // Boundary: a profile with no uri is rejected with a clear message.
+    #[test]
+    fn profile_to_options_missing_uri_errors() {
+        let profile: Profile = serde_yaml::from_str("verify: true\n").unwrap();
+        let err = profile_to_options("noname", profile).unwrap_err();
+        assert!(format!("{err}").contains("no 'uri' field"), "{err}");
+    }
+
+    // Boundary: a negative timeout would panic Duration::from_secs_f64; it must
+    // surface as an error instead of aborting construction.
+    #[test]
+    fn profile_to_options_rejects_negative_timeout() {
+        let yaml = "uri: http://x\ntimeout:\n  read: -1.0\n";
+        let profile: Profile = serde_yaml::from_str(yaml).unwrap();
+        let err = profile_to_options("p", profile).unwrap_err();
+        assert!(format!("{err}").contains("non-negative"), "{err}");
+    }
+
+    // Boundary: a header value carrying a control character is not a valid
+    // HeaderValue and must be reported, not silently dropped.
+    #[test]
+    fn profile_to_options_invalid_header_value_errors() {
+        let yaml = "uri: http://x\nheaders:\n  X-Bad: \"a\\nb\"\n";
+        let profile: Profile = serde_yaml::from_str(yaml).unwrap();
+        let err = profile_to_options("p", profile).unwrap_err();
+        assert!(
+            format!("{err}").contains("invalid value for header"),
+            "{err}"
+        );
     }
 
     // FINDING 2: an upstream-shaped profile types `timeout` as an object
