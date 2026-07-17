@@ -499,6 +499,12 @@ pub async fn api_key_revoke(
         .principal
         .clone()
         .ok_or_else(|| ServerError::Unauthorized("login required to revoke an api key".into()))?;
+    // Truncate a pasted full-length key to the stored 8-char prefix, matching
+    // upstream `revoke_apikey` (`authentication.py:1640`, `first_eight[:8]`) and
+    // the sibling `current_apikey_revoke` route below. `get(..8)` is
+    // char-boundary-safe: a shorter (or non-boundary) input falls back to the
+    // value as given.
+    let first_eight = first_eight.get(..8).unwrap_or(&first_eight).to_string();
     // Look up the key owner before revoking so a non-admin can't drop a
     // key that belongs to someone else (just having ApiKeyRevoke scope on
     // your own session would otherwise be enough).
@@ -785,10 +791,14 @@ pub async fn admin_revoke_principal_apikey(
         .ok_or_else(|| {
             ServerError::NotFound(format!("The principal {uuid} has no such API key."))
         })?;
+    // Truncate a pasted full-length key to the stored 8-char prefix, matching
+    // upstream `revoke_apikey_for_principal` (`authentication.py:1381`,
+    // `first_eight[:8]`). `get(..8)` is char-boundary-safe.
+    let first_eight = q.first_eight.get(..8).unwrap_or(&q.first_eight).to_string();
     // Revoke the key scoped to this principal's id so we only delete keys
     // that actually belong to them (mirrors Python: `api_key_orm.principal.uuid != uuid`).
     let _ = db
-        .revoke_api_key(&q.first_eight, Some(principal.id))
+        .revoke_api_key(&first_eight, Some(principal.id))
         .await
         .map_err(|e| match e {
             crate::auth::AuthError::NotFound(_) => {
