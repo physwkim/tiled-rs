@@ -8,6 +8,7 @@
 //! send → 401? → refresh → retry-once loop.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use reqwest::header::{ACCEPT_ENCODING, HeaderMap, HeaderValue};
 use reqwest::{Client, Method, RequestBuilder, Response};
@@ -32,6 +33,15 @@ use crate::client::utils::{decode_response, default_headers, handle_error, retry
 /// [`ContextInner::data_fetch_semaphore`], acquired at the same bulk-data
 /// fetch sites Python throttles.
 pub(crate) const MAX_CONCURRENT_CONNECTIONS: usize = 16;
+
+/// Default connection-establishment timeout. Mirrors the `connect` field of
+/// Python tiled's `DEFAULT_TIMEOUT_PARAMS` (`tiled/client/utils.py:369`): 5s.
+pub(crate) const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Default per-read (socket inactivity) timeout. Mirrors the `read` field of
+/// Python tiled's `DEFAULT_TIMEOUT_PARAMS` (`tiled/client/utils.py:369`): 30s.
+/// Deliberately high so ~100 MB chunks over slow links don't trip it.
+pub(crate) const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Connection context: HTTP client + base URL + auth state.
 ///
@@ -205,6 +215,16 @@ impl Context {
                 .user_agent(crate::client::utils::USER_AGENT_VALUE)
                 .cookie_store(true)
                 .pool_max_idle_per_host(MAX_CONCURRENT_CONNECTIONS)
+                // Mirror httpx.Timeout(connect=5, read=30, write=30, pool=5)
+                // from Python tiled's DEFAULT_TIMEOUT_PARAMS. reqwest's
+                // ClientBuilder exposes only connect and per-read timeouts; it
+                // has no per-request `write` timeout and no `pool`
+                // (connection-acquire) timeout knob, so those two parameters
+                // have no analogue and are not applied. No total request
+                // deadline is set — upstream sets none, and one would abort
+                // large slow downloads mid-stream.
+                .connect_timeout(DEFAULT_CONNECT_TIMEOUT)
+                .read_timeout(DEFAULT_READ_TIMEOUT)
                 .build()?,
         };
 
