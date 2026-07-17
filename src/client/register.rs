@@ -43,6 +43,7 @@ use crate::core::structures::{Spec, StructureFamily};
 
 use crate::client::container::ContainerClient;
 use crate::client::error::{ClientError, Result};
+use crate::client::utils::retry;
 
 // ---------------------------------------------------------------------------
 // Default mimetypes by file extension
@@ -450,7 +451,11 @@ async fn create_container(parent: &ContainerClient, key: &str) -> Result<()> {
         "id": key,
     });
     let url = build_register_url(parent)?;
-    parent.base().context().post_json(&url, &body).await?;
+    // Wrapped in `retry` to match upstream, which issues this container create
+    // via `node.new` → `Container.new` inside `retry_context` (register.py:168,
+    // 240 → create_node_or_drop_collision:634 → container.py:735-745). A 409
+    // collision stays non-transient, so it surfaces immediately as before.
+    retry(|| async { parent.base().context().post_json(&url, &body).await }).await?;
     Ok(())
 }
 
@@ -601,7 +606,10 @@ async fn try_register_single(
         }],
         "id": key,
     });
-    node.base().context().post_json(&url, &body).await?;
+    // Wrapped in `retry` to match upstream `register_single_item`, which issues
+    // this create via `node.new` → `Container.new` inside `retry_context`
+    // (register.py:349 → create_node_or_drop_collision:634 → container.py:735-745).
+    retry(|| async { node.base().context().post_json(&url, &body).await }).await?;
     Ok(Some(()))
 }
 
@@ -726,7 +734,10 @@ async fn register_image_sequence(
         }],
         "id": key,
     });
-    node.base().context().post_json(&url, &body).await?;
+    // Wrapped in `retry` to match upstream `register_image_sequence`, which
+    // issues this create via `node.new` → `Container.new` inside `retry_context`
+    // (register.py:437 → create_node_or_drop_collision:634 → container.py:735-745).
+    retry(|| async { node.base().context().post_json(&url, &body).await }).await?;
     Ok(())
 }
 

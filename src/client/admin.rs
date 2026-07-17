@@ -16,7 +16,7 @@ use reqwest::Method;
 
 use crate::client::context::{ApiKeyCreated, Context};
 use crate::client::error::Result;
-use crate::client::utils::{JSON_MIME_TYPE, decode_response, handle_error};
+use crate::client::utils::{JSON_MIME_TYPE, decode_response, handle_error, retry};
 
 /// Administrative view over a [`Context`], obtained via
 /// [`Context::admin`](crate::client::Context::admin).
@@ -44,15 +44,20 @@ impl<'a> Admin<'a> {
         url.query_pairs_mut()
             .append_pair("page[offset]", &offset.to_string())
             .append_pair("page[limit]", &limit.to_string());
-        let req = self
-            .context
-            .request(Method::GET, &url)
-            .await?
-            .header(reqwest::header::ACCEPT, JSON_MIME_TYPE);
-        let resp = self.context.send_with_auth(req).await?;
-        self.context.maybe_capture_csrf(&resp).await;
-        let resp = handle_error(resp).await?;
-        decode_response::<Vec<PrincipalView>>(resp).await
+        // Wrapped in `retry` to match upstream `Admin.list_principals`, which
+        // issues the GET inside `retry_context` (`context.py:1225-1230`).
+        retry(|| async {
+            let req = self
+                .context
+                .request(Method::GET, &url)
+                .await?
+                .header(reqwest::header::ACCEPT, JSON_MIME_TYPE);
+            let resp = self.context.send_with_auth(req).await?;
+            self.context.maybe_capture_csrf(&resp).await;
+            let resp = handle_error(resp).await?;
+            decode_response::<Vec<PrincipalView>>(resp).await
+        })
+        .await
     }
 
     /// Show one principal by UUID (`GET /api/v1/auth/principal/{uuid}`).
@@ -66,15 +71,20 @@ impl<'a> Admin<'a> {
             .context
             .api_uri()
             .join(&format!("auth/principal/{uuid}"))?;
-        let req = self
-            .context
-            .request(Method::GET, &url)
-            .await?
-            .header(reqwest::header::ACCEPT, JSON_MIME_TYPE);
-        let resp = self.context.send_with_auth(req).await?;
-        self.context.maybe_capture_csrf(&resp).await;
-        let resp = handle_error(resp).await?;
-        decode_response::<PrincipalView>(resp).await
+        // Wrapped in `retry` to match upstream `Admin.show_principal`, which
+        // issues the GET inside `retry_context` (`context.py:1233-1239`).
+        retry(|| async {
+            let req = self
+                .context
+                .request(Method::GET, &url)
+                .await?
+                .header(reqwest::header::ACCEPT, JSON_MIME_TYPE);
+            let resp = self.context.send_with_auth(req).await?;
+            self.context.maybe_capture_csrf(&resp).await;
+            let resp = handle_error(resp).await?;
+            decode_response::<PrincipalView>(resp).await
+        })
+        .await
     }
 
     /// Create a new service principal with the given role
@@ -86,16 +96,23 @@ impl<'a> Admin<'a> {
     pub async fn create_service_principal(&self, role: &str) -> Result<PrincipalView> {
         let mut url = self.context.api_uri().join("auth/principal")?;
         url.query_pairs_mut().append_pair("role", role);
-        let req = self
-            .context
-            .request(Method::POST, &url)
-            .await?
-            .header(reqwest::header::ACCEPT, JSON_MIME_TYPE);
-        let req = self.context.add_csrf(req).await;
-        let resp = self.context.send_with_auth(req).await?;
-        self.context.maybe_capture_csrf(&resp).await;
-        let resp = handle_error(resp).await?;
-        decode_response::<PrincipalView>(resp).await
+        // Wrapped in `retry` to match upstream `Admin.create_service_principal`,
+        // which issues the POST inside `retry_context` (`context.py:1290-1300`).
+        // Upstream retries this non-idempotent create, so parity requires we do
+        // too.
+        retry(|| async {
+            let req = self
+                .context
+                .request(Method::POST, &url)
+                .await?
+                .header(reqwest::header::ACCEPT, JSON_MIME_TYPE);
+            let req = self.context.add_csrf(req).await;
+            let resp = self.context.send_with_auth(req).await?;
+            self.context.maybe_capture_csrf(&resp).await;
+            let resp = handle_error(resp).await?;
+            decode_response::<PrincipalView>(resp).await
+        })
+        .await
     }
 
     /// Generate a new API key for another principal
@@ -123,12 +140,19 @@ impl<'a> Admin<'a> {
             "expires_in_seconds": expires_in_seconds,
             "note": note,
         });
-        let req = self.context.request(Method::POST, &url).await?.json(&body);
-        let req = self.context.add_csrf(req).await;
-        let resp = self.context.send_with_auth(req).await?;
-        self.context.maybe_capture_csrf(&resp).await;
-        let resp = handle_error(resp).await?;
-        decode_response::<ApiKeyCreated>(resp).await
+        // Wrapped in `retry` to match upstream `Admin.create_api_key`, which
+        // issues the POST inside `retry_context` (`context.py:1265-1279`).
+        // Upstream retries this non-idempotent create, so parity requires we do
+        // too.
+        retry(|| async {
+            let req = self.context.request(Method::POST, &url).await?.json(&body);
+            let req = self.context.add_csrf(req).await;
+            let resp = self.context.send_with_auth(req).await?;
+            self.context.maybe_capture_csrf(&resp).await;
+            let resp = handle_error(resp).await?;
+            decode_response::<ApiKeyCreated>(resp).await
+        })
+        .await
     }
 
     /// Revoke an API key belonging to any principal
@@ -146,12 +170,17 @@ impl<'a> Admin<'a> {
             .join(&format!("auth/principal/{uuid}/apikey"))?;
         url.query_pairs_mut()
             .append_pair("first_eight", first_eight);
-        let req = self.context.request(Method::DELETE, &url).await?;
-        let req = self.context.add_csrf(req).await;
-        let resp = self.context.send_with_auth(req).await?;
-        self.context.maybe_capture_csrf(&resp).await;
-        handle_error(resp).await?;
-        Ok(())
+        // Wrapped in `retry` to match upstream `Admin.revoke_api_key`, which
+        // issues the DELETE inside `retry_context` (`context.py:1315-1329`).
+        retry(|| async {
+            let req = self.context.request(Method::DELETE, &url).await?;
+            let req = self.context.add_csrf(req).await;
+            let resp = self.context.send_with_auth(req).await?;
+            self.context.maybe_capture_csrf(&resp).await;
+            handle_error(resp).await?;
+            Ok(())
+        })
+        .await
     }
 }
 
