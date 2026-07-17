@@ -42,6 +42,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use indexmap::IndexMap;
 use serde::{Deserialize, Deserializer};
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
@@ -83,7 +84,11 @@ pub enum TagConfigSource {
 pub struct TagConfig {
     #[serde(default)]
     pub roles: BTreeMap<String, RoleDef>,
-    pub tags: BTreeMap<String, TagDef>,
+    /// `IndexMap` (not `BTreeMap`) so config-document order is preserved: the
+    /// compiler enters the `auto_tags` DFS in this order (upstream `for tag in
+    /// adjacent_tags`), which is the tie-break that decides cyclic `auto_tags`
+    /// resolution. Acyclic configs are order-invariant.
+    pub tags: IndexMap<String, TagDef>,
     #[serde(default)]
     pub tag_owners: BTreeMap<String, OwnerDef>,
 }
@@ -230,7 +235,7 @@ pub enum AccessTagsError {
 /// Read-only inputs threaded through the `auto_tags` DFS.
 struct CompileInputs<'a> {
     adjacency: &'a BTreeMap<String, BTreeSet<String>>,
-    tags: &'a BTreeMap<String, TagDef>,
+    tags: &'a IndexMap<String, TagDef>,
     roles: &'a BTreeMap<String, RoleDef>,
     valid_scopes: &'a BTreeSet<String>,
     group_parser: &'a Option<GroupParser>,
@@ -251,7 +256,7 @@ pub struct AccessTagsCompiler {
     tag_config: TagConfigSource,
     group_parser: Option<GroupParser>,
     roles: BTreeMap<String, RoleDef>,
-    tags: BTreeMap<String, TagDef>,
+    tags: IndexMap<String, TagDef>,
     tag_owners: BTreeMap<String, OwnerDef>,
     pool: SqlitePool,
 }
@@ -287,7 +292,7 @@ impl AccessTagsCompiler {
             tag_config,
             group_parser,
             roles: BTreeMap::new(),
-            tags: BTreeMap::new(),
+            tags: IndexMap::new(),
             tag_owners: BTreeMap::new(),
             pool,
         };
@@ -411,7 +416,12 @@ impl AccessTagsCompiler {
             adjacency.insert(tag.clone(), adj);
         }
 
-        // 3. DFS each tag to resolve its ACL and public status.
+        // 3. DFS each tag to resolve its ACL and public status. Enter in
+        //    config-insertion order (upstream `for tag in adjacent_tags`), not
+        //    sorted order: for cyclic `auto_tags` the first-visited tag wins the
+        //    shared ACL, so the entry order is a semantic tie-break. `self.tags`
+        //    (IndexMap) and `adjacency` hold the same key set, so iterating
+        //    `self.tags` covers every tag while giving config order.
         let inputs = CompileInputs {
             adjacency: &adjacency,
             tags: &self.tags,
@@ -420,7 +430,7 @@ impl AccessTagsCompiler {
             group_parser: &self.group_parser,
             max_nesting: MAX_TAG_NESTING,
         };
-        for tag in adjacency.keys() {
+        for tag in self.tags.keys() {
             let mut seen = BTreeSet::new();
             Self::dfs(&inputs, &mut out, &mut seen, tag, 0).map_err(|e| {
                 AccessTagsError::Compile {
