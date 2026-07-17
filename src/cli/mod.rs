@@ -141,6 +141,48 @@ pub enum Command {
         #[arg(long)]
         catalog_uri: Option<String>,
 
+        /// Make a fresh catalog in a temporary directory and serve it.
+        /// Mirrors upstream `tiled serve catalog --temp` (_serve.py): a new
+        /// SQLite catalog DB is created and initialized in a system tempdir,
+        /// and — unless `--writable-storage` is given — a `data/` subdir under
+        /// it becomes writable file storage. Conflicts with any other catalog
+        /// source (`--catalog-uri` / `--mongo-uri` / `--demo`): do one or the
+        /// other. The tempdir is NOT removed at shutdown (upstream leaves this
+        /// as a TODO), so a long-lived process leaks one temp tree per start.
+        #[arg(long)]
+        temp: bool,
+
+        /// Create/initialize the catalog database if it is not already
+        /// initialized, instead of erroring. Mirrors upstream `tiled serve
+        /// catalog --init` (`from_uri(init_if_not_exists=...)`, _serve.py):
+        /// without this flag an uninitialized `--catalog-uri` is a hard error
+        /// (initialize it first with `tiled catalog init`); on an
+        /// already-initialized DB `--init` is a no-op. `--temp` always creates
+        /// a fresh initialized DB, so it implies `--init`.
+        #[arg(long)]
+        init: bool,
+
+        /// Streaming data-cache URI: `memory` for the in-process TTL cache or a
+        /// `redis://...` URI for the shared Redis backend. Mirrors upstream
+        /// `tiled serve catalog --cache` (_serve.py, `StreamingCacheConfig`);
+        /// takes precedence over the config-file `streaming:` block. `--temp`
+        /// defaults this to `memory` when unset.
+        #[arg(long)]
+        cache: Option<String>,
+
+        /// Max retention time, in seconds, for cached streaming data (upstream
+        /// `--cache-data-ttl` / `StreamingCacheConfig.data_ttl`). Only applied
+        /// when `--cache` is set; defaults to 2 592 000 s (30 days).
+        #[arg(long = "cache-data-ttl")]
+        cache_data_ttl: Option<u64>,
+
+        /// Max retention time, in seconds, for a node's streaming sequence
+        /// counter when idle (upstream `--cache-seq-ttl` /
+        /// `StreamingCacheConfig.seq_ttl`). Only applied when `--cache` is set;
+        /// defaults to 3600 s.
+        #[arg(long = "cache-seq-ttl")]
+        cache_seq_ttl: Option<u64>,
+
         /// Auth DB URI. When set, the server runs in multi-user mode:
         /// `/auth/{provider}/login` and friends use this DB; API keys
         /// are looked up here too. Required when --user is supplied.
@@ -654,6 +696,88 @@ fn generate_single_user_key() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// A freshly-created temporary catalog directory. Mirrors upstream's
+/// `serve catalog --temp` / `serve directory` tempdir (_serve.py): a system
+/// tempdir holding a SQLite `catalog.db` plus a `data/` subdir intended for
+/// writable file storage.
+///
+/// Like upstream, the directory is **not** removed at shutdown (upstream leaves
+/// this as a `# TODO Hook into server lifecycle hooks to delete this` note), so
+/// each start leaks one temp tree. Callers that own cleanup (e.g. tests) keep
+/// the [`TempCatalog::dir`] path and remove it themselves.
+struct TempCatalog {
+    /// Root of the temp tree (`<system tmp>/tiled-catalog-<rand>`).
+    dir: std::path::PathBuf,
+    /// `sqlite://<dir>/catalog.db` — the catalog DB URI.
+    catalog_uri: String,
+    /// `<dir>/data` — the intended writable file-storage subdir. Created by
+    /// the caller only when it decides to use it (upstream creates it only
+    /// when no explicit writable storage was given).
+    data_dir: std::path::PathBuf,
+}
+
+/// Create a fresh temporary catalog directory (`SQLITE_CATALOG_FILENAME` +
+/// `data/` subdir), reused by `serve --temp` and `serve directory`. The DB
+/// itself is created and migrated by the caller via [`crate::catalog::Catalog`]
+/// (`connect` uses `create_if_missing`), mirroring upstream's
+/// `initialize_database` + `stamp_head` on the temp DB.
+fn create_temp_catalog() -> Result<TempCatalog> {
+    let mut dir = std::env::temp_dir();
+    // A random suffix so concurrent `serve --temp` starts never collide.
+    // Reuse the same CSPRNG hex as the single-user key, truncated to 16 hex
+    // chars (8 bytes) — plenty for a per-process tempdir name.
+    let suffix: String = generate_single_user_key().chars().take(16).collect();
+    dir.push(format!("tiled-catalog-{suffix}"));
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| anyhow::anyhow!("create temp catalog dir {}: {e}", dir.display()))?;
+    let db_path = dir.join("catalog.db");
+    // `sqlite://<absolute path>` — the absolute path already starts with `/`
+    // (or a drive letter), so this yields the `sqlite:///…` sqlx expects.
+    let catalog_uri = format!("sqlite://{}", db_path.display());
+    let data_dir = dir.join("data");
+    Ok(TempCatalog {
+        dir,
+        catalog_uri,
+        data_dir,
+    })
+}
+
+/// Whether a catalog DB already has its schema (migrations) applied. Used to
+/// mirror upstream `from_uri(init_if_not_exists=False)`: without `--init` an
+/// uninitialized catalog is a hard error. [`crate::catalog::Catalog::connect`]
+/// uses `create_if_missing`, so a fresh `--catalog-uri` connects to an EMPTY
+/// DB whose `_tiled_migrations` table does not exist yet — `applied_migrations`
+/// then errs, which we read as "not initialized".
+async fn catalog_is_initialized(cat: &crate::catalog::Catalog) -> bool {
+    matches!(cat.applied_migrations().await, Ok(names) if !names.is_empty())
+}
+
+/// Build a streaming-cache [`config::StreamingConfig`] from the `serve --cache*`
+/// flags. Mirrors upstream `StreamingCacheConfig(uri=…, data_ttl=…, seq_ttl=…)`
+/// (_serve.py): `memory` selects the in-process TTL cache; a `redis…` URI
+/// selects the Redis backend. Unset TTLs fall back to the same defaults as the
+/// config schema.
+fn streaming_config_from_cli(
+    uri: &str,
+    data_ttl: Option<u64>,
+    seq_ttl: Option<u64>,
+) -> Result<config::StreamingConfig> {
+    let (backend, redis_uri) = if uri == "memory" {
+        (config::StreamingBackend::Memory, None)
+    } else if uri.starts_with("redis") {
+        (config::StreamingBackend::Redis, Some(uri.to_string()))
+    } else {
+        anyhow::bail!("--cache expects 'memory' or a redis:// URI, got '{uri}'");
+    };
+    Ok(config::StreamingConfig {
+        backend,
+        uri: redis_uri,
+        seq_ttl: seq_ttl.unwrap_or_else(config::default_stream_seq_ttl),
+        data_ttl: data_ttl.unwrap_or_else(config::default_stream_data_ttl),
+        maxsize: config::default_stream_maxsize(),
+    })
+}
+
 /// Validate an operator-supplied single-user API key at startup, mirroring
 /// Python `build_app` (server/app.py:549-561) and the config schema
 /// `[a-zA-Z0-9]+` (config.py:149). An empty key would pass the server's
@@ -793,6 +917,11 @@ pub async fn run(command: Command) -> Result<()> {
             public,
             mongo_uri,
             catalog_uri,
+            temp,
+            init,
+            cache,
+            cache_data_ttl,
+            cache_seq_ttl,
             auth_db_uri,
             jwt_secret,
             users,
@@ -847,6 +976,45 @@ pub async fn run(command: Command) -> Result<()> {
                     .as_ref()
                     .and_then(|c| c.catalog_uri().map(String::from))
             });
+
+            // `--temp`: synthesize a fresh, initialized catalog in a system
+            // tempdir and serve it. Mirrors upstream `serve catalog --temp`
+            // (_serve.py). It provides a catalog *source*, so it conflicts with
+            // any other source (upstream: "The option --temp was set but a
+            // database was also provided. Do one or the other."). When no
+            // explicit writable storage is given, a `data/` subdir under the
+            // temp tree becomes writable file storage (upstream's `data/`); the
+            // duckdb tabular-storage half of upstream's temp layout has no
+            // tiled-rs analogue and is skipped.
+            let mut temp_writable_dirs: Vec<std::path::PathBuf> = Vec::new();
+            let resolved_catalog_uri = if temp {
+                if resolved_catalog_uri.is_some() || resolved_mongo_uri.is_some() || demo {
+                    anyhow::bail!(
+                        "--temp was set but a catalog source was also provided \
+                         (--catalog-uri / --mongo-uri / --demo). Do one or the other."
+                    );
+                }
+                let tc = create_temp_catalog()?;
+                eprintln!("Initializing temporary storage in {}", tc.dir.display());
+                eprintln!("  catalog database: {}/catalog.db", tc.dir.display());
+                // Upstream adds writable `data/` storage only when the user
+                // supplied no explicit --write; mirror that with the CLI
+                // --writable-storage flag and the config `catalog.writable_storage`.
+                let config_has_writable = file_config
+                    .as_ref()
+                    .and_then(|c| c.catalog.as_ref())
+                    .is_some_and(|c| !c.writable_storage.is_empty());
+                if writable_storage.is_empty() && !config_has_writable {
+                    std::fs::create_dir_all(&tc.data_dir).map_err(|e| {
+                        anyhow::anyhow!("create temp writable dir {}: {e}", tc.data_dir.display())
+                    })?;
+                    eprintln!("  writable file storage: {}", tc.data_dir.display());
+                    temp_writable_dirs.push(tc.data_dir);
+                }
+                Some(tc.catalog_uri)
+            } else {
+                resolved_catalog_uri
+            };
 
             // Resolve auth DB URI: CLI flag / TILED_AUTH_DB_URI env > config file
             // `database.uri` (upstream's top-level `database:` block). Symmetric
@@ -917,9 +1085,13 @@ pub async fn run(command: Command) -> Result<()> {
             // Canonicalise the writable-storage roots to absolute paths,
             // creating them if missing, so `init_storage` can build valid
             // `file://` URIs and the read/delete/write containment checks
-            // compare against real paths. Sources: CLI `--writable-storage`
-            // and config `catalog.writable_storage`.
-            let all_writable_dirs = writable_storage.iter().cloned().chain(config_writable_dirs);
+            // compare against real paths. Sources: CLI `--writable-storage`,
+            // config `catalog.writable_storage`, and the `--temp` `data/` dir.
+            let all_writable_dirs = writable_storage
+                .iter()
+                .cloned()
+                .chain(config_writable_dirs)
+                .chain(temp_writable_dirs.iter().cloned());
             let mut writable_abs: Vec<std::path::PathBuf> = Vec::new();
             for dir in all_writable_dirs {
                 std::fs::create_dir_all(&dir).map_err(|e| {
@@ -957,6 +1129,23 @@ pub async fn run(command: Command) -> Result<()> {
                                 .await
                                 .map_err(|e| anyhow::anyhow!("catalog connect: {e}"))?,
                         };
+                        // Mirror upstream `from_uri(init_if_not_exists=…)`: only
+                        // `--init` (or `--temp`, which always makes a fresh DB)
+                        // may create the schema. Without it, an uninitialized
+                        // catalog is a hard error rather than being silently
+                        // initialized — the operator must run `tiled catalog
+                        // init` first. (`connect` uses `create_if_missing`, so a
+                        // brand-new `--catalog-uri` path connects to an empty,
+                        // un-migrated DB, which this gate rejects.)
+                        let may_initialize = init || temp;
+                        if !may_initialize && !catalog_is_initialized(&cat).await {
+                            anyhow::bail!(
+                                "Catalog database at {} is not initialized. \
+                                 Initialize it with `tiled catalog init` (or pass \
+                                 --init to create it now).",
+                                redact_mongo_uri(uri)
+                            );
+                        }
                         // Contain managed-asset physical deletion to the same
                         // directories the read-side resolver allows. A client can
                         // register an internally-managed data source with an
@@ -1205,6 +1394,28 @@ pub async fn run(command: Command) -> Result<()> {
                     None => Vec::new(),
                 };
 
+            // Streaming data cache: the `--cache*` flags override the config
+            // `streaming:` block (upstream `StreamingCacheConfig` from
+            // _serve.py). `--temp` defaults `--cache` to `memory` when unset,
+            // matching upstream's temp-catalog cache default. When no CLI cache
+            // is in play the config block stands. `--cache-data-ttl` /
+            // `--cache-seq-ttl` are honoured only alongside `--cache`.
+            let cli_cache_uri = cache.clone().or_else(|| {
+                if temp {
+                    Some("memory".to_string())
+                } else {
+                    None
+                }
+            });
+            let streaming_cfg: Option<config::StreamingConfig> = match cli_cache_uri {
+                Some(uri) => Some(streaming_config_from_cli(
+                    &uri,
+                    cache_data_ttl,
+                    cache_seq_ttl,
+                )?),
+                None => file_config.as_ref().and_then(|c| c.streaming.clone()),
+            };
+
             let state = crate::server::AppState {
                 root_tree,
                 serialization_registry: registry,
@@ -1262,9 +1473,7 @@ pub async fn run(command: Command) -> Result<()> {
                     .as_ref()
                     .map(|c| c.response_bytesize_limit)
                     .unwrap_or_else(config::default_response_bytesize_limit),
-                streaming_cache: build_streaming_cache(
-                    file_config.as_ref().and_then(|c| c.streaming.as_ref()),
-                ),
+                streaming_cache: build_streaming_cache(streaming_cfg.as_ref()),
                 access_policy: access_policy_value,
                 default_login_scopes: crate::server::AppState::default_login_scopes(),
                 enable_web: !no_web,
@@ -2060,6 +2269,111 @@ mod tests {
             8000,
             "default when neither flag nor config"
         );
+    }
+
+    // cli-w27-P8: the serve utility flags parse and default correctly.
+    #[test]
+    fn serve_temp_init_cache_flags_parse() {
+        let cli = TestCli::parse_from([
+            "tiled",
+            "serve",
+            "--temp",
+            "--init",
+            "--cache",
+            "memory",
+            "--cache-data-ttl",
+            "60",
+            "--cache-seq-ttl",
+            "30",
+        ]);
+        let Command::Serve {
+            temp,
+            init,
+            cache,
+            cache_data_ttl,
+            cache_seq_ttl,
+            ..
+        } = cli.command
+        else {
+            panic!("expected Serve variant");
+        };
+        assert!(temp);
+        assert!(init);
+        assert_eq!(cache.as_deref(), Some("memory"));
+        assert_eq!(cache_data_ttl, Some(60));
+        assert_eq!(cache_seq_ttl, Some(30));
+    }
+
+    #[test]
+    fn serve_utility_flags_default_off() {
+        let cli = TestCli::parse_from(["tiled", "serve", "--demo"]);
+        let Command::Serve {
+            temp,
+            init,
+            cache,
+            cache_data_ttl,
+            cache_seq_ttl,
+            ..
+        } = cli.command
+        else {
+            panic!("expected Serve variant");
+        };
+        assert!(!temp);
+        assert!(!init);
+        assert_eq!(cache, None);
+        assert_eq!(cache_data_ttl, None);
+        assert_eq!(cache_seq_ttl, None);
+    }
+
+    // `--cache memory` selects the in-process TTL backend; TTL flags override
+    // the schema defaults, and an unset TTL keeps the default.
+    #[test]
+    fn streaming_config_from_cli_memory() {
+        let cfg = streaming_config_from_cli("memory", Some(60), None).unwrap();
+        assert_eq!(cfg.backend, config::StreamingBackend::Memory);
+        assert_eq!(cfg.uri, None);
+        assert_eq!(cfg.data_ttl, 60);
+        assert_eq!(cfg.seq_ttl, config::default_stream_seq_ttl());
+    }
+
+    // A `redis://` URI selects the Redis backend and is carried through as the
+    // connection URI.
+    #[test]
+    fn streaming_config_from_cli_redis() {
+        let cfg = streaming_config_from_cli("redis://localhost:6379", None, Some(30)).unwrap();
+        assert_eq!(cfg.backend, config::StreamingBackend::Redis);
+        assert_eq!(cfg.uri.as_deref(), Some("redis://localhost:6379"));
+        assert_eq!(cfg.seq_ttl, 30);
+        assert_eq!(cfg.data_ttl, config::default_stream_data_ttl());
+    }
+
+    // Anything that is neither `memory` nor a redis URI is a hard error.
+    #[test]
+    fn streaming_config_from_cli_rejects_unknown() {
+        assert!(streaming_config_from_cli("bogus://x", None, None).is_err());
+    }
+
+    // `create_temp_catalog` yields a real directory and a well-formed
+    // `sqlite://` URI; a `Catalog::connect` + `migrate` on it initializes the
+    // schema (so `catalog_is_initialized` flips true).
+    #[tokio::test]
+    async fn temp_catalog_connect_initializes() {
+        let tc = create_temp_catalog().unwrap();
+        assert!(tc.dir.exists());
+        assert!(tc.catalog_uri.starts_with("sqlite://"));
+
+        let cat = crate::catalog::Catalog::connect(&tc.catalog_uri)
+            .await
+            .unwrap();
+        // Fresh, un-migrated DB → not initialized (mirrors upstream's
+        // uninitialized-without-`--init` error path).
+        assert!(!catalog_is_initialized(&cat).await);
+        cat.migrate().await.unwrap();
+        assert!(catalog_is_initialized(&cat).await);
+
+        // Cleanup: the temp tree is intentionally leaked at runtime (upstream
+        // parity), so the test removes it explicitly.
+        let _ = std::fs::remove_dir_all(&tc.dir);
     }
 
     // cli-L1: an IPv6 `--host` must not be string-concatenated with the port.
