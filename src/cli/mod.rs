@@ -572,6 +572,13 @@ pub enum ApiKeyCommand {
         /// Repeat to grant a scope. Default: full scope set.
         #[arg(long = "scope")]
         scopes: Vec<String>,
+        /// Restrict the key to specific access tags (repeatable). Mirrors
+        /// upstream `--access-tags` (_api_key.py). Omitted ⟹ no tag
+        /// restriction; given ⟹ narrow to those tags. A tag restriction cannot
+        /// combine with the `inherit` / `admin:apikeys` scopes, so pass
+        /// `--scope` to narrow the scopes when using this.
+        #[arg(long = "access-tags")]
+        access_tags: Vec<String>,
         /// Expiration in seconds from now. None = never expires.
         #[arg(long)]
         expires_in: Option<i64>,
@@ -591,6 +598,14 @@ pub enum ApiKeyCommand {
 
 #[derive(Subcommand)]
 pub enum AdminCommand {
+    /// Manage API keys for a specific principal (by UUID). DB-direct; mirrors
+    /// Python `tiled admin api-key` (_admin_api_key.py). Where upstream reaches
+    /// a running server's admin API, tiled-rs operates on the auth DB directly,
+    /// consistent with the other `tiled admin` subcommands.
+    ApiKey {
+        #[command(subcommand)]
+        command: AdminApiKeyCommand,
+    },
     /// Initialize the auth database schema. DB-direct; mirrors Python
     /// `tiled admin initialize-database` (_admin.py:16).
     InitializeDatabase {
@@ -645,6 +660,58 @@ pub enum AdminCommand {
         auth_db_uri: String,
         /// UUID identifying the principal of interest.
         uuid: String,
+    },
+}
+
+/// `tiled admin api-key` subcommands. Per-principal API-key management,
+/// DB-direct. Mirrors upstream `_admin_api_key.py` (create / list / revoke,
+/// each targeting a Principal by UUID).
+#[derive(Subcommand)]
+pub enum AdminApiKeyCommand {
+    /// Create an API key for a principal. Mirrors upstream `tiled admin
+    /// api-key create <principal_uuid>` (_admin_api_key.py). Prints the
+    /// plaintext secret exactly once.
+    Create {
+        /// Auth DB URI (e.g. sqlite:///var/lib/tiled-auth.db).
+        #[arg(long, env = "TILED_AUTH_DB_URI")]
+        auth_db_uri: String,
+        /// UUID identifying the principal to create the key for.
+        principal_uuid: String,
+        /// Optional note describing the key.
+        #[arg(long)]
+        note: Option<String>,
+        /// Repeat to grant a scope. Default: full scope set.
+        #[arg(long = "scope")]
+        scopes: Vec<String>,
+        /// Restrict the key to specific access tags (repeatable). Mirrors
+        /// upstream `--access-tags`; cannot combine with the `inherit` /
+        /// `admin:apikeys` scopes.
+        #[arg(long = "access-tags")]
+        access_tags: Vec<String>,
+        /// Expiration in seconds from now. None = never expires.
+        #[arg(long)]
+        expires_in: Option<i64>,
+    },
+    /// List a principal's API keys. Mirrors upstream `tiled admin api-key list
+    /// <principal_uuid>` (_admin_api_key.py).
+    List {
+        /// Auth DB URI (e.g. sqlite:///var/lib/tiled-auth.db).
+        #[arg(long, env = "TILED_AUTH_DB_URI")]
+        auth_db_uri: String,
+        /// UUID identifying the principal whose keys to list.
+        principal_uuid: String,
+    },
+    /// Revoke one of a principal's API keys by its first-eight prefix. Mirrors
+    /// upstream `tiled admin api-key revoke <principal_uuid> <first_eight>`
+    /// (_admin_api_key.py).
+    Revoke {
+        /// Auth DB URI (e.g. sqlite:///var/lib/tiled-auth.db).
+        #[arg(long, env = "TILED_AUTH_DB_URI")]
+        auth_db_uri: String,
+        /// UUID identifying the principal whose key to revoke.
+        principal_uuid: String,
+        /// First eight characters of the API key (or the whole key).
+        first_eight: String,
     },
 }
 
@@ -2187,6 +2254,7 @@ pub async fn run(command: Command) -> Result<()> {
                 principal,
                 note,
                 scopes,
+                access_tags,
                 expires_in,
             } => {
                 let db = crate::auth::AuthDb::connect(&auth_db_uri)
@@ -2212,50 +2280,8 @@ pub async fn run(command: Command) -> Result<()> {
                         p.id
                     }
                 };
-                let scope_set = if scopes.is_empty() {
-                    crate::auth::ScopeSet::full()
-                } else {
-                    let mut set = crate::auth::ScopeSet::default();
-                    for s in &scopes {
-                        let scope = crate::auth::Scope::parse(s)
-                            .ok_or_else(|| anyhow::anyhow!("unknown scope: {s}"))?;
-                        set.insert(scope);
-                    }
-                    set
-                };
-                let exp = expires_in.map(|s| chrono::Utc::now() + chrono::Duration::seconds(s));
-                let material = db
-                    .create_api_key(crate::auth::ApiKeyCreate {
-                        principal_id,
-                        note,
-                        scopes: scope_set,
-                        expiration_time: exp,
-                        // The CLI apikey-create command does not accept a tag restriction.
-                        access_tags: None,
-                    })
+                create_and_print_api_key(&db, principal_id, note, &scopes, &access_tags, expires_in)
                     .await
-                    .map_err(|e| anyhow::anyhow!("create api key: {e}"))?;
-                println!("secret: {}", material.secret);
-                println!("first_eight: {}", material.record.first_eight);
-                println!(
-                    "scopes: {}",
-                    material
-                        .record
-                        .scopes
-                        .iter()
-                        .map(|s| s.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
-                if let Some(t) = material.record.expiration_time {
-                    println!("expires_at: {t}");
-                }
-                eprintln!(
-                    "\n\
-                    NOTE: Save the secret above — the server only kept its hash, so this is \n\
-                    the only chance to copy it.",
-                );
-                Ok(())
             }
             ApiKeyCommand::List { auth_db_uri } => {
                 let db = crate::auth::AuthDb::connect(&auth_db_uri)
@@ -2268,31 +2294,7 @@ pub async fn run(command: Command) -> Result<()> {
                     .list_api_keys(None)
                     .await
                     .map_err(|e| anyhow::anyhow!("list: {e}"))?;
-                if keys.is_empty() {
-                    println!("(no keys)");
-                } else {
-                    println!(
-                        "{:<8} {:<6} {:<40} {:<24} expires",
-                        "PREFIX", "ID", "SCOPES", "NOTE"
-                    );
-                    for k in keys {
-                        let scopes: String = k
-                            .scopes
-                            .iter()
-                            .map(|s| s.as_str())
-                            .collect::<Vec<_>>()
-                            .join(",");
-                        let note = k.note.unwrap_or_default();
-                        let exp = k
-                            .expiration_time
-                            .map(|t| t.to_rfc3339())
-                            .unwrap_or_else(|| "never".into());
-                        println!(
-                            "{:<8} {:<6} {:<40} {:<24} {}",
-                            k.first_eight, k.id, scopes, note, exp
-                        );
-                    }
-                }
+                print_api_keys_table(&keys);
                 Ok(())
             }
             ApiKeyCommand::Revoke {
@@ -2317,6 +2319,83 @@ pub async fn run(command: Command) -> Result<()> {
             }
         },
         Command::Admin { command } => match command {
+            AdminCommand::ApiKey { command } => match command {
+                AdminApiKeyCommand::Create {
+                    auth_db_uri,
+                    principal_uuid,
+                    note,
+                    scopes,
+                    access_tags,
+                    expires_in,
+                } => {
+                    let db = crate::auth::AuthDb::connect(&auth_db_uri)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("auth db: {e}"))?;
+                    db.migrate()
+                        .await
+                        .map_err(|e| anyhow::anyhow!("auth migrate: {e}"))?;
+                    let principal_id = find_principal_by_uuid(&db, &principal_uuid)
+                        .await?
+                        .ok_or_else(|| anyhow::anyhow!("principal {principal_uuid} not found"))?;
+                    create_and_print_api_key(
+                        &db,
+                        principal_id,
+                        note,
+                        &scopes,
+                        &access_tags,
+                        expires_in,
+                    )
+                    .await
+                }
+                AdminApiKeyCommand::List {
+                    auth_db_uri,
+                    principal_uuid,
+                } => {
+                    let db = crate::auth::AuthDb::connect(&auth_db_uri)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("auth db: {e}"))?;
+                    db.migrate()
+                        .await
+                        .map_err(|e| anyhow::anyhow!("auth migrate: {e}"))?;
+                    let principal_id = find_principal_by_uuid(&db, &principal_uuid)
+                        .await?
+                        .ok_or_else(|| anyhow::anyhow!("principal {principal_uuid} not found"))?;
+                    let keys = db
+                        .list_api_keys(Some(principal_id))
+                        .await
+                        .map_err(|e| anyhow::anyhow!("list: {e}"))?;
+                    print_api_keys_table(&keys);
+                    Ok(())
+                }
+                AdminApiKeyCommand::Revoke {
+                    auth_db_uri,
+                    principal_uuid,
+                    first_eight,
+                } => {
+                    let db = crate::auth::AuthDb::connect(&auth_db_uri)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("auth db: {e}"))?;
+                    db.migrate()
+                        .await
+                        .map_err(|e| anyhow::anyhow!("auth migrate: {e}"))?;
+                    let principal_id = find_principal_by_uuid(&db, &principal_uuid)
+                        .await?
+                        .ok_or_else(|| anyhow::anyhow!("principal {principal_uuid} not found"))?;
+                    // Scope the revoke to this principal's keys (upstream admin
+                    // api-key revoke takes the principal_uuid). `first_eight[:8]`
+                    // matches upstream's truncation of a full key to its prefix.
+                    let prefix: String = first_eight.chars().take(8).collect();
+                    let removed = db
+                        .revoke_api_key(&prefix, Some(principal_id))
+                        .await
+                        .map_err(|e| anyhow::anyhow!("revoke: {e}"))?;
+                    println!(
+                        "revoked api key {} (id={})",
+                        removed.first_eight, removed.id
+                    );
+                    Ok(())
+                }
+            },
             AdminCommand::InitializeDatabase { uri } => {
                 let db = crate::auth::AuthDb::connect(&uri)
                     .await
@@ -2488,6 +2567,109 @@ async fn build_auth_state(
         None
     };
     Ok((Some(db), Some(issuer), authenticators, proxied))
+}
+
+/// Create an API key for `principal_id` and print the secret + summary. Shared
+/// by `tiled api-key create` and `tiled admin api-key create`.
+///
+/// `access_tags` are the raw repeatable `--access-tags` values: empty ⟹ omitted
+/// ⟹ `None` (no tag restriction); non-empty ⟹ `Some(tags)` (narrow to those
+/// tags). The illegal combination of a tag restriction with the `inherit` /
+/// `admin:apikeys` scopes is rejected by the DB layer — the sole INSERT-owner
+/// for `api_keys` — so this helper does not re-check it.
+async fn create_and_print_api_key(
+    db: &crate::auth::AuthDb,
+    principal_id: i64,
+    note: Option<String>,
+    scopes: &[String],
+    access_tags: &[String],
+    expires_in: Option<i64>,
+) -> Result<()> {
+    let scope_set = if scopes.is_empty() {
+        crate::auth::ScopeSet::full()
+    } else {
+        let mut set = crate::auth::ScopeSet::default();
+        for s in scopes {
+            let scope = crate::auth::Scope::parse(s)
+                .ok_or_else(|| anyhow::anyhow!("unknown scope: {s}"))?;
+            set.insert(scope);
+        }
+        set
+    };
+    // Repeatable `--access-tags`: none given ⟹ `None` (no restriction);
+    // ≥1 given ⟹ `Some(tags)`. `Some(vec![])` (deny-all-tagged) is only
+    // reachable via the REST API, never the CLI (you cannot pass zero values to
+    // a repeatable option), so the empty-vec case correctly maps to `None`.
+    let access_tags = if access_tags.is_empty() {
+        None
+    } else {
+        Some(access_tags.to_vec())
+    };
+    let exp = expires_in.map(|s| chrono::Utc::now() + chrono::Duration::seconds(s));
+    let material = db
+        .create_api_key(crate::auth::ApiKeyCreate {
+            principal_id,
+            note,
+            scopes: scope_set,
+            expiration_time: exp,
+            access_tags,
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("create api key: {e}"))?;
+    println!("secret: {}", material.secret);
+    println!("first_eight: {}", material.record.first_eight);
+    println!(
+        "scopes: {}",
+        material
+            .record
+            .scopes
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    if let Some(tags) = &material.record.access_tags {
+        println!("access_tags: {}", tags.join(", "));
+    }
+    if let Some(t) = material.record.expiration_time {
+        println!("expires_at: {t}");
+    }
+    eprintln!(
+        "\n\
+        NOTE: Save the secret above — the server only kept its hash, so this is \n\
+        the only chance to copy it.",
+    );
+    Ok(())
+}
+
+/// Print a table of API-key records (or a `(no keys)` line). Shared by
+/// `tiled api-key list` and `tiled admin api-key list`.
+fn print_api_keys_table(keys: &[crate::auth::ApiKeyRecord]) {
+    if keys.is_empty() {
+        println!("(no keys)");
+        return;
+    }
+    println!(
+        "{:<8} {:<6} {:<40} {:<24} expires",
+        "PREFIX", "ID", "SCOPES", "NOTE"
+    );
+    for k in keys {
+        let scopes: String = k
+            .scopes
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        let note = k.note.clone().unwrap_or_default();
+        let exp = k
+            .expiration_time
+            .map(|t| t.to_rfc3339())
+            .unwrap_or_else(|| "never".into());
+        println!(
+            "{:<8} {:<6} {:<40} {:<24} {}",
+            k.first_eight, k.id, scopes, note, exp
+        );
+    }
 }
 
 async fn find_principal_by_uuid(
@@ -3140,5 +3322,241 @@ mod tests {
         })
         .await
         .expect("profile list must succeed");
+    }
+
+    // cli-w27-P6: `--access-tags` on `tiled api-key create` parses as a
+    // repeatable list (upstream typer `access_tags: Optional[List[str]]`,
+    // rendered `--access-tags`), independent of `--scope`.
+    #[test]
+    fn api_key_create_access_tags_parse() {
+        let cli = TestCli::parse_from([
+            "tiled",
+            "api-key",
+            "create",
+            "--auth-db-uri",
+            "sqlite::memory:",
+            "--scope",
+            "read:data",
+            "--access-tags",
+            "team-a",
+            "--access-tags",
+            "team-b",
+        ]);
+        let Command::ApiKey { command } = cli.command else {
+            panic!("expected ApiKey variant");
+        };
+        let ApiKeyCommand::Create {
+            scopes,
+            access_tags,
+            ..
+        } = command
+        else {
+            panic!("expected Create variant");
+        };
+        assert_eq!(scopes, vec!["read:data"]);
+        assert_eq!(access_tags, vec!["team-a", "team-b"]);
+    }
+
+    #[test]
+    fn api_key_create_access_tags_default_empty() {
+        let cli = TestCli::parse_from([
+            "tiled",
+            "api-key",
+            "create",
+            "--auth-db-uri",
+            "sqlite::memory:",
+        ]);
+        let Command::ApiKey { command } = cli.command else {
+            panic!("expected ApiKey variant");
+        };
+        let ApiKeyCommand::Create { access_tags, .. } = command else {
+            panic!("expected Create variant");
+        };
+        assert!(
+            access_tags.is_empty(),
+            "omitted --access-tags ⟹ empty vec ⟹ no tag restriction"
+        );
+    }
+
+    // cli-w27-P6: the `tiled admin api-key` subgroup parses create/list/revoke,
+    // each targeting a Principal by UUID (upstream `_admin_api_key.py`).
+    fn parse_admin(args: &[&str]) -> AdminCommand {
+        let mut argv = vec!["tiled", "admin"];
+        argv.extend_from_slice(args);
+        let cli = TestCli::parse_from(argv);
+        let Command::Admin { command } = cli.command else {
+            panic!("expected Admin variant");
+        };
+        command
+    }
+
+    #[test]
+    fn admin_api_key_create_parses() {
+        let AdminCommand::ApiKey { command } = parse_admin(&[
+            "api-key",
+            "create",
+            "the-uuid",
+            "--auth-db-uri",
+            "sqlite::memory:",
+            "--scope",
+            "read:data",
+            "--access-tags",
+            "team-a",
+            "--note",
+            "ci",
+            "--expires-in",
+            "3600",
+        ]) else {
+            panic!("expected ApiKey variant");
+        };
+        let AdminApiKeyCommand::Create {
+            auth_db_uri,
+            principal_uuid,
+            note,
+            scopes,
+            access_tags,
+            expires_in,
+        } = command
+        else {
+            panic!("expected Create variant");
+        };
+        assert_eq!(auth_db_uri, "sqlite::memory:");
+        assert_eq!(principal_uuid, "the-uuid");
+        assert_eq!(note.as_deref(), Some("ci"));
+        assert_eq!(scopes, vec!["read:data"]);
+        assert_eq!(access_tags, vec!["team-a"]);
+        assert_eq!(expires_in, Some(3600));
+    }
+
+    #[test]
+    fn admin_api_key_list_and_revoke_parse() {
+        let AdminCommand::ApiKey { command } = parse_admin(&[
+            "api-key",
+            "list",
+            "the-uuid",
+            "--auth-db-uri",
+            "sqlite::memory:",
+        ]) else {
+            panic!("expected ApiKey variant");
+        };
+        match command {
+            AdminApiKeyCommand::List {
+                auth_db_uri,
+                principal_uuid,
+            } => {
+                assert_eq!(auth_db_uri, "sqlite::memory:");
+                assert_eq!(principal_uuid, "the-uuid");
+            }
+            _ => panic!("expected List"),
+        }
+
+        let AdminCommand::ApiKey { command } = parse_admin(&[
+            "api-key",
+            "revoke",
+            "the-uuid",
+            "abcd1234",
+            "--auth-db-uri",
+            "sqlite::memory:",
+        ]) else {
+            panic!("expected ApiKey variant");
+        };
+        match command {
+            AdminApiKeyCommand::Revoke {
+                auth_db_uri,
+                principal_uuid,
+                first_eight,
+            } => {
+                assert_eq!(auth_db_uri, "sqlite::memory:");
+                assert_eq!(principal_uuid, "the-uuid");
+                assert_eq!(first_eight, "abcd1234");
+            }
+            _ => panic!("expected Revoke"),
+        }
+    }
+
+    // cli-w27-P6: the shared create helper (used by both `api-key create` and
+    // `admin api-key create`) persists `--access-tags` as a real tag
+    // restriction. DB-direct against in-memory sqlite.
+    #[tokio::test]
+    async fn create_and_print_api_key_persists_access_tags() {
+        let db = crate::auth::AuthDb::connect("sqlite::memory:")
+            .await
+            .expect("in-memory auth db");
+        db.migrate().await.expect("auth migrate");
+        let p = db.create_principal("user").await.expect("principal");
+
+        // A tag restriction cannot combine with the broad `inherit` /
+        // `admin:apikeys` scopes (enforced by the DB INSERT owner), so pass a
+        // narrow `--scope` alongside the tags.
+        create_and_print_api_key(
+            &db,
+            p.id,
+            Some("tagged".into()),
+            &["read:data".to_string()],
+            &["team-a".to_string(), "team-b".to_string()],
+            None,
+        )
+        .await
+        .expect("create with access tags must succeed under a narrow scope");
+
+        let keys = db.list_api_keys(Some(p.id)).await.expect("list");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(
+            keys[0].access_tags,
+            Some(vec!["team-a".to_string(), "team-b".to_string()]),
+            "the two --access-tags values persist as Some(restriction)"
+        );
+    }
+
+    // Empty `--access-tags` and empty `--scope` ⟹ no tag restriction (None) and
+    // the full scope set. This is the boundary that maps CLI-absence to the
+    // `None` / `full()` defaults, distinct from `Some(vec![])` (deny-all-tagged,
+    // reachable only via REST).
+    #[tokio::test]
+    async fn create_and_print_api_key_no_tags_is_unrestricted() {
+        let db = crate::auth::AuthDb::connect("sqlite::memory:")
+            .await
+            .expect("in-memory auth db");
+        db.migrate().await.expect("auth migrate");
+        let p = db.create_principal("user").await.expect("principal");
+
+        create_and_print_api_key(&db, p.id, None, &[], &[], None)
+            .await
+            .expect("create without tags must succeed");
+
+        let keys = db.list_api_keys(Some(p.id)).await.expect("list");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(
+            keys[0].access_tags, None,
+            "omitted --access-tags ⟹ SQL NULL ⟹ None (no restriction)"
+        );
+        assert_eq!(
+            keys[0].scopes,
+            crate::auth::ScopeSet::full(),
+            "omitted --scope ⟹ full scope set"
+        );
+    }
+
+    // The tag-restriction guard lives at the DB INSERT owner; the helper must
+    // surface it as an error rather than swallow it. Empty scopes ⟹ full
+    // (includes `admin:apikeys`), which cannot combine with a tag restriction,
+    // so this create must fail and persist nothing.
+    #[tokio::test]
+    async fn create_and_print_api_key_rejects_tags_with_broad_scopes() {
+        let db = crate::auth::AuthDb::connect("sqlite::memory:")
+            .await
+            .expect("in-memory auth db");
+        db.migrate().await.expect("auth migrate");
+        let p = db.create_principal("user").await.expect("principal");
+
+        create_and_print_api_key(&db, p.id, None, &[], &["team-a".to_string()], None)
+            .await
+            .expect_err("access tags + full (broad) scopes must be rejected");
+
+        let keys = db.list_api_keys(Some(p.id)).await.expect("list");
+        assert!(
+            keys.is_empty(),
+            "the rejected create must not persist a key"
+        );
     }
 }
