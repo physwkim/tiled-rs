@@ -13,7 +13,12 @@
 use crate::core::queries::AccessBlobFilter;
 use async_trait::async_trait;
 
+pub mod access_tags;
+
 pub use crate::auth::{Principal, Scope, ScopeSet};
+pub use access_tags::{
+    AccessTagsCompiler, AccessTagsError, GroupParser, TagConfig, TagConfigSource, all_scope_names,
+};
 
 /// The built-in always-public tag. A node tagged with this exact string is
 /// world-readable, mirroring Python's `public_tag` (access_policies.py:90,
