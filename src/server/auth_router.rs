@@ -394,7 +394,15 @@ pub struct ApiKeyCreateRequest {
     pub note: Option<String>,
     #[serde(default)]
     pub scopes: Option<Vec<String>>,
-    #[serde(default)]
+    // Canonical Rust spelling is `expires_in_seconds` (an intentional divergence
+    // documented in the Rust client: `src/client/context.rs:951`,
+    // `src/client/admin.rs:105`). The `expires_in` alias also accepts the
+    // upstream python-tiled client's wire field (`tiled/server/schemas.py:449`,
+    // `tiled/client/context.py:883`) so a canonical client's requested expiry is
+    // honored rather than silently dropped into a permanent key. Both the user
+    // route (`api_key_create`) and the admin route
+    // (`admin_create_principal_apikey`) share this struct, so one alias covers both.
+    #[serde(default, alias = "expires_in")]
     pub expires_in_seconds: Option<i64>,
 }
 
