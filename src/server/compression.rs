@@ -50,8 +50,13 @@ pub(crate) async fn apply_encoding(
     let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
         Ok(b) => b,
         // The body stream errored mid-flight and the original bytes are gone;
-        // send an empty body rather than a partial one.
-        Err(_) => return Response::from_parts(parts, Body::empty()),
+        // send an empty body rather than a partial one. Drop the handler's
+        // Content-Length first — keeping it would advertise a length we no
+        // longer deliver, framing the empty body as truncated.
+        Err(_) => {
+            parts.headers.remove(header::CONTENT_LENGTH);
+            return Response::from_parts(parts, Body::empty());
+        }
     };
 
     if body_bytes.len() < MINIMUM_SIZE {
@@ -121,5 +126,39 @@ mod tests {
         assert!(!worth_compressing(1000, 950));
         // Expanded (incompressible + overhead): not worth keeping.
         assert!(!worth_compressing(1000, 1010));
+    }
+
+    /// When the response body stream errors mid-flight, `apply_encoding` sends
+    /// an empty body and must drop the handler's now-false Content-Length so the
+    /// empty body is not framed as a truncated 1600-byte one.
+    #[tokio::test]
+    async fn body_stream_error_drops_stale_content_length() {
+        // A body whose single frame is an error, so `to_bytes` fails.
+        let err_body = Body::from_stream(futures::stream::once(async {
+            Err::<bytes::Bytes, std::io::Error>(std::io::Error::other("boom"))
+        }));
+        let mut response = Response::new(err_body);
+        response
+            .headers_mut()
+            .insert(header::CONTENT_LENGTH, "1600".parse().unwrap());
+
+        // compress must never be called (we bail before it); assert if it is.
+        let out = apply_encoding(response, None, "gzip", |_| {
+            panic!("compress must not run on a body-stream error")
+        })
+        .await;
+
+        assert!(
+            out.headers().get(header::CONTENT_LENGTH).is_none(),
+            "stale Content-Length must be dropped on body error"
+        );
+        assert!(out.headers().get(header::CONTENT_ENCODING).is_none());
+        let bytes = axum::body::to_bytes(out.into_body(), usize::MAX)
+            .await
+            .expect("empty body reads cleanly");
+        assert!(
+            bytes.is_empty(),
+            "body must be empty after the stream error"
+        );
     }
 }
