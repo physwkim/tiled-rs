@@ -264,6 +264,20 @@ impl AppState {
         }
     }
 
+    /// The default value for [`Self::default_login_scopes`] when the operator
+    /// does not narrow it. The **full** scope set, so a login/API key carries
+    /// its principal's full role scopes: `role ∩ default == role` (identity).
+    /// Upstream imposes no global login-scope cap below role scopes — it mints
+    /// the principal's role scopes straight into the session token
+    /// (`"scp": list(role scopes)`, `tiled/server/authentication.py:856`). A
+    /// narrower default (e.g. `read_only()`) silently strips every write/create
+    /// scope even from an admin, contradicting the field's documented intent;
+    /// this is the single source of truth for that default so the CLI wiring
+    /// and the doc cannot drift.
+    pub fn default_login_scopes() -> crate::auth::ScopeSet {
+        crate::auth::ScopeSet::full()
+    }
+
     pub fn resolve_base_url(&self, headers: &axum::http::HeaderMap) -> String {
         self.resolve_base_url_with_peer(headers, None)
     }

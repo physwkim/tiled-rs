@@ -836,7 +836,7 @@ pub async fn run(command: Command) -> Result<()> {
                     .unwrap_or_else(config::default_response_bytesize_limit),
                 streaming_bus: crate::server::streaming::StreamingBus::new(),
                 access_policy: access_policy_value,
-                default_login_scopes: crate::auth::ScopeSet::read_only(),
+                default_login_scopes: crate::server::AppState::default_login_scopes(),
                 enable_web: !no_web,
                 web_assets_dir,
                 spec_views: file_config
