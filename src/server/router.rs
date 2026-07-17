@@ -1730,6 +1730,72 @@ async fn stream_array_data(
         .await;
 }
 
+/// Publish a `table-data` streaming event on the table node's OWN stream
+/// (upstream `CatalogTableAdapter._stream`, catalog/adapter.py:1858-1871).
+/// `partition` is `None` for a whole-table write, the partition index otherwise;
+/// `append` distinguishes a partition append (PATCH) from a replace (PUT). Same
+/// best-effort, catalog-gated contract as [`stream_array_data`].
+async fn stream_table_data(
+    state: &AppState,
+    segments: &[String],
+    media_type: &str,
+    partition: Option<usize>,
+    append: bool,
+    body: bytes::Bytes,
+) {
+    let Some(catalog) = state.catalog.as_ref() else {
+        return;
+    };
+    let Ok(Some(node)) = catalog.lookup(segments).await else {
+        return;
+    };
+    let seq = state.streaming_cache.incr_seq(node.id).await;
+    state
+        .streaming_cache
+        .set(
+            node.id,
+            seq,
+            crate::server::streaming_cache::StreamEvent::table_data(
+                seq, media_type, partition, append, body,
+            ),
+        )
+        .await;
+}
+
+/// Publish a `ragged-data` streaming event on the ragged node's OWN stream
+/// (upstream `CatalogRaggedAdapter._stream`, catalog/adapter.py:1770-1783; the
+/// full-write path inherits `CatalogArrayAdapter.write`, which dispatches to
+/// this overridden `_stream`). `shape` is the ragged structure's shape (variable
+/// axes are `None`); `offset`/`block` describe the written region. Same
+/// best-effort, catalog-gated contract as [`stream_array_data`].
+async fn stream_ragged_data(
+    state: &AppState,
+    segments: &[String],
+    media_type: &str,
+    shape: &[Option<usize>],
+    offset: Option<&[usize]>,
+    block: Option<&[usize]>,
+    body: bytes::Bytes,
+) {
+    let Some(catalog) = state.catalog.as_ref() else {
+        return;
+    };
+    let Ok(Some(node)) = catalog.lookup(segments).await else {
+        return;
+    };
+    let seq = state.streaming_cache.incr_seq(node.id).await;
+    state
+        .streaming_cache
+        .set(
+            node.id,
+            seq,
+            crate::server::streaming_cache::StreamEvent::ragged_data(
+                seq, media_type, shape, offset, block, body,
+            ),
+        )
+        .await;
+}
+
 pub async fn array_patch(
     State(state): State<AppState>,
     OriginalUri(uri): OriginalUri,
@@ -4033,11 +4099,26 @@ pub async fn ragged_full_put(
         .as_writable()
         .expect("resolve_writable_ragged guarantees a writable face");
 
-    // Python streams unconditionally then skips the write when !persist; the
-    // Rust bus only signals "data changed", so with !persist nothing changed
-    // and we neither deserialize nor publish.
+    // Stream the whole-ragged write BEFORE the persist branch — upstream's
+    // inherited `write` calls `_stream` ahead of `if not persist: return`
+    // (catalog/adapter.py:1665-1669, dispatching the ragged `_stream` override
+    // :1770), so a stream-only write still reaches subscribers. `shape` is the
+    // structure's shape (variable axes `None`); the body is the raw request
+    // encoding and `media_type` its Content-Type.
+    let media_type = content_type_of(&headers);
+    stream_ragged_data(
+        &state,
+        &segments,
+        &media_type,
+        &ragged.structure().shape,
+        None,
+        None,
+        body.clone(),
+    )
+    .await;
+
     if persist {
-        let data = deserialize_ragged_body(&content_type_of(&headers), &body)?;
+        let data = deserialize_ragged_body(&media_type, &body)?;
         writable.write(&data).await.map_err(ServerError::from)?;
     }
     Ok(Json(serde_json::json!({ "ok": true })))
@@ -4079,8 +4160,24 @@ pub async fn ragged_block_put(
         .as_writable()
         .expect("resolve_writable_ragged guarantees a writable face");
 
+    // Stream the block write BEFORE the persist branch — upstream `write_block`
+    // calls `_stream` ahead of `if not persist: return`
+    // (catalog/adapter.py:1785-1795), carrying the full structure shape (ragged
+    // blocks have variable axes, so no per-block shape) and the block coordinate.
+    let media_type = content_type_of(&headers);
+    stream_ragged_data(
+        &state,
+        &segments,
+        &media_type,
+        &ragged.structure().shape,
+        None,
+        Some(&block),
+        body.clone(),
+    )
+    .await;
+
     if persist {
-        let data = deserialize_ragged_body(&content_type_of(&headers), &body)?;
+        let data = deserialize_ragged_body(&media_type, &body)?;
         writable
             .write_block(&data, chunk_index)
             .await
@@ -4114,10 +4211,9 @@ pub async fn ragged_full_patch(
         ));
     }
     // `?shape=` and `?offset=` are required query params (Python `shape_param`
-    // / `offset_param`). `shape` feeds Python's streaming metadata only, which
-    // this port does not maintain, so it is validated for parity but unused;
-    // `offset` drives the append.
-    let _shape =
+    // / `offset_param`). `shape` is the incoming block's shape (streamed as the
+    // `ragged-data` metadata), `offset` where it lands (drives the append).
+    let shape =
         parse_csv_usize(params.get("shape").ok_or_else(|| {
             ServerError::BadRequest("ragged patch requires a ?shape= param".into())
         })?)?;
@@ -4138,6 +4234,23 @@ pub async fn ragged_full_patch(
         .as_writable()
         .expect("resolve_writable_ragged guarantees a writable face");
 
+    // Stream the incoming block BEFORE the persist branch — upstream `patch`
+    // calls `_stream` ahead of `if not persist: return`
+    // (catalog/adapter.py:1802-1807), so a stream-only patch still reaches
+    // subscribers. The `?shape=` axes are concrete (query-param ints).
+    let media_type = content_type_of(&headers);
+    let shape_opt: Vec<Option<usize>> = shape.iter().map(|&d| Some(d)).collect();
+    stream_ragged_data(
+        &state,
+        &segments,
+        &media_type,
+        &shape_opt,
+        Some(&offset),
+        None,
+        body.clone(),
+    )
+    .await;
+
     // !persist: return the current structure unchanged, no write (Python
     // patch_ragged_full returns entry.structure() before deserializing).
     if !persist {
@@ -4146,7 +4259,7 @@ pub async fn ragged_full_patch(
         return Ok(Json(structure_json));
     }
 
-    let data = deserialize_ragged_body(&content_type_of(&headers), &body)?;
+    let data = deserialize_ragged_body(&media_type, &body)?;
     let new_structure = writable
         .patch(&data, &offset, extend)
         .await
@@ -4937,6 +5050,18 @@ pub async fn table_full_put(
 
     writable.write(table).await.map_err(ServerError::from)?;
 
+    // Stream the whole-table write on the table node's own stream. The wire
+    // encoding is Arrow IPC; `partition=None`/`append=false` mark a full replace.
+    stream_table_data(
+        &state,
+        &segments,
+        crate::core::media_type::mime::ARROW_FILE,
+        None,
+        false,
+        body,
+    )
+    .await;
+
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -5032,6 +5157,17 @@ pub async fn table_partition_put(
         .await
         .map_err(ServerError::from)?;
 
+    // Stream the partition replace (Arrow IPC; `append=false`).
+    stream_table_data(
+        &state,
+        &segments,
+        crate::core::media_type::mime::ARROW_FILE,
+        Some(partition),
+        false,
+        body,
+    )
+    .await;
+
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -5087,6 +5223,18 @@ pub async fn table_partition_patch(
         .append_partition(table, partition)
         .await
         .map_err(ServerError::from)?;
+
+    // Stream the partition append (Arrow IPC; `append=true` — the append flag is
+    // set only on this PATCH path, distinguishing it from a PUT replace).
+    stream_table_data(
+        &state,
+        &segments,
+        crate::core::media_type::mime::ARROW_FILE,
+        Some(partition),
+        true,
+        body,
+    )
+    .await;
 
     Ok(Json(serde_json::json!({ "ok": true })))
 }
