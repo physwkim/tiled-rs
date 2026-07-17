@@ -78,6 +78,7 @@ async fn build_write_app() -> (axum::Router, tempfile::TempDir, tempfile::TempDi
         web_assets_dir: None,
         spec_views: Vec::new(),
         webhook_config: None,
+        webhook_dispatcher: None,
         request_timeout_secs: 30,
         expose_raw_assets: true,
         exact_count_limit: u64::MAX,

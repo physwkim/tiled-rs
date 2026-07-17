@@ -895,6 +895,8 @@ pub async fn run(command: Command) -> Result<()> {
                 // Move catalog_handle's presence check before AppState consumes
                 // it; otherwise the borrow-after-move check fires.
                 webhook_config: webhook_config_value,
+                // Populated by `build_app` when webhooks are enabled.
+                webhook_dispatcher: None,
                 request_timeout_secs: file_config
                     .as_ref()
                     .map(|c| c.request_timeout_secs)
