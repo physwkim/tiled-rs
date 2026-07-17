@@ -13,7 +13,7 @@ use url::Url;
 use crate::client::base::{BaseClient, Item, ParsedStructure};
 use crate::client::context::Context;
 use crate::client::error::{ClientError, Result};
-use crate::client::utils::{decode_response, retry};
+use crate::client::utils::{decode_response, resolve_export_format, retry};
 
 /// The ragged write content-type — the Awkward zipped-buffers form
 /// (`tiled/serialization/ragged.py:90-111`).
@@ -169,5 +169,29 @@ impl RaggedClient {
             })
         })
         .await
+    }
+
+    /// Export the whole ragged array to a file at `dest`, mirroring Python
+    /// `RaggedClient.export` (`client/ragged.py:222`): sends
+    /// `GET /api/v1/ragged/full/{path}?format=<fmt>` and streams the response
+    /// bytes to `dest`.
+    ///
+    /// `format` is resolved by the shared `resolve_export_format` helper:
+    /// `Some(fmt)` is used as given with a single leading `.` stripped, while
+    /// `None` infers the format from `dest`'s file extension. The ragged `full`
+    /// route serves the list-of-lists (`json` / `application/json`, or the zipped
+    /// buffers via `zip`); an unsupported format surfaces as a mapped server error
+    /// (`406`). Unlike Python this does not accept a `slice` filter — the Rust
+    /// client exports the whole array, the same shape as
+    /// [`ArrayClient::export`](crate::client::array::ArrayClient::export).
+    pub async fn export(&self, dest: &std::path::Path, format: Option<&str>) -> Result<()> {
+        let resolved = resolve_export_format(dest, format)?;
+        let link = self.base.require_link("full")?;
+        let mut url = Url::parse(link)?;
+        url.query_pairs_mut().append_pair("format", &resolved);
+        let _permit = self.base.context.data_fetch_permit().await;
+        let bytes = retry(|| async { self.base.context.get_bytes(&url, "*/*").await }).await?;
+        std::fs::write(dest, &bytes)
+            .map_err(|e| ClientError::Invalid(format!("write {}: {e}", dest.display())))
     }
 }

@@ -11,7 +11,7 @@ use url::Url;
 use crate::client::base::{BaseClient, Item, ParsedStructure};
 use crate::client::context::Context;
 use crate::client::error::{ClientError, Result};
-use crate::client::utils::{OCTET_STREAM_MIME_TYPE, retry};
+use crate::client::utils::{OCTET_STREAM_MIME_TYPE, resolve_export_format, retry};
 
 /// Buffers fetched via `links.buffers`.
 ///
@@ -136,6 +136,30 @@ impl AwkwardClient {
                 .map(|_| ())
         })
         .await
+    }
+
+    /// Export the whole awkward array to a file at `dest`, mirroring Python
+    /// `AwkwardClient.export` (`client/awkward.py:81`): sends
+    /// `GET /api/v1/awkward/full/{path}?format=<fmt>` and streams the response
+    /// bytes to `dest`.
+    ///
+    /// `format` is resolved by the shared `resolve_export_format` helper:
+    /// `Some(fmt)` is used as given with a single leading `.` stripped, while
+    /// `None` infers the format from `dest`'s file extension. The awkward `full`
+    /// route serves the zipped buffer archive (`zip` / `application/zip`); an
+    /// unsupported format surfaces as a mapped server error (`406`). Unlike Python
+    /// this does not accept a `slice` filter — the Rust client exports the whole
+    /// array, the same shape as
+    /// [`ArrayClient::export`](crate::client::array::ArrayClient::export).
+    pub async fn export(&self, dest: &std::path::Path, format: Option<&str>) -> Result<()> {
+        let resolved = resolve_export_format(dest, format)?;
+        let link = self.base.require_link("full")?;
+        let mut url = Url::parse(link)?;
+        url.query_pairs_mut().append_pair("format", &resolved);
+        let _permit = self.base.context.data_fetch_permit().await;
+        let bytes = retry(|| async { self.base.context.get_bytes(&url, "*/*").await }).await?;
+        std::fs::write(dest, &bytes)
+            .map_err(|e| ClientError::Invalid(format!("write {}: {e}", dest.display())))
     }
 }
 

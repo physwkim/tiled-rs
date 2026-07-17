@@ -2097,6 +2097,171 @@ async fn container_export_to_zip() {
     assert!(!bad.exists(), "no file written when the request fails");
 }
 
+/// `AwkwardClient::export` GETs `/awkward/full?format=<fmt>` and writes the
+/// zipped buffer archive to a file. Same test shape as the array/container
+/// export: explicit media type, inferred-from-extension, and an unknown-format
+/// error. The `ak` node is pre-seeded with one `node0-data` buffer of 3 float64
+/// values.
+#[tokio::test]
+async fn awkward_export_to_file() {
+    let base = spawn_server_with_root(build_awkward_root(), None).await;
+    let root = from_uri(&base).await.unwrap().into_container().unwrap();
+    let ak = root.get("ak").await.unwrap().into_awkward().unwrap();
+
+    let out = tempfile::tempdir().unwrap();
+
+    // 1. Explicit media type: the zipped buffer archive (a ZIP begins with "PK").
+    let explicit = out.path().join("explicit.zip");
+    ak.export(&explicit, Some("application/zip"))
+        .await
+        .expect("export application/zip");
+    assert!(
+        std::fs::read(&explicit).unwrap().starts_with(b"PK"),
+        "awkward export is a ZIP archive"
+    );
+
+    // 2. Format inferred from the `.zip` extension (format = None).
+    let inferred = out.path().join("buffers.zip");
+    ak.export(&inferred, None)
+        .await
+        .expect("export inferred zip");
+    assert!(
+        std::fs::read(&inferred).unwrap().starts_with(b"PK"),
+        "inferred zip export is a ZIP archive"
+    );
+
+    // 3. Unknown format → mapped server error; nothing is written through.
+    let bad = out.path().join("bad.zip");
+    let err = ak.export(&bad, Some("bogus")).await;
+    assert!(err.is_err(), "unknown format maps to an error, got {err:?}");
+    assert!(!bad.exists(), "no file written when the request fails");
+}
+
+/// `SparseClient::export` GETs `/array/full?format=<fmt>` and writes the
+/// serialized COO frame to a file. Same test shape as the array/container
+/// export. The node is seeded via `write_sparse` with (0,1)=1.5, (2,0)=3.7.
+#[tokio::test]
+async fn sparse_export_to_file() {
+    use tiled_rs::core::dtype::{BuiltinDType, DType, Endianness, Kind};
+    use tiled_rs::core::structures::SparseStructure;
+
+    let (base, _wd, _db) = spawn_write_server().await;
+    let root = from_uri(&base).await.unwrap().into_container().unwrap();
+
+    let structure = SparseStructure {
+        chunks: vec![vec![3], vec![3]],
+        shape: vec![3, 3],
+        data_type: Some(DType::Builtin(BuiltinDType::new(
+            Endianness::Little,
+            Kind::Float,
+            8,
+        ))),
+        ..Default::default()
+    };
+    let sc = root
+        .write_sparse(
+            Some("exp_sparse"),
+            structure,
+            (&[vec![0, 2], vec![1, 0]], &[1.5, 3.7]),
+            serde_json::json!({}),
+            vec![],
+            None,
+        )
+        .await
+        .expect("write_sparse");
+
+    let out = tempfile::tempdir().unwrap();
+
+    // 1. Explicit media type: the JSON column-dict {dim0, dim1, data}.
+    let explicit = out.path().join("explicit.json");
+    sc.export(&explicit, Some("application/json"))
+        .await
+        .expect("export application/json");
+    let json = std::fs::read_to_string(&explicit).unwrap();
+    assert!(
+        json.contains("data") && json.contains("1.5") && json.contains("3.7"),
+        "sparse json export holds the COO frame: {json:?}"
+    );
+
+    // 2. Format inferred from the `.json` extension (format = None).
+    let inferred = out.path().join("coo.json");
+    sc.export(&inferred, None)
+        .await
+        .expect("export inferred json");
+    assert!(
+        std::fs::read_to_string(&inferred).unwrap().contains("3.7"),
+        "inferred json export holds the data"
+    );
+
+    // 3. Unknown format → mapped server error; nothing is written through.
+    let bad = out.path().join("bad.json");
+    let err = sc.export(&bad, Some("bogus")).await;
+    assert!(err.is_err(), "unknown format maps to an error, got {err:?}");
+    assert!(!bad.exists(), "no file written when the request fails");
+}
+
+/// `RaggedClient::export` GETs `/ragged/full?format=<fmt>` and writes the
+/// serialized list-of-lists to a file. Same test shape as the array/container
+/// export. The node is seeded via `write_ragged` with `[[1, 2, 3], [4]]`.
+#[tokio::test]
+async fn ragged_export_to_file() {
+    use tiled_rs::core::dtype::{BuiltinDType, DType, Endianness, Kind};
+    use tiled_rs::core::structures::RaggedStructure;
+
+    let (base, _wd, _db) = spawn_write_server().await;
+    let root = from_uri(&base).await.unwrap().into_container().unwrap();
+
+    // One chunk of 2 rows; 4 leaf elements total ([1,2,3] + [4]).
+    let structure = RaggedStructure {
+        data_type: DType::Builtin(BuiltinDType::new(Endianness::Little, Kind::Integer, 8)),
+        shape: vec![Some(2), None],
+        size: 4,
+        chunks: vec![Some(vec![2]), None],
+        dims: None,
+        resizable: Default::default(),
+    };
+    let data = serde_json::json!([[1, 2, 3], [4]]);
+    let rag = root
+        .write_ragged(
+            Some("exp_ragged"),
+            structure,
+            &data,
+            serde_json::json!({}),
+            vec![],
+            None,
+        )
+        .await
+        .expect("write_ragged");
+
+    let out = tempfile::tempdir().unwrap();
+
+    // 1. Explicit media type: the list-of-lists round-trips exactly.
+    let explicit = out.path().join("explicit.json");
+    rag.export(&explicit, Some("application/json"))
+        .await
+        .expect("export application/json");
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&explicit).unwrap()).unwrap();
+    assert_eq!(
+        v,
+        serde_json::json!([[1, 2, 3], [4]]),
+        "ragged json export round-trips the rows"
+    );
+
+    // 2. Format inferred from the `.json` extension (format = None).
+    let inferred = out.path().join("rows.json");
+    rag.export(&inferred, None)
+        .await
+        .expect("export inferred json");
+    let v2: serde_json::Value = serde_json::from_slice(&std::fs::read(&inferred).unwrap()).unwrap();
+    assert_eq!(v2, serde_json::json!([[1, 2, 3], [4]]));
+
+    // 3. Unknown format → mapped server error; nothing is written through.
+    let bad = out.path().join("bad.json");
+    let err = rag.export(&bad, Some("bogus")).await;
+    assert!(err.is_err(), "unknown format maps to an error, got {err:?}");
+    assert!(!bad.exists(), "no file written when the request fails");
+}
+
 // ---------------------------------------------------------------------------
 // Blosc2 content-encoding tests
 // ---------------------------------------------------------------------------
