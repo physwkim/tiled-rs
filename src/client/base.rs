@@ -10,6 +10,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use futures::StreamExt;
 use serde::Deserialize;
 use url::Url;
 
@@ -805,32 +806,53 @@ impl BaseClient {
         Ok(out)
     }
 
-    /// Download the raw assets backing this node into `dest_dir`, returning the
-    /// paths written (in download order).
+    /// Download the raw assets backing this node — to disk or into an in-memory
+    /// map — returning the delivered paths or keyed bytes.
     ///
     /// Mirrors Python `BaseClient.raw_export` (`base.py:380`): it refuses a node
     /// backed by more than one data source
     /// (["Export of multiple data sources not yet supported"]), and for the
-    /// single data source writes each asset — a single-file asset as one file,
+    /// single data source downloads each asset — a single-file asset as one file,
     /// a directory asset as its manifest walk, each file fetched with its
-    /// `relative_path` and written preserving the relative layout. When the data
-    /// source has exactly one asset the files land directly under `dest_dir`;
-    /// when it has several, each asset is namespaced under `dest_dir/{asset id}`
-    /// (matching upstream's `Path(destination, str(asset.id))`).
+    /// `relative_path`. When the data source has exactly one asset the files are
+    /// named directly; when it has several, each asset is namespaced under its id
+    /// (matching upstream's `Path(destination, str(asset.id))` /
+    /// `f"{asset.id}/{...}"`).
     ///
-    /// A single-file asset's on-disk name is the basename of its `file://`
-    /// `data_uri`, which is exactly the `Content-Disposition` attachment
-    /// filename the server sends (upstream writes to that header via
-    /// `ATTACHMENT_FILENAME_PLACEHOLDER`; deriving it locally avoids a
-    /// dependency on response headers, which [`Context::get_bytes`] discards).
+    /// [`ExportDestination::Directory`] writes each asset to disk under that
+    /// directory, preserving the relative layout, and returns
+    /// [`ExportOutput::Paths`] (the written paths, in download-submission order).
+    /// [`ExportDestination::Memory`] holds each asset in memory and returns
+    /// [`ExportOutput::Memory`], a map from posix-style relative-path key to
+    /// bytes — upstream's `destination=<MutableMapping>` sink. The two sinks
+    /// deliver identical bytes for the same node.
     ///
-    /// Deviation from upstream: downloads run sequentially — the `max_workers`
-    /// parallelism is not reproduced (parity does not depend on it, and no
-    /// progress callback is invented). The data sources are resolved through
-    /// [`data_sources`](Self::data_sources), which lazily fetches them (with
-    /// their asset ids) when this client was not built with
+    /// A single-file asset's name is the basename of its `file://` `data_uri`,
+    /// which is exactly the `Content-Disposition` attachment filename the server
+    /// sends (upstream writes to that header via `ATTACHMENT_FILENAME_PLACEHOLDER`;
+    /// deriving it locally avoids a dependency on response headers, which
+    /// [`Context::get_bytes`] discards).
+    ///
+    /// `max_workers` bounds how many assets download concurrently, matching
+    /// upstream's `ThreadPoolExecutor(max_workers)` (`download.py:154`); results
+    /// stay in submission order regardless. A value of 0 is clamped to 1 (a
+    /// zero-width pool cannot make progress; upstream's executor likewise rejects
+    /// 0). The first failing download surfaces its error while the remaining
+    /// in-flight and queued downloads are cancelled — the pool never hangs.
+    ///
+    /// Deviation from upstream: the `rich` progress bar and its SIGINT-cancel
+    /// (`download.py`) are not reproduced — porting them would add a display
+    /// dependency and an interactive concern this library layer does not own, and
+    /// no progress callback is invented in their place. Bounded parallelism and
+    /// the two sinks are the behavioral pieces ported. The data sources are
+    /// resolved through [`data_sources`](Self::data_sources), which lazily fetches
+    /// them (with their asset ids) when this client was not built with
     /// `include_data_sources=true`.
-    pub async fn raw_export(&self, dest_dir: &Path) -> Result<Vec<PathBuf>> {
+    pub async fn raw_export(
+        &self,
+        destination: ExportDestination,
+        max_workers: usize,
+    ) -> Result<ExportOutput> {
         let data_sources = self.data_sources().await?.unwrap_or_default();
         // Upstream guard (base.py:435): a node backed by anything other than
         // exactly one data source is refused (0 or >1 both hit this).
@@ -841,35 +863,161 @@ impl BaseClient {
         }
         let manifest_link = self.asset_manifest_link()?;
         let bytes_link = self.asset_bytes_link()?;
-        let mut written = Vec::new();
+
+        // Flatten the node's assets into one download job per file, preserving
+        // upstream's submission order (base.py:456-489). Each job carries the
+        // asset + `relative_path` needed to fetch its bytes and the posix-style
+        // key naming the result (upstream's `targets`): bare for a lone asset,
+        // else namespaced `{asset id}/…` when several assets back the node.
+        let mut jobs: Vec<ExportJob<'_>> = Vec::new();
         for ds in &data_sources {
-            // Single asset → files land directly in `dest_dir`; several assets →
-            // namespace each by its id (base.py:444-451).
             let namespace_by_id = ds.assets.len() != 1;
             for asset in &ds.assets {
-                let base = if namespace_by_id {
-                    dest_dir.join(require_asset_id(asset)?.to_string())
+                let namespace = if namespace_by_id {
+                    Some(require_asset_id(asset)?.to_string())
                 } else {
-                    dest_dir.to_path_buf()
+                    None
                 };
                 if asset.is_directory {
                     for rel in self.fetch_manifest(&manifest_link, asset).await? {
-                        let bytes = self
-                            .fetch_asset_bytes(&bytes_link, asset, Some(&rel))
-                            .await?;
-                        let target = base.join(&rel);
-                        write_asset_file(&target, &bytes).await?;
-                        written.push(target);
+                        let key = join_export_key(namespace.as_deref(), &rel);
+                        jobs.push(ExportJob {
+                            asset,
+                            relative_path: Some(rel),
+                            key,
+                        });
                     }
                 } else {
-                    let bytes = self.fetch_asset_bytes(&bytes_link, asset, None).await?;
-                    let target = base.join(single_file_name(asset)?);
-                    write_asset_file(&target, &bytes).await?;
-                    written.push(target);
+                    let key = join_export_key(namespace.as_deref(), &single_file_name(asset)?);
+                    jobs.push(ExportJob {
+                        asset,
+                        relative_path: None,
+                        key,
+                    });
                 }
             }
         }
-        Ok(written)
+
+        // Download with bounded parallelism. `buffered(n)` drives up to `n`
+        // futures at once and yields their results in submission order —
+        // upstream's `ThreadPoolExecutor(max_workers)` plus its submission-order
+        // result list (`download.py:154-173`).
+        let workers = max_workers.max(1);
+        let to_memory = matches!(destination, ExportDestination::Memory);
+        let mut stream = futures::stream::iter(jobs.into_iter().map(|job| {
+            let bytes_link = bytes_link.as_str();
+            let destination = &destination;
+            async move {
+                let bytes = self
+                    .fetch_asset_bytes(bytes_link, job.asset, job.relative_path.as_deref())
+                    .await?;
+                match destination {
+                    ExportDestination::Directory(dir) => {
+                        let target = dir.join(&job.key);
+                        write_asset_file(&target, &bytes).await?;
+                        Ok::<ExportItem, ClientError>(ExportItem::Path(target))
+                    }
+                    ExportDestination::Memory => Ok(ExportItem::Entry(job.key, bytes)),
+                }
+            }
+        }))
+        .buffered(workers);
+
+        let mut paths = Vec::new();
+        let mut map = BTreeMap::new();
+        // The first failing download propagates here; dropping `stream` cancels
+        // the remaining in-flight and queued downloads, so the pool never hangs.
+        while let Some(item) = stream.next().await {
+            match item? {
+                ExportItem::Path(p) => paths.push(p),
+                ExportItem::Entry(k, v) => {
+                    map.insert(k, v);
+                }
+            }
+        }
+        Ok(if to_memory {
+            ExportOutput::Memory(map)
+        } else {
+            ExportOutput::Paths(paths)
+        })
+    }
+}
+
+/// Where [`BaseClient::raw_export`] delivers the downloaded asset bytes.
+///
+/// Mirrors upstream's `destination` argument (`base.py:380`), which is either a
+/// filesystem path or an in-memory `MutableMapping`.
+#[derive(Debug, Clone)]
+pub enum ExportDestination {
+    /// Write each asset to disk under this directory, reproducing its relative
+    /// layout. [`BaseClient::raw_export`] returns [`ExportOutput::Paths`].
+    Directory(PathBuf),
+    /// Collect each asset in memory instead of touching disk.
+    /// [`BaseClient::raw_export`] returns [`ExportOutput::Memory`], keyed by the
+    /// asset's posix-style relative path.
+    Memory,
+}
+
+/// The assets delivered by a [`BaseClient::raw_export`], shaped by the
+/// [`ExportDestination`] that produced it.
+///
+/// Mirrors upstream's `List[Path]` (disk) versus populated `MutableMapping`
+/// (in-memory) return values.
+#[derive(Debug, Clone)]
+pub enum ExportOutput {
+    /// Paths written to disk, in download-submission order — from
+    /// [`ExportDestination::Directory`].
+    Paths(Vec<PathBuf>),
+    /// In-memory asset bytes keyed by their posix-style relative path — from
+    /// [`ExportDestination::Memory`].
+    Memory(BTreeMap<String, bytes::Bytes>),
+}
+
+impl ExportOutput {
+    /// The paths written to disk, for a [`ExportDestination::Directory`] export;
+    /// `None` when this came from an in-memory export.
+    pub fn into_paths(self) -> Option<Vec<PathBuf>> {
+        match self {
+            Self::Paths(paths) => Some(paths),
+            Self::Memory(_) => None,
+        }
+    }
+
+    /// The in-memory asset map, for a [`ExportDestination::Memory`] export;
+    /// `None` when this came from a directory export.
+    pub fn into_memory(self) -> Option<BTreeMap<String, bytes::Bytes>> {
+        match self {
+            Self::Memory(map) => Some(map),
+            Self::Paths(_) => None,
+        }
+    }
+}
+
+/// One flattened download job in [`BaseClient::raw_export`]: the asset (and, for
+/// a directory asset, the `relative_path` within it) to fetch, plus the
+/// posix-style key naming the delivered bytes.
+struct ExportJob<'a> {
+    asset: &'a Asset,
+    relative_path: Option<String>,
+    key: String,
+}
+
+/// The outcome of one [`ExportJob`], discriminated by the active
+/// [`ExportDestination`]: a path written to disk, or a keyed byte payload held in
+/// memory.
+enum ExportItem {
+    Path(PathBuf),
+    Entry(String, bytes::Bytes),
+}
+
+/// Join an optional asset-id namespace with a relative name into a posix-style
+/// export key (`{namespace}/{name}`, or bare `{name}` when unnamespaced),
+/// matching upstream's `f"{base}/{rp}"` / `Path(base, rp)` construction
+/// (`base.py:461-489`).
+fn join_export_key(namespace: Option<&str>, name: &str) -> String {
+    match namespace {
+        Some(ns) => format!("{ns}/{name}"),
+        None => name.to_string(),
     }
 }
 
@@ -1240,6 +1388,16 @@ mod tests {
             single_file_name(&asset("file:///data/my%20scan.h5", Some(1))).unwrap(),
             "my scan.h5"
         );
+    }
+
+    #[test]
+    fn join_export_key_namespaces_only_when_present() {
+        // No namespace (lone asset) → bare name; a namespace (several assets) →
+        // `{namespace}/{name}`, posix-separated regardless of platform.
+        assert_eq!(join_export_key(None, "scan.h5"), "scan.h5");
+        assert_eq!(join_export_key(None, "sub/b.txt"), "sub/b.txt");
+        assert_eq!(join_export_key(Some("7"), "scan.h5"), "7/scan.h5");
+        assert_eq!(join_export_key(Some("7"), "sub/b.txt"), "7/sub/b.txt");
     }
 
     #[test]

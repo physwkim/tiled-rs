@@ -20,7 +20,9 @@ use tokio::net::TcpListener;
 use tiled_rs::catalog::adapter::UnresolvedLeaf;
 use tiled_rs::catalog::data_source::{AssetSpec, DataSourceSpec};
 use tiled_rs::catalog::{Catalog, CatalogAdapter, RegisterRequest};
-use tiled_rs::client::{ClientError, ContextOptions, from_uri, from_uri_with_options};
+use tiled_rs::client::{
+    ClientError, ContextOptions, ExportDestination, from_uri, from_uri_with_options,
+};
 use tiled_rs::core::adapters::ContainerAdapter;
 use tiled_rs::core::queries::Query;
 
@@ -157,6 +159,74 @@ async fn add_two_source_node(cat: &Catalog, key: &str, uri_a: &str, uri_b: &str)
         .unwrap();
 }
 
+/// A `DataSourceSpec` for one external data source backed by *two* single-file
+/// assets (the namespace-by-id `raw_export` path: `len(assets) != 1`). The two
+/// assets share a list-valued `parameter` and are ordered by `num`.
+fn two_file_asset_source(uri_a: &str, uri_b: &str) -> DataSourceSpec {
+    DataSourceSpec {
+        structure_family: "array".into(),
+        structure: json!({
+            "shape": [10],
+            "data_type": {"endianness": "little", "kind": "f", "itemsize": 8},
+            "chunks": [[10]],
+        }),
+        mimetype: "application/x-hdf5".into(),
+        parameters: json!({}),
+        management: "external".into(),
+        assets: vec![
+            AssetSpec {
+                data_uri: uri_a.into(),
+                is_directory: false,
+                parameter: "data_uris".into(),
+                num: Some(0),
+            },
+            AssetSpec {
+                data_uri: uri_b.into(),
+                is_directory: false,
+                parameter: "data_uris".into(),
+                num: Some(1),
+            },
+        ],
+    }
+}
+
+/// Register a root array node `key` carrying one external data source with two
+/// single-file assets (a multi-asset node, namespaced by asset id on export).
+async fn add_two_asset_node(cat: &Catalog, key: &str, uri_a: &str, uri_b: &str) {
+    let node = cat
+        .create_node(
+            None,
+            vec![],
+            RegisterRequest {
+                key: key.into(),
+                structure_family: "array".into(),
+                metadata: json!({}),
+                specs: json!([]),
+                access_blob: json!({}),
+            },
+        )
+        .await
+        .unwrap();
+    cat.create_data_source(node.id, two_file_asset_source(uri_a, uri_b))
+        .await
+        .unwrap();
+}
+
+/// A temp directory seeded with `files` (relative posix path → contents). The
+/// directory is registered as a single directory asset whose manifest lists
+/// every file, giving one download job per file.
+fn make_dir(files: &[(&str, &[u8])]) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    for (rel, contents) in files {
+        let target = dir.path().join(rel);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&target, contents).unwrap();
+    }
+    dir
+}
+
 fn file_uri(path: &std::path::Path) -> String {
     tiled_rs::core::file_uri::path_to_file_uri(path).unwrap()
 }
@@ -224,9 +294,11 @@ async fn raw_export_single_file_writes_named_file() {
     let dest = tempfile::tempdir().unwrap();
     let written = node_base(&base, "frame")
         .await
-        .raw_export(dest.path())
+        .raw_export(ExportDestination::Directory(dest.path().to_path_buf()), 4)
         .await
-        .unwrap();
+        .unwrap()
+        .into_paths()
+        .expect("directory export returns paths");
 
     // Single asset → the file lands directly under dest, named after the
     // data_uri basename (== the server's Content-Disposition filename).
@@ -247,9 +319,11 @@ async fn raw_export_directory_writes_relative_layout() {
     let dest = tempfile::tempdir().unwrap();
     let written = node_base(&base, "frames")
         .await
-        .raw_export(dest.path())
+        .raw_export(ExportDestination::Directory(dest.path().to_path_buf()), 4)
         .await
-        .unwrap();
+        .unwrap()
+        .into_paths()
+        .expect("directory export returns paths");
 
     // Single asset → files land directly under dest, preserving the relative
     // layout of the manifest (nested `sub/` recreated).
@@ -268,7 +342,7 @@ async fn raw_export_refuses_multiple_data_sources() {
     let dest = tempfile::tempdir().unwrap();
     let err = node_base(&base, "multi")
         .await
-        .raw_export(dest.path())
+        .raw_export(ExportDestination::Directory(dest.path().to_path_buf()), 4)
         .await
         .unwrap_err();
     match err {
@@ -314,9 +388,11 @@ async fn asset_accessors_lazily_fetch_without_include_data_sources() {
     // raw_export likewise succeeds and writes the file's bytes.
     let dest = tempfile::tempdir().unwrap();
     let written = base_client
-        .raw_export(dest.path())
+        .raw_export(ExportDestination::Directory(dest.path().to_path_buf()), 4)
         .await
-        .expect("raw_export must lazily fetch data sources");
+        .expect("raw_export must lazily fetch data sources")
+        .into_paths()
+        .expect("directory export returns paths");
     let expected = dest.path().join("scan.h5");
     assert_eq!(written, vec![expected.clone()]);
     assert_eq!(std::fs::read(&expected).unwrap(), payload);
@@ -395,5 +471,199 @@ async fn data_sources_none_for_node_without_sources() {
             .expect("eager root data_sources"),
         None,
         "a container node reports no data sources (eager)"
+    );
+}
+
+// --- parallel + in-memory raw_export boundary cases -------------------------
+
+#[tokio::test]
+async fn raw_export_parallel_downloads_every_asset_once() {
+    // A directory asset with several files → one download job per file. With
+    // `max_workers > 1` they download concurrently; every file must land exactly
+    // once (one distinct path each), with its exact bytes.
+    let (base, cat, _db) = spawn_catalog_server().await;
+    let files: &[(&str, &[u8])] = &[
+        ("f0.bin", b"zero"),
+        ("f1.bin", b"one-1"),
+        ("f2.bin", b"two-22"),
+        ("sub/f3.bin", b"three-333"),
+        ("sub/deep/f4.bin", b"four-4444"),
+    ];
+    let dir = make_dir(files);
+    add_asset(&cat, "frames", &file_uri(dir.path()), true).await;
+
+    let dest = tempfile::tempdir().unwrap();
+    let written = node_base(&base, "frames")
+        .await
+        .raw_export(ExportDestination::Directory(dest.path().to_path_buf()), 4)
+        .await
+        .unwrap()
+        .into_paths()
+        .expect("directory export returns paths");
+
+    // Exactly one path per file, all distinct → each asset downloaded once.
+    assert_eq!(written.len(), files.len());
+    let distinct: std::collections::BTreeSet<_> = written.iter().cloned().collect();
+    assert_eq!(distinct.len(), files.len(), "no path written twice");
+    for &(rel, contents) in files {
+        let path = dest.path().join(rel);
+        assert!(written.contains(&path), "missing {rel} in {written:?}");
+        assert_eq!(
+            std::fs::read(&path).unwrap().as_slice(),
+            contents,
+            "bytes for {rel}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn raw_export_failing_asset_surfaces_error_without_hanging() {
+    // One data source with two single-file assets (namespaced path): the first
+    // exists, the second's backing file is deleted before export so its byte
+    // fetch fails. The failure must surface as an error, and the pool must
+    // return promptly rather than hang — asserted via a bounded timeout.
+    let (base, cat, _db) = spawn_catalog_server().await;
+
+    let live_dir = tempfile::tempdir().unwrap();
+    let live = live_dir.path().join("present.bin");
+    std::fs::write(&live, b"i am here").unwrap();
+
+    let gone_dir = tempfile::tempdir().unwrap();
+    let gone = gone_dir.path().join("absent.bin");
+    std::fs::write(&gone, b"deleted soon").unwrap();
+    let gone_uri = file_uri(&gone);
+    std::fs::remove_file(&gone).unwrap();
+
+    add_two_asset_node(&cat, "pair", &file_uri(&live), &gone_uri).await;
+
+    let dest = tempfile::tempdir().unwrap();
+    let node = node_base(&base, "pair").await;
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        node.raw_export(ExportDestination::Directory(dest.path().to_path_buf()), 4),
+    )
+    .await
+    .expect("raw_export must return, not hang, when a download fails");
+    assert!(
+        result.is_err(),
+        "a failing asset download must surface as an error, got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn raw_export_memory_sink_matches_disk_bytes() {
+    // The in-memory sink must deliver the same bytes the disk sink writes, keyed
+    // by the same posix relative paths.
+    let (base, cat, _db) = spawn_catalog_server().await;
+    let files: &[(&str, &[u8])] = &[
+        ("a.txt", b"AAA"),
+        ("sub/b.txt", b"BBBB"),
+        ("sub/c.txt", b"CCCCC"),
+    ];
+    let dir = make_dir(files);
+    add_asset(&cat, "frames", &file_uri(dir.path()), true).await;
+
+    let dest = tempfile::tempdir().unwrap();
+    let disk = node_base(&base, "frames")
+        .await
+        .raw_export(ExportDestination::Directory(dest.path().to_path_buf()), 3)
+        .await
+        .unwrap()
+        .into_paths()
+        .expect("directory export returns paths");
+
+    let mem = node_base(&base, "frames")
+        .await
+        .raw_export(ExportDestination::Memory, 3)
+        .await
+        .unwrap()
+        .into_memory()
+        .expect("memory export returns a map");
+
+    assert_eq!(mem.len(), files.len());
+    for &(rel, contents) in files {
+        // In-memory bytes keyed by the posix relative path == the source bytes.
+        assert_eq!(
+            mem.get(rel).map(|b| b.as_ref()),
+            Some(contents),
+            "memory bytes for {rel}"
+        );
+        // The disk sink wrote the identical bytes to dest/<rel>.
+        let disk_path = dest.path().join(rel);
+        assert!(disk.contains(&disk_path), "disk path for {rel}");
+        assert_eq!(
+            std::fs::read(&disk_path).unwrap().as_slice(),
+            contents,
+            "disk bytes for {rel}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn raw_export_sequential_max_workers_one_writes_all() {
+    // `max_workers == 1` runs the jobs one at a time; every file must still be
+    // written correctly.
+    let (base, cat, _db) = spawn_catalog_server().await;
+    let files: &[(&str, &[u8])] = &[("one.bin", b"1"), ("two.bin", b"22"), ("three.bin", b"333")];
+    let dir = make_dir(files);
+    add_asset(&cat, "frames", &file_uri(dir.path()), true).await;
+
+    let dest = tempfile::tempdir().unwrap();
+    let written = node_base(&base, "frames")
+        .await
+        .raw_export(ExportDestination::Directory(dest.path().to_path_buf()), 1)
+        .await
+        .unwrap()
+        .into_paths()
+        .expect("directory export returns paths");
+
+    assert_eq!(written.len(), files.len());
+    for &(rel, contents) in files {
+        let path = dest.path().join(rel);
+        assert!(written.contains(&path), "missing {rel}");
+        assert_eq!(std::fs::read(&path).unwrap().as_slice(), contents);
+    }
+}
+
+#[tokio::test]
+async fn raw_export_multiple_assets_namespaced_by_id() {
+    // A node backed by two assets namespaces each asset's key/path under its
+    // server-assigned id (`{asset_id}/{filename}`), matching upstream's
+    // `Path(destination, str(asset.id))` / `f"{asset.id}/{...}"`.
+    let (base, cat, _db) = spawn_catalog_server().await;
+    let dir_a = tempfile::tempdir().unwrap();
+    let a = dir_a.path().join("alpha.bin");
+    std::fs::write(&a, b"alpha-bytes").unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    let b = dir_b.path().join("beta.bin");
+    std::fs::write(&b, b"beta-bytes").unwrap();
+    add_two_asset_node(&cat, "pair", &file_uri(&a), &file_uri(&b)).await;
+
+    let node = node_base(&base, "pair").await;
+    let sources = node.data_sources().await.unwrap().unwrap();
+    let ids: Vec<i64> = sources[0]
+        .assets
+        .iter()
+        .map(|asset| asset.id.expect("eager asset id"))
+        .collect();
+    assert_eq!(ids.len(), 2);
+
+    let mem = node
+        .raw_export(ExportDestination::Memory, 4)
+        .await
+        .unwrap()
+        .into_memory()
+        .expect("memory export returns a map");
+    assert_eq!(mem.len(), 2);
+    assert_eq!(
+        mem.get(&format!("{}/alpha.bin", ids[0]))
+            .map(|b| b.as_ref()),
+        Some(&b"alpha-bytes"[..]),
+        "asset 0 namespaced key + bytes"
+    );
+    assert_eq!(
+        mem.get(&format!("{}/beta.bin", ids[1])).map(|b| b.as_ref()),
+        Some(&b"beta-bytes"[..]),
+        "asset 1 namespaced key + bytes"
     );
 }
