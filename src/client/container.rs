@@ -61,6 +61,21 @@ pub struct ContainerClient {
     queries: Vec<(String, String)>,
 }
 
+/// Split a lookup key into path segments, matching Python
+/// `Container.__getitem__`'s `tuple("/".join(keys).strip("/").split("/"))`
+/// (container.py:279): leading and trailing slashes are trimmed, then each
+/// remaining `/`-delimited piece is one segment. `"a/b/c"` → `["a", "b", "c"]`;
+/// `"/a/"` → `["a"]`.
+///
+/// There is no escape for a literal `/` *inside* a key — upstream treats every
+/// `/` as a separator, so a child whose name contains `/` is not addressable
+/// (deliberate: no disambiguation). Empty internal segments (e.g. from `a//b`)
+/// are preserved to mirror upstream; the server drops them when it splits the
+/// raw path.
+fn split_key_segments(key: &str) -> Vec<&str> {
+    key.trim_matches('/').split('/').collect()
+}
+
 impl ContainerClient {
     /// Wrap an item that the caller has already parsed into a container.
     pub fn from_item(context: Context, item: Item, include_data_sources: bool) -> Result<Self> {
@@ -138,9 +153,20 @@ impl ContainerClient {
             return self.get_within_search(key).await;
         }
         let mut url = Url::parse(self.base.require_link("self")?).map_err(ClientError::from)?;
-        // self link points to /metadata/.../<this>; appending `/<key>` walks one step.
-        // Percent-encode the key so `?`, `#`, `/`, etc. don't reshape the URL.
-        let encoded = utf8_percent_encode(key, PATH_SEGMENT).to_string();
+        // self link points to /metadata/.../<this>; appending `/<seg>` per key
+        // segment walks the tree one step at a time. Split the key on `/` and
+        // percent-encode each segment *separately*, so `get("a/b/c")` builds
+        // `…/a/b/c` (a three-step walk) rather than collapsing the slashes into
+        // one `a%2Fb%2Fc` segment that 404s. Mirrors Python
+        // `Container.__getitem__` (container.py:279, 357), which appends the
+        // remaining keys as separate `/`-delimited path segments in one request.
+        // Encoding stays per-segment so `?`, `#`, `%`, etc. inside a name don't
+        // reshape the URL.
+        let encoded = split_key_segments(key)
+            .into_iter()
+            .map(|seg| utf8_percent_encode(seg, PATH_SEGMENT).to_string())
+            .collect::<Vec<_>>()
+            .join("/");
         let new_path = if url.path().ends_with('/') {
             format!("{}{}", url.path(), encoded)
         } else {
@@ -167,13 +193,26 @@ impl ContainerClient {
         )
     }
 
-    /// Look up `key` *within* the active search results: route a `KeyLookup`
-    /// filter plus the active queries through the `search` link with
-    /// `page[limit]=1`. An empty result means the key is not in the filtered
-    /// view → [`ClientError::KeyNotFound`] (Python's `KeyError`).
+    /// Look up `key` *within* the active search results. For a nested key
+    /// (`"a/b/c"`) only the *first* segment is resolved against the filtered
+    /// view — a `KeyLookup` filter plus the active queries routed through the
+    /// `search` link with `page[limit]=1` — and the remaining segments are a
+    /// plain nested walk on the resulting child. An empty result for the first
+    /// segment means it is not in the filtered view → [`ClientError::KeyNotFound`]
+    /// (Python's `KeyError`).
+    ///
+    /// Mirrors Python `Container.__getitem__`'s search branch (container.py:282,
+    /// 318-319): `key, *tail = keys; ... if tail: result = result[tail]`. The
+    /// child carries no search filters, so the tail walk re-enters the
+    /// straightforward (non-search) [`get`](Self::get) path.
     async fn get_within_search(&self, key: &str) -> Result<AnyClient> {
+        let segments = split_key_segments(key);
+        let (first, tail) = segments
+            .split_first()
+            .expect("split('/') always yields at least one segment");
+        let first = *first;
         let lookup = crate::core::queries::Query::Lookup(crate::core::queries::KeyLookup {
-            key: key.into(),
+            key: first.into(),
         });
         let url = self.search_url_with(0, 1, &lookup.encode(), self.base.include_data_sources)?;
         let resp: SearchResponse = retry(|| async {
@@ -182,13 +221,21 @@ impl ContainerClient {
         })
         .await?;
         let item = resp.data.into_iter().next().ok_or_else(|| {
-            ClientError::KeyNotFound(format!("no child '{key}' in filtered results"))
+            ClientError::KeyNotFound(format!("no child '{first}' in filtered results"))
         })?;
-        AnyClient::from_item(
+        let child = AnyClient::from_item(
             self.base.context.clone(),
             item,
             self.base.include_data_sources,
-        )
+        )?;
+        if tail.is_empty() {
+            Ok(child)
+        } else {
+            // The child has no active queries, so this re-enters the plain
+            // (non-search) `get` path. `Box::pin` breaks the static
+            // `get → get_within_search → get` recursion cycle.
+            Box::pin(child.into_container()?.get(&tail.join("/"))).await
+        }
     }
 
     /// List the children of this container, optionally limited to `limit`
