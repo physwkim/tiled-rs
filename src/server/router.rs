@@ -1987,6 +1987,7 @@ async fn persist_array_patch(
 pub async fn array_full_put(
     State(state): State<AppState>,
     OriginalUri(uri): OriginalUri,
+    Query(params): Query<HashMap<String, String>>,
     auth: crate::server::AuthContext,
     body: bytes::Bytes,
 ) -> Result<impl IntoResponse, ServerError> {
@@ -2000,6 +2001,13 @@ pub async fn array_full_put(
         crate::auth::Scope::WriteData,
     )
     .await?;
+
+    // `persist=false` (non-default) streams the write to subscribers but skips the
+    // storage commit. Upstream `write` streams via `_stream` BEFORE `if not
+    // persist: return` (catalog/adapter.py:1665-1670), so both families below emit
+    // the payload ahead of the persist gate. Mirrors `put_array_full`'s `persist`
+    // (router.py:2022) which gates the {array, sparse} write uniformly.
+    let persist = query_bool(&params, "persist", true);
 
     let adapter = core::walk_tree(state.root_tree.as_ref(), &segments).await?;
 
@@ -2017,13 +2025,11 @@ pub async fn array_full_put(
             )
         })?;
         let ndim = sparse.structure().shape.len();
-        let data = deserialize_sparse_coo(&body, ndim)?;
-        ensure_sparse_data_dtype(sparse.structure(), &data)?;
         let stream_shape = sparse.structure().shape.clone();
-        writable.write(data).await.map_err(ServerError::from)?;
 
-        // Sparse inherits the array `_stream` upstream (adapter.py:1846): emit an
-        // `array-data` event carrying the COO write body (Arrow IPC).
+        // Sparse inherits the array `_stream` upstream (adapter.py:1665-1670): emit
+        // an `array-data` event carrying the COO write body (Arrow IPC) BEFORE the
+        // persist gate, so a stream-only write still reaches subscribers.
         stream_array_data(
             &state,
             &segments,
@@ -2031,9 +2037,15 @@ pub async fn array_full_put(
             &stream_shape,
             None,
             None,
-            body,
+            body.clone(),
         )
         .await;
+
+        if persist {
+            let data = deserialize_sparse_coo(&body, ndim)?;
+            ensure_sparse_data_dtype(sparse.structure(), &data)?;
+            writable.write(data).await.map_err(ServerError::from)?;
+        }
 
         return Ok(Json(serde_json::json!({ "ok": true })));
     }
@@ -2051,32 +2063,12 @@ pub async fn array_full_put(
     })?;
 
     let structure = array_adapter.structure();
-    let dtype = match &structure.data_type {
-        crate::core::dtype::DType::Builtin(b) => b.clone(),
-        _ => {
-            return Err(ServerError::Validation(
-                "array write: only builtin (non-struct) dtypes are supported".into(),
-            ));
-        }
-    };
-    let elem = dtype.element_size();
-    let nelem: usize = structure.shape.iter().product();
-    let expected = nelem * elem;
-    if body.len() != expected {
-        return Err(ServerError::Validation(format!(
-            "array write: body is {} bytes but the array needs {expected} \
-             (shape {:?}, {elem}-byte elements)",
-            body.len(),
-            structure.shape
-        )));
-    }
     let shape = structure.shape.clone();
-    let stream_body = body.clone();
-    let payload = crate::core::dtype::DynNDArray::new(body, dtype, shape.clone());
-    writable.write(payload).await.map_err(ServerError::from)?;
 
-    // Stream the whole-array write on the array node's own stream. The dense
-    // wire encoding is a raw C-order buffer (octet-stream).
+    // Stream the whole-array write BEFORE the persist gate — upstream `write`
+    // calls `_stream` ahead of `if not persist: return` (catalog/adapter.py:
+    // 1665-1670), so a stream-only write still reaches subscribers. The dense wire
+    // encoding is a raw C-order buffer (octet-stream).
     stream_array_data(
         &state,
         &segments,
@@ -2084,9 +2076,33 @@ pub async fn array_full_put(
         &shape,
         None,
         None,
-        stream_body,
+        body.clone(),
     )
     .await;
+
+    if persist {
+        let dtype = match &structure.data_type {
+            crate::core::dtype::DType::Builtin(b) => b.clone(),
+            _ => {
+                return Err(ServerError::Validation(
+                    "array write: only builtin (non-struct) dtypes are supported".into(),
+                ));
+            }
+        };
+        let elem = dtype.element_size();
+        let nelem: usize = structure.shape.iter().product();
+        let expected = nelem * elem;
+        if body.len() != expected {
+            return Err(ServerError::Validation(format!(
+                "array write: body is {} bytes but the array needs {expected} \
+                 (shape {:?}, {elem}-byte elements)",
+                body.len(),
+                structure.shape
+            )));
+        }
+        let payload = crate::core::dtype::DynNDArray::new(body, dtype, shape);
+        writable.write(payload).await.map_err(ServerError::from)?;
+    }
 
     Ok(Json(serde_json::json!({ "ok": true })))
 }
@@ -2149,6 +2165,13 @@ pub async fn array_block_put(
     )
     .await?;
 
+    // `persist=false` (non-default) streams the block to subscribers but skips the
+    // storage commit. Upstream `write_block` streams via `_stream` BEFORE `if not
+    // persist: return` (catalog/adapter.py:1682-1699), so both families below emit
+    // the payload ahead of the persist gate. Mirrors `put_array_block`'s `persist`
+    // (router.py:2065) which gates the {array, sparse} write uniformly.
+    let persist = query_bool(&params, "persist", true);
+
     let adapter = core::walk_tree(state.root_tree.as_ref(), &segments).await?;
 
     // Sparse (COO) leaf: one block's non-zeros arrive as an Arrow IPC COO table,
@@ -2165,16 +2188,11 @@ pub async fn array_block_put(
             )
         })?;
         let block = parse_block_param(&params, sparse.structure().shape.len())?;
-        let data = deserialize_sparse_coo(&body, block.len())?;
-        ensure_sparse_data_dtype(sparse.structure(), &data)?;
         let stream_shape = sparse.structure().shape.clone();
-        writable
-            .write_block(data, &block)
-            .await
-            .map_err(ServerError::from)?;
 
-        // Sparse inherits the array `_stream` (adapter.py:1846): emit `array-data`
-        // for the written block, carrying the COO block body (Arrow IPC).
+        // Sparse inherits the array `_stream` (adapter.py:1682-1699): emit
+        // `array-data` for the block, carrying the COO body (Arrow IPC), BEFORE the
+        // persist gate so a stream-only write still reaches subscribers.
         stream_array_data(
             &state,
             &segments,
@@ -2182,9 +2200,18 @@ pub async fn array_block_put(
             &stream_shape,
             None,
             Some(&block),
-            body,
+            body.clone(),
         )
         .await;
+
+        if persist {
+            let data = deserialize_sparse_coo(&body, block.len())?;
+            ensure_sparse_data_dtype(sparse.structure(), &data)?;
+            writable
+                .write_block(data, &block)
+                .await
+                .map_err(ServerError::from)?;
+        }
 
         return Ok(Json(serde_json::json!({ "ok": true })));
     }
@@ -2203,14 +2230,6 @@ pub async fn array_block_put(
 
     let structure = array_adapter.structure();
     let ndim = structure.shape.len();
-    let dtype = match &structure.data_type {
-        crate::core::dtype::DType::Builtin(b) => b.clone(),
-        _ => {
-            return Err(ServerError::Validation(
-                "array write: only builtin (non-struct) dtypes are supported".into(),
-            ));
-        }
-    };
 
     // `?block=` is one index per axis (no ranges: a write targets exactly one
     // chunk). Empty defaults to the origin chunk.
@@ -2229,24 +2248,11 @@ pub async fn array_block_put(
         })?;
         chunk_shape.push(len);
     }
-    let elem = dtype.element_size();
-    let expected = chunk_shape.iter().product::<usize>() * elem;
-    if body.len() != expected {
-        return Err(ServerError::Validation(format!(
-            "array block write: body is {} bytes but chunk {block:?} needs {expected} \
-             (chunk shape {chunk_shape:?}, {elem}-byte elements)",
-            body.len()
-        )));
-    }
-    let stream_body = body.clone();
-    let payload = crate::core::dtype::DynNDArray::new(body, dtype, chunk_shape.clone());
-    writable
-        .write_block(payload, &block)
-        .await
-        .map_err(ServerError::from)?;
 
-    // Stream the written chunk on the array node's own stream; `block` is the
-    // chunk coordinate, `shape` the chunk's dense shape, wire encoding raw C-order.
+    // Stream the written chunk BEFORE the persist gate — upstream `write_block`
+    // calls `_stream` ahead of `if not persist: return` (catalog/adapter.py:
+    // 1682-1699). `block` is the chunk coordinate, `shape` the chunk's dense shape,
+    // wire encoding raw C-order.
     stream_array_data(
         &state,
         &segments,
@@ -2254,9 +2260,34 @@ pub async fn array_block_put(
         &chunk_shape,
         None,
         Some(&block),
-        stream_body,
+        body.clone(),
     )
     .await;
+
+    if persist {
+        let dtype = match &structure.data_type {
+            crate::core::dtype::DType::Builtin(b) => b.clone(),
+            _ => {
+                return Err(ServerError::Validation(
+                    "array write: only builtin (non-struct) dtypes are supported".into(),
+                ));
+            }
+        };
+        let elem = dtype.element_size();
+        let expected = chunk_shape.iter().product::<usize>() * elem;
+        if body.len() != expected {
+            return Err(ServerError::Validation(format!(
+                "array block write: body is {} bytes but chunk {block:?} needs {expected} \
+                 (chunk shape {chunk_shape:?}, {elem}-byte elements)",
+                body.len()
+            )));
+        }
+        let payload = crate::core::dtype::DynNDArray::new(body, dtype, chunk_shape);
+        writable
+            .write_block(payload, &block)
+            .await
+            .map_err(ServerError::from)?;
+    }
 
     Ok(Json(serde_json::json!({ "ok": true })))
 }

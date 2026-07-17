@@ -199,9 +199,18 @@ impl ArrayClient {
 
     /// Overwrite the whole array. `data` is the C-order element buffer —
     /// `nelem * dtype.element_size()` bytes, matching `PUT /api/v1/array/full`.
-    pub async fn write(&self, data: bytes::Bytes) -> Result<()> {
+    ///
+    /// `persist = false` streams the write to live subscribers without committing
+    /// it to storage, so a subsequent read does not see it (mirrors
+    /// `ArrayClient.write`, client/array.py:299-316); `persist = true` is the
+    /// default commit-and-broadcast behavior. Python appends `persist` to the
+    /// query only for the non-default `false`, and so does this.
+    pub async fn write(&self, data: bytes::Bytes, persist: bool) -> Result<()> {
         let link = self.base.require_link("full")?;
-        let url = Url::parse(link)?;
+        let mut url = Url::parse(link)?;
+        if !persist {
+            url.query_pairs_mut().append_pair("persist", "false");
+        }
         let _permit = self.base.context.data_fetch_permit().await;
         retry(|| async {
             self.base
@@ -215,7 +224,17 @@ impl ArrayClient {
 
     /// Overwrite one chunk. `block` is the per-axis chunk index; `data` is
     /// the C-order buffer for that chunk — matches `PUT /api/v1/array/block`.
-    pub async fn write_block(&self, block: &[usize], data: bytes::Bytes) -> Result<()> {
+    ///
+    /// `persist = false` streams the block to live subscribers without committing
+    /// it to storage (mirrors `ArrayClient.write_block`, client/array.py:318-339);
+    /// `persist = true` is the default commit-and-broadcast behavior. The
+    /// non-default `persist=false` is added to the query, matching Python.
+    pub async fn write_block(
+        &self,
+        block: &[usize],
+        data: bytes::Bytes,
+        persist: bool,
+    ) -> Result<()> {
         let link = self.base.require_link("block")?;
         let mut url = Url::parse(link)?;
         let block_str = block
@@ -224,6 +243,9 @@ impl ArrayClient {
             .collect::<Vec<_>>()
             .join(",");
         url.query_pairs_mut().append_pair("block", &block_str);
+        if !persist {
+            url.query_pairs_mut().append_pair("persist", "false");
+        }
         let _permit = self.base.context.data_fetch_permit().await;
         retry(|| async {
             self.base

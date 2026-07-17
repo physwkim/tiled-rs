@@ -950,6 +950,161 @@ async fn array_patch_persist_false_still_streams() {
     assert_eq!(read_json, json!([0.0, 0.0, 0.0, 0.0]));
 }
 
+/// A whole-array PUT with `persist=false` (stream-only) streams `array-data` to
+/// live subscribers but skips the storage commit; the default `persist=true`
+/// commits AND streams. Upstream `write` calls `_stream` BEFORE `if not persist:
+/// return` (catalog/adapter.py:1665-1670), and `put_array_full` threads `persist`
+/// (router.py:2022).
+#[tokio::test]
+async fn array_full_write_persist_false_streams_but_skips_storage() {
+    let (base, client, _wdir, _dbdir) = spawn_write_server().await;
+    // Zarr genuinely persists a full write, so a zeros read-back below proves the
+    // `persist=false` path streamed but skipped the write.
+    create_managed_array(
+        &client,
+        &base,
+        "arr",
+        "application/x-zarr",
+        f64_array_structure(4, vec![4]),
+    )
+    .await;
+
+    let url = ws_url(&base, "arr");
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    assert_eq!(
+        next_text_json(&mut ws).await.expect("schema")["type"],
+        "array-schema"
+    );
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // persist=false: streams the payload but must NOT commit.
+    let resp = client
+        .put(format!("{base}/api/v1/array/full/arr?persist=false"))
+        .body(f64_bytes(&[9.5, 10.5, 11.5, 12.5]))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "stream-only write: {}",
+        resp.status()
+    );
+
+    let ev = next_text_json(&mut ws)
+        .await
+        .expect("array-data (persist=false)");
+    assert_eq!(ev["type"], "array-data");
+    assert_eq!(ev["shape"], json!([4]));
+    assert_eq!(ev["offset"], Value::Null);
+    assert_eq!(ev["block"], Value::Null);
+    assert_eq!(ev["payload"], json!([9.5, 10.5, 11.5, 12.5]));
+
+    // persist=false must NOT have written: a read-back stays zeros.
+    let read_json = read_array_json(&client, &base, "arr").await;
+    assert_eq!(read_json, json!([0.0, 0.0, 0.0, 0.0]));
+
+    // Default persist=true commits AND streams (regression: behavior unchanged).
+    let resp = client
+        .put(format!("{base}/api/v1/array/full/arr"))
+        .body(f64_bytes(&[1.5, 2.5, 3.5, 4.5]))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "committing write: {}",
+        resp.status()
+    );
+
+    let ev = next_text_json(&mut ws)
+        .await
+        .expect("array-data (persist=true)");
+    assert_eq!(ev["type"], "array-data");
+    assert_eq!(ev["payload"], json!([1.5, 2.5, 3.5, 4.5]));
+
+    let read_json = read_array_json(&client, &base, "arr").await;
+    assert_eq!(read_json, json!([1.5, 2.5, 3.5, 4.5]));
+}
+
+/// A single-chunk block PUT with `persist=false` streams `array-data` (carrying
+/// the chunk coordinate) to live subscribers but skips the storage commit; the
+/// default `persist=true` commits AND streams. Mirrors the full-write case for
+/// the per-chunk `write_block` path (catalog/adapter.py:1682-1699).
+#[tokio::test]
+async fn array_block_write_persist_false_streams_but_skips_storage() {
+    let (base, client, _wdir, _dbdir) = spawn_write_server().await;
+    // shape [4] in two chunks of 2; block index 1 targets the second chunk.
+    create_managed_array(
+        &client,
+        &base,
+        "arr",
+        "application/x-zarr",
+        f64_array_structure(4, vec![2, 2]),
+    )
+    .await;
+
+    let url = ws_url(&base, "arr");
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    assert_eq!(
+        next_text_json(&mut ws).await.expect("schema")["type"],
+        "array-schema"
+    );
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // persist=false: streams the block but must NOT commit.
+    let resp = client
+        .put(format!(
+            "{base}/api/v1/array/block/arr?block=1&persist=false"
+        ))
+        .body(f64_bytes(&[5.5, 6.5]))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "stream-only block write: {}",
+        resp.status()
+    );
+
+    let ev = next_text_json(&mut ws)
+        .await
+        .expect("array-data (persist=false)");
+    assert_eq!(ev["type"], "array-data");
+    assert_eq!(ev["shape"], json!([2]));
+    assert_eq!(ev["block"], json!([1]));
+    assert_eq!(ev["payload"], json!([5.5, 6.5]));
+
+    // persist=false must NOT have written: the whole array stays zeros.
+    let read_json = read_array_json(&client, &base, "arr").await;
+    assert_eq!(read_json, json!([0.0, 0.0, 0.0, 0.0]));
+
+    // Default persist=true commits block 1 AND streams (regression).
+    let resp = client
+        .put(format!("{base}/api/v1/array/block/arr?block=1"))
+        .body(f64_bytes(&[5.5, 6.5]))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "committing block write: {}",
+        resp.status()
+    );
+
+    let ev = next_text_json(&mut ws)
+        .await
+        .expect("array-data (persist=true)");
+    assert_eq!(ev["type"], "array-data");
+    assert_eq!(ev["block"], json!([1]));
+    assert_eq!(ev["payload"], json!([5.5, 6.5]));
+
+    // Block 1 committed; block 0 remains zeros.
+    let read_json = read_array_json(&client, &base, "arr").await;
+    assert_eq!(read_json, json!([0.0, 0.0, 5.5, 6.5]));
+}
+
 // ---------------------------------------------------------------------------
 // PR4: table-data + ragged-data payload events (Wave-24).
 //

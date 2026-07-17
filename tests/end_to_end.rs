@@ -540,7 +540,7 @@ async fn array_write_full_roundtrip() {
     // Write 4 f64s.
     let values = [1.5f64, 2.5, 3.5, 4.5];
     let payload: bytes::Bytes = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-    arr.write(payload.clone()).await.expect("write");
+    arr.write(payload.clone(), true).await.expect("write");
 
     // Read back and verify.
     let blocks = arr.read().await.expect("read");
@@ -596,7 +596,9 @@ async fn array_write_block_roundtrip() {
 
     let values = [10.0f64, 20.0, 30.0, 40.0];
     let payload: bytes::Bytes = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-    arr.write_block(&[0], payload).await.expect("write_block");
+    arr.write_block(&[0], payload, true)
+        .await
+        .expect("write_block");
 
     let block = arr.read_block(&[0]).await.expect("read_block");
     let got: Vec<f64> = block
@@ -605,6 +607,161 @@ async fn array_write_block_roundtrip() {
         .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
         .collect();
     assert_eq!(got, values.to_vec());
+}
+
+/// `ArrayClient::write(_, persist=false)` threads `persist=false` to the request,
+/// so the server streams to subscribers but skips the storage commit: after a
+/// committing (persist=true) write, a persist=false write over it leaves the
+/// stored data unchanged.
+#[tokio::test]
+async fn array_write_persist_false_does_not_commit() {
+    use tiled_rs::core::data_source::{DataSource, Management};
+    use tiled_rs::core::dtype::{BuiltinDType, DType, Endianness, Kind};
+    use tiled_rs::core::structures::{AnyStructure, ArrayStructure, StructureFamily};
+
+    async fn read_f64s(arr: &tiled_rs::client::ArrayClient) -> Vec<f64> {
+        arr.read()
+            .await
+            .expect("read")
+            .iter()
+            .flat_map(|b| {
+                b.data
+                    .chunks_exact(8)
+                    .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+            })
+            .collect()
+    }
+
+    let (base, _wd, _db) = spawn_write_server().await;
+    let client = from_uri(&base).await.unwrap();
+    let root = client.into_container().unwrap();
+
+    let structure = ArrayStructure {
+        data_type: DType::Builtin(BuiltinDType::new(Endianness::Little, Kind::Float, 8)),
+        chunks: vec![vec![4]],
+        shape: vec![4],
+        dims: None,
+        resizable: Default::default(),
+    };
+    let ds = DataSource {
+        structure_family: StructureFamily::Array,
+        structure: Some(AnyStructure::Array(structure)),
+        id: None,
+        mimetype: Some("application/x-npy".into()),
+        parameters: serde_json::json!({}),
+        properties: serde_json::json!({}),
+        assets: vec![],
+        management: Management::Writable,
+    };
+    root.create_node(
+        Some("pf_arr"),
+        StructureFamily::Array,
+        serde_json::json!({}),
+        vec![],
+        vec![ds],
+    )
+    .await
+    .expect("create_node");
+
+    let arr = root.get("pf_arr").await.unwrap().into_array().unwrap();
+
+    // Commit real data (persist=true), then confirm it round-trips.
+    let committed = [1.5f64, 2.5, 3.5, 4.5];
+    let payload: bytes::Bytes = committed.iter().flat_map(|v| v.to_le_bytes()).collect();
+    arr.write(payload, true).await.expect("committing write");
+    assert_eq!(
+        read_f64s(&arr).await,
+        committed.to_vec(),
+        "persist=true commits"
+    );
+
+    // A persist=false write must NOT overwrite the stored data.
+    let ephemeral = [9.9f64, 9.9, 9.9, 9.9];
+    let payload2: bytes::Bytes = ephemeral.iter().flat_map(|v| v.to_le_bytes()).collect();
+    arr.write(payload2, false).await.expect("stream-only write");
+    assert_eq!(
+        read_f64s(&arr).await,
+        committed.to_vec(),
+        "persist=false leaves stored data unchanged"
+    );
+}
+
+/// `ArrayClient::write_block(_, _, persist=false)` threads `persist=false`, so
+/// the server streams the block but skips the storage commit: after a committing
+/// (persist=true) block write, a persist=false block write over it leaves the
+/// stored chunk unchanged.
+#[tokio::test]
+async fn array_write_block_persist_false_does_not_commit() {
+    use tiled_rs::core::data_source::{DataSource, Management};
+    use tiled_rs::core::dtype::{BuiltinDType, DType, Endianness, Kind};
+    use tiled_rs::core::structures::{AnyStructure, ArrayStructure, StructureFamily};
+
+    async fn read_block_f64s(arr: &tiled_rs::client::ArrayClient, block: &[usize]) -> Vec<f64> {
+        arr.read_block(block)
+            .await
+            .expect("read_block")
+            .data
+            .chunks_exact(8)
+            .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+            .collect()
+    }
+
+    let (base, _wd, _db) = spawn_write_server().await;
+    let client = from_uri(&base).await.unwrap();
+    let root = client.into_container().unwrap();
+
+    let structure = ArrayStructure {
+        data_type: DType::Builtin(BuiltinDType::new(Endianness::Little, Kind::Float, 8)),
+        chunks: vec![vec![4]],
+        shape: vec![4],
+        dims: None,
+        resizable: Default::default(),
+    };
+    let ds = DataSource {
+        structure_family: StructureFamily::Array,
+        structure: Some(AnyStructure::Array(structure)),
+        id: None,
+        mimetype: Some("application/x-npy".into()),
+        parameters: serde_json::json!({}),
+        properties: serde_json::json!({}),
+        assets: vec![],
+        management: Management::Writable,
+    };
+    root.create_node(
+        Some("pfb_arr"),
+        StructureFamily::Array,
+        serde_json::json!({}),
+        vec![],
+        vec![ds],
+    )
+    .await
+    .expect("create_node");
+
+    let arr = root.get("pfb_arr").await.unwrap().into_array().unwrap();
+
+    // Commit block 0 (persist=true), then confirm it round-trips.
+    let committed = [10.0f64, 20.0, 30.0, 40.0];
+    let payload: bytes::Bytes = committed.iter().flat_map(|v| v.to_le_bytes()).collect();
+    arr.write_block(&[0], payload, true)
+        .await
+        .expect("committing block write");
+    assert_eq!(
+        read_block_f64s(&arr, &[0]).await,
+        committed.to_vec(),
+        "persist=true commits the block"
+    );
+
+    // A persist=false block write must NOT overwrite the stored chunk.
+    let ephemeral = [99.0f64, 99.0, 99.0, 99.0];
+    let payload2: bytes::Bytes = ephemeral.iter().flat_map(|v| v.to_le_bytes()).collect();
+    arr.write_block(&[0], payload2, false)
+        .await
+        .expect("stream-only block write");
+    assert_eq!(
+        read_block_f64s(&arr, &[0]).await,
+        committed.to_vec(),
+        "persist=false leaves the stored chunk unchanged"
+    );
 }
 
 /// PATCH /array/full writes a data block into a slice (`offset`/`shape`) and,
@@ -672,7 +829,7 @@ async fn array_patch_slice_write_and_extend_roundtrip() {
         .iter()
         .flat_map(|v| v.to_le_bytes())
         .collect();
-    arr.write(seed).await.expect("seed write");
+    arr.write(seed, true).await.expect("seed write");
 
     // (1) In-bounds slice write: place [9.0, 9.0] at offset [1], no extend.
     let block: bytes::Bytes = [9.0f64, 9.0].iter().flat_map(|v| v.to_le_bytes()).collect();
@@ -1802,7 +1959,7 @@ async fn array_export_to_file() {
     let arr = root.get("exp_arr").await.unwrap().into_array().unwrap();
     let values = [1.0f64, 2.0, 3.0, 4.0];
     let payload: bytes::Bytes = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-    arr.write(payload).await.unwrap();
+    arr.write(payload, true).await.unwrap();
 
     let out = tempfile::tempdir().unwrap();
 
@@ -1997,7 +2154,7 @@ async fn container_export_to_zip() {
         .iter()
         .flat_map(|v| v.to_le_bytes())
         .collect();
-    arr.write(payload).await.unwrap();
+    arr.write(payload, true).await.unwrap();
 
     // Table child, then write one batch.
     let tbl_ds = DataSource {
