@@ -40,6 +40,7 @@ pub mod ragged;
 pub mod register;
 pub mod sparse;
 pub mod stream;
+pub mod sync;
 pub mod utils;
 pub mod xarray_client;
 
@@ -77,4 +78,5 @@ pub use stream::{
     ArrayData, ArrayPatch, ArrayRef, ChildCreated, ChildMetadataUpdated, Schema, Subscription,
     SubscriptionStream, TableData, Update,
 };
+pub use sync::{OnConflict, copy};
 pub use xarray_client::DatasetClient;
