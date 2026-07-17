@@ -6316,23 +6316,90 @@ fn to_asset_specs(
         .collect()
 }
 
+/// Map a [`CatalogError`](crate::catalog::CatalogError) to a [`ServerError`]
+/// (HTTP status) for the direct route path (`.map_err(map_catalog_err)?`).
+///
+/// Single owner: delegates to the `CatalogError -> TiledError -> ServerError`
+/// bridge (`catalog/error.rs` + `From<TiledError> for ServerError`) rather than
+/// keeping its own parallel match. The async adapter path reaches HTTP status
+/// through that same bridge (its methods return `TiledError` and are `?`-ed),
+/// so routing both through one owner guarantees the two paths can never
+/// disagree. Previously this function had a parallel match whose `other =>
+/// Internal` catch-all swallowed `CatalogError::UnsupportedQuery` to HTTP 500,
+/// while the bridge correctly mapped it to 400 — the divergence this collapse
+/// closes. The bridge's `From<CatalogError>` match is exhaustive, so a future
+/// `CatalogError` variant is a compile error there instead of a silent 500
+/// here. The 500-class variants (Database/Migration/Json/Io) still return a
+/// generic body via `ServerError::Internal`, so DB internals are not leaked.
 fn map_catalog_err(e: crate::catalog::CatalogError) -> ServerError {
+    ServerError::from(crate::core::TiledError::from(e))
+}
+
+#[cfg(test)]
+mod map_catalog_err_tests {
+    use super::*;
     use crate::catalog::CatalogError as CE;
-    match e {
-        CE::NotFound(m) => ServerError::NotFound(m),
-        CE::Validation(m) => ServerError::Validation(m),
-        // A duplicate `(parent_id, key)` create → 409, matching Python tiled,
-        // which raises `Collision(Conflicts)` on the unique-constraint failure
-        // (catalog/adapter.py:740-745) and answers HTTP_409_CONFLICT via the
-        // `Conflicts` handler (app.py:350-354). Previously mislabeled as 422.
-        CE::Conflict(m) => ServerError::Conflict(m),
-        // Deleting a subtree with internally-managed data sources → 409,
-        // matching Python's WouldDeleteData handler (app.py:367-374).
-        CE::WouldDeleteData(m) => ServerError::Conflict(m),
-        // Database/Migration/Json/Io are all 500-class; the IntoResponse
-        // impl logs the detail and returns a generic 500 body so we don't
-        // leak DB internals to the client (R7).
-        other => ServerError::Internal(other.to_string()),
+
+    // Locks the CatalogError -> ServerError family so the two-bridge divergence
+    // stays closed. Each String-carrying variant is asserted against its target
+    // ServerError variant (and thus HTTP status via `IntoResponse`). The
+    // `#[from]` variants (Database/Json) are not independently constructible
+    // without a real sqlx/serde error, but they share the 500-class Internal
+    // path exercised here by Migration and Io.
+
+    #[test]
+    fn unsupported_query_maps_to_400_not_500() {
+        // The finding: the old catch-all swallowed this to Internal (500); the
+        // bridge maps it to UnsupportedQuery (400), matching Python tiled's
+        // UnsupportedQueryType handler (app.py:355-365).
+        assert!(matches!(
+            map_catalog_err(CE::UnsupportedQuery("bad query".into())),
+            ServerError::UnsupportedQuery(_)
+        ));
+    }
+
+    #[test]
+    fn not_found_maps_to_404() {
+        assert!(matches!(
+            map_catalog_err(CE::NotFound("x".into())),
+            ServerError::NotFound(_)
+        ));
+    }
+
+    #[test]
+    fn validation_maps_to_422() {
+        assert!(matches!(
+            map_catalog_err(CE::Validation("x".into())),
+            ServerError::Validation(_)
+        ));
+    }
+
+    #[test]
+    fn conflict_maps_to_409() {
+        assert!(matches!(
+            map_catalog_err(CE::Conflict("x".into())),
+            ServerError::Conflict(_)
+        ));
+    }
+
+    #[test]
+    fn would_delete_data_maps_to_409() {
+        assert!(matches!(
+            map_catalog_err(CE::WouldDeleteData("x".into())),
+            ServerError::Conflict(_)
+        ));
+    }
+
+    #[test]
+    fn migration_and_io_map_to_500_internal() {
+        assert!(matches!(
+            map_catalog_err(CE::Migration("x".into())),
+            ServerError::Internal(_)
+        ));
+        assert!(matches!(
+            map_catalog_err(CE::Io(std::io::Error::other("x"))),
+            ServerError::Internal(_)
+        ));
     }
 }
 
