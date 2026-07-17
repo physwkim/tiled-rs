@@ -470,7 +470,13 @@ fn matches_query(
     match query {
         FullText(q) => meta.to_string().contains(&q.text),
         Eq(eq) => nested_get(meta, &eq.key).is_some_and(|v| v == &eq.value),
-        NotEq(neq) => nested_get(meta, &neq.key).is_none_or(|v| v != &neq.value),
+        // A missing key is EXCLUDED, matching the authoritative SQL `push_neq`
+        // (`{lhs} != ?` with no `IS NULL OR` arm, so `NULL != ?` is NULL and the
+        // row drops — `search.rs`), the in-memory `MapAdapter` evaluator
+        // (`map_adapter.rs`), and upstream `mapping.py::noteq` (whose
+        // `iter_child_metadata` skips children missing the key). `is_some_and`
+        // requires the path to resolve before the inequality is applied.
+        NotEq(neq) => nested_get(meta, &neq.key).is_some_and(|v| v != &neq.value),
         KeyPresent(kp) => nested_get(meta, &kp.key).is_some() == kp.exists,
         StructureFamily(sf) => structure_family == sf.value.to_string(),
         AccessBlobFilter(f) => matches_access_blob_filter(access_blob, f),
@@ -805,10 +811,14 @@ mod tests {
     }
 
     #[test]
-    fn not_eq_dotted_key_includes_missing_path_like_sql() {
-        // The catalog SQL NotEq is `(lhs IS NULL OR lhs != value)`, so a node
-        // missing the (nested) key is "not equal" and stays in the result. The
-        // in-memory screen mirrors that.
+    fn not_eq_dotted_key_excludes_missing_path_like_sql() {
+        // The authoritative catalog SQL NotEq is a plain `{lhs} != ?` with no
+        // `IS NULL OR` arm (`push_neq`, `search.rs`): a node missing the
+        // (nested) key makes `json_extract(...) -> NULL`, so `NULL != ?` is NULL
+        // (three-valued logic) and the row is EXCLUDED. This in-memory screen
+        // mirrors that, and it also agrees with the in-memory `MapAdapter`
+        // evaluator and upstream `mapping.py::noteq` (whose `iter_child_metadata`
+        // skips children missing the key).
         let blob = json!({});
         let present_equal = json!({"a": {"b": 5}});
         assert!(
@@ -835,7 +845,7 @@ mod tests {
         ));
         let missing = json!({"a": {"z": 0}});
         assert!(
-            matches_query(
+            !matches_query(
                 &missing,
                 FAMILY,
                 &blob,
@@ -844,7 +854,7 @@ mod tests {
                     value: json!(5)
                 })
             ),
-            "missing nested path must be included by NotEq (SQL parity)"
+            "missing nested path must be EXCLUDED by NotEq (SQL/MapAdapter/upstream parity)"
         );
     }
 }
