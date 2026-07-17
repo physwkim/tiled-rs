@@ -219,6 +219,60 @@ pub enum Command {
         webhooks_allow_private_addresses: bool,
     },
 
+    /// Register files or directories on a running Tiled server.
+    ///
+    /// Walks the given path, detects each file's mimetype by extension, and
+    /// POSTs the recognized files to the server's register endpoint under
+    /// `--prefix`. Mirrors Python `tiled register` (`_register.py`).
+    Register {
+        /// URL of the Tiled node to register on (e.g.
+        /// `http://localhost:8000`). An inline `?api_key=` is promoted to a
+        /// header; `TILED_API_KEY` is read when neither `?api_key=` nor
+        /// `--api-key` is given.
+        uri: String,
+
+        /// A file or directory to register.
+        filepath: std::path::PathBuf,
+
+        /// Log details of directory traversal and file registration. Accepted
+        /// for CLI compatibility; the register engine emits progress via the
+        /// `tiled.register` tracing target (shown at the process log level).
+        /// For per-file detail set `RUST_LOG=tiled_rs::client::register=debug`.
+        #[arg(short, long)]
+        verbose: bool,
+
+        /// Keep the catalog in sync with the directory: do an initial walk,
+        /// then re-register on filesystem changes. Runs until interrupted
+        /// (Ctrl-C / SIGTERM).
+        #[arg(short, long)]
+        watch: bool,
+
+        /// Location within the catalog's namespace to register these files.
+        /// Intermediate containers are created as needed.
+        #[arg(long, default_value = "/")]
+        prefix: String,
+
+        /// Serve a file like `measurements.csv` under its full name including
+        /// the extension, instead of the default which strips it to
+        /// `measurements`. Discouraged: it leaks the storage format to clients.
+        #[arg(long)]
+        keep_ext: bool,
+
+        /// Include only files with these extensions (repeatable). Include the
+        /// leading '.', e.g. `--include-ext .csv --include-ext .tiff`.
+        #[arg(long = "include-ext")]
+        include_ext: Vec<String>,
+
+        /// Map a custom file extension to a known mimetype (repeatable). Spell
+        /// like `.tif=image/tiff`; include the leading '.'.
+        #[arg(long)]
+        ext: Vec<String>,
+
+        /// Single-user API key for the server. Also read from `TILED_API_KEY`.
+        #[arg(long)]
+        api_key: Option<String>,
+    },
+
     /// Database management commands (not yet implemented)
     #[command(hide = true)]
     Catalog {
@@ -382,6 +436,25 @@ fn resolve_serve_host(flag: Option<String>, config: Option<&str>) -> String {
 /// (`if port is None: port = uvicorn_kwargs.get("port", 8000)`).
 fn resolve_serve_port(flag: Option<u16>, config: Option<u16>) -> u16 {
     flag.or(config).unwrap_or(8000)
+}
+
+/// Parse `tiled register --ext` items of the form `.tif=image/tiff` into an
+/// extension→mimetype override map. Mirrors Python `_register.py`'s EXT_PATTERN
+/// parse: a malformed item (no `=`, or an empty extension/mimetype) is a hard
+/// error. Whitespace around `=` is trimmed.
+fn parse_ext_overrides(
+    items: &[String],
+) -> anyhow::Result<std::collections::HashMap<String, String>> {
+    let mut map = std::collections::HashMap::new();
+    for item in items {
+        let (ext, mimetype) = item
+            .split_once('=')
+            .map(|(e, m)| (e.trim(), m.trim()))
+            .filter(|(e, m)| !e.is_empty() && !m.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("--ext expects '.ext=mimetype', got '{item}'"))?;
+        map.insert(ext.to_string(), mimetype.to_string());
+    }
+    Ok(map)
 }
 
 /// Generate a 64-character hex string from 32 cryptographically-random bytes.
@@ -1075,6 +1148,95 @@ pub async fn run(command: Command) -> Result<()> {
             background_tasks.shutdown().await;
             Ok(())
         }
+        Command::Register {
+            uri,
+            filepath,
+            // Accepted for CLI compatibility. The global tracing subscriber is
+            // installed in `main` before dispatch, so `run` cannot raise the
+            // filter; the register engine's progress logs already emit under
+            // the `tiled.register` target at the process log level.
+            verbose: _verbose,
+            watch: watch_mode,
+            prefix,
+            keep_ext,
+            include_ext,
+            ext,
+            api_key,
+        } => {
+            use crate::client::register::{
+                Settings, default_filter, register, strip_suffixes, watch,
+            };
+
+            // Parse `--ext` items ('.tif=image/tiff') into the mimetype override
+            // map. Mirrors Python `_register.py`'s EXT_PATTERN parse.
+            let mimetypes_by_ext = parse_ext_overrides(&ext)?;
+
+            // `--keep-ext`: serve files under their full name (identity key)
+            // instead of stripping suffixes.
+            let key_from_filename: Box<dyn Fn(&str) -> String + Send + Sync> = if keep_ext {
+                Box::new(|s: &str| s.to_string())
+            } else {
+                Box::new(strip_suffixes)
+            };
+
+            // `--include-ext`: include only files whose last extension is in the
+            // allow-list. The walk applies this filter to files only (it always
+            // descends directories that pass the hidden-name check), mirroring
+            // Python's `default_filter(path) and (path.is_dir() or path.suffix
+            // in include_ext)`.
+            let filter: Box<dyn Fn(&std::path::Path) -> bool + Send + Sync> =
+                if include_ext.is_empty() {
+                    Box::new(default_filter)
+                } else {
+                    let allow = include_ext.clone();
+                    Box::new(move |p: &std::path::Path| {
+                        default_filter(p)
+                            && p.extension()
+                                .and_then(|e| e.to_str())
+                                .map(|e| allow.contains(&format!(".{e}")))
+                                .unwrap_or(false)
+                    })
+                };
+
+            let settings = Settings {
+                mimetypes_by_ext,
+                key_from_filename,
+                filter,
+                ..Settings::default()
+            };
+
+            // Connect to the server. `--api-key` wins; otherwise the context
+            // falls back to `?api_key=` in the URL, then `TILED_API_KEY`.
+            let options = crate::client::ContextOptions {
+                api_key,
+                ..Default::default()
+            };
+            let node = crate::client::from_uri_with_options(&uri, options, false)
+                .await
+                .map_err(|e| anyhow::anyhow!("connect to {uri}: {e}"))?
+                .into_container()
+                .map_err(|e| anyhow::anyhow!("{uri} is not a container node: {e}"))?;
+
+            if watch_mode {
+                tracing::info!(
+                    target: "tiled.register",
+                    "watching {} (prefix '{prefix}')",
+                    filepath.display()
+                );
+                let handle = watch(node, filepath, prefix, Arc::new(settings))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("watch: {e}"))?;
+                // Block until Ctrl-C / SIGTERM, then stop the watcher cleanly.
+                shutdown_signal().await;
+                handle.stop().await;
+            } else {
+                register(&node, &filepath, &prefix, &settings, false)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("register: {e}"))?;
+                eprintln!("Indexing complete.");
+            }
+            Ok(())
+        }
         Command::Catalog { command } => match command {
             CatalogCommand::Init { uri } => {
                 tracing::info!("Initialising catalog at {}", redact_mongo_uri(&uri));
@@ -1534,6 +1696,106 @@ mod tests {
             resolved.iter().any(|a| a.is_ipv6() && a.port() == 8000),
             "tuple form must resolve ::1 to an IPv6 socket addr; got {resolved:?}"
         );
+    }
+
+    // cli-w27-F3: `tiled register` parses its positional URI + path and the
+    // implemented option subset.
+    #[test]
+    fn register_command_parses() {
+        let cli = TestCli::parse_from([
+            "tiled",
+            "register",
+            "http://localhost:8000",
+            "/data/runs",
+            "-v",
+            "--watch",
+            "--prefix",
+            "/raw",
+            "--keep-ext",
+            "--include-ext",
+            ".csv",
+            "--include-ext",
+            ".tiff",
+            "--ext",
+            ".tif=image/tiff",
+            "--api-key",
+            "secret",
+        ]);
+        let Command::Register {
+            uri,
+            filepath,
+            verbose,
+            watch,
+            prefix,
+            keep_ext,
+            include_ext,
+            ext,
+            api_key,
+        } = cli.command
+        else {
+            panic!("expected Register variant");
+        };
+        assert_eq!(uri, "http://localhost:8000");
+        assert_eq!(filepath, std::path::PathBuf::from("/data/runs"));
+        assert!(verbose);
+        assert!(watch);
+        assert_eq!(prefix, "/raw");
+        assert!(keep_ext);
+        assert_eq!(include_ext, vec![".csv".to_string(), ".tiff".to_string()]);
+        assert_eq!(ext, vec![".tif=image/tiff".to_string()]);
+        assert_eq!(api_key.as_deref(), Some("secret"));
+    }
+
+    // `--prefix` defaults to "/"; the boolean flags default to false.
+    #[test]
+    fn register_command_defaults() {
+        let cli = TestCli::parse_from(["tiled", "register", "http://x", "/p"]);
+        let Command::Register {
+            verbose,
+            watch,
+            prefix,
+            keep_ext,
+            include_ext,
+            ext,
+            api_key,
+            ..
+        } = cli.command
+        else {
+            panic!("expected Register variant");
+        };
+        assert!(!verbose);
+        assert!(!watch);
+        assert_eq!(prefix, "/");
+        assert!(!keep_ext);
+        assert!(include_ext.is_empty());
+        assert!(ext.is_empty());
+        assert_eq!(api_key, None);
+    }
+
+    #[test]
+    fn parse_ext_overrides_parses_and_rejects() {
+        let map = parse_ext_overrides(&[
+            ".tif=image/tiff".to_string(),
+            " .foo = application/x-foo ".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(map.get(".tif").map(String::as_str), Some("image/tiff"));
+        // Whitespace around '=' is trimmed.
+        assert_eq!(
+            map.get(".foo").map(String::as_str),
+            Some("application/x-foo")
+        );
+
+        // Malformed items are hard errors (mirrors Python's ValueError).
+        for bad in ["notanext", ".tif=", "=image/tiff", ""] {
+            let err = parse_ext_overrides(&[bad.to_string()])
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("--ext expects"),
+                "malformed --ext {bad:?} must error: {err}"
+            );
+        }
     }
 
     // cli-w27-F2: `serve --public` forces anonymous read access. The flag
