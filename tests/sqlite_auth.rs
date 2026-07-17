@@ -121,6 +121,7 @@ async fn api_key_create_verify_revoke() {
             note: Some("test".into()),
             scopes: scopes.clone(),
             expiration_time: None,
+            access_tags: None,
         })
         .await
         .unwrap();
@@ -156,6 +157,7 @@ async fn revoke_api_key_cross_principal_rejected() {
             note: None,
             scopes: ScopeSet::default(),
             expiration_time: None,
+            access_tags: None,
         })
         .await
         .unwrap();

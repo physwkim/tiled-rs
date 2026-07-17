@@ -404,6 +404,14 @@ pub struct ApiKeyCreateRequest {
     // (`admin_create_principal_apikey`) share this struct, so one alias covers both.
     #[serde(default, alias = "expires_in")]
     pub expires_in_seconds: Option<i64>,
+    /// Optional tag restriction for the new key (matches upstream
+    /// `APIKeyRequestParams.access_tags`, `tiled/server/schemas.py`). When
+    /// present, the key's effective tag grant becomes the intersection of the
+    /// principal's tags and this set (authn_access_tags narrowing). Upstream
+    /// forbids combining it with the `inherit` / `admin:apikeys` scopes; that
+    /// guard is enforced in `AuthDb::create_api_key`.
+    #[serde(default)]
+    pub access_tags: Option<Vec<String>>,
 }
 
 pub async fn api_key_create(
@@ -444,6 +452,7 @@ pub async fn api_key_create(
             note: req.note,
             scopes,
             expiration_time: exp,
+            access_tags: req.access_tags,
         })
         .await
         .map_err(map_auth_err)?;
@@ -847,6 +856,8 @@ pub async fn admin_create_principal_apikey(
             note: req.note,
             scopes,
             expiration_time: exp,
+            // The admin principal route does not accept a tag restriction.
+            access_tags: None,
         })
         .await
         .map_err(map_auth_err)?;

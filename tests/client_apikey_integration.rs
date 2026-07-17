@@ -108,6 +108,7 @@ async fn bootstrap_alice_key(auth_db: &AuthDb) -> String {
             note: Some("bootstrap".into()),
             scopes: ScopeSet::for_role("user"),
             expiration_time: None,
+            access_tags: None,
         })
         .await
         .unwrap();

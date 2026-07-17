@@ -16,7 +16,7 @@ use sqlx::Row;
 
 use crate::auth::db::{AuthDb, AuthPool};
 use crate::auth::error::{AuthError, Result};
-use crate::auth::scopes::ScopeSet;
+use crate::auth::scopes::{Scope, ScopeSet};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiKeyRecord {
@@ -42,6 +42,13 @@ pub struct ApiKeyCreate {
     pub note: Option<String>,
     pub scopes: ScopeSet,
     pub expiration_time: Option<chrono::DateTime<chrono::Utc>>,
+    /// Optional tag restriction to persist on the key (Python
+    /// `APIKeyRequestParams.access_tags`). `Some` — including `Some(vec![])` —
+    /// means the caller supplied `access_tags`, which upstream forbids
+    /// combining with the `inherit` / `admin:apikeys` scopes. `None` means the
+    /// field was omitted (no restriction). Stored as a JSON array; an empty
+    /// array reads back as "no restriction" (authn_access_tags).
+    pub access_tags: Option<Vec<String>>,
 }
 
 /// One-time material returned from `create_api_key`. The caller MUST
@@ -62,7 +69,28 @@ const API_KEY_LIMIT: i64 = 100;
 
 impl AuthDb {
     pub async fn create_api_key(&self, req: ApiKeyCreate) -> Result<KeyMaterial> {
-        // 0. Enforce the per-principal cap BEFORE any work (Python parity:
+        // 0a. A tag-restricted key must not also carry the `inherit` or
+        //     `admin:apikeys` scope (upstream `scopes_no_tag_restrict`,
+        //     authentication.py:1188-1198). `access_tags is not None` triggers
+        //     the check — matching upstream, an explicit empty list still
+        //     counts. Enforced here — the sole INSERT-owner for api_keys — so
+        //     every create path (API route, admin SPA, CLI) is bound by
+        //     construction rather than at each caller.
+        if req.access_tags.is_some() {
+            let offending: Vec<&str> = [Scope::AdminApiKeys, Scope::Inherit]
+                .into_iter()
+                .filter(|s| req.scopes.contains(*s))
+                .map(|s| s.as_str())
+                .collect();
+            if !offending.is_empty() {
+                return Err(AuthError::Forbidden(format!(
+                    "Requested scopes contain {offending:?}, which cannot be \
+                     combined with access tag restrictions."
+                )));
+            }
+        }
+
+        // 0b. Enforce the per-principal cap BEFORE any work (Python parity:
         //    authentication.py:1207-1221). Counting is done here — the sole
         //    INSERT-owner for api_keys — so every caller path (API routes,
         //    admin SPA, CLI) is bounded by construction rather than at each
@@ -94,13 +122,17 @@ impl AuthDb {
         let first_eight = secret.get(..8).unwrap_or(&secret).to_string();
         let scopes_json = req.scopes.to_json();
         let exp_iso = req.expiration_time.map(|t| t.to_rfc3339());
+        // Persist access_tags as a JSON array. `None` and `Some(vec![])` both
+        // serialize to "[]" — an empty restriction, which the read side treats
+        // as "no restriction" and which matches the column default.
+        let access_tags_json = serde_json::to_string(req.access_tags.as_deref().unwrap_or(&[]))?;
 
         let record = match self.pool() {
             AuthPool::Sqlite(pool) => {
                 let row = sqlx::query(
                     "INSERT INTO api_keys (principal_id, secret_hash, first_eight,
-                                            note, scopes, expiration_time)
-                     VALUES (?, ?, ?, ?, ?, ?)
+                                            note, scopes, expiration_time, access_tags)
+                     VALUES (?, ?, ?, ?, ?, ?, ?)
                      RETURNING id, principal_id, first_eight, note, scopes,
                                expiration_time, time_created, latest_activity,
                                access_tags",
@@ -111,6 +143,7 @@ impl AuthDb {
                 .bind(&req.note)
                 .bind(&scopes_json)
                 .bind(&exp_iso)
+                .bind(&access_tags_json)
                 .fetch_one(pool)
                 .await?;
                 api_key_from_sqlite(&row)?
@@ -118,8 +151,8 @@ impl AuthDb {
             AuthPool::Postgres(pool) => {
                 let row = sqlx::query(
                     "INSERT INTO api_keys (principal_id, secret_hash, first_eight,
-                                            note, scopes, expiration_time)
-                     VALUES ($1, $2, $3, $4, $5::jsonb, $6::timestamptz)
+                                            note, scopes, expiration_time, access_tags)
+                     VALUES ($1, $2, $3, $4, $5::jsonb, $6::timestamptz, $7::jsonb)
                      RETURNING id, principal_id, first_eight, note, scopes,
                                expiration_time, time_created, latest_activity,
                                access_tags",
@@ -130,6 +163,7 @@ impl AuthDb {
                 .bind(&req.note)
                 .bind(&scopes_json)
                 .bind(&exp_iso)
+                .bind(&access_tags_json)
                 .fetch_one(pool)
                 .await?;
                 api_key_from_postgres(&row)?
@@ -432,4 +466,153 @@ fn api_key_from_postgres(row: &sqlx::postgres::PgRow) -> Result<ApiKeyRecord> {
         latest_activity: row.try_get("latest_activity").ok(),
         access_tags,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn mem_db() -> AuthDb {
+        let db = AuthDb::connect("sqlite::memory:")
+            .await
+            .expect("in-memory sqlite");
+        db.migrate().await.expect("migrations");
+        db
+    }
+
+    fn create(
+        principal_id: i64,
+        scopes: ScopeSet,
+        access_tags: Option<Vec<String>>,
+    ) -> ApiKeyCreate {
+        ApiKeyCreate {
+            principal_id,
+            note: None,
+            scopes,
+            expiration_time: None,
+            access_tags,
+        }
+    }
+
+    /// The `scopes_no_tag_restrict` guard (upstream authentication.py:1188-1198):
+    /// a key that carries `inherit` or `admin:apikeys` may NOT also be
+    /// tag-restricted. Enforced at every boundary value of `access_tags`
+    /// (`None` / `Some([])` / `Some([tag])`) crossed with each broad scope,
+    /// and confirmed not to fire for a narrow scope. Lives in `create_api_key`,
+    /// the sole INSERT owner, so it binds every create path.
+    #[tokio::test]
+    async fn create_api_key_tag_restriction_guard() {
+        let db = mem_db().await;
+        let p = db.create_principal("user").await.expect("principal");
+        let tags = || Some(vec!["team-a".to_string()]);
+
+        // inherit + access_tags → Forbidden.
+        let err = db
+            .create_api_key(create(p.id, ScopeSet::from_iter([Scope::Inherit]), tags()))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, AuthError::Forbidden(_)),
+            "inherit + access_tags must be Forbidden, got {err:?}"
+        );
+
+        // admin:apikeys + access_tags → Forbidden.
+        let err = db
+            .create_api_key(create(
+                p.id,
+                ScopeSet::from_iter([Scope::AdminApiKeys]),
+                tags(),
+            ))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, AuthError::Forbidden(_)),
+            "admin:apikeys + access_tags must be Forbidden, got {err:?}"
+        );
+
+        // An explicit EMPTY access_tags still counts as "provided" (upstream's
+        // `access_tags is not None`), so it also trips the guard.
+        let err = db
+            .create_api_key(create(
+                p.id,
+                ScopeSet::from_iter([Scope::Inherit]),
+                Some(vec![]),
+            ))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, AuthError::Forbidden(_)),
+            "inherit + empty access_tags must be Forbidden, got {err:?}"
+        );
+
+        // Narrow scope + access_tags → allowed.
+        let ok = db
+            .create_api_key(create(
+                p.id,
+                ScopeSet::from_iter([Scope::ReadMetadata]),
+                tags(),
+            ))
+            .await;
+        assert!(
+            ok.is_ok(),
+            "narrow scope + access_tags must be allowed, got {ok:?}"
+        );
+
+        // inherit WITHOUT access_tags → allowed (guard only fires when the
+        // caller supplied access_tags).
+        let ok = db
+            .create_api_key(create(p.id, ScopeSet::from_iter([Scope::Inherit]), None))
+            .await;
+        assert!(
+            ok.is_ok(),
+            "inherit with no access_tags must be allowed, got {ok:?}"
+        );
+    }
+
+    /// Persistence: a supplied `access_tags` round-trips through the INSERT and
+    /// is readable back via `list_api_keys` (the same column the auth
+    /// middleware feeds into `authn_access_tags`). `None` persists as an empty
+    /// restriction.
+    #[tokio::test]
+    async fn create_api_key_persists_access_tags() {
+        let db = mem_db().await;
+        let p = db.create_principal("user").await.expect("principal");
+
+        let restricted = db
+            .create_api_key(create(
+                p.id,
+                ScopeSet::from_iter([Scope::ReadMetadata]),
+                Some(vec!["team-a".to_string(), "team-b".to_string()]),
+            ))
+            .await
+            .expect("create restricted key");
+        // The returned record carries the tags immediately.
+        assert_eq!(restricted.record.access_tags, vec!["team-a", "team-b"]);
+
+        let unrestricted = db
+            .create_api_key(create(
+                p.id,
+                ScopeSet::from_iter([Scope::ReadMetadata]),
+                None,
+            ))
+            .await
+            .expect("create unrestricted key");
+        assert!(
+            unrestricted.record.access_tags.is_empty(),
+            "no access_tags persists as an empty (no-restriction) list"
+        );
+
+        // Read the tags back from the DB, not just the create return value.
+        let keys = db.list_api_keys(Some(p.id)).await.expect("list keys");
+        let restricted_read = keys
+            .iter()
+            .find(|k| k.first_eight == restricted.record.first_eight)
+            .expect("restricted key present");
+        assert_eq!(restricted_read.access_tags, vec!["team-a", "team-b"]);
+        let unrestricted_read = keys
+            .iter()
+            .find(|k| k.first_eight == unrestricted.record.first_eight)
+            .expect("unrestricted key present");
+        assert!(unrestricted_read.access_tags.is_empty());
+    }
 }

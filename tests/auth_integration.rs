@@ -1616,6 +1616,104 @@ async fn singular_apikey_path_serves_post_get_delete() {
     );
 }
 
+/// X4 write side: `POST /auth/apikey` accepts an `access_tags` field, persists
+/// it through the wire, and enforces upstream's `scopes_no_tag_restrict` guard
+/// (authentication.py:1188-1198) — a key carrying `inherit` or `admin:apikeys`
+/// may not be tag-restricted, so those requests return 403.
+#[tokio::test]
+async fn apikey_create_persists_access_tags_and_rejects_broad_scope() {
+    let (app, _dir, _cat, auth_db) = build_test_app().await;
+
+    // alice (user role) logs in.
+    let (_, body) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/auth/dummy/login",
+        &[],
+        Some(json!({"username": "alice", "password": "wonderland"})),
+    )
+    .await;
+    let alice_sub = body["identity"]["id"].as_str().unwrap().to_string();
+    let bearer = format!("Bearer {}", body["access_token"].as_str().unwrap());
+
+    // Narrow scopes + access_tags → 200, and the tags persist through the wire.
+    let (status, body) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/auth/apikey",
+        &[("authorization", &bearer)],
+        Some(json!({
+            "note": "tagged",
+            "scopes": ["read:metadata"],
+            "access_tags": ["team-a"],
+        })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "narrow-scope tagged key must be created: {body}"
+    );
+    let first_eight = body["first_eight"].as_str().unwrap().to_string();
+
+    let (alice, _) = auth_db.ensure_principal("dummy", &alice_sub).await.unwrap();
+    let keys = auth_db.list_api_keys(Some(alice.id)).await.unwrap();
+    let rec = keys
+        .iter()
+        .find(|k| k.first_eight == first_eight)
+        .expect("created key present");
+    assert_eq!(
+        rec.access_tags,
+        vec!["team-a".to_string()],
+        "access_tags must persist from the POST body"
+    );
+
+    // Promote alice to admin so she can request inherit / admin:apikeys, re-login.
+    auth_db
+        .update_principal_role(alice.id, "admin")
+        .await
+        .unwrap();
+    let (_, body) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/auth/dummy/login",
+        &[],
+        Some(json!({"username": "alice", "password": "wonderland"})),
+    )
+    .await;
+    let admin_bearer = format!("Bearer {}", body["access_token"].as_str().unwrap());
+
+    // inherit + access_tags → 403 (scopes_no_tag_restrict guard).
+    let (status, _) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/auth/apikey",
+        &[("authorization", &admin_bearer)],
+        Some(json!({"scopes": ["inherit"], "access_tags": ["team-a"]})),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "inherit + access_tags must be rejected with 403"
+    );
+
+    // admin:apikeys + access_tags → 403.
+    let (status, _) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/auth/apikey",
+        &[("authorization", &admin_bearer)],
+        Some(json!({"scopes": ["admin:apikeys"], "access_tags": ["team-a"]})),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "admin:apikeys + access_tags must be rejected with 403"
+    );
+}
+
 /// `GET /api/v1/auth/principal` (list) requires `read:principals` scope (admin
 /// role only). A user-role caller → 403. An admin caller receives a paginated
 /// list of all principals (Python authentication.py:1247-1286 parity).

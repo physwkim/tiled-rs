@@ -1053,6 +1053,8 @@ pub async fn run(command: Command) -> Result<()> {
                         note,
                         scopes: scope_set,
                         expiration_time: exp,
+                        // The CLI apikey-create command does not accept a tag restriction.
+                        access_tags: None,
                     })
                     .await
                     .map_err(|e| anyhow::anyhow!("create api key: {e}"))?;

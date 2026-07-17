@@ -1107,6 +1107,74 @@ mod tests {
         );
     }
 
+    /// End-to-end for the API-key write side (X4): a key created *with*
+    /// `access_tags` persists that restriction, and reading it back drives
+    /// `TagBasedPolicy` narrowing — a key scoped to `[team-a]` cannot reach a
+    /// `team-b` node even though its principal holds both tags. This closes the
+    /// loop the read-only side already had: create → persist → read → narrow.
+    #[tokio::test]
+    async fn api_key_access_tags_persist_and_narrow_through_policy() {
+        let db = setup_auth_db().await;
+        let p = principal_with_tags(&db, &["team-a", "team-b"]).await;
+
+        // WRITE side: create a key restricted to [team-a].
+        let material = db
+            .create_api_key(crate::auth::ApiKeyCreate {
+                principal_id: p.id,
+                note: None,
+                scopes: read_metadata(),
+                expiration_time: None,
+                access_tags: Some(vec!["team-a".to_string()]),
+            })
+            .await
+            .expect("create tag-restricted key");
+
+        // Read the restriction back from the DB — the same column the auth
+        // middleware turns into `authn_access_tags`.
+        let keys = db.list_api_keys(Some(p.id)).await.expect("list keys");
+        let record = keys
+            .iter()
+            .find(|k| k.first_eight == material.record.first_eight)
+            .expect("key present");
+        assert_eq!(record.access_tags, vec!["team-a"], "access_tags persisted");
+
+        // Drive TagBasedPolicy with the persisted restriction.
+        let key_tags: Vec<String> = record.access_tags.clone();
+        let policy = TagBasedPolicy::new(Arc::new(db), ScopeSet::full());
+        let session = ScopeSet::for_role("user");
+        let meta = serde_json::json!({});
+
+        // team-b node: principal holds team-b, but the key does not → DENIED.
+        let blob_b = serde_json::json!({"tags": ["team-b"]});
+        let d_b = policy
+            .principal_decision(
+                &principal_from(&p),
+                &session,
+                Some(&key_tags),
+                ctx(&blob_b, &meta),
+            )
+            .await;
+        assert!(
+            !d_b.scopes.contains(Scope::ReadMetadata),
+            "a key restricted to team-a must not reach a team-b node"
+        );
+
+        // team-a node → GRANTED.
+        let blob_a = serde_json::json!({"tags": ["team-a"]});
+        let d_a = policy
+            .principal_decision(
+                &principal_from(&p),
+                &session,
+                Some(&key_tags),
+                ctx(&blob_a, &meta),
+            )
+            .await;
+        assert!(
+            d_a.scopes.contains(Scope::ReadMetadata),
+            "a key restricted to team-a reaches a team-a node"
+        );
+    }
+
     /// Store-backed tag intersection: a principal sees only nodes whose
     /// `access_blob.tags` intersect the DB-stored principal tags.
     #[tokio::test]
