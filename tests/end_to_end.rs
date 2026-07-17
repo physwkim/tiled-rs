@@ -2569,10 +2569,10 @@ async fn ragged_export_to_file() {
 
 /// Build a catalog with two large arrays, both over the 500-byte floor:
 /// - `big`  : 200 f64 = 1 600 bytes of a smooth ramp — compresses well
-///            (lz4 ratio ~1.84, blosc2 ~1.29, both above the 1/0.9 gate).
+///   (lz4 ratio ~1.84, blosc2 ~1.29, both above the 1/0.9 gate).
 /// - `noise`: 400 f64 = 3 200 bytes of deterministic high-entropy bits (an LCG
-///            reinterpreted as f64) — does NOT compress below the ratio gate
-///            (lz4 ratio ~0.99, blosc2 ~0.99), so it must be served identity.
+///   reinterpreted as f64) — does NOT compress below the ratio gate
+///   (lz4 ratio ~0.99, blosc2 ~0.99), so it must be served identity.
 fn build_large_array_catalog() -> MapAdapter {
     let data: Vec<f64> = (0..200).map(|i| i as f64 * 1.5).collect();
     let arr = ArrayAdapter::from_f64_1d(&data, serde_json::json!({}));
