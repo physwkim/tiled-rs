@@ -552,6 +552,17 @@ pub async fn run(command: Command) -> Result<()> {
                     .and_then(|c| c.catalog_uri().map(String::from))
             });
 
+            // Resolve auth DB URI: CLI flag / TILED_AUTH_DB_URI env > config file
+            // `database.uri` (upstream's top-level `database:` block). Symmetric
+            // with the catalog/mongo resolution above; without this a valid
+            // Python `database: {uri: ...}` config never reaches the auth DB and
+            // multi-user auth silently stays off.
+            let auth_db_uri = auth_db_uri.or_else(|| {
+                file_config
+                    .as_ref()
+                    .and_then(|c| c.auth_db_uri().map(String::from))
+            });
+
             // Resolve API key: CLI flag > config file > env var.
             let api_key = api_key.or_else(|| file_config.as_ref().and_then(|c| c.api_key()));
             // Validate an operator-supplied single-user key once, at startup.
@@ -859,10 +870,18 @@ pub async fn run(command: Command) -> Result<()> {
                     }
                     None => None,
                 };
+            // Webhook safety relaxations: CLI `--webhooks-*` flags OR the config
+            // file's `webhooks:` block (upstream's top-level `webhooks:`). The
+            // store_true CLI flags cannot express an explicit `false`, so either
+            // source enabling a relaxation turns it on. The presence of a
+            // `webhooks:` block does not itself enable webhooks — as before,
+            // webhooks run only when a catalog (DB) is configured.
+            let webhooks_cfg = file_config.as_ref().and_then(|c| c.webhooks.as_ref());
             let webhook_config_value = if catalog_handle.is_some() {
                 Some(crate::server::webhook_dispatch::WebhookConfig {
-                    allow_http: webhooks_allow_http,
-                    allow_private_addresses: webhooks_allow_private_addresses,
+                    allow_http: webhooks_allow_http || webhooks_cfg.is_some_and(|w| w.allow_http),
+                    allow_private_addresses: webhooks_allow_private_addresses
+                        || webhooks_cfg.is_some_and(|w| w.allow_private_addresses),
                     ..Default::default()
                 })
             } else {

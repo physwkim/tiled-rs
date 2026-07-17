@@ -79,6 +79,19 @@ pub struct TiledConfig {
     /// [`Self::root_path`].
     #[serde(default)]
     pub uvicorn: Option<UvicornConfig>,
+    /// Optional `database:` block configuring the authentication database —
+    /// Python tiled's top-level `database:` (`config.py:193`, the `Database`
+    /// model). Its `uri` is the config-file source for the auth DB URI
+    /// (otherwise `--auth-db-uri` / `TILED_AUTH_DB_URI`). See [`DatabaseConfig`].
+    #[serde(default)]
+    pub database: Option<DatabaseConfig>,
+    /// Optional `webhooks:` block configuring outbound-webhook safety limits —
+    /// Python tiled's top-level `webhooks:` (`config.py:242`, the
+    /// `WebhooksConfig` model). Supplies `allow_http` / `allow_private_addresses`
+    /// from the config file (otherwise the matching `--webhooks-*` CLI flags).
+    /// See [`WebhooksConfig`].
+    #[serde(default)]
+    pub webhooks: Option<WebhooksConfig>,
     /// Catch-all for config keys the Rust port does not yet model.
     /// Captured keys are warn-logged once at startup (see
     /// [`TiledConfig::warn_unknown_keys`]) so operators know their
@@ -193,6 +206,78 @@ pub fn default_stream_maxsize() -> usize {
     1000
 }
 
+/// `database:` block — the authentication database. Mirrors Python tiled's
+/// top-level `database:` (`config.py:193`, the `Database` model).
+///
+/// ```yaml
+/// database:
+///   uri: sqlite:////var/lib/tiled/auth.db
+/// ```
+///
+/// Only `uri` is mapped in the Rust port: it becomes the auth DB URI when
+/// `--auth-db-uri` / `TILED_AUTH_DB_URI` is not given (CLI/env wins). The other
+/// upstream fields (`pool_size`, `max_overflow`, `pool_pre_ping`,
+/// `init_if_not_exists`) describe SQLAlchemy's pool + init gate, which have no
+/// analogue here — the Rust auth DB uses a fixed-size SQLx pool (default 8
+/// SQLite / 16 Postgres) and always runs migrations on connect. They are parsed
+/// (so an upstream config is accepted) and warn-logged as no-ops at load; see
+/// [`TiledConfig::warn_unknown_keys`].
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct DatabaseConfig {
+    /// Auth DB URI (e.g. `sqlite:///…` or `postgresql://…`). Config-file source
+    /// for the auth DB URI; overridden by `--auth-db-uri` / `TILED_AUTH_DB_URI`.
+    #[serde(default)]
+    pub uri: Option<String>,
+    /// Upstream SQLAlchemy `pool_size` (persistent connections). No SQLx
+    /// analogue — accepted and warned as a no-op.
+    #[serde(default)]
+    pub pool_size: Option<u32>,
+    /// Upstream SQLAlchemy `max_overflow` (temporary connections above
+    /// `pool_size`). No SQLx analogue — accepted and warned as a no-op.
+    #[serde(default)]
+    pub max_overflow: Option<u32>,
+    /// Upstream SQLAlchemy `pool_pre_ping`. No SQLx analogue — accepted and
+    /// warned as a no-op.
+    #[serde(default)]
+    pub pool_pre_ping: Option<bool>,
+    /// Upstream init-on-missing gate. The Rust auth DB always migrates on
+    /// connect, so this is accepted and warned as a no-op.
+    #[serde(default)]
+    pub init_if_not_exists: Option<bool>,
+}
+
+/// `webhooks:` block — outbound-webhook safety limits. Mirrors Python tiled's
+/// top-level `webhooks:` (`config.py:242`, the `WebhooksConfig` model).
+///
+/// ```yaml
+/// webhooks:
+///   allow_http: false
+///   allow_private_addresses: false
+/// ```
+///
+/// `allow_http` and `allow_private_addresses` are config-file sources for the
+/// matching `WebhookConfig` fields; they are OR-combined with the
+/// `--webhooks-allow-http` / `--webhooks-allow-private-addresses` CLI flags
+/// (either source enabling turns the relaxation on — a store_true flag cannot
+/// express an explicit `false` to override a config `true`). Upstream's
+/// `secret_keys` (Fernet keys used to encrypt webhook signing secrets at rest)
+/// has no analogue here — Rust does not encrypt webhook secrets at rest — so it
+/// is parsed and warn-logged as a no-op; see [`TiledConfig::warn_unknown_keys`].
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct WebhooksConfig {
+    /// Allow `http://` webhook targets (default `false` — HTTPS required).
+    #[serde(default)]
+    pub allow_http: bool,
+    /// Allow webhook targets that resolve to private / loopback / reserved IPs
+    /// (default `false` — SSRF protection).
+    #[serde(default)]
+    pub allow_private_addresses: bool,
+    /// Upstream Fernet keys encrypting webhook signing secrets at rest. No
+    /// analogue here — accepted and warned as a no-op.
+    #[serde(default)]
+    pub secret_keys: Vec<String>,
+}
+
 // `Default` is hand-written (not derived) so `response_bytesize_limit` agrees
 // with its serde default (300 MB) instead of `usize::default()` (0), which
 // would otherwise make every response "exceed" the limit.
@@ -211,6 +296,8 @@ impl Default for TiledConfig {
             exact_count_limit: default_exact_count_limit(),
             streaming: None,
             uvicorn: None,
+            database: None,
+            webhooks: None,
             unknown: BTreeMap::new(),
         }
     }
@@ -1247,6 +1334,43 @@ impl TiledConfig {
                 );
             }
         }
+        if let Some(db) = &self.database {
+            // `database.uri` is honored; the SQLAlchemy pool + init-gate fields
+            // have no SQLx analogue (fixed-size pool, always-migrate). Surface
+            // each set-but-ignored field so operators are not misled.
+            if db.pool_size.is_some() {
+                tracing::warn!(
+                    "config key 'database.pool_size' is not modelled in tiled-rs \
+                     (the auth DB uses a fixed-size SQLx pool) and has no effect"
+                );
+            }
+            if db.max_overflow.is_some() {
+                tracing::warn!(
+                    "config key 'database.max_overflow' is not modelled in tiled-rs \
+                     (the auth DB uses a fixed-size SQLx pool) and has no effect"
+                );
+            }
+            if db.pool_pre_ping.is_some() {
+                tracing::warn!(
+                    "config key 'database.pool_pre_ping' is not modelled in tiled-rs \
+                     and has no effect"
+                );
+            }
+            if db.init_if_not_exists.is_some() {
+                tracing::warn!(
+                    "config key 'database.init_if_not_exists' is not modelled in tiled-rs \
+                     (the auth DB always runs migrations on connect) and has no effect"
+                );
+            }
+        }
+        if let Some(webhooks) = &self.webhooks
+            && !webhooks.secret_keys.is_empty()
+        {
+            tracing::warn!(
+                "config key 'webhooks.secret_keys' is not modelled in tiled-rs \
+                 (webhook signing secrets are not encrypted at rest) and has no effect"
+            );
+        }
     }
 
     /// Reverse-proxy `root_path` declared in the `uvicorn:` block (upstream
@@ -1282,6 +1406,14 @@ impl TiledConfig {
                 None
             }
         })
+    }
+
+    /// Auth DB URI declared in the config file (`database.uri`). Config-file
+    /// source for the auth DB URI; the `--auth-db-uri` flag / `TILED_AUTH_DB_URI`
+    /// env take precedence (resolved in the serve command). Mirrors Python
+    /// `Database.uri` (`config.py:194`).
+    pub fn auth_db_uri(&self) -> Option<&str> {
+        self.database.as_ref().and_then(|d| d.uri.as_deref())
     }
 
     /// Extract the API key from authentication config or env var.
@@ -2568,5 +2700,103 @@ authentication:
             cfg.overlay_response_bytesize_limit(Some("not-a-number"))
                 .is_err()
         );
+    }
+
+    // P13: the top-level `database:` block resolves the auth DB URI — without
+    // it a valid Python `database: {uri: ...}` config never reaches the auth DB
+    // and multi-user auth silently stays off.
+    #[test]
+    fn database_block_resolves_auth_db_uri() {
+        let cfg: TiledConfig =
+            serde_yaml::from_str("database:\n  uri: sqlite:////var/lib/tiled/auth.db\n").unwrap();
+        assert_eq!(cfg.auth_db_uri(), Some("sqlite:////var/lib/tiled/auth.db"));
+        // `database:` is modeled — it must NOT land in the top-level catch-all.
+        assert!(
+            !cfg.unknown.contains_key("database"),
+            "modeled key 'database' must not appear in the catch-all; got {:?}",
+            cfg.unknown
+        );
+    }
+
+    // Absent `database:` block → no auth DB URI from config (unchanged default).
+    #[test]
+    fn database_absent_yields_no_auth_db_uri() {
+        let cfg: TiledConfig = serde_yaml::from_str("trees: []").unwrap();
+        assert!(cfg.database.is_none());
+        assert_eq!(cfg.auth_db_uri(), None);
+    }
+
+    // A full upstream `database:` block (all five fields) parses into the typed
+    // struct — the pool/init fields are captured (then warned as no-ops at load)
+    // rather than rejected, so an upstream config file is accepted verbatim.
+    #[test]
+    fn database_full_upstream_shape_parses() {
+        let cfg: TiledConfig = serde_yaml::from_str(
+            "database:\n\
+             \x20 uri: postgresql://tiled@db/auth\n\
+             \x20 pool_size: 5\n\
+             \x20 max_overflow: 10\n\
+             \x20 pool_pre_ping: true\n\
+             \x20 init_if_not_exists: false\n",
+        )
+        .unwrap();
+        let db = cfg.database.as_ref().expect("database block present");
+        assert_eq!(db.uri.as_deref(), Some("postgresql://tiled@db/auth"));
+        assert_eq!(db.pool_size, Some(5));
+        assert_eq!(db.max_overflow, Some(10));
+        assert_eq!(db.pool_pre_ping, Some(true));
+        assert_eq!(db.init_if_not_exists, Some(false));
+    }
+
+    // P13: the top-level `webhooks:` block parses into the typed struct, and
+    // both safety-relaxation flags plus `secret_keys` are captured.
+    #[test]
+    fn webhooks_block_parses() {
+        let cfg: TiledConfig = serde_yaml::from_str(
+            "webhooks:\n\
+             \x20 allow_http: true\n\
+             \x20 allow_private_addresses: true\n\
+             \x20 secret_keys:\n\
+             \x20   - deadbeef\n",
+        )
+        .unwrap();
+        let wh = cfg.webhooks.as_ref().expect("webhooks block present");
+        assert!(wh.allow_http);
+        assert!(wh.allow_private_addresses);
+        assert_eq!(wh.secret_keys, vec!["deadbeef".to_string()]);
+        // `webhooks:` is modeled — it must NOT land in the top-level catch-all.
+        assert!(
+            !cfg.unknown.contains_key("webhooks"),
+            "modeled key 'webhooks' must not appear in the catch-all; got {:?}",
+            cfg.unknown
+        );
+    }
+
+    // Absent `webhooks:` block → None; and an empty block defaults both
+    // relaxations to false (HTTPS + SSRF protection stay on).
+    #[test]
+    fn webhooks_absent_and_defaults() {
+        let cfg: TiledConfig = serde_yaml::from_str("trees: []").unwrap();
+        assert!(cfg.webhooks.is_none());
+        let cfg: TiledConfig = serde_yaml::from_str("webhooks: {}").unwrap();
+        let wh = cfg.webhooks.as_ref().expect("empty webhooks block present");
+        assert!(!wh.allow_http);
+        assert!(!wh.allow_private_addresses);
+        assert!(wh.secret_keys.is_empty());
+    }
+
+    // Regression: a config with neither `database:` nor `webhooks:` still parses
+    // and leaves both as None (existing configs are unaffected by the new
+    // blocks).
+    #[test]
+    fn config_without_new_blocks_still_parses() {
+        let cfg: TiledConfig = serde_yaml::from_str(
+            "trees: []\n\
+             response_bytesize_limit: 42\n",
+        )
+        .unwrap();
+        assert!(cfg.database.is_none());
+        assert!(cfg.webhooks.is_none());
+        assert_eq!(cfg.response_bytesize_limit, 42);
     }
 }
