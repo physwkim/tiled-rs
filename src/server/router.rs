@@ -6677,6 +6677,15 @@ pub async fn delete_metadata(
             )
         })
         .unwrap_or(true);
+    // `?recursive=true` deletes the whole subtree in one call; default false,
+    // matching Python `recursive: bool = Query(False)` (router.py:1980). When
+    // false, a non-empty container is refused (the empty-check below); when
+    // true the check is skipped and the catalog's `delete_node` cascades the
+    // subtree. `external_only` still governs managed data independently.
+    let recursive = params
+        .get("recursive")
+        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
+        .unwrap_or(false);
     let catalog = state.catalog.as_ref().ok_or_else(|| {
         ServerError::Validation("server has no catalog DB; DELETE not supported".into())
     })?;
@@ -6693,11 +6702,13 @@ pub async fn delete_metadata(
         .await
         .map_err(map_catalog_err)?
         .ok_or_else(|| ServerError::NotFound(format!("'{}' not found", segments.join("/"))))?;
-    // Reject deletion of a non-empty container (upstream tiled #503).
-    // Cascading FK delete *would* succeed, but silently dropping a
-    // subtree is the kind of thing that needs explicit `rm -rf`
-    // semantics; require the caller to empty the container first.
-    if node.structure_family == "container" {
+    // Reject deletion of a non-empty container unless `recursive=true`
+    // (upstream tiled #503; `if not recursive` gate at adapter.py:1069-1085).
+    // Cascading FK delete *would* succeed, but silently dropping a subtree is
+    // the kind of thing that needs explicit `rm -rf` semantics; a
+    // non-recursive caller must empty the container first. With recursive=true
+    // the caller has opted in and `delete_node` cascades the whole subtree.
+    if !recursive && node.structure_family == "container" {
         let kid_count = catalog
             .count_children(Some(node.id))
             .await
@@ -6707,7 +6718,7 @@ pub async fn delete_metadata(
             // (adapter.py:1024 -> app.py:350-353).
             return Err(ServerError::Conflict(format!(
                 "container '{}' is not empty ({kid_count} children); \
-                 delete its contents first or use a future recursive endpoint",
+                 delete its contents first or pass recursive=true",
                 segments.join("/"),
             )));
         }
