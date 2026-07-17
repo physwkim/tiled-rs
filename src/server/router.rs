@@ -5579,7 +5579,10 @@ async fn create_node_core(
             .await
             .map_err(map_catalog_err)?;
 
-        // Persist any data sources sent with the create request.
+        // Persist any data sources sent with the create request, capturing the
+        // DB-assigned primary key of each in creation order so the child-created
+        // stream event below can carry them (upstream adapter.py:847-855).
+        let mut persisted_ds_ids: Vec<i64> = Vec::with_capacity(req.data_sources.len());
         for ds in &req.data_sources {
             // Two creation modes share this core:
             //  * `/register` (generate_storage=false): the client supplies the
@@ -5646,10 +5649,11 @@ async fn create_node_core(
                 management: format!("{:?}", ds.management).to_lowercase(),
                 assets,
             };
-            catalog
+            let created = catalog
                 .create_data_source(node.id, spec)
                 .await
                 .map_err(map_catalog_err)?;
+            persisted_ds_ids.push(created.id);
         }
 
         let child_path = if path.is_empty() {
@@ -5664,6 +5668,19 @@ async fn create_node_core(
         // there is no ancestor fan-out (D4), and a root-level create (no parent
         // node id) does not stream, since the root has no subscribable node id.
         if let Some(parent_id) = parent_id {
+            // Stamp each streamed data source with its DB-assigned primary key
+            // (upstream adapter.py:848-855: `ds = data_source.model_copy(); ds.id
+            // = data_source_orm.id`). The request objects carry no id; the
+            // persisted rows do, matched here by creation order.
+            let data_sources_with_ids: Vec<crate::core::data_source::DataSource> = req
+                .data_sources
+                .iter()
+                .zip(&persisted_ds_ids)
+                .map(|(ds, &id)| crate::core::data_source::DataSource {
+                    id: Some(id),
+                    ..ds.clone()
+                })
+                .collect();
             let seq = state.streaming_cache.incr_seq(parent_id).await;
             state
                 .streaming_cache
@@ -5676,7 +5693,7 @@ async fn create_node_core(
                         &structure_family,
                         node.specs.clone(),
                         node.metadata.clone(),
-                        serde_json::to_value(&req.data_sources).unwrap_or_default(),
+                        serde_json::to_value(&data_sources_with_ids).unwrap_or_default(),
                         node.access_blob.clone(),
                     ),
                 )
