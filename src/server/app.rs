@@ -401,13 +401,15 @@ pub fn build_app(mut state: AppState) -> Router {
     #[cfg(feature = "web")]
     {
         if state.enable_web {
-            let bus = state.streaming_bus.clone();
             let web_state = crate::web::WebState {
                 auth_db: state.auth_db.clone(),
                 issuer: state.issuer.clone(),
                 default_login_scopes: state.default_login_scopes.clone(),
                 login_provider: "dummy".into(),
-                channel_count_fn: std::sync::Arc::new(move || bus.channel_count()),
+                // The notification bus (which exposed a live channel count) was
+                // retired in Wave-24 PR2b; the per-node streaming cache tracks
+                // no global channel total, so the admin metric reads 0.
+                channel_count_fn: std::sync::Arc::new(|| 0),
                 // Honor X-Forwarded-Proto for the cookie Secure flag only when
                 // we trust a fronting proxy's forwarded headers. peer_ip is not
                 // plumbed here (no ConnectInfo), so peer_is_trusted(None) folds

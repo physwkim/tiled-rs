@@ -1,7 +1,8 @@
 //! Per-node data-streaming cache (Wave-24, upstream `tiled.streaming`).
 //!
-//! Upstream tiled keeps a *data* stream per catalog node, distinct from the
-//! notification-only [`StreamingBus`](crate::server::streaming::StreamingBus).
+//! Upstream tiled keeps a *data* stream per catalog node. This per-node cache
+//! is the sole streaming primitive after Wave-24 PR2b retired the old
+//! notification-only streaming bus; it now backs the WebSocket path directly.
 //! Each node has a monotonic sequence counter and a cache of the actual event
 //! payloads (array blocks, table partitions, tree events, …) keyed by
 //! `(node_id, sequence)`. A WebSocket handler replays cached events from a
@@ -218,6 +219,21 @@ impl StreamEvent {
         }
     }
 
+    /// `node-deleted` event: published on the deleted node's own id when the
+    /// node is removed. tiled-rs extension (Wave-24 PR2b, D9) — upstream's
+    /// `delete()` (`tiled/catalog/adapter.py:1042`) emits no streaming event;
+    /// tiled-rs keeps its delete notification. No payload.
+    pub fn node_deleted(sequence: u64) -> Self {
+        Self {
+            metadata: json!({
+                "type": "node-deleted",
+                "sequence": sequence,
+                "timestamp": now_timestamp(),
+            }),
+            payload: None,
+        }
+    }
+
     /// `end_of_stream` marker (`tiled/streaming.py` `close`): the final event,
     /// carrying only a timestamp and the `end_of_stream: true` flag. No `type`
     /// and no `sequence` inside the header (the sequence is the cache key). No
@@ -277,14 +293,12 @@ struct NodeEntry {
     /// every `incr_seq`. Mirrors upstream's `seq_ttl` on the counter cache.
     seq_deadline: std::sync::Mutex<Instant>,
     /// `sequence -> (deadline, event)`, ordered so the oldest sequence evicts
-    /// first when `maxsize` is exceeded. Mirrors the bounded history ring in
-    /// [`StreamingBus`](crate::server::streaming) at `streaming.rs:55-113`.
+    /// first when `maxsize` is exceeded — a bounded history ring for replay.
     data: std::sync::Mutex<BTreeMap<u64, DataEntry>>,
     notify: broadcast::Sender<u64>,
 }
 
-/// Broadcast channel depth for live sequence notifications. Matches the
-/// `CHANNEL_CAPACITY` used by [`StreamingBus`](crate::server::streaming).
+/// Broadcast channel depth for live sequence notifications.
 const CHANNEL_CAPACITY: usize = 256;
 
 /// In-process data-streaming cache backed by [`DashMap`], mirroring upstream's

@@ -73,18 +73,16 @@ pub struct AppState {
     /// tiled's `response_bytesize_limit` (config.py / settings.py).
     pub response_bytesize_limit: usize,
 
-    /// In-process pub/sub bus for WebSocket subscribers. Write handlers
-    /// publish to it after a successful catalog write; subscribers
-    /// connected to /api/v1/stream/single/{*path} receive matching
-    /// updates.
-    pub streaming_bus: crate::server::streaming::StreamingBus,
-    /// Per-node *data* streaming cache (upstream `tiled.streaming`), distinct
-    /// from `streaming_bus` (notification-only). Holds the actual event
-    /// payloads keyed by `(node_id, sequence)` so a WebSocket client can
-    /// replay from a requested sequence, then follow live ones. Defaults to a
+    /// Per-node *data* streaming cache (upstream `tiled.streaming`). Holds the
+    /// event metadata (and, from PR3 on, payloads) keyed by `(node_id,
+    /// sequence)` so a WebSocket client connected to
+    /// `/api/v1/stream/single/{*path}` can replay from a requested sequence,
+    /// then follow live ones. The catalog write handlers publish tree events
+    /// into it; the WS handler in [`streaming`](crate::server::streaming) is the
+    /// sole consumer. Defaults to a
     /// [`DisabledStreamingCache`](crate::server::streaming_cache::DisabledStreamingCache)
-    /// no-op unless a `streaming:` config block selects a backend. Constructed
-    /// but not yet consumed — the write-path/WebSocket wiring is Wave-24 PR2+.
+    /// no-op (schema then no events) unless a `streaming:` config block selects
+    /// a backend.
     pub streaming_cache: Arc<dyn crate::server::streaming_cache::StreamingCache>,
     /// Optional AccessPolicy. When set, search/read handlers consult it
     /// for per-node scope decisions (tiled#287). `None` keeps the

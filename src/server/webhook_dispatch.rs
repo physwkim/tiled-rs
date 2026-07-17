@@ -585,7 +585,7 @@ mod tests {
     }
 
     /// The `data` blob for a `child-created` event — the JSON the router
-    /// builds by serializing `UpdateKind::ChildCreated`. The dispatcher passes
+    /// builds inline (`{type, key, structure_family}`). The dispatcher passes
     /// it through verbatim, so tests construct it directly (no dependency on
     /// the streaming module's types).
     fn child_created_data() -> serde_json::Value {

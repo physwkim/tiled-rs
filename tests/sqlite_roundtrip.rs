@@ -102,7 +102,7 @@ async fn migrate_create_lookup_delete() {
     assert_eq!(assets[0].data_uri, "file:///tmp/frame.h5");
 
     // Update metadata; should write a revision row.
-    let updated = cat
+    let (updated, revision_number) = cat
         .update_metadata(
             container.id,
             json!({"description": "second"}),
@@ -113,6 +113,8 @@ async fn migrate_create_lookup_delete() {
         .await
         .unwrap();
     assert_eq!(updated.metadata, json!({"description": "second"}));
+    // The first revision recorded for this node is revision 1.
+    assert_eq!(revision_number, Some(1));
 
     // Children listing.
     let kids = cat.list_children(Some(container.id), 0, 100).await.unwrap();
