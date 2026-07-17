@@ -477,8 +477,18 @@ impl ContainerClient {
         if let Some(tags) = access_tags {
             body["access_blob"] = serde_json::json!({ "tags": tags });
         }
-        let resp = self.base.context.post_json(&url, &body).await?;
-        let created = decode_response::<PostMetadataResponse>(resp).await?;
+        // Wrapped in `retry` to match upstream `Container.new`, which issues the
+        // POST inside `retry_context` (`container.py:735-745`). This is the single
+        // write behind `create_node` and every `write_*` helper, so wrapping here
+        // covers the whole create-node family. The `post_json` primitive stays
+        // bare (batch-3 parity: retry is applied at the call site, never doubled
+        // inside the primitive). Upstream retries this non-idempotent create, so
+        // parity requires we do too.
+        let created = retry(|| async {
+            let resp = self.base.context.post_json(&url, &body).await?;
+            decode_response::<PostMetadataResponse>(resp).await
+        })
+        .await?;
         Ok(created.id)
     }
 
