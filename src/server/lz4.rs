@@ -3,7 +3,7 @@
 //! Mirrors Python tiled's `CompressionMiddleware` / `CompressionRegistry` lz4
 //! arm (`tiled/server/compression.py`, `tiled/media_type_registration.py:289-343`):
 //! when the client advertises `lz4` in `Accept-Encoding` and the response body
-//! is eligible (>= 500 bytes, media type in the lz4-eligible set), the body is
+//! is eligible (>= 1000 bytes, media type in the lz4-eligible set), the body is
 //! compressed and `Content-Encoding: lz4` is set.
 //!
 //! ## Wire format
@@ -37,8 +37,10 @@ use crate::core::media_type::mime;
 use crate::server::server_timing::timing_from_request;
 
 /// Minimum response body size (bytes) to trigger lz4 compression.
-/// Mirrors Python's `CompressionMiddleware(minimum_size=500)`.
-pub const MINIMUM_SIZE: usize = 500;
+/// The running app overrides `CompressionMiddleware`'s 500-byte class default
+/// (`compression.py:11`) with `minimum_size=1000` in `app.add_middleware(...)`
+/// (`tiled/server/app.py:760-764`), so the effective floor is 1000, not 500.
+pub const MINIMUM_SIZE: usize = 1000;
 
 /// Media types for which lz4 is offered. Matches the set registered for lz4 in
 /// Python's `media_type_registration.py:333-342` exactly.

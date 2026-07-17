@@ -3,7 +3,7 @@
 //! Mirrors Python tiled's `CompressionMiddleware` / `CompressionRegistry`
 //! (`tiled/server/compression.py`, `tiled/media_type_registration.py`):
 //! when the client advertises `blosc2` in `Accept-Encoding` and the response
-//! body is eligible (>= 500 bytes, media type in the blosc2-eligible set),
+//! body is eligible (>= 1000 bytes, media type in the blosc2-eligible set),
 //! the body is compressed and `Content-Encoding: blosc2` is set.
 //!
 //! This layer must sit **inside** (closer to the handler than) tower-http's
@@ -19,8 +19,10 @@ use axum::response::Response;
 use blosc2_pure_rs::{BLOSC_NOSHUFFLE, BLOSC2_MAX_OVERHEAD, blosc1_compress, blosc1_decompress};
 
 /// Minimum response body size (bytes) to trigger blosc2 compression.
-/// Mirrors Python's `CompressionMiddleware(minimum_size=500)`.
-pub const MINIMUM_SIZE: usize = 500;
+/// The running app overrides `CompressionMiddleware`'s 500-byte class default
+/// (`compression.py:11`) with `minimum_size=1000` in `app.add_middleware(...)`
+/// (`tiled/server/app.py:760-764`), so the effective floor is 1000, not 500.
+pub const MINIMUM_SIZE: usize = 1000;
 
 /// Media types for which blosc2 is offered.  Python's `media_type_registration.py`
 /// registers blosc2 only for `application/octet-stream` and the Arrow file
