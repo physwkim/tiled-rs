@@ -55,8 +55,29 @@ pub struct KeyMaterial {
 
 const KEY_BYTES: usize = 32; // 256 bits
 
+/// Max API keys allowed per principal. Matches Python tiled's `API_KEY_LIMIT`
+/// (authentication.py:84). The routes that list keys are unpaginated, so this
+/// bounds their response size and guards against key-table abuse.
+const API_KEY_LIMIT: i64 = 100;
+
 impl AuthDb {
     pub async fn create_api_key(&self, req: ApiKeyCreate) -> Result<KeyMaterial> {
+        // 0. Enforce the per-principal cap BEFORE any work (Python parity:
+        //    authentication.py:1207-1221). Counting is done here — the sole
+        //    INSERT-owner for api_keys — so every caller path (API routes,
+        //    admin SPA, CLI) is bounded by construction rather than at each
+        //    route. Count ALL rows for the principal: upstream's `keys_count`
+        //    query filters on principal.id alone, with no expiration/revoked
+        //    exclusion, so expired keys still count until deleted.
+        let existing = self.count_api_keys(req.principal_id).await?;
+        if existing >= API_KEY_LIMIT {
+            return Err(AuthError::LimitExceeded(format!(
+                "This Principal already has {existing} API keys which is greater \
+                 than or equal to the maximum number allowed, {API_KEY_LIMIT}. \
+                 Some API keys must be deleted before creating new ones."
+            )));
+        }
+
         // 1. Generate plaintext secret. Hex so it's URL/header-safe.
         let mut bytes = [0u8; KEY_BYTES];
         rand::thread_rng().fill_bytes(&mut bytes);
@@ -116,6 +137,27 @@ impl AuthDb {
         };
 
         Ok(KeyMaterial { record, secret })
+    }
+
+    /// Count every API key row owned by `principal_id`. Matches Python tiled's
+    /// `keys_count` query (authentication.py:1207-1213): no expiration/revoked
+    /// filter, so expired keys count against [`API_KEY_LIMIT`] until deleted.
+    async fn count_api_keys(&self, principal_id: i64) -> Result<i64> {
+        let n: i64 = match self.pool() {
+            AuthPool::Sqlite(pool) => {
+                sqlx::query_scalar("SELECT COUNT(*) FROM api_keys WHERE principal_id = ?")
+                    .bind(principal_id)
+                    .fetch_one(pool)
+                    .await?
+            }
+            AuthPool::Postgres(pool) => {
+                sqlx::query_scalar("SELECT COUNT(*) FROM api_keys WHERE principal_id = $1")
+                    .bind(principal_id)
+                    .fetch_one(pool)
+                    .await?
+            }
+        };
+        Ok(n)
     }
 
     pub async fn list_api_keys(&self, principal_id: Option<i64>) -> Result<Vec<ApiKeyRecord>> {
