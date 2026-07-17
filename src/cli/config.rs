@@ -423,12 +423,14 @@ pub struct AuthConfig {
     /// Only takes effect in multi-user mode (`--auth-db-uri`).
     #[serde(default)]
     pub tiled_admins: Vec<TiledAdmin>,
-    /// External authentication providers — the OIDC family of Python's
-    /// `authentication.providers` (`config.py`). Each OIDC-family entry is
-    /// validated and wired into the external-OIDC validator at startup
-    /// (bearer + authorization-code flow); non-OIDC authenticators
-    /// (SAML/LDAP/PAM) in the same list are skipped with a warning until they
-    /// are modeled. See [`AuthProviderConfig`].
+    /// Authentication providers — Python's `authentication.providers`
+    /// (`config.py`). OIDC-family entries are validated and wired into the
+    /// external-OIDC validator at startup (bearer + authorization-code flow);
+    /// the internal username/password families (dictionary, LDAP, PAM) are
+    /// built by [`AuthConfig::build_internal_authenticators`]; SAML entries are
+    /// wired by `build_saml_providers` under the `saml` feature. Any other
+    /// authenticator is skipped with a warning until it is modeled. See
+    /// [`AuthProviderConfig`].
     #[serde(default)]
     pub providers: Vec<AuthProviderConfig>,
     /// Catch-all for authentication config keys the Rust port does not yet
@@ -444,8 +446,10 @@ pub struct AuthConfig {
 /// Python uses an import path (`tiled.authenticators:OIDCAuthenticator`); the
 /// Rust port cannot import arbitrary code, so `authenticator` is matched by its
 /// class name — the OIDC family (`OIDCAuthenticator`, `ProxiedOIDCAuthenticator`,
-/// `EntraAuthenticator`) or the short selectors `oidc`/`entra`/`proxied_oidc`.
-/// Any other authenticator is skipped with a warning (not yet modeled).
+/// `EntraAuthenticator`) or the short selectors `oidc`/`entra`/`proxied_oidc`;
+/// the internal families `DictionaryAuthenticator`/`dictionary`,
+/// `LDAPAuthenticator`/`ldap`, `PAMAuthenticator`/`pam`; and `SAMLAuthenticator`/
+/// `saml`. Any other authenticator is skipped with a warning (not yet modeled).
 ///
 /// ```yaml
 /// authentication:
@@ -469,8 +473,10 @@ pub struct AuthProviderConfig {
     /// `authenticator` selector (exactly as Python passes a generic `args`
     /// dict to the named authenticator's constructor). Each builder
     /// deserializes it into its own typed config: [`OidcProviderArgs`] for the
-    /// OIDC family, `crate::auth::LdapConfig` for LDAP, `crate::auth::PamConfig`
-    /// for PAM. An absent `args:` is `Null`, treated as an empty mapping.
+    /// OIDC family, [`DictionaryProviderArgs`] for the dictionary authenticator,
+    /// `crate::auth::LdapConfig` for LDAP, `crate::auth::PamConfig` for PAM,
+    /// [`SamlProviderArgs`] for SAML. An absent `args:` is `Null`, treated as an
+    /// empty mapping.
     #[serde(default)]
     pub args: serde_yaml::Value,
 }
@@ -576,6 +582,25 @@ pub struct SamlEndpoint {
     pub url: String,
 }
 
+/// `args` for a dictionary (username/password map) provider. Mirrors the
+/// constructor kwargs of Python's `DictionaryAuthenticator`
+/// (`authenticators.py:46`): a `users_to_passwords` map checked at login. Built
+/// into the Rust [`crate::auth::DummyAuthenticator`], which stores each password
+/// Argon2id-hashed rather than in plaintext.
+///
+/// Upstream's optional `confirmation_message` (a string the client may display
+/// after login) is intentionally not modeled: the Rust login flow never
+/// surfaces it (the LDAP/PAM authenticators carry it only as a parity field
+/// that no server route reads), so an entry that sets it parses and the key is
+/// ignored — the same treatment every unmodeled `args` key already gets.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DictionaryProviderArgs {
+    /// Username → plaintext password. Required (Python's constructor has no
+    /// default); each password is Argon2id-hashed at construction (see
+    /// [`crate::auth::DummyAuthenticator::add_user`]).
+    pub users_to_passwords: BTreeMap<String, String>,
+}
+
 impl AuthConfig {
     /// Build the external-OIDC validator from `providers` entries in the OIDC
     /// family. Returns `None` when no such providers are configured.
@@ -603,15 +628,17 @@ impl AuthConfig {
     }
 
     /// Build the internal (username/password) authenticators declared in
-    /// `providers` — currently LDAP and PAM. These are added to
-    /// `AppState.authenticators` and served at `/auth/{provider}/login`, and
-    /// advertised by the About endpoint as `mode: internal`. OIDC-family
-    /// providers are handled by [`AuthConfig::build_oidc_validator`]; any other
-    /// authenticator is skipped with a warning.
+    /// `providers` — the dictionary (username/password map), LDAP, and PAM
+    /// families. These are added to `AppState.authenticators` and served at
+    /// `/auth/{provider}/login`, and advertised by the About endpoint as
+    /// `mode: internal`. OIDC-family providers are handled by
+    /// [`AuthConfig::build_oidc_validator`]; any other authenticator is skipped
+    /// with a warning.
     ///
     /// LDAP/PAM are compiled in only under the matching build feature; when the
     /// feature is off, a provider that names them is skipped with a warning
-    /// (mirroring SAML's opt-in build).
+    /// (mirroring SAML's opt-in build). The dictionary authenticator has no
+    /// feature gate — it is always available.
     pub fn build_internal_authenticators(
         &self,
     ) -> anyhow::Result<Vec<Arc<dyn crate::auth::Authenticator>>> {
@@ -619,6 +646,8 @@ impl AuthConfig {
         for entry in &self.providers {
             if is_oidc_authenticator(&entry.authenticator) {
                 continue; // handled by build_oidc_validator
+            } else if is_dictionary_authenticator(&entry.authenticator) {
+                out.push(build_dictionary_authenticator(entry)?);
             } else if is_ldap_authenticator(&entry.authenticator) {
                 out.extend(build_ldap_authenticator(entry)?);
             } else if is_pam_authenticator(&entry.authenticator) {
@@ -701,6 +730,20 @@ fn is_oidc_authenticator(authenticator: &str) -> bool {
     ) || matches!(authenticator, "oidc" | "entra" | "proxied_oidc")
 }
 
+/// True when `authenticator` names the dictionary authenticator — a Python
+/// import path ending in `DictionaryAuthenticator`, or the short selector
+/// `dictionary`. Selects the Rust [`crate::auth::DummyAuthenticator`] (a
+/// username/password map). Note this does *not* match Python's separate
+/// `DummyAuthenticator` (which accepts any credentials); only the
+/// dictionary-backed authenticator is modeled.
+fn is_dictionary_authenticator(authenticator: &str) -> bool {
+    let class = authenticator
+        .rsplit([':', '.'])
+        .next()
+        .unwrap_or(authenticator);
+    class == "DictionaryAuthenticator" || authenticator == "dictionary"
+}
+
 /// True when `authenticator` is the Entra-specific authenticator (a Python
 /// import path ending in `EntraAuthenticator`, or the short selector `entra`).
 /// Selects [`IdentityMapping::Entra`] — uuid5 subject + username derivation.
@@ -755,6 +798,33 @@ fn warn_saml_needs_feature(entry: &AuthProviderConfig) {
         provider = %entry.provider,
         "authentication.providers: SAML authenticator requires the 'saml' build feature; skipping"
     );
+}
+
+/// Build a dictionary (username/password map) authenticator from a provider
+/// entry — the Rust [`crate::auth::DummyAuthenticator`] populated from the
+/// entry's `users_to_passwords` map. Mirrors Python's `DictionaryAuthenticator`
+/// (`authenticators.py:46`). Unlike LDAP/PAM this is always compiled in, so it
+/// returns the authenticator directly rather than an `Option`.
+fn build_dictionary_authenticator(
+    entry: &AuthProviderConfig,
+) -> anyhow::Result<Arc<dyn crate::auth::Authenticator>> {
+    let args: DictionaryProviderArgs =
+        deserialize_provider_args(&entry.args).with_context(|| {
+            format!(
+                "authentication.providers '{}': dictionary args",
+                entry.provider
+            )
+        })?;
+    let mut auth = crate::auth::DummyAuthenticator::new(entry.provider.clone());
+    for (username, password) in &args.users_to_passwords {
+        auth.add_user(username, password).with_context(|| {
+            format!(
+                "authentication.providers '{}': hashing password for user '{username}'",
+                entry.provider
+            )
+        })?;
+    }
+    Ok(Arc::new(auth))
 }
 
 /// Build an LDAP authenticator from a provider entry. Compiled only under the
@@ -1500,6 +1570,152 @@ authentication:
         assert!(
             built.is_empty(),
             "OIDC and unknown authenticators contribute no internal authenticator"
+        );
+    }
+
+    #[test]
+    fn is_dictionary_authenticator_matches_class_and_selector() {
+        assert!(is_dictionary_authenticator(
+            "tiled.authenticators:DictionaryAuthenticator"
+        ));
+        assert!(is_dictionary_authenticator("dictionary"));
+        // The bare class name (no import path) also matches.
+        assert!(is_dictionary_authenticator("DictionaryAuthenticator"));
+        // Python's separate accept-anything DummyAuthenticator is NOT the
+        // dictionary authenticator and must not match.
+        assert!(!is_dictionary_authenticator(
+            "tiled.authenticators:DummyAuthenticator"
+        ));
+        assert!(!is_dictionary_authenticator("oidc"));
+        assert!(!is_dictionary_authenticator("ldap"));
+        assert!(!is_dictionary_authenticator("pam"));
+        assert!(!is_dictionary_authenticator("saml"));
+    }
+
+    #[test]
+    fn build_internal_authenticators_builds_dictionary_from_config() {
+        // Both the import-path form and the short `dictionary` selector build a
+        // username/password authenticator named after the provider. Dictionary
+        // has no build-feature gate, so this holds unconditionally.
+        let cfg: TiledConfig = serde_yaml::from_str(
+            r#"
+trees: []
+authentication:
+  providers:
+    - provider: toy
+      authenticator: tiled.authenticators:DictionaryAuthenticator
+      args:
+        users_to_passwords:
+          alice: secret1
+          bob: secret2
+    - provider: toy2
+      authenticator: dictionary
+      args:
+        users_to_passwords:
+          cara: secret3
+"#,
+        )
+        .unwrap();
+        let auth = cfg.authentication.unwrap();
+        let built = auth.build_internal_authenticators().unwrap();
+        assert_eq!(built.len(), 2);
+        assert_eq!(built[0].name(), "toy");
+        assert_eq!(built[1].name(), "toy2");
+    }
+
+    #[test]
+    fn dictionary_provider_without_users_errors() {
+        // users_to_passwords is required (Python's constructor has no default);
+        // an absent `args:` (Null → empty mapping) must surface a "missing
+        // field" error, not silently build an empty authenticator.
+        let cfg: TiledConfig = serde_yaml::from_str(
+            r#"
+trees: []
+authentication:
+  providers:
+    - provider: toy
+      authenticator: dictionary
+"#,
+        )
+        .unwrap();
+        let auth = cfg.authentication.unwrap();
+        // The Ok type (Vec<Arc<dyn Authenticator>>) is not Debug, so unwrap_err
+        // is unavailable; take the error via .err() and format with {:#} to
+        // include the missing-field detail from the source chain.
+        let err = format!(
+            "{:#}",
+            auth.build_internal_authenticators()
+                .err()
+                .expect("missing users_to_passwords must error")
+        );
+        assert!(
+            err.contains("users_to_passwords"),
+            "error must name the missing users_to_passwords field: {err}"
+        );
+    }
+
+    #[test]
+    fn dictionary_confirmation_message_is_accepted_and_ignored() {
+        // Upstream's optional `confirmation_message` arg is not modeled; a config
+        // that sets it must still parse and build (the key is ignored, the same
+        // treatment every unmodeled `args` key gets), not fail.
+        let cfg: TiledConfig = serde_yaml::from_str(
+            r#"
+trees: []
+authentication:
+  providers:
+    - provider: toy
+      authenticator: dictionary
+      args:
+        users_to_passwords:
+          alice: secret1
+        confirmation_message: "Welcome to the toy provider"
+"#,
+        )
+        .unwrap();
+        let auth = cfg.authentication.unwrap();
+        let built = auth.build_internal_authenticators().unwrap();
+        assert_eq!(built.len(), 1);
+        assert_eq!(built[0].name(), "toy");
+    }
+
+    #[tokio::test]
+    async fn dictionary_authenticator_end_to_end_login() {
+        // A dictionary provider built from config authenticates the configured
+        // user with the correct password and rejects a wrong one — the same
+        // login path `/auth/{provider}/login` exercises at runtime.
+        let cfg: TiledConfig = serde_yaml::from_str(
+            r#"
+trees: []
+authentication:
+  providers:
+    - provider: toy
+      authenticator: tiled.authenticators:DictionaryAuthenticator
+      args:
+        users_to_passwords:
+          alice: s3cret!
+"#,
+        )
+        .unwrap();
+        let auth = cfg.authentication.unwrap();
+        let built = auth.build_internal_authenticators().unwrap();
+        assert_eq!(built.len(), 1);
+        let authenticator = &built[0];
+
+        let ok = authenticator
+            .authenticate("alice", "s3cret!")
+            .await
+            .unwrap();
+        assert_eq!(ok.provider, "toy");
+        assert_eq!(ok.sub, "alice");
+
+        assert!(
+            authenticator.authenticate("alice", "wrong").await.is_err(),
+            "wrong password must be rejected"
+        );
+        assert!(
+            authenticator.authenticate("nobody", "x").await.is_err(),
+            "unknown user must be rejected"
         );
     }
 
