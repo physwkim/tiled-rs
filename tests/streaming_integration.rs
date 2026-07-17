@@ -73,6 +73,7 @@ fn build_state(
         request_timeout_secs: 30,
         expose_raw_assets: true,
         exact_count_limit: u64::MAX,
+        allow_anonymous_access: false,
         background_tasks: tiled_rs::server::state::BackgroundTasks::new(),
     }
 }
@@ -1944,6 +1945,7 @@ async fn spawn_auth_stream_server(
         request_timeout_secs: 30,
         expose_raw_assets: true,
         exact_count_limit: u64::MAX,
+        allow_anonymous_access: false,
         background_tasks: tiled_rs::server::state::BackgroundTasks::new(),
     };
     (serve(state).await, dir)
@@ -2217,6 +2219,7 @@ async fn spawn_webhook_stream_server() -> (String, reqwest::Client, Catalog, i64
         request_timeout_secs: 30,
         expose_raw_assets: true,
         exact_count_limit: u64::MAX,
+        allow_anonymous_access: false,
         background_tasks: background,
     };
     (

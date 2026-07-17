@@ -68,6 +68,7 @@ async fn build_test_app() -> (axum::Router, tempfile::TempDir, Catalog, AuthDb) 
         request_timeout_secs: 30,
         expose_raw_assets: true,
         exact_count_limit: u64::MAX,
+        allow_anonymous_access: false,
         background_tasks: tiled_rs::server::state::BackgroundTasks::new(),
     };
     (tiled_rs::server::build_app(state), dir, catalog, auth_db)
@@ -887,6 +888,7 @@ async fn build_oidc_state(
         request_timeout_secs: 30,
         expose_raw_assets: true,
         exact_count_limit: u64::MAX,
+        allow_anonymous_access: false,
         background_tasks: tiled_rs::server::state::BackgroundTasks::new(),
     };
     (state, auth_db, validator, dir)
@@ -2148,6 +2150,7 @@ async fn build_code_flow_app_with_mapping(
         request_timeout_secs: 30,
         expose_raw_assets: true,
         exact_count_limit: u64::MAX,
+        allow_anonymous_access: false,
         background_tasks: tiled_rs::server::state::BackgroundTasks::new(),
     };
     let app = tiled_rs::server::build_app(state);

@@ -891,6 +891,18 @@ pub async fn run(command: Command) -> Result<()> {
                 cors_policy,
                 trust_forwarded_headers,
                 api_key,
+                // Operator opt-in from `authentication.allow_anonymous_access`
+                // (Python `Settings.allow_anonymous_access`, default false):
+                // admit unauthenticated requests as the public principal with
+                // read-only scopes. Honored on a server that has auth
+                // configured; `no_auth_configured()` (dev mode) already grants
+                // full anonymous access regardless. See
+                // `AppState::anonymous_scopes`.
+                allow_anonymous_access: file_config
+                    .as_ref()
+                    .and_then(|c| c.authentication.as_ref())
+                    .map(|a| a.allow_anonymous_access)
+                    .unwrap_or(false),
                 catalog: catalog_handle,
                 auth_db: auth_db_handle,
                 issuer: issuer_handle,

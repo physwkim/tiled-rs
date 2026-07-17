@@ -261,7 +261,17 @@ async fn run_subscription(
     // non-browser clients usually arrive. Fall back to a first-message
     // handshake (tiled#1351) if the headers carried nothing usable.
     let auth_ctx = match header_auth {
-        Some(ctx) if !matches!(ctx.kind, AuthKind::Anonymous) || state.no_auth_configured() => ctx,
+        // A real header credential is always honored. An anonymous header ctx is
+        // honored directly only when anonymous admission is allowed at all
+        // (`anonymous_scopes().is_some()` — dev escape hatch OR the
+        // `allow_anonymous_access` opt-in); its scopes were already set by
+        // `resolve_header_auth`. Otherwise fall through to the first-message
+        // handshake so a browser client can still present credentials in-band.
+        Some(ctx)
+            if !matches!(ctx.kind, AuthKind::Anonymous) || state.anonymous_scopes().is_some() =>
+        {
+            ctx
+        }
         _ => match handshake_auth(&state, &mut tx, &mut rx).await {
             Ok(ctx) => ctx,
             Err(close_reason) => {
@@ -909,13 +919,16 @@ async fn handshake_auth(
 ) -> Result<AuthContext, String> {
     use tokio::time::Duration;
 
-    // Anonymous mode: no auth backend at all → grant full scopes
-    // immediately, matching the HTTP middleware policy. Skip the
-    // handshake to keep latency down for unprotected demos.
-    if state.no_auth_configured() {
+    // Anonymous admission: when an unauthenticated request is admitted at all
+    // (dev escape hatch → full scope, or the `allow_anonymous_access` opt-in →
+    // public read scopes), grant those scopes immediately and skip the
+    // first-message wait — matching the HTTP middleware policy via the single
+    // `anonymous_scopes()` owner. Upstream likewise skips first-message auth
+    // when `allow_anonymous_access` is set (`router.py:782`).
+    if let Some(scopes) = state.anonymous_scopes() {
         return Ok(AuthContext {
             principal: None,
-            scopes: crate::auth::ScopeSet::full(),
+            scopes,
             kind: AuthKind::Anonymous,
             authn_access_tags: None,
         });

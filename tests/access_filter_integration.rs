@@ -166,6 +166,7 @@ async fn search_respects_tag_based_access_policy() {
         request_timeout_secs: 30,
         expose_raw_assets: true,
         exact_count_limit: u64::MAX,
+        allow_anonymous_access: false,
         background_tasks: tiled_rs::server::state::BackgroundTasks::new(),
     };
     let app = tiled_rs::server::build_app(state);
@@ -292,6 +293,7 @@ async fn admin_search_sees_all_nodes() {
         request_timeout_secs: 30,
         expose_raw_assets: true,
         exact_count_limit: u64::MAX,
+        allow_anonymous_access: false,
         background_tasks: tiled_rs::server::state::BackgroundTasks::new(),
     };
     let app = tiled_rs::server::build_app(state);
@@ -422,6 +424,7 @@ async fn array_append_denied_by_tag_policy_returns_404() {
         request_timeout_secs: 30,
         expose_raw_assets: true,
         exact_count_limit: u64::MAX,
+        allow_anonymous_access: false,
         background_tasks: tiled_rs::server::state::BackgroundTasks::new(),
     };
     let app = tiled_rs::server::build_app(state);
@@ -526,6 +529,7 @@ async fn anonymous_search_shows_only_public_nodes() {
         request_timeout_secs: 30,
         expose_raw_assets: true,
         exact_count_limit: u64::MAX,
+        allow_anonymous_access: false,
         background_tasks: tiled_rs::server::state::BackgroundTasks::new(),
     };
     let app = tiled_rs::server::build_app(state);
@@ -627,6 +631,7 @@ async fn public_tagged_node_is_listable_and_readable_by_anonymous() {
         request_timeout_secs: 30,
         expose_raw_assets: true,
         exact_count_limit: u64::MAX,
+        allow_anonymous_access: false,
         background_tasks: tiled_rs::server::state::BackgroundTasks::new(),
     };
     let app = tiled_rs::server::build_app(state);
@@ -741,6 +746,7 @@ async fn anonymous_search_excludes_user_owned_nodes() {
         request_timeout_secs: 30,
         expose_raw_assets: true,
         exact_count_limit: u64::MAX,
+        allow_anonymous_access: false,
         background_tasks: tiled_rs::server::state::BackgroundTasks::new(),
     };
     let app = tiled_rs::server::build_app(state);
@@ -852,6 +858,7 @@ async fn cross_user_search_excludes_other_users_owned_nodes() {
         request_timeout_secs: 30,
         expose_raw_assets: true,
         exact_count_limit: u64::MAX,
+        allow_anonymous_access: false,
         background_tasks: tiled_rs::server::state::BackgroundTasks::new(),
     };
     let app = tiled_rs::server::build_app(state);
@@ -970,6 +977,7 @@ async fn metadata_read_excludes_other_users_owned_node() {
         request_timeout_secs: 30,
         expose_raw_assets: true,
         exact_count_limit: u64::MAX,
+        allow_anonymous_access: false,
         background_tasks: tiled_rs::server::state::BackgroundTasks::new(),
     };
     let app = tiled_rs::server::build_app(state);
@@ -1136,6 +1144,7 @@ async fn zarr_access_app(with_policy: bool) -> (axum::Router, String, tempfile::
         request_timeout_secs: 30,
         expose_raw_assets: true,
         exact_count_limit: u64::MAX,
+        allow_anonymous_access: false,
         background_tasks: tiled_rs::server::state::BackgroundTasks::new(),
     };
     let app = tiled_rs::server::build_app(state);

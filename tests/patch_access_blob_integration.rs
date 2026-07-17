@@ -143,6 +143,7 @@ async fn build_app_with_echo_policy(seed_access_blob: serde_json::Value) -> axum
         request_timeout_secs: 30,
         expose_raw_assets: true,
         exact_count_limit: u64::MAX,
+        allow_anonymous_access: false,
         background_tasks: tiled_rs::server::state::BackgroundTasks::new(),
     };
     tiled_rs::server::build_app(state)

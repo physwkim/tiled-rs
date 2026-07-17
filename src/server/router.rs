@@ -256,14 +256,17 @@ pub async fn about(State(state): State<AppState>, BaseUrl(base_url): BaseUrl) ->
         }
     }
     // Python: `authentication.required = not settings.allow_anonymous_access`
-    // (router.py:301) — purely the anonymous-access policy, NOT whether login
-    // providers exist. Rust's `no_auth_configured()` (no api_key AND no
-    // auth_db) is the single source of truth for "anonymous access allowed",
-    // so it is exactly Rust's `allow_anonymous_access`. Negating it fixes the
-    // previous `!providers.is_empty() || external_oidc.is_some()`, which
-    // misreported a single-user `api_key`-only server (no authenticators) as
-    // NOT requiring auth even though every request needs the key.
-    let auth_required = !state.no_auth_configured();
+    // (router.py:205) — purely the anonymous-access policy, NOT whether login
+    // providers exist. `AppState::anonymous_scopes()` is the single source of
+    // truth for "is an unauthenticated request admitted": it is `Some` when the
+    // dev/demo escape hatch (`no_auth_configured()`) OR the operator opt-in
+    // (`allow_anonymous_access`) admits anonymous callers, and `None` otherwise.
+    // Auth is therefore required iff anonymous admission is `None`. This both
+    // fixes the previous `!providers.is_empty()` mistake (which misreported a
+    // single-user `api_key`-only server as not requiring auth) and honors
+    // `allow_anonymous_access` in multi-user mode, where the old
+    // `!no_auth_configured()` reported `required = true` even with the flag set.
+    let auth_required = state.anonymous_scopes().is_none();
 
     // authentication.links — Python router.py:262-278 builds this dict whenever
     // any login path exists (`if provider_specs:`). It is the client's contract:
