@@ -331,6 +331,15 @@ pub enum Command {
         uri: Option<String>,
     },
 
+    /// Examine Tiled "profiles" (client-side config).
+    ///
+    /// Port of the upstream `tiled profile` group (`commandline/_profile.py`),
+    /// wrapping the profile store in `client::profiles`.
+    Profile {
+        #[command(subcommand)]
+        command: ProfileCommand,
+    },
+
     /// Database management commands (not yet implemented)
     #[command(hide = true)]
     Catalog {
@@ -364,6 +373,59 @@ pub enum CatalogCommand {
         /// Database URI
         uri: String,
     },
+}
+
+/// `tiled profile` subcommands. Names mirror upstream `_profile.py`; clap's
+/// default kebab-case rename maps `GetDefault` → `get-default`, etc.
+#[derive(Subcommand)]
+pub enum ProfileCommand {
+    /// List the locations the client searches for profiles.
+    Paths,
+    /// List the profiles found and the files they were read from.
+    List,
+    /// Show the content of a profile.
+    Show {
+        /// Profile name.
+        profile_name: String,
+    },
+    /// Open a profile's source file in the platform's default editor.
+    Edit {
+        /// Profile name.
+        profile_name: String,
+    },
+    /// Create a profile that can be used to connect to a Tiled server.
+    Create {
+        /// URI 'http[s]://...'.
+        uri: String,
+        /// Profile name, a short convenient alias.
+        #[arg(long, default_value = "auto")]
+        name: String,
+        /// Do NOT set the new profile as the default. Upstream defaults
+        /// `--set-default` to on; this negation flag turns it off (clap has no
+        /// native `--flag/--no-flag` toggle).
+        #[arg(long)]
+        no_set_default: bool,
+        /// Overwrite an existing profile of this name.
+        #[arg(long)]
+        overwrite: bool,
+        /// Skip SSL verification.
+        #[arg(long)]
+        no_verify: bool,
+    },
+    /// Delete a profile.
+    Delete {
+        /// Profile name.
+        name: String,
+    },
+    /// Show the current default Tiled profile.
+    GetDefault,
+    /// Set the default Tiled profile.
+    SetDefault {
+        /// Profile name.
+        profile_name: String,
+    },
+    /// Clear the default Tiled profile.
+    ClearDefault,
 }
 
 #[derive(Subcommand)]
@@ -520,6 +582,33 @@ fn resolve_client_target(profile: Option<String>, uri: Option<String>) -> Result
         .ok_or_else(|| anyhow::anyhow!("profile '{name}' has no 'uri' field."))?;
     let verify = profile.verify.unwrap_or(true);
     Ok((uri, verify))
+}
+
+/// Launch the platform's default handler (the GUI editor association) for
+/// `path`. Mirrors Python `_profile.py::profile_edit`, which shells out to
+/// `open` (macOS), `os.startfile` (Windows), or `xdg-open` (other).
+fn open_in_editor(path: &std::path::Path) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    let mut cmd = std::process::Command::new("open");
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        // `start` is a cmd builtin; the empty first argument is the window
+        // title `start` otherwise consumes.
+        let mut c = std::process::Command::new("cmd");
+        c.args(["/C", "start", ""]);
+        c
+    };
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let mut cmd = std::process::Command::new("xdg-open");
+
+    let status = cmd
+        .arg(path)
+        .status()
+        .map_err(|e| anyhow::anyhow!("launch editor for {}: {e}", path.display()))?;
+    if !status.success() {
+        return Err(anyhow::anyhow!("editor exited with status {status}"));
+    }
+    Ok(())
 }
 
 /// Resolve the serve bind host: CLI `--host` flag > config `uvicorn.host` >
@@ -1409,6 +1498,132 @@ pub async fn run(command: Command) -> Result<()> {
             }
             Ok(())
         }
+        Command::Profile { command } => {
+            use crate::client::profiles;
+            match command {
+                ProfileCommand::Paths => {
+                    for p in profiles::paths() {
+                        println!("{}", p.display());
+                    }
+                    Ok(())
+                }
+                ProfileCommand::List => {
+                    let set =
+                        profiles::load_profiles().map_err(|e| anyhow::anyhow!("profiles: {e}"))?;
+                    let names = set.names();
+                    if names.is_empty() {
+                        println!("No profiles found.");
+                    } else {
+                        // Left-align names in a column `max_name + 4` wide, then
+                        // the source path — mirrors upstream `_profile.py:list`.
+                        const PADDING: usize = 4;
+                        let width = names.iter().map(String::len).max().unwrap_or(0) + PADDING;
+                        for name in &names {
+                            if let Some((filepath, _)) = set.get(name) {
+                                println!("{name:<width$}{}", filepath.display());
+                            }
+                        }
+                    }
+                    Ok(())
+                }
+                ProfileCommand::Show { profile_name } => {
+                    let set =
+                        profiles::load_profiles().map_err(|e| anyhow::anyhow!("profiles: {e}"))?;
+                    let (filepath, content) = set.get(&profile_name).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "The profile '{profile_name}' could not be found. \
+                             Use `tiled profile list` to see profile names."
+                        )
+                    })?;
+                    // Source line and separator on stderr, YAML body on stdout,
+                    // matching upstream's stream split.
+                    eprintln!("Source: {}", filepath.display());
+                    eprintln!("--");
+                    let yaml = serde_yaml::to_string(content)
+                        .map_err(|e| anyhow::anyhow!("yaml dump: {e}"))?;
+                    print!("{yaml}");
+                    Ok(())
+                }
+                ProfileCommand::Edit { profile_name } => {
+                    let set =
+                        profiles::load_profiles().map_err(|e| anyhow::anyhow!("profiles: {e}"))?;
+                    let (filepath, _content) = set.get(&profile_name).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "The profile '{profile_name}' could not be found. \
+                             Use `tiled profile list` to see profile names."
+                        )
+                    })?;
+                    eprintln!("Opening {} in default text editor...", filepath.display());
+                    open_in_editor(filepath)?;
+                    Ok(())
+                }
+                ProfileCommand::Create {
+                    uri,
+                    name,
+                    no_set_default,
+                    overwrite,
+                    no_verify,
+                } => {
+                    profiles::create_profile(&uri, &name, !no_verify, overwrite)
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
+                    if no_set_default {
+                        eprintln!("Tiled profile '{name}' created.");
+                    } else {
+                        profiles::set_default_profile_name(Some(&name))
+                            .map_err(|e| anyhow::anyhow!("set default: {e}"))?;
+                        eprintln!("Tiled profile '{name}' created and set as the default.");
+                    }
+                    Ok(())
+                }
+                ProfileCommand::Delete { name } => {
+                    // Unset the default first if this profile is the default,
+                    // mirroring upstream `_profile.py:delete`.
+                    if profiles::get_default_profile_name().as_deref() == Some(name.as_str()) {
+                        profiles::set_default_profile_name(None)
+                            .map_err(|e| anyhow::anyhow!("clear default: {e}"))?;
+                    }
+                    match profiles::delete_profile(&name)
+                        .map_err(|e| anyhow::anyhow!("delete profile: {e}"))?
+                    {
+                        Some(_) => eprintln!("Tiled profile '{name}' deleted."),
+                        None => eprintln!("Tiled profile '{name}' not found."),
+                    }
+                    Ok(())
+                }
+                ProfileCommand::GetDefault => {
+                    match profiles::get_default_profile_name() {
+                        None => eprintln!("No default."),
+                        Some(name) => {
+                            let set = profiles::load_profiles()
+                                .map_err(|e| anyhow::anyhow!("profiles: {e}"))?;
+                            match set.get(&name) {
+                                Some((filepath, content)) => {
+                                    println!("# Profile name: '{name}'");
+                                    println!("# {} \n", filepath.display());
+                                    let yaml = serde_yaml::to_string(content)
+                                        .map_err(|e| anyhow::anyhow!("yaml dump: {e}"))?;
+                                    print!("{yaml}");
+                                }
+                                // The default names a profile that no longer
+                                // exists (e.g. its file was removed by hand).
+                                None => eprintln!("Default profile '{name}' not found."),
+                            }
+                        }
+                    }
+                    Ok(())
+                }
+                ProfileCommand::SetDefault { profile_name } => {
+                    profiles::set_default_profile_name(Some(&profile_name))
+                        .map_err(|e| anyhow::anyhow!("set default: {e}"))?;
+                    Ok(())
+                }
+                ProfileCommand::ClearDefault => {
+                    profiles::set_default_profile_name(None)
+                        .map_err(|e| anyhow::anyhow!("clear default: {e}"))?;
+                    Ok(())
+                }
+            }
+        }
         Command::Catalog { command } => match command {
             CatalogCommand::Init { uri } => {
                 tracing::info!("Initialising catalog at {}", redact_mongo_uri(&uri));
@@ -2128,5 +2343,121 @@ mod tests {
             err.contains("tiled-rs-nonexistent-profile-x9q7z"),
             "missing profile must be named in the error: {err}"
         );
+    }
+
+    // cli-w27b2-F2: the `tiled profile` subcommands parse. Helper unwraps the
+    // Profile wrapper.
+    fn parse_profile(args: &[&str]) -> ProfileCommand {
+        let mut argv = vec!["tiled", "profile"];
+        argv.extend_from_slice(args);
+        let cli = TestCli::parse_from(argv);
+        let Command::Profile { command } = cli.command else {
+            panic!("expected Profile variant");
+        };
+        command
+    }
+
+    #[test]
+    fn profile_simple_subcommands_parse() {
+        assert!(matches!(parse_profile(&["paths"]), ProfileCommand::Paths));
+        assert!(matches!(parse_profile(&["list"]), ProfileCommand::List));
+        // Kebab-case rename: GetDefault → get-default, etc.
+        assert!(matches!(
+            parse_profile(&["get-default"]),
+            ProfileCommand::GetDefault
+        ));
+        assert!(matches!(
+            parse_profile(&["clear-default"]),
+            ProfileCommand::ClearDefault
+        ));
+    }
+
+    #[test]
+    fn profile_name_arg_subcommands_parse() {
+        match parse_profile(&["show", "prod"]) {
+            ProfileCommand::Show { profile_name } => assert_eq!(profile_name, "prod"),
+            _ => panic!("expected Show"),
+        }
+        match parse_profile(&["edit", "prod"]) {
+            ProfileCommand::Edit { profile_name } => assert_eq!(profile_name, "prod"),
+            _ => panic!("expected Edit"),
+        }
+        match parse_profile(&["delete", "prod"]) {
+            ProfileCommand::Delete { name } => assert_eq!(name, "prod"),
+            _ => panic!("expected Delete"),
+        }
+        match parse_profile(&["set-default", "prod"]) {
+            ProfileCommand::SetDefault { profile_name } => assert_eq!(profile_name, "prod"),
+            _ => panic!("expected SetDefault"),
+        }
+    }
+
+    #[test]
+    fn profile_create_defaults() {
+        match parse_profile(&["create", "http://localhost:8000"]) {
+            ProfileCommand::Create {
+                uri,
+                name,
+                no_set_default,
+                overwrite,
+                no_verify,
+            } => {
+                assert_eq!(uri, "http://localhost:8000");
+                assert_eq!(name, "auto", "name defaults to 'auto'");
+                assert!(!no_set_default, "set-default is on by default");
+                assert!(!overwrite);
+                assert!(!no_verify);
+            }
+            _ => panic!("expected Create"),
+        }
+    }
+
+    #[test]
+    fn profile_create_all_flags() {
+        match parse_profile(&[
+            "create",
+            "https://example.com",
+            "--name",
+            "prod",
+            "--no-set-default",
+            "--overwrite",
+            "--no-verify",
+        ]) {
+            ProfileCommand::Create {
+                uri,
+                name,
+                no_set_default,
+                overwrite,
+                no_verify,
+            } => {
+                assert_eq!(uri, "https://example.com");
+                assert_eq!(name, "prod");
+                assert!(no_set_default);
+                assert!(overwrite);
+                assert!(no_verify);
+            }
+            _ => panic!("expected Create"),
+        }
+    }
+
+    // Read-only smoke tests: the `paths` and `list` arms are fully wired and
+    // return Ok. (Mutating arms touch the real user-config dir, so they are
+    // exercised by profiles.rs's own unit tests, not here.)
+    #[tokio::test]
+    async fn profile_paths_runs() {
+        run(Command::Profile {
+            command: ProfileCommand::Paths,
+        })
+        .await
+        .expect("profile paths must succeed");
+    }
+
+    #[tokio::test]
+    async fn profile_list_runs() {
+        run(Command::Profile {
+            command: ProfileCommand::List,
+        })
+        .await
+        .expect("profile list must succeed");
     }
 }
