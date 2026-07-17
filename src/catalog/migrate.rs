@@ -10,6 +10,27 @@ use sqlx::Row;
 use crate::catalog::db::{Catalog, DbPool};
 use crate::catalog::error::{CatalogError, Result};
 
+/// The schema state of a catalog DB relative to the migrations this binary
+/// ships, mirroring the states upstream `check_catalog_database`
+/// (`catalog/core.py`) distinguishes before serving.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SchemaState {
+    /// No migrations applied — the `_tiled_migrations` table is absent or
+    /// empty. Upstream `UninitializedDatabase`.
+    Uninitialized,
+    /// Every shipped migration is applied and the DB carries no unknown ones.
+    /// Safe to serve.
+    Current,
+    /// A subset of the shipped migrations is applied; the DB was written by an
+    /// older tiled-rs and needs a forward migration. Upstream
+    /// `DatabaseUpgradeNeeded`.
+    Behind { applied: usize, required: usize },
+    /// The DB carries migration name(s) this binary does not know about — it
+    /// was written by a newer tiled-rs. Upstream `UnrecognizedDatabase`
+    /// ("created by a newer version").
+    Ahead { unknown: Vec<String> },
+}
+
 const SQLITE_MIGRATIONS: &[(&str, &str)] = &[
     (
         "0001_initial",
@@ -138,6 +159,122 @@ impl Catalog {
                     .map(|r| r.get::<String, _>("name"))
                     .collect())
             }
+        }
+    }
+
+    /// The migration names this binary ships for the active dialect, oldest
+    /// first. This is the authoritative "current schema" the serve guard
+    /// compares a DB against.
+    fn known_migration_names(&self) -> Vec<&'static str> {
+        match self.pool() {
+            DbPool::Sqlite(_) => SQLITE_MIGRATIONS.iter().map(|(n, _)| *n).collect(),
+            DbPool::Postgres(_) => POSTGRES_MIGRATIONS.iter().map(|(n, _)| *n).collect(),
+        }
+    }
+
+    /// Whether the `_tiled_migrations` bookkeeping table exists. A brand-new
+    /// `--catalog-uri` connects (via `create_if_missing`) to an empty DB where
+    /// it does not — that DB is uninitialized, distinct from a real query
+    /// error.
+    async fn migrations_table_exists(&self) -> Result<bool> {
+        match self.pool() {
+            DbPool::Sqlite(pool) => {
+                let found: Option<String> = sqlx::query_scalar(
+                    "SELECT name FROM sqlite_master \
+                     WHERE type = 'table' AND name = '_tiled_migrations'",
+                )
+                .fetch_optional(pool)
+                .await?;
+                Ok(found.is_some())
+            }
+            DbPool::Postgres(pool) => {
+                // `to_regclass` yields NULL when the relation does not exist.
+                let reg: Option<String> =
+                    sqlx::query_scalar("SELECT to_regclass('_tiled_migrations')::text")
+                        .fetch_one(pool)
+                        .await?;
+                Ok(reg.is_some())
+            }
+        }
+    }
+
+    /// Classify the DB's schema relative to the migrations this binary ships,
+    /// without mutating it. Mirrors upstream `check_catalog_database`'s
+    /// revision check (`catalog/core.py`): uninitialized / current / behind /
+    /// ahead. Never auto-migrates.
+    pub async fn schema_state(&self) -> Result<SchemaState> {
+        if !self.migrations_table_exists().await? {
+            return Ok(SchemaState::Uninitialized);
+        }
+        let applied = self.applied_migrations().await?;
+        if applied.is_empty() {
+            return Ok(SchemaState::Uninitialized);
+        }
+        let known = self.known_migration_names();
+        let known_set: std::collections::HashSet<&str> = known.iter().copied().collect();
+        // Any applied migration we do not ship was written by a newer tiled-rs.
+        let unknown: Vec<String> = applied
+            .iter()
+            .filter(|n| !known_set.contains(n.as_str()))
+            .cloned()
+            .collect();
+        if !unknown.is_empty() {
+            return Ok(SchemaState::Ahead { unknown });
+        }
+        // All applied names are known; behind if any shipped migration is
+        // still pending.
+        let applied_set: std::collections::HashSet<&str> =
+            applied.iter().map(String::as_str).collect();
+        let pending = known.iter().filter(|n| !applied_set.contains(**n)).count();
+        if pending > 0 {
+            Ok(SchemaState::Behind {
+                applied: applied.len(),
+                required: known.len(),
+            })
+        } else {
+            Ok(SchemaState::Current)
+        }
+    }
+
+    /// Verify a catalog DB is safe to serve, mirroring upstream
+    /// `check_catalog_database` (`catalog/core.py`). The single owner of the
+    /// serve-time schema decision — there is deliberately **no** silent
+    /// auto-migrate on serve:
+    ///
+    /// * `Current` → no-op (serve).
+    /// * `Uninitialized` + `may_initialize` (serve `--init`/`--temp`) → apply
+    ///   migrations to initialize in place.
+    /// * `Uninitialized` without the flag → refuse, naming `tiled catalog init`.
+    /// * `Behind` → refuse, naming `tiled catalog upgrade-database`.
+    /// * `Ahead`/unknown → refuse with a version-mismatch error.
+    ///
+    /// `redacted_uri` is only used in messages; the caller passes an
+    /// already password-redacted URI.
+    pub async fn ensure_serveable(&self, redacted_uri: &str, may_initialize: bool) -> Result<()> {
+        match self.schema_state().await? {
+            SchemaState::Current => Ok(()),
+            SchemaState::Uninitialized => {
+                if may_initialize {
+                    self.migrate().await
+                } else {
+                    Err(CatalogError::Validation(format!(
+                        "Catalog database at {redacted_uri} is not initialized. \
+                         Initialize it with `tiled catalog init {redacted_uri}` \
+                         (or pass --init to create it now)."
+                    )))
+                }
+            }
+            SchemaState::Behind { applied, required } => Err(CatalogError::Migration(format!(
+                "Catalog database at {redacted_uri} was created by an older tiled-rs \
+                 ({applied} of {required} migrations applied). Back up the database, \
+                 then upgrade it with `tiled catalog upgrade-database {redacted_uri}`."
+            ))),
+            SchemaState::Ahead { unknown } => Err(CatalogError::Migration(format!(
+                "Catalog database at {redacted_uri} has migration(s) this tiled-rs \
+                 does not recognize ({}); it was created by a newer version of tiled-rs. \
+                 Upgrade tiled-rs to serve this catalog.",
+                unknown.join(", ")
+            ))),
         }
     }
 }
@@ -303,5 +440,136 @@ mod tests {
         let stmts = split_nonempty("-- a comment; not a statement\nSELECT 1;");
         assert_eq!(stmts.len(), 1);
         assert!(stmts[0].contains("SELECT 1"));
+    }
+
+    // --- w28-F2: serve-time schema-version guard boundaries ---
+
+    use crate::catalog::db::{Catalog, DbPool};
+    use crate::catalog::migrate::SchemaState;
+
+    /// A fresh, un-migrated catalog in a temp dir (kept alive by the returned
+    /// dir). File-backed so a multi-connection pool sees one consistent DB,
+    /// unlike `sqlite::memory:`.
+    async fn fresh_catalog() -> (tempfile::TempDir, Catalog) {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = format!("sqlite://{}", dir.path().join("catalog.db").display());
+        let cat = Catalog::connect(&uri).await.unwrap();
+        (dir, cat)
+    }
+
+    /// Run a raw statement against the (sqlite) test pool.
+    async fn exec_sqlite(cat: &Catalog, sql: &str) {
+        match cat.pool() {
+            DbPool::Sqlite(pool) => {
+                sqlx::query(sql).execute(pool).await.unwrap();
+            }
+            DbPool::Postgres(_) => unreachable!("tests use sqlite"),
+        }
+    }
+
+    // Boundary: an uninitialized catalog is refused when neither --init nor
+    // --temp is set, with a message naming `tiled catalog init`.
+    #[tokio::test]
+    async fn uninitialized_without_flag_refuses() {
+        let (_dir, cat) = fresh_catalog().await;
+        assert_eq!(
+            cat.schema_state().await.unwrap(),
+            SchemaState::Uninitialized
+        );
+        let err = cat
+            .ensure_serveable("sqlite://cat.db", false)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("not initialized"), "message: {msg}");
+        assert!(msg.contains("tiled catalog init"), "message: {msg}");
+    }
+
+    // Boundary: an uninitialized catalog with --init/--temp is initialized in
+    // place (migrations applied), leaving it Current.
+    #[tokio::test]
+    async fn uninitialized_with_init_initializes() {
+        let (_dir, cat) = fresh_catalog().await;
+        cat.ensure_serveable("sqlite://cat.db", true).await.unwrap();
+        assert_eq!(cat.schema_state().await.unwrap(), SchemaState::Current);
+    }
+
+    // Boundary: a fully-migrated catalog is Current and serves without a
+    // re-migrate.
+    #[tokio::test]
+    async fn current_serves() {
+        let (_dir, cat) = fresh_catalog().await;
+        cat.migrate().await.unwrap();
+        assert_eq!(cat.schema_state().await.unwrap(), SchemaState::Current);
+        // Serving neither errors nor requires the init flag.
+        cat.ensure_serveable("sqlite://cat.db", false)
+            .await
+            .unwrap();
+    }
+
+    // Boundary: a catalog missing the newest shipped migration (written by an
+    // older tiled-rs) is Behind and refused — even with --init — naming the
+    // upgrade command. `--init` is not `--upgrade`.
+    #[tokio::test]
+    async fn behind_refuses_and_names_upgrade_command() {
+        let (_dir, cat) = fresh_catalog().await;
+        cat.migrate().await.unwrap();
+        // Drop the newest migration row to simulate a behind-schema DB.
+        exec_sqlite(
+            &cat,
+            "DELETE FROM _tiled_migrations WHERE name = '0005_metadata_fts5'",
+        )
+        .await;
+        match cat.schema_state().await.unwrap() {
+            SchemaState::Behind { applied, required } => {
+                assert_eq!(applied, 4);
+                assert_eq!(required, 5);
+            }
+            other => panic!("expected Behind, got {other:?}"),
+        }
+        // Without the flag: refused, naming upgrade-database.
+        let err = cat
+            .ensure_serveable("sqlite://cat.db", false)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("tiled catalog upgrade-database"),
+            "message: {err}"
+        );
+        // With --init: still refused (init initializes, it does not upgrade).
+        assert!(
+            cat.ensure_serveable("sqlite://cat.db", true).await.is_err(),
+            "--init must not silently upgrade a behind DB"
+        );
+    }
+
+    // Boundary: a catalog carrying a migration this binary does not know about
+    // (written by a newer tiled-rs) is Ahead and refused with a version
+    // mismatch error, regardless of the init flag.
+    #[tokio::test]
+    async fn ahead_unknown_revision_refuses() {
+        let (_dir, cat) = fresh_catalog().await;
+        cat.migrate().await.unwrap();
+        // Stamp a future migration the current binary does not ship.
+        exec_sqlite(
+            &cat,
+            "INSERT INTO _tiled_migrations (name) VALUES ('9999_from_future')",
+        )
+        .await;
+        match cat.schema_state().await.unwrap() {
+            SchemaState::Ahead { unknown } => {
+                assert_eq!(unknown, vec!["9999_from_future".to_string()]);
+            }
+            other => panic!("expected Ahead, got {other:?}"),
+        }
+        // Refused whether or not --init is set — a newer-schema DB is never
+        // servable by this binary.
+        for may_init in [false, true] {
+            let err = cat
+                .ensure_serveable("sqlite://cat.db", may_init)
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("newer version"), "message: {err}");
+        }
     }
 }
