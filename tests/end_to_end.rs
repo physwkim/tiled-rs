@@ -1917,6 +1917,146 @@ async fn base_replace_metadata_wholesale() {
     );
 }
 
+#[tokio::test]
+async fn base_update_metadata_diff_builder() {
+    use std::collections::BTreeMap;
+    use tiled_rs::client::MetadataUpdate;
+
+    let (base, _wd, _db) = spawn_write_server().await;
+    let client = from_uri(&base).await.unwrap();
+    let root = client.into_container().unwrap();
+
+    root.create_container(
+        Some("upd_node"),
+        serde_json::json!({"a": 1, "b": 2, "obj": {"x": 1, "y": 2}}),
+    )
+    .await
+    .expect("create");
+    let node = root.get("upd_node").await.unwrap();
+
+    // One diff-built PATCH exercising every boundary at once:
+    //   replace b, add c, delete a, and a nested merge that deletes obj/x and
+    //   adds obj/z while leaving obj/y untouched.
+    let update: BTreeMap<String, MetadataUpdate> = [
+        ("a".to_string(), MetadataUpdate::Delete),
+        ("b".to_string(), MetadataUpdate::Set(serde_json::json!(20))),
+        ("c".to_string(), MetadataUpdate::Set(serde_json::json!(3))),
+        (
+            "obj".to_string(),
+            MetadataUpdate::Merge(
+                [
+                    ("x".to_string(), MetadataUpdate::Delete),
+                    ("z".to_string(), MetadataUpdate::Set(serde_json::json!(9))),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+        ),
+    ]
+    .into_iter()
+    .collect();
+
+    node.base()
+        .expect("base")
+        .update_metadata(Some(&update), None, None, false)
+        .await
+        .expect("update_metadata");
+
+    let updated = root.get("upd_node").await.unwrap();
+    let meta = updated.base().expect("base").metadata().clone();
+    assert_eq!(
+        meta,
+        serde_json::json!({"b": 20, "c": 3, "obj": {"y": 2, "z": 9}}),
+        "diff-built patch applied add/replace/delete + nested-leaf merge"
+    );
+}
+
+#[tokio::test]
+async fn base_update_metadata_noop_is_accepted() {
+    use std::collections::BTreeMap;
+    use tiled_rs::client::MetadataUpdate;
+
+    let (base, _wd, _db) = spawn_write_server().await;
+    let client = from_uri(&base).await.unwrap();
+    let root = client.into_container().unwrap();
+
+    root.create_container(Some("noop_node"), serde_json::json!({"a": 1}))
+        .await
+        .expect("create");
+    let node = root.get("noop_node").await.unwrap();
+
+    // Setting `a` to its current value produces an empty patch; upstream still
+    // issues the PATCH and the server accepts it, leaving metadata unchanged.
+    let update: BTreeMap<String, MetadataUpdate> =
+        [("a".to_string(), MetadataUpdate::Set(serde_json::json!(1)))]
+            .into_iter()
+            .collect();
+    node.base()
+        .expect("base")
+        .update_metadata(Some(&update), None, None, false)
+        .await
+        .expect("no-op update_metadata still succeeds");
+
+    let updated = root.get("noop_node").await.unwrap();
+    assert_eq!(
+        updated.base().expect("base").metadata().clone(),
+        serde_json::json!({"a": 1}),
+        "no-op update leaves metadata unchanged"
+    );
+}
+
+#[tokio::test]
+async fn base_update_metadata_specs() {
+    use tiled_rs::core::structures::StructureFamily;
+
+    let (base, _wd, _db) = spawn_write_server().await;
+    let client = from_uri(&base).await.unwrap();
+    let root = client.into_container().unwrap();
+
+    // Create a node that already carries one spec.
+    root.create_node(
+        Some("spec_node"),
+        StructureFamily::Container,
+        serde_json::json!({}),
+        vec![serde_json::json!({"name": "alpha"})],
+        vec![],
+    )
+    .await
+    .expect("create with spec");
+    let node = root.get("spec_node").await.unwrap();
+    assert_eq!(
+        node.base().expect("base").specs().len(),
+        1,
+        "node starts with one spec"
+    );
+
+    // Update the spec-name set: keep alpha, add beta.
+    node.base()
+        .expect("base")
+        .update_metadata(
+            None,
+            Some(&["alpha".to_string(), "beta".to_string()]),
+            None,
+            false,
+        )
+        .await
+        .expect("update_metadata specs");
+
+    let updated = root.get("spec_node").await.unwrap();
+    let names: Vec<&str> = updated
+        .base()
+        .expect("base")
+        .specs()
+        .iter()
+        .map(|s| s.name.as_str())
+        .collect();
+    assert_eq!(
+        names,
+        ["alpha", "beta"],
+        "specs diff added beta, kept alpha"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Scope 5: ArrayClient::export, TableClient::export
 // ---------------------------------------------------------------------------

@@ -7,6 +7,7 @@
 //! - the parsed structure (`ArrayStructure`, `TableStructure`, ...),
 //! - per-family helpers like `metadata`, `specs`, `uri`.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -50,6 +51,219 @@ impl PatchContentType {
         match self {
             Self::JsonPatch => JSON_PATCH_MIME,
             Self::MergePatch => MERGE_PATCH_MIME,
+        }
+    }
+}
+
+/// One value in a metadata update tree passed to
+/// [`BaseClient::update_metadata`] / [`BaseClient::build_metadata_patches`].
+///
+/// Mirrors the value slot of upstream's nested `metadata` dict, whose three
+/// cases in `metadata_update.py::_update_obj` (`base.py:516`) map 1:1 onto the
+/// three variants here:
+/// - [`Set`](Self::Set) ↔ `else: result[key] = value`. A JSON **object** value
+///   merges into the existing object leaf-by-leaf (upstream always *recurses*
+///   into `dict` values — it never wholesale-replaces one); a scalar or array
+///   value replaces the existing value wholesale.
+/// - [`Delete`](Self::Delete) ↔ `value is DELETE_KEY: result.pop(key, None)` —
+///   removes the key. This is the Rust analogue of upstream's `DELETE_KEY`
+///   sentinel object.
+/// - [`Merge`](Self::Merge) ↔ the `isinstance(value, dict)` recurse. Because a
+///   [`Set`] holding an object can only carry plain JSON (no nested
+///   [`Delete`]), `Merge` is how you place a [`Delete`] — or mix deletes and
+///   sets — inside a nested object while leaving its sibling keys untouched.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MetadataUpdate {
+    /// Add or replace this key. An object value merges into the existing
+    /// object; a scalar or array replaces wholesale.
+    Set(serde_json::Value),
+    /// Remove this key (upstream's `DELETE_KEY` sentinel).
+    Delete,
+    /// Merge a nested tree of updates into the existing object at this key,
+    /// leaving unmentioned sibling keys untouched.
+    Merge(BTreeMap<String, MetadataUpdate>),
+}
+
+impl From<serde_json::Value> for MetadataUpdate {
+    /// A bare JSON value is a [`Set`](MetadataUpdate::Set), matching upstream
+    /// where any non-`DELETE_KEY`, non-`dict` value is assigned directly.
+    fn from(value: serde_json::Value) -> Self {
+        MetadataUpdate::Set(value)
+    }
+}
+
+/// The three RFC 6902 patch documents produced by
+/// [`BaseClient::build_metadata_patches`], ready to hand to
+/// [`BaseClient::patch_metadata`] under [`PatchContentType::JsonPatch`].
+///
+/// Mirrors upstream's `(metadata_patch, specs_patch, access_blob_patch)` tuple
+/// (`base.py:585`): `metadata` is **always** a (possibly empty) ops array;
+/// `specs` / `access_blob` are `None` when that facet was not part of the
+/// update (specs not supplied; `access_tags` absent or empty).
+#[derive(Debug, Clone, PartialEq)]
+pub struct MetadataPatches {
+    /// RFC 6902 patch for the metadata document. Always an array; `[]` when no
+    /// metadata update was requested or the update produced no change.
+    pub metadata: serde_json::Value,
+    /// RFC 6902 patch for the specs list, or `None` when specs were not part of
+    /// this update.
+    pub specs: Option<serde_json::Value>,
+    /// RFC 6902 patch for the `access_blob`, or `None` when no (non-empty)
+    /// `access_tags` were supplied.
+    pub access_blob: Option<serde_json::Value>,
+}
+
+/// Port of `metadata_update.py::_update_obj` (with `position=None`): merge the
+/// update tree into `target` in place. A non-object `target` is reset to an
+/// empty object first, matching upstream's `if not isinstance(result, dict)`.
+fn apply_update(target: &mut serde_json::Value, update: &BTreeMap<String, MetadataUpdate>) {
+    if !target.is_object() {
+        *target = serde_json::Value::Object(serde_json::Map::new());
+    }
+    let map = target
+        .as_object_mut()
+        .expect("target was just coerced to an object");
+    for (key, upd) in update {
+        match upd {
+            MetadataUpdate::Delete => {
+                // upstream: `result.pop(key, None)` — absent key is a no-op.
+                map.remove(key);
+            }
+            MetadataUpdate::Merge(nested) => {
+                let child = map
+                    .entry(key.clone())
+                    .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+                apply_update(child, nested);
+            }
+            MetadataUpdate::Set(serde_json::Value::Object(obj)) => {
+                // upstream recurses into dict values rather than replacing them.
+                let child = map
+                    .entry(key.clone())
+                    .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+                merge_raw_object(child, obj);
+            }
+            MetadataUpdate::Set(value) => {
+                map.insert(key.clone(), value.clone());
+            }
+        }
+    }
+}
+
+/// Merge a plain JSON object (no sentinels) into `target`, recursing into
+/// nested objects the same way [`apply_update`] does. This is the branch
+/// upstream takes for a `dict` value already stripped of any `DELETE_KEY`.
+fn merge_raw_object(
+    target: &mut serde_json::Value,
+    source: &serde_json::Map<String, serde_json::Value>,
+) {
+    if !target.is_object() {
+        *target = serde_json::Value::Object(serde_json::Map::new());
+    }
+    let map = target
+        .as_object_mut()
+        .expect("target was just coerced to an object");
+    for (key, value) in source {
+        if let serde_json::Value::Object(obj) = value {
+            let child = map
+                .entry(key.clone())
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+            merge_raw_object(child, obj);
+        } else {
+            map.insert(key.clone(), value.clone());
+        }
+    }
+}
+
+/// Serialize an RFC 6902 patch to its JSON ops array. Infallible for the
+/// `json_patch::Patch` produced from already-valid JSON documents.
+fn patch_to_value(patch: json_patch::Patch) -> serde_json::Value {
+    serde_json::to_value(patch).expect("an RFC 6902 patch is always JSON-serializable")
+}
+
+/// Pure core of [`BaseClient::build_metadata_patches`]: compute the three RFC
+/// 6902 patches from the current values (`current_metadata`,
+/// `current_spec_names`, `current_access_blob`) and the requested changes.
+/// Split out from the method so the diff behavior is unit-testable without a
+/// live client/server.
+fn compute_metadata_patches(
+    current_metadata: &serde_json::Value,
+    current_spec_names: &[String],
+    current_access_blob: &serde_json::Value,
+    metadata: Option<&BTreeMap<String, MetadataUpdate>>,
+    specs: Option<&[String]>,
+    access_tags: Option<&[String]>,
+) -> MetadataPatches {
+    let metadata_patch = match metadata {
+        None => serde_json::Value::Array(Vec::new()),
+        Some(update) => {
+            let mut merged = current_metadata.clone();
+            apply_update(&mut merged, update);
+            patch_to_value(json_patch::diff(current_metadata, &merged))
+        }
+    };
+
+    let specs_patch = specs.map(|specs| {
+        let current: Vec<serde_json::Value> = current_spec_names
+            .iter()
+            .map(|name| serde_json::Value::String(name.clone()))
+            .collect();
+        let target: Vec<serde_json::Value> = specs
+            .iter()
+            .map(|name| serde_json::Value::String(name.clone()))
+            .collect();
+        let mut ops = patch_to_value(json_patch::diff(
+            &serde_json::Value::Array(current),
+            &serde_json::Value::Array(target),
+        ));
+        normalize_spec_ops(&mut ops);
+        ops
+    });
+
+    let access_blob_patch = match access_tags {
+        Some(tags) if !tags.is_empty() => {
+            let mut merged = current_access_blob.clone();
+            let mut update = BTreeMap::new();
+            update.insert(
+                "tags".to_string(),
+                MetadataUpdate::Set(serde_json::Value::Array(
+                    tags.iter()
+                        .cloned()
+                        .map(serde_json::Value::String)
+                        .collect(),
+                )),
+            );
+            apply_update(&mut merged, &update);
+            Some(patch_to_value(json_patch::diff(
+                current_access_blob,
+                &merged,
+            )))
+        }
+        _ => None,
+    };
+
+    MetadataPatches {
+        metadata: metadata_patch,
+        specs: specs_patch,
+        access_blob: access_blob_patch,
+    }
+}
+
+/// Rewrite each `add`/`replace` op's bare-string spec name into a `Spec`
+/// object, mirroring upstream's normalization of the string-list specs diff
+/// into `asdict(Spec(value))` before it hits the wire (`base.py:776-782`).
+fn normalize_spec_ops(ops: &mut serde_json::Value) {
+    let Some(arr) = ops.as_array_mut() else {
+        return;
+    };
+    for op in arr {
+        let Some(name) = op.get("value").and_then(|v| v.as_str()).map(str::to_owned) else {
+            continue; // `remove` ops carry no value.
+        };
+        if let Some(obj) = op.as_object_mut() {
+            obj.insert(
+                "value".to_string(),
+                serde_json::to_value(Spec::new(name)).expect("Spec is always JSON-serializable"),
+            );
         }
     }
 }
@@ -318,6 +532,82 @@ impl BaseClient {
             "access_blob": access_blob,
         });
         self.context.put_json(&url, &body).await.map(|_| ())
+    }
+
+    /// Build the RFC 6902 patches that [`update_metadata`](Self::update_metadata)
+    /// would send, without sending them. Mirrors Python
+    /// `BaseClient.build_metadata_patches` (`base.py:585-691`).
+    ///
+    /// Each patch is computed by merging the caller's desired changes into a
+    /// copy of the *current* value (the snapshot this client holds) and diffing
+    /// old-vs-new — the JSON-Merge-Patch-as-intermediary approach upstream uses
+    /// so the surface reads like `dict.update` while still emitting a minimal
+    /// RFC 6902 patch:
+    /// - `metadata`: the merged tree (see [`MetadataUpdate`]) diffed against the
+    ///   current metadata. **Always** an ops array — `[]` when `metadata` is
+    ///   `None` or the merge changes nothing, matching upstream where
+    ///   `metadata_patch` is never `None`.
+    /// - `specs`: `None` when `specs` is `None`; otherwise the current spec
+    ///   *names* diffed against the requested names, with each add/replace value
+    ///   normalized from a bare name to a `Spec` object. Passing this call only
+    ///   sets spec names (versions become unset), exactly as upstream's
+    ///   name-list diff does.
+    /// - `access_blob`: `None` when `access_tags` is `None` or empty (an empty
+    ///   list is a no-op upstream); otherwise `{"tags": access_tags}` merged
+    ///   into the current `access_blob` and diffed.
+    pub fn build_metadata_patches(
+        &self,
+        metadata: Option<&BTreeMap<String, MetadataUpdate>>,
+        specs: Option<&[String]>,
+        access_tags: Option<&[String]>,
+    ) -> MetadataPatches {
+        const NULL: serde_json::Value = serde_json::Value::Null;
+        let current_spec_names: Vec<String> = self.specs().iter().map(|s| s.name.clone()).collect();
+        let current_access_blob = self.item.attributes.access_blob.as_ref().unwrap_or(&NULL);
+        compute_metadata_patches(
+            self.metadata(),
+            &current_spec_names,
+            current_access_blob,
+            metadata,
+            specs,
+            access_tags,
+        )
+    }
+
+    /// Update this node's metadata/specs/access via a `dict.update`-like
+    /// interface, building the RFC 6902 patches from the desired changes and
+    /// PATCHing them. Mirrors Python `BaseClient.update_metadata`
+    /// (`base.py:516-583`): a convenience wrapper over
+    /// [`patch_metadata`](Self::patch_metadata) that always sends
+    /// [`PatchContentType::JsonPatch`].
+    ///
+    /// `metadata` is a tree of [`MetadataUpdate`]s — [`Set`](MetadataUpdate::Set)
+    /// to add/replace, [`Delete`](MetadataUpdate::Delete) to remove a key,
+    /// [`Merge`](MetadataUpdate::Merge) to descend into a nested object. `specs`
+    /// replaces the spec-name set; `access_tags`, when non-empty, sets the
+    /// `access_blob` tags. `drop_revision` behaves as in
+    /// [`patch_metadata`](Self::patch_metadata).
+    ///
+    /// Like upstream, this always issues the PATCH even when the diff is empty
+    /// (an empty metadata ops array), so the server still records a revision
+    /// unless `drop_revision` is set. This client's held snapshot is **not**
+    /// mutated; re-fetch the node to observe the server's post-patch state.
+    pub async fn update_metadata(
+        &self,
+        metadata: Option<&BTreeMap<String, MetadataUpdate>>,
+        specs: Option<&[String]>,
+        access_tags: Option<&[String]>,
+        drop_revision: bool,
+    ) -> Result<()> {
+        let patches = self.build_metadata_patches(metadata, specs, access_tags);
+        self.patch_metadata(
+            Some(patches.metadata),
+            patches.specs,
+            patches.access_blob,
+            PatchContentType::JsonPatch,
+            drop_revision,
+        )
+        .await
     }
 
     /// Access this node's metadata revision history, served by
@@ -950,5 +1240,262 @@ mod tests {
                 "expected Invalid for {uri}, got {err:?}"
             );
         }
+    }
+
+    // --- update_metadata diff-builder (compute_metadata_patches) ---------------
+
+    use serde_json::json;
+
+    /// Build a metadata-only patch from `current` and `update`.
+    fn md_patch(
+        current: serde_json::Value,
+        update: BTreeMap<String, MetadataUpdate>,
+    ) -> serde_json::Value {
+        compute_metadata_patches(
+            &current,
+            &[],
+            &serde_json::Value::Null,
+            Some(&update),
+            None,
+            None,
+        )
+        .metadata
+    }
+
+    /// Apply an emitted RFC 6902 ops array back onto `doc`, returning the result.
+    fn apply_ops(mut doc: serde_json::Value, ops: &serde_json::Value) -> serde_json::Value {
+        let patch: json_patch::Patch = serde_json::from_value(ops.clone()).unwrap();
+        json_patch::patch(&mut doc, &patch).unwrap();
+        doc
+    }
+
+    fn upd(pairs: Vec<(&str, MetadataUpdate)>) -> BTreeMap<String, MetadataUpdate> {
+        pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
+    }
+
+    #[test]
+    fn update_metadata_adds_new_key() {
+        let current = json!({"a": 1});
+        let ops = md_patch(
+            current.clone(),
+            upd(vec![("b", MetadataUpdate::Set(json!(2)))]),
+        );
+        assert_eq!(ops, json!([{"op": "add", "path": "/b", "value": 2}]));
+        assert_eq!(apply_ops(current, &ops), json!({"a": 1, "b": 2}));
+    }
+
+    #[test]
+    fn update_metadata_replaces_existing_key() {
+        let current = json!({"a": 1});
+        let ops = md_patch(
+            current.clone(),
+            upd(vec![("a", MetadataUpdate::Set(json!(2)))]),
+        );
+        assert_eq!(ops, json!([{"op": "replace", "path": "/a", "value": 2}]));
+        assert_eq!(apply_ops(current, &ops), json!({"a": 2}));
+    }
+
+    #[test]
+    fn update_metadata_deletes_key_via_sentinel() {
+        let current = json!({"a": 1, "b": 2});
+        let ops = md_patch(current.clone(), upd(vec![("b", MetadataUpdate::Delete)]));
+        assert_eq!(ops, json!([{"op": "remove", "path": "/b"}]));
+        assert_eq!(apply_ops(current, &ops), json!({"a": 1}));
+    }
+
+    #[test]
+    fn update_metadata_delete_absent_key_is_noop() {
+        // upstream `result.pop(key, None)` — deleting a missing key changes
+        // nothing, so the diff is empty.
+        let current = json!({"a": 1});
+        let ops = md_patch(current, upd(vec![("missing", MetadataUpdate::Delete)]));
+        assert_eq!(ops, json!([]));
+    }
+
+    #[test]
+    fn update_metadata_nested_merge_patches_only_changed_leaf() {
+        // Merge into `a`: only `a/b` changes; sibling `a/c` is untouched, so the
+        // emitted patch names only `/a/b`.
+        let current = json!({"a": {"b": 1, "c": 2}, "d": 9});
+        let ops = md_patch(
+            current.clone(),
+            upd(vec![(
+                "a",
+                MetadataUpdate::Merge(upd(vec![("b", MetadataUpdate::Set(json!(10)))])),
+            )]),
+        );
+        assert_eq!(ops, json!([{"op": "replace", "path": "/a/b", "value": 10}]));
+        assert_eq!(
+            apply_ops(current, &ops),
+            json!({"a": {"b": 10, "c": 2}, "d": 9})
+        );
+    }
+
+    #[test]
+    fn update_metadata_set_object_merges_like_nested_dict() {
+        // A `Set` holding an object merges (upstream recurses into dict values)
+        // rather than replacing wholesale: `a/c` survives.
+        let current = json!({"a": {"b": 1, "c": 2}});
+        let ops = md_patch(
+            current.clone(),
+            upd(vec![("a", MetadataUpdate::Set(json!({"b": 10})))]),
+        );
+        assert_eq!(ops, json!([{"op": "replace", "path": "/a/b", "value": 10}]));
+        assert_eq!(apply_ops(current, &ops), json!({"a": {"b": 10, "c": 2}}));
+    }
+
+    #[test]
+    fn update_metadata_nested_delete_leaves_siblings() {
+        let current = json!({"a": {"b": 1, "c": 2}});
+        let ops = md_patch(
+            current.clone(),
+            upd(vec![(
+                "a",
+                MetadataUpdate::Merge(upd(vec![("c", MetadataUpdate::Delete)])),
+            )]),
+        );
+        assert_eq!(ops, json!([{"op": "remove", "path": "/a/c"}]));
+        assert_eq!(apply_ops(current, &ops), json!({"a": {"b": 1}}));
+    }
+
+    #[test]
+    fn update_metadata_noop_yields_empty_patch() {
+        let current = json!({"a": 1});
+        // metadata = None → always [] (mirrors upstream `metadata_patch = []`).
+        assert_eq!(
+            compute_metadata_patches(&current, &[], &serde_json::Value::Null, None, None, None)
+                .metadata,
+            json!([])
+        );
+        // Empty update map → [].
+        assert_eq!(md_patch(current.clone(), BTreeMap::new()), json!([]));
+        // Setting a key to its existing value → [].
+        assert_eq!(
+            md_patch(current, upd(vec![("a", MetadataUpdate::Set(json!(1)))])),
+            json!([])
+        );
+    }
+
+    #[test]
+    fn update_metadata_specs_add_replace_remove_normalize_to_spec_objects() {
+        // add: ["foo"] -> ["foo", "bar"]
+        let p = compute_metadata_patches(
+            &serde_json::Value::Null,
+            &["foo".into()],
+            &serde_json::Value::Null,
+            None,
+            Some(&["foo".into(), "bar".into()]),
+            None,
+        );
+        assert_eq!(
+            p.specs.unwrap(),
+            json!([{"op": "add", "path": "/1", "value": {"name": "bar"}}]),
+            "added spec name normalizes to a Spec object (no null version)"
+        );
+
+        // replace: ["foo"] -> ["bar"]
+        let p = compute_metadata_patches(
+            &serde_json::Value::Null,
+            &["foo".into()],
+            &serde_json::Value::Null,
+            None,
+            Some(&["bar".into()]),
+            None,
+        );
+        assert_eq!(
+            p.specs.unwrap(),
+            json!([{"op": "replace", "path": "/0", "value": {"name": "bar"}}])
+        );
+
+        // remove: ["foo", "bar"] -> ["foo"]
+        let p = compute_metadata_patches(
+            &serde_json::Value::Null,
+            &["foo".into(), "bar".into()],
+            &serde_json::Value::Null,
+            None,
+            Some(&["foo".into()]),
+            None,
+        );
+        assert_eq!(
+            p.specs.unwrap(),
+            json!([{"op": "remove", "path": "/1"}]),
+            "remove ops carry no value to normalize"
+        );
+    }
+
+    #[test]
+    fn update_metadata_specs_none_vs_empty() {
+        // specs = None → no specs patch at all.
+        let p = compute_metadata_patches(
+            &serde_json::Value::Null,
+            &["foo".into()],
+            &serde_json::Value::Null,
+            None,
+            None,
+            None,
+        );
+        assert!(p.specs.is_none());
+
+        // specs = [] → clear all specs (a real patch, not None).
+        let p = compute_metadata_patches(
+            &serde_json::Value::Null,
+            &["foo".into()],
+            &serde_json::Value::Null,
+            None,
+            Some(&[]),
+            None,
+        );
+        assert_eq!(p.specs.unwrap(), json!([{"op": "remove", "path": "/0"}]));
+    }
+
+    #[test]
+    fn update_metadata_access_tags_none_and_empty_are_noops() {
+        // access_tags = None → no access_blob patch.
+        let p = compute_metadata_patches(
+            &serde_json::Value::Null,
+            &[],
+            &json!({"tags": ["old"]}),
+            None,
+            None,
+            None,
+        );
+        assert!(p.access_blob.is_none());
+        // access_tags = [] → still a no-op (upstream: empty list is a no-op).
+        let p = compute_metadata_patches(
+            &serde_json::Value::Null,
+            &[],
+            &json!({"tags": ["old"]}),
+            None,
+            None,
+            Some(&[]),
+        );
+        assert!(p.access_blob.is_none());
+    }
+
+    #[test]
+    fn update_metadata_access_tags_sets_tags() {
+        let current_blob = json!({"tags": ["old"], "owner": "u"});
+        let p = compute_metadata_patches(
+            &serde_json::Value::Null,
+            &[],
+            &current_blob,
+            None,
+            None,
+            Some(&["new".into()]),
+        );
+        let ops = p.access_blob.unwrap();
+        // Only the tags key is touched; `owner` is left alone.
+        assert_eq!(
+            apply_ops(current_blob, &ops),
+            json!({"tags": ["new"], "owner": "u"})
+        );
+    }
+
+    #[test]
+    fn metadata_update_from_value_is_set() {
+        assert_eq!(
+            MetadataUpdate::from(json!(5)),
+            MetadataUpdate::Set(json!(5))
+        );
     }
 }
