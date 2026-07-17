@@ -212,6 +212,85 @@ async fn subscribe_then_register_emits_child_created_msgpack() {
     assert_eq!(ev["key"], "scan1");
 }
 
+/// Finding #2 parity: the `container-child-created` event streams each child data
+/// source stamped with its DB-assigned primary key (upstream adapter.py:847-855).
+/// Before the fix the event carried the raw request objects, whose `id` is null,
+/// so a subscriber could not address the newly created data source.
+#[tokio::test]
+async fn child_created_streams_data_sources_with_db_ids() {
+    let (base, client, _wdir, _dbdir) = spawn_write_server().await;
+
+    // A parent container so the child create streams on a subscribable node — a
+    // root-level create has no parent node id and does not stream.
+    let resp = client
+        .post(format!("{base}/api/v1/metadata/"))
+        .json(&json!({
+            "key": "expt",
+            "structure_family": "container",
+            "metadata": {},
+            "specs": [],
+            "data_sources": [],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "create parent: {}",
+        resp.status()
+    );
+
+    let url = ws_url(&base, "expt");
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    assert_eq!(
+        next_text_json(&mut ws).await.expect("schema")["type"],
+        "container-schema"
+    );
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // A child array WITH one managed data source under the subscribed parent.
+    let resp = client
+        .post(format!("{base}/api/v1/metadata/expt"))
+        .json(&json!({
+            "key": "scan1",
+            "structure_family": "array",
+            "metadata": {},
+            "specs": [],
+            "data_sources": [{
+                "structure_family": "array",
+                "structure": f64_array_structure(4, vec![4]),
+                "id": null,
+                "mimetype": "application/x-npy",
+                "parameters": {},
+                "properties": {},
+                "assets": [],
+                "management": "writable",
+            }],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "create child: {}",
+        resp.status()
+    );
+
+    let ev = next_text_json(&mut ws).await.expect("child-created");
+    assert_eq!(ev["type"], "container-child-created");
+    assert_eq!(ev["key"], "scan1");
+
+    // The streamed data source carries the DB-assigned id, matching what the
+    // catalog persisted (read back via ?include_data_sources=true).
+    let persisted = data_source_id(&client, &base, "expt/scan1").await;
+    assert!(persisted > 0, "persisted id must be a real primary key");
+    assert_eq!(
+        ev["data_sources"][0]["id"].as_i64(),
+        Some(persisted),
+        "streamed data_source id must match the persisted DB id, event: {ev}"
+    );
+}
+
 /// `?start=` replays cached events without a live race: register the child
 /// first (cached at sequence 1 on the parent), then subscribe with `?start=1`.
 #[tokio::test]
