@@ -1695,6 +1695,41 @@ fn parse_range(header: &str, total: usize) -> Option<(usize, usize)> {
 //   - !persist                  → stream-only: return the current structure,
 //                                 do not deserialize or write
 
+/// Publish an `array-data` streaming event on the array node's OWN stream
+/// (upstream `CatalogArrayAdapter._stream`, catalog/adapter.py:1642-1656; sparse
+/// inherits it, :1846). No-op when the deployment has no catalog — an in-memory
+/// tree has no subscribable node id. `body` is the raw write payload
+/// (`media_type` its wire encoding); `shape`/`offset`/`block` describe the
+/// written region. Emitting is best-effort: a lookup miss silently drops the
+/// event rather than failing the write that already succeeded.
+async fn stream_array_data(
+    state: &AppState,
+    segments: &[String],
+    media_type: &str,
+    shape: &[usize],
+    offset: Option<&[usize]>,
+    block: Option<&[usize]>,
+    body: bytes::Bytes,
+) {
+    let Some(catalog) = state.catalog.as_ref() else {
+        return;
+    };
+    let Ok(Some(node)) = catalog.lookup(segments).await else {
+        return;
+    };
+    let seq = state.streaming_cache.incr_seq(node.id).await;
+    state
+        .streaming_cache
+        .set(
+            node.id,
+            seq,
+            crate::server::streaming_cache::StreamEvent::array_data(
+                seq, media_type, shape, offset, block, body,
+            ),
+        )
+        .await;
+}
+
 pub async fn array_patch(
     State(state): State<AppState>,
     OriginalUri(uri): OriginalUri,
@@ -1745,6 +1780,21 @@ pub async fn array_patch(
     let writable = array_adapter.as_writable().ok_or_else(|| {
         ServerError::MethodNotAllowed("This node cannot accept array data.".into())
     })?;
+
+    // Stream the incoming block BEFORE the persist branch — upstream `patch`
+    // calls `_stream` before `if not persist: return` (catalog/adapter.py:
+    // 1702-1706), so subscribers see the block even on a stream-only patch.
+    // `shape`/`offset` are the incoming-block dimensions (`?shape=` / `?offset=`).
+    stream_array_data(
+        &state,
+        &segments,
+        crate::core::media_type::mime::OCTET_STREAM,
+        &shape,
+        Some(&offset),
+        None,
+        body.clone(),
+    )
+    .await;
 
     // !persist: stream-only. Python returns entry.structure() before
     // deserializing or writing (catalog/adapter.py:1648-1649).
@@ -1877,7 +1927,21 @@ pub async fn array_full_put(
         let ndim = sparse.structure().shape.len();
         let data = deserialize_sparse_coo(&body, ndim)?;
         ensure_sparse_data_dtype(sparse.structure(), &data)?;
+        let stream_shape = sparse.structure().shape.clone();
         writable.write(data).await.map_err(ServerError::from)?;
+
+        // Sparse inherits the array `_stream` upstream (adapter.py:1846): emit an
+        // `array-data` event carrying the COO write body (Arrow IPC).
+        stream_array_data(
+            &state,
+            &segments,
+            crate::core::media_type::mime::ARROW_FILE,
+            &stream_shape,
+            None,
+            None,
+            body,
+        )
+        .await;
 
         return Ok(Json(serde_json::json!({ "ok": true })));
     }
@@ -1915,8 +1979,22 @@ pub async fn array_full_put(
         )));
     }
     let shape = structure.shape.clone();
-    let payload = crate::core::dtype::DynNDArray::new(body, dtype, shape);
+    let stream_body = body.clone();
+    let payload = crate::core::dtype::DynNDArray::new(body, dtype, shape.clone());
     writable.write(payload).await.map_err(ServerError::from)?;
+
+    // Stream the whole-array write on the array node's own stream. The dense
+    // wire encoding is a raw C-order buffer (octet-stream).
+    stream_array_data(
+        &state,
+        &segments,
+        crate::core::media_type::mime::OCTET_STREAM,
+        &shape,
+        None,
+        None,
+        stream_body,
+    )
+    .await;
 
     Ok(Json(serde_json::json!({ "ok": true })))
 }
@@ -1997,10 +2075,24 @@ pub async fn array_block_put(
         let block = parse_block_param(&params, sparse.structure().shape.len())?;
         let data = deserialize_sparse_coo(&body, block.len())?;
         ensure_sparse_data_dtype(sparse.structure(), &data)?;
+        let stream_shape = sparse.structure().shape.clone();
         writable
             .write_block(data, &block)
             .await
             .map_err(ServerError::from)?;
+
+        // Sparse inherits the array `_stream` (adapter.py:1846): emit `array-data`
+        // for the written block, carrying the COO block body (Arrow IPC).
+        stream_array_data(
+            &state,
+            &segments,
+            crate::core::media_type::mime::ARROW_FILE,
+            &stream_shape,
+            None,
+            Some(&block),
+            body,
+        )
+        .await;
 
         return Ok(Json(serde_json::json!({ "ok": true })));
     }
@@ -2054,11 +2146,25 @@ pub async fn array_block_put(
             body.len()
         )));
     }
-    let payload = crate::core::dtype::DynNDArray::new(body, dtype, chunk_shape);
+    let stream_body = body.clone();
+    let payload = crate::core::dtype::DynNDArray::new(body, dtype, chunk_shape.clone());
     writable
         .write_block(payload, &block)
         .await
         .map_err(ServerError::from)?;
+
+    // Stream the written chunk on the array node's own stream; `block` is the
+    // chunk coordinate, `shape` the chunk's dense shape, wire encoding raw C-order.
+    stream_array_data(
+        &state,
+        &segments,
+        crate::core::media_type::mime::OCTET_STREAM,
+        &chunk_shape,
+        None,
+        Some(&block),
+        stream_body,
+    )
+    .await;
 
     Ok(Json(serde_json::json!({ "ok": true })))
 }

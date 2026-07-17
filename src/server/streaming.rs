@@ -22,6 +22,8 @@
 //! JSON text frames; `msgpack` sends msgpack binary frames (upstream
 //! `EnvelopeFormat`, `tiled/server/schemas.py:619`).
 
+use std::sync::Arc;
+
 use axum::extract::OriginalUri;
 use axum::extract::{
     Query, State, WebSocketUpgrade,
@@ -29,12 +31,27 @@ use axum::extract::{
 };
 use bytes::Bytes;
 use serde::Deserialize;
+use serde::ser::{Serialize, SerializeMap, Serializer};
 use serde_json::Value;
 use tokio::sync::broadcast;
 
+use crate::core::dtype::BuiltinDType;
+use crate::core::structures::StructureFamily;
+use crate::serialization::registry::SerializationRegistry;
 use crate::server::auth_context::{AuthContext, AuthKind};
 use crate::server::error::ServerError;
 use crate::server::state::AppState;
+
+/// Per-subscription context for transcoding a data event's raw payload into a
+/// JSON-native value on the `json` envelope. Fixed for the life of a
+/// subscription: the shared serializer registry plus, when the subscribed node
+/// is an array/sparse node, its element dtype (needed to decode the raw C-order
+/// payload back into nested lists). `array_dtype` is `None` for every other
+/// family, so no array-data transcode is attempted there.
+struct PayloadCtx {
+    registry: Arc<SerializationRegistry>,
+    array_dtype: Option<BuiltinDType>,
+}
 
 /// WebSocket envelope format (upstream `EnvelopeFormat`,
 /// `tiled/server/schemas.py:619`). `Json` (the default) sends JSON text frames;
@@ -259,10 +276,27 @@ async fn run_subscription(
         return;
     }
 
+    // Resolve the array element dtype once for the life of the subscription:
+    // the json envelope needs it to transcode array-data payloads into nested
+    // lists (upstream reads it from `entry.structure()` per format call). It is
+    // carried in the array-schema (`data_type`); sparse inherits array-schema,
+    // so both resolve here. Non-array subscriptions leave it `None`.
+    let array_dtype = if schema.get("type").and_then(Value::as_str) == Some("array-schema") {
+        schema
+            .get("data_type")
+            .and_then(|dt| BuiltinDType::from_json(dt).ok())
+    } else {
+        None
+    };
+    let payload_ctx = PayloadCtx {
+        registry: state.serialization_registry.clone(),
+        array_dtype,
+    };
+
     // First message: the node's per-family schema, sent through the same
     // envelope formatter as the events (upstream `formatter(websocket, schema,
     // None)`).
-    match encode(&schema, None, format) {
+    match encode(&schema, None, format, &payload_ctx) {
         Some(msg) => {
             if tx.send(msg).await.is_err() {
                 return;
@@ -296,7 +330,18 @@ async fn run_subscription(
         let current = state.streaming_cache.current_seq(node_id).await;
         last_sent = current;
         for seq in start..=current {
-            match send_seq(&mut tx, &state, &auth_ctx, &segments, node_id, seq, format).await {
+            match send_seq(
+                &mut tx,
+                &state,
+                &auth_ctx,
+                &segments,
+                node_id,
+                seq,
+                format,
+                &payload_ctx,
+            )
+            .await
+            {
                 SendOutcome::EndOfStream => {
                     ended = true;
                     break;
@@ -320,7 +365,18 @@ async fn run_subscription(
                             if seq <= last_sent {
                                 continue;
                             }
-                            match send_seq(&mut tx, &state, &auth_ctx, &segments, node_id, seq, format).await {
+                            match send_seq(
+                                &mut tx,
+                                &state,
+                                &auth_ctx,
+                                &segments,
+                                node_id,
+                                seq,
+                                format,
+                                &payload_ctx,
+                            )
+                            .await
+                            {
                                 SendOutcome::EndOfStream => break,
                                 SendOutcome::ClientGone => return,
                                 SendOutcome::Sent | SendOutcome::Skipped => last_sent = seq,
@@ -367,6 +423,7 @@ enum SendOutcome {
 }
 
 /// Fetch the cached event at `(node_id, seq)`, authorize it, and send it.
+#[allow(clippy::too_many_arguments)]
 async fn send_seq(
     tx: &mut futures::stream::SplitSink<WebSocket, Message>,
     state: &AppState,
@@ -375,6 +432,7 @@ async fn send_seq(
     node_id: i64,
     seq: u64,
     format: EnvelopeFormat,
+    payload_ctx: &PayloadCtx,
 ) -> SendOutcome {
     use futures::SinkExt;
     let event = match state.streaming_cache.get(node_id, seq).await {
@@ -398,7 +456,7 @@ async fn send_seq(
     {
         return SendOutcome::Skipped;
     }
-    match encode(&event.metadata, event.payload.as_ref(), format) {
+    match encode(&event.metadata, event.payload.as_ref(), format, payload_ctx) {
         Some(msg) => {
             if tx.send(msg).await.is_err() {
                 SendOutcome::ClientGone
@@ -424,32 +482,55 @@ async fn wait_for_close(rx: &mut futures::stream::SplitStream<WebSocket>) {
     }
 }
 
-/// Encode one event (or the schema) into a WebSocket frame for `format`.
+/// Encode one event (or the schema) into a WebSocket frame for `format`,
+/// mirroring upstream `get_websocket_envelope_formatter` (core.py:754-820).
 ///
-/// - `Json`: send the flat metadata as a text frame. Data payloads
-///   (array/table blocks) are transcoded into `metadata["payload"]` in a later
-///   wave (PR3/PR4); PR2b tree/EOS events and the schema carry no payload.
-/// - `Msgpack`: pack the flat metadata as a binary frame, embedding the raw
-///   payload under `"payload"` when present.
-fn encode(metadata: &Value, payload: Option<&Bytes>, format: EnvelopeFormat) -> Option<Message> {
+/// - `Json`: transcode a data payload into a JSON-native value under
+///   `metadata["payload"]` (array-data → nested lists), then send the metadata
+///   as a text frame. Tree/EOS events and the schema carry no payload.
+/// - `Msgpack`: pack the metadata as a binary frame; a payload is embedded under
+///   `"payload"` as a msgpack **bin** (byte string), matching
+///   `msgpack.packb({..., "payload": <bytes>})`.
+fn encode(
+    metadata: &Value,
+    payload: Option<&Bytes>,
+    format: EnvelopeFormat,
+    ctx: &PayloadCtx,
+) -> Option<Message> {
     match format {
-        EnvelopeFormat::Json => match serde_json::to_string(metadata) {
-            Ok(s) => Some(Message::Text(s.into())),
-            Err(e) => {
-                tracing::warn!(target: "tiled.streaming", "json encode: {e}");
-                None
-            }
-        },
-        EnvelopeFormat::Msgpack => {
-            let packed = match payload {
+        EnvelopeFormat::Json => {
+            let text = match payload {
+                // Transcode the raw payload into JSON-native values. If the
+                // family/mimetype can't be transcoded here, fall through to the
+                // metadata alone (no `payload`) rather than emit raw bytes.
                 Some(bytes) => {
                     let mut m = metadata.clone();
-                    if let Some(obj) = m.as_object_mut() {
-                        obj.insert("payload".into(), Value::from(bytes.as_ref()));
+                    if let Some(json_payload) = transcode_payload_to_json(&m, bytes, ctx)
+                        && let Some(obj) = m.as_object_mut()
+                    {
+                        obj.insert("payload".into(), json_payload);
+                        obj.insert("content-type".into(), Value::from("application/json"));
                     }
-                    rmp_serde::to_vec_named(&m)
+                    serde_json::to_string(&m)
                 }
-                None => rmp_serde::to_vec_named(metadata),
+                None => serde_json::to_string(metadata),
+            };
+            match text {
+                Ok(s) => Some(Message::Text(s.into())),
+                Err(e) => {
+                    tracing::warn!(target: "tiled.streaming", "json encode: {e}");
+                    None
+                }
+            }
+        }
+        EnvelopeFormat::Msgpack => {
+            let packed = match (payload, metadata.as_object()) {
+                // Embed the payload as a msgpack bin alongside the metadata map.
+                (Some(bytes), Some(map)) => rmp_serde::to_vec_named(&MsgpackEnvelope {
+                    map,
+                    payload: bytes,
+                }),
+                _ => rmp_serde::to_vec_named(metadata),
             };
             match packed {
                 Ok(v) => Some(Message::Binary(v.into())),
@@ -460,6 +541,88 @@ fn encode(metadata: &Value, payload: Option<&Bytes>, format: EnvelopeFormat) -> 
             }
         }
     }
+}
+
+/// A metadata map plus a binary payload, serialized as a single msgpack map that
+/// preserves the metadata field order and encodes `payload` as a msgpack **bin**
+/// (via `serialize_bytes`), not an array of ints. Mirrors upstream
+/// `msgpack.packb({**metadata, "payload": payload_bytes})`.
+struct MsgpackEnvelope<'a> {
+    map: &'a serde_json::Map<String, Value>,
+    payload: &'a [u8],
+}
+
+impl Serialize for MsgpackEnvelope<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // +1 for the payload entry, unless the metadata already carries a
+        // `payload` key (it never does — the constructors omit it — but guard so
+        // we never emit a duplicate map key).
+        let has_payload_key = self.map.contains_key("payload");
+        let len = self.map.len() + usize::from(!has_payload_key);
+        let mut map = serializer.serialize_map(Some(len))?;
+        for (k, v) in self.map {
+            if k == "payload" {
+                continue;
+            }
+            map.serialize_entry(k, v)?;
+        }
+        map.serialize_entry("payload", serde_bytes::Bytes::new(self.payload))?;
+        map.end()
+    }
+}
+
+/// Transcode a data event's raw `payload` into a JSON-native value, dispatched
+/// by the event `type` (upstream `stream_json`, core.py:772-816). PR3 wires the
+/// array arm; the table/ragged arms land in PR4/PR5. Returns `None` when the
+/// event carries no transcodable payload for this build (e.g. a sparse Arrow
+/// body, or a family not yet wired) — the caller then omits `payload`.
+fn transcode_payload_to_json(metadata: &Value, payload: &Bytes, ctx: &PayloadCtx) -> Option<Value> {
+    match metadata.get("type").and_then(Value::as_str) {
+        Some("array-data") => transcode_array_payload_to_json(metadata, payload, ctx),
+        _ => None,
+    }
+}
+
+/// Transcode a raw C-order array payload into nested JSON lists, REUSING the
+/// read-path array→JSON serializer from the registry so the output is identical
+/// to `GET /array/full` with `Accept: application/json`. Only the octet-stream
+/// (dense) wire form is transcodable here; a sparse (Arrow) `array-data` payload
+/// has no array-family JSON serializer, so this returns `None` and the payload
+/// is omitted from the json envelope (msgpack still ships the raw bin).
+fn transcode_array_payload_to_json(
+    metadata: &Value,
+    payload: &Bytes,
+    ctx: &PayloadCtx,
+) -> Option<Value> {
+    // Dense arrays travel as a raw C-order buffer; anything else (sparse Arrow)
+    // is not decodable by the array serializer.
+    if metadata.get("mimetype").and_then(Value::as_str)
+        != Some(crate::core::media_type::mime::OCTET_STREAM)
+    {
+        return None;
+    }
+    let dtype = ctx.array_dtype.as_ref()?;
+    let shape = metadata.get("shape").cloned().unwrap_or(Value::Null);
+    // Build the serializer metadata exactly as the read path does
+    // (`build_array_response`), so the nested-list encoding matches byte-for-byte.
+    let ser_meta = serde_json::json!({
+        "itemsize": dtype.element_size(),
+        "kind": String::from(dtype.kind.to_numpy_char()),
+        "byteorder": String::from(dtype.endianness.to_numpy_char()),
+        "dt_units": dtype.dt_units,
+        "shape": shape,
+    });
+    let serializer = ctx
+        .registry
+        .dispatch(StructureFamily::Array, crate::core::media_type::mime::JSON)?;
+    let json_bytes = match serializer(payload, &ser_meta) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(target: "tiled.streaming", "array-data json transcode: {e}");
+            return None;
+        }
+    };
+    serde_json::from_slice(&json_bytes).ok()
 }
 
 /// Per-message delivery authorization.
