@@ -74,9 +74,10 @@ pub struct TiledConfig {
     pub streaming: Option<StreamingConfig>,
     /// Optional `uvicorn:` block. tiled-rs runs on axum, not uvicorn, so only
     /// `root_path` (the reverse-proxy mount prefix, upstream `config.py:411` →
-    /// `uvicorn.get("root_path")`) is read; the rest of uvicorn's keys are
+    /// `uvicorn.get("root_path")`), `host`, and `port` (the bind address,
+    /// upstream `_serve.py:711-714`) are read; the rest of uvicorn's keys are
     /// captured in [`UvicornConfig::unknown`] and warn-logged at startup. See
-    /// [`Self::root_path`].
+    /// [`Self::root_path`], [`Self::uvicorn_host`], [`Self::uvicorn_port`].
     #[serde(default)]
     pub uvicorn: Option<UvicornConfig>,
     /// Optional `database:` block configuring the authentication database —
@@ -125,9 +126,8 @@ pub fn default_exact_count_limit() -> u64 {
 
 /// `uvicorn:` block — mirrors upstream tiled's free-form uvicorn settings dict
 /// (`config.py:282`). tiled-rs is served by axum rather than uvicorn, so only
-/// `root_path` is modelled here; host/port/workers/ssl and friends are supplied
-/// by CLI flags or ignored (captured in [`Self::unknown`] and warned about at
-/// startup).
+/// `root_path`, `host`, and `port` are modelled here; workers/ssl_* and friends
+/// are ignored (captured in [`Self::unknown`] and warned about at startup).
 #[derive(Debug, Deserialize)]
 pub struct UvicornConfig {
     /// Reverse-proxy mount prefix (upstream `uvicorn.root_path`). Prepended to
@@ -135,7 +135,17 @@ pub struct UvicornConfig {
     /// The `--root-path` CLI flag takes precedence over this.
     #[serde(default)]
     pub root_path: Option<String>,
-    /// Uvicorn keys tiled-rs does not model (host, port, workers, ssl_*, …).
+    /// Bind host (upstream `uvicorn.host`). Config-file source for the serve
+    /// bind address; the `--host` CLI flag takes precedence, and absent both
+    /// the default is `127.0.0.1`. Read by [`TiledConfig::uvicorn_host`].
+    #[serde(default)]
+    pub host: Option<String>,
+    /// Bind port (upstream `uvicorn.port`). Config-file source for the serve
+    /// bind port; the `--port` CLI flag takes precedence, and absent both the
+    /// default is `8000`. Read by [`TiledConfig::uvicorn_port`].
+    #[serde(default)]
+    pub port: Option<u16>,
+    /// Uvicorn keys tiled-rs does not model (workers, ssl_*, …).
     #[serde(flatten)]
     pub unknown: BTreeMap<String, serde_yaml::Value>,
 }
@@ -1380,6 +1390,20 @@ impl TiledConfig {
         self.uvicorn.as_ref().and_then(|u| u.root_path.as_deref())
     }
 
+    /// Bind host declared in the `uvicorn:` block (upstream `uvicorn.host`,
+    /// `_serve.py:711`). `None` when unset. The `--host` CLI flag takes
+    /// precedence over this (resolved in `run`).
+    pub fn uvicorn_host(&self) -> Option<&str> {
+        self.uvicorn.as_ref().and_then(|u| u.host.as_deref())
+    }
+
+    /// Bind port declared in the `uvicorn:` block (upstream `uvicorn.port`,
+    /// `_serve.py:713`). `None` when unset. The `--port` CLI flag takes
+    /// precedence over this (resolved in `run`).
+    pub fn uvicorn_port(&self) -> Option<u16> {
+        self.uvicorn.as_ref().and_then(|u| u.port)
+    }
+
     /// Extract the MongoDB URI from the first tree that looks like a mongo adapter.
     pub fn mongo_uri(&self) -> Option<&str> {
         self.trees.iter().find_map(|t| {
@@ -1439,13 +1463,23 @@ mod tests {
         // Absent `uvicorn:` block → no root_path.
         let cfg: TiledConfig = serde_yaml::from_str("trees: []").unwrap();
         assert_eq!(cfg.root_path(), None);
-        // `uvicorn.root_path` is read; sibling uvicorn keys are captured (and
-        // warned about) rather than rejected, mirroring upstream's free-form
-        // uvicorn settings dict.
-        let cfg: TiledConfig =
-            serde_yaml::from_str("uvicorn:\n  root_path: /instrument1\n  port: 9000").unwrap();
+        // `uvicorn.root_path`, `host`, and `port` are read; other uvicorn keys
+        // (e.g. `workers`) are captured (and warned about) rather than rejected,
+        // mirroring upstream's free-form uvicorn settings dict.
+        let cfg: TiledConfig = serde_yaml::from_str(
+            "uvicorn:\n  root_path: /instrument1\n  host: 0.0.0.0\n  port: 9000\n  workers: 4",
+        )
+        .unwrap();
         assert_eq!(cfg.root_path(), Some("/instrument1"));
-        assert!(cfg.uvicorn.as_ref().unwrap().unknown.contains_key("port"));
+        assert_eq!(cfg.uvicorn_host(), Some("0.0.0.0"));
+        assert_eq!(cfg.uvicorn_port(), Some(9000));
+        assert!(
+            cfg.uvicorn
+                .as_ref()
+                .unwrap()
+                .unknown
+                .contains_key("workers")
+        );
     }
 
     #[test]
