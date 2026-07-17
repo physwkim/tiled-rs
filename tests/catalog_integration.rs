@@ -498,6 +498,158 @@ async fn delete_internally_managed_requires_external_only_false() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
+/// Register a plain (asset-free) container `key` under `parent` ("" for root).
+async fn register_container(app: &axum::Router, parent: &str, key: &str) {
+    let uri = if parent.is_empty() {
+        "/api/v1/register/".to_string()
+    } else {
+        format!("/api/v1/register/{parent}")
+    };
+    let (status, body) = json_request(
+        app,
+        Method::POST,
+        &uri,
+        serde_json::json!({
+            "key": key,
+            "structure_family": "container",
+            "metadata": {},
+            "specs": [],
+            "data_sources": [],
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "register {parent}/{key}: {body}"
+    );
+}
+
+/// `?recursive=true` deletes a non-empty container and its whole subtree in one
+/// call (upstream `adapter.py:1069` gates the has-children refusal on
+/// `if not recursive`; client `base.py:918-936` sends `recursive`). Boundary:
+/// recursive=true over a multi-level subtree.
+#[tokio::test]
+async fn delete_recursive_removes_whole_subtree() {
+    let (app, _dir) = build_test_app().await;
+    // expt / expt/a / expt/a/b  (three nested containers).
+    register_container(&app, "", "expt").await;
+    register_container(&app, "expt", "a").await;
+    register_container(&app, "expt/a", "b").await;
+
+    // One DELETE with recursive=true removes the root and every descendant.
+    let (status, body) =
+        empty_request(&app, Method::DELETE, "/api/v1/metadata/expt?recursive=true").await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "recursive delete: {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    for path in ["expt", "expt/a", "expt/a/b"] {
+        let (status, _) =
+            empty_request(&app, Method::GET, &format!("/api/v1/metadata/{path}")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{path} should be gone");
+    }
+}
+
+/// Boundary: recursive absent / `recursive=false` still refuses a non-empty
+/// container with 409 (upstream's default `recursive=False` empty-check).
+#[tokio::test]
+async fn delete_non_recursive_conflicts_on_nonempty() {
+    let (app, _dir) = build_test_app().await;
+    register_container(&app, "", "expt").await;
+    register_container(&app, "expt", "a").await;
+
+    // No recursive param → 409, message names non-emptiness (not managed data).
+    let (status, body) = empty_request(&app, Method::DELETE, "/api/v1/metadata/expt").await;
+    assert_eq!(status, StatusCode::CONFLICT, "absent recursive → 409");
+    assert!(
+        String::from_utf8_lossy(&body).contains("is not empty"),
+        "empty-check message: {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    // Explicit recursive=false → still 409.
+    let (status, _) = empty_request(
+        &app,
+        Method::DELETE,
+        "/api/v1/metadata/expt?recursive=false",
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "recursive=false → 409");
+
+    // Node still present.
+    let (status, _) = empty_request(&app, Method::GET, "/api/v1/metadata/expt").await;
+    assert_eq!(status, StatusCode::OK, "node survives a refused delete");
+}
+
+/// Boundary: recursive=true + external_only=true (default) over a subtree that
+/// holds an internally-managed data source still refuses, with the
+/// `WouldDeleteData` message — recursive skips the empty-check, but the
+/// managed-data gate (`delete_node`'s subtree scan) still fires. Before the fix
+/// this returned the empty-check 409 instead; the message distinguishes them.
+#[tokio::test]
+async fn delete_recursive_still_refuses_managed_subtree() {
+    let (app, dir) = build_test_app().await;
+    let data_uri =
+        tiled_rs::core::file_uri::path_to_file_uri(&dir.path().join("frame.h5")).unwrap();
+
+    register_container(&app, "", "root").await;
+    // Child array carrying a *writable* (internally-managed) data source.
+    let (status, body) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/register/root",
+        serde_json::json!({
+            "key": "managed",
+            "structure_family": "array",
+            "metadata": {},
+            "specs": [],
+            "data_sources": [{
+                "structure_family": "array",
+                "mimetype": "application/x-hdf5",
+                "management": "writable",
+                "assets": [{
+                    "data_uri": data_uri,
+                    "is_directory": false,
+                    "parameter": "data_uri"
+                }]
+            }]
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "register managed child: {body}"
+    );
+
+    // recursive=true does NOT override external_only (still default true): the
+    // managed data source in the subtree blocks the delete with WouldDeleteData.
+    let (status, body) =
+        empty_request(&app, Method::DELETE, "/api/v1/metadata/root?recursive=true").await;
+    let text = String::from_utf8_lossy(&body);
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "recursive + managed → 409: {text}"
+    );
+    assert!(
+        text.contains("internally managed"),
+        "WouldDeleteData message (not empty-check): {text}"
+    );
+
+    // Subtree intact.
+    let (status, _) = empty_request(&app, Method::GET, "/api/v1/metadata/root/managed").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "managed child survives refused delete"
+    );
+}
+
 /// F-A: json-patch ops are applied DIRECTLY to each document (metadata ops
 /// target the metadata doc, specs ops target the specs array), the body
 /// `content-type` discriminator is read from the body (not the transport
