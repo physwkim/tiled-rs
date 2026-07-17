@@ -462,6 +462,37 @@ impl Catalog {
         }
     }
 
+    /// Fetch a node by its internal DB id, or `None` if absent. Used to recover
+    /// a node's path (`ancestors + key`) from a foreign-key reference such as a
+    /// webhook's `node_id`, so per-node access-control checks can run against
+    /// the by-id routes.
+    pub async fn get_node_by_id(&self, id: i64) -> Result<Option<Node>> {
+        match self.pool() {
+            DbPool::Sqlite(pool) => {
+                let row = sqlx::query(
+                    "SELECT id, key, parent_id, ancestors, structure_family, metadata,
+                            specs, access_blob, time_created, time_updated
+                       FROM nodes WHERE id = ?",
+                )
+                .bind(id)
+                .fetch_optional(pool)
+                .await?;
+                row.map(|r| node_from_sqlite_row(&r)).transpose()
+            }
+            DbPool::Postgres(pool) => {
+                let row = sqlx::query(
+                    "SELECT id, key, parent_id, ancestors, structure_family, metadata,
+                            specs, access_blob, time_created, time_updated
+                       FROM nodes WHERE id = $1",
+                )
+                .bind(id)
+                .fetch_optional(pool)
+                .await?;
+                row.map(|r| node_from_postgres_row(&r)).transpose()
+            }
+        }
+    }
+
     pub async fn list_children(
         &self,
         parent_id: Option<i64>,
