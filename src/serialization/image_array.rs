@@ -238,32 +238,75 @@ fn decode_numeric_to_f32(
     Ok(values)
 }
 
+/// Auto-scale float pixel values to `u8` grayscale using **percentile clipping**,
+/// mirroring upstream `save_to_buffer_PIL` (array.py:78-83):
+///
+/// ```python
+/// low  = numpy.percentile(array.ravel(), 1)
+/// high = numpy.percentile(array.ravel(), 99)
+/// scaled = numpy.clip((array - low) / (high - low), 0, 1)
+/// ... img_as_ubyte(scaled)
+/// ```
+///
+/// Clipping at the 1st/99th percentiles instead of the raw min/max keeps a
+/// single extreme outlier pixel from washing out the whole preview: the outlier
+/// is clipped to white while the body of the image keeps its contrast. (Under
+/// min/max a lone hot pixel sets `high`, crushing every other pixel toward 0.)
+///
+/// Percentiles use numpy's default `method="linear"` — see [`percentile_sorted`].
+/// The `[0, 1]` → `u8` step mirrors scikit-image's `img_as_ubyte`
+/// (image_serializer_helpers.py): `rint(scaled * 255)` (round half to even) then
+/// clip to `[0, 255]`. When `high == low` (degenerate, e.g. an all-equal image)
+/// the division yields `0/0 = NaN` for `v == low` and `±inf` for `v ≷ low`,
+/// exactly as numpy's `clip` sees them: NaN casts to 0 (black) and the infinities
+/// clip to 0/255 — no special-casing needed.
+///
+/// Non-finite handling: upstream feeds every raveled value to `percentile`, so a
+/// single NaN poisons both percentiles and the whole preview goes black. This
+/// port instead takes the percentiles over the finite values only and maps each
+/// non-finite pixel to 0; on all-finite data (the common case, and every boundary
+/// test below) the two agree.
 fn normalize_floats(values: &[f32]) -> Vec<u8> {
     if values.is_empty() {
         return Vec::new();
     }
-    let mut min = f32::INFINITY;
-    let mut max = f32::NEG_INFINITY;
-    for &v in values {
-        if v.is_finite() {
-            min = min.min(v);
-            max = max.max(v);
-        }
-    }
-    if !min.is_finite() || !max.is_finite() || (max - min).abs() < f32::EPSILON {
+    // Percentiles over the finite values (numpy `method="linear"`).
+    let mut finite: Vec<f32> = values.iter().copied().filter(|v| v.is_finite()).collect();
+    if finite.is_empty() {
         return vec![0u8; values.len()];
     }
+    finite.sort_by(f32::total_cmp);
+    let low = percentile_sorted(&finite, 1.0);
+    let high = percentile_sorted(&finite, 99.0);
+    let span = high - low;
     values
         .iter()
         .map(|&v| {
             if !v.is_finite() {
-                0
-            } else {
-                let normalized = ((v - min) / (max - min)) * 255.0;
-                normalized.clamp(0.0, 255.0) as u8
+                return 0;
             }
+            // clip((v - low) / span, 0, 1). NaN (0/0 when span == 0) propagates
+            // through `clamp` and casts to 0; ±inf clip to 0/255.
+            let scaled = ((v - low) / span).clamp(0.0, 1.0);
+            // img_as_ubyte: rint(scaled * 255), clip to [0, 255], cast. Rust's
+            // saturating float→int cast maps NaN → 0, matching numpy's
+            // `astype(uint8)` of NaN.
+            (scaled * 255.0).round_ties_even().clamp(0.0, 255.0) as u8
         })
         .collect()
+}
+
+/// numpy `percentile(sorted, q)` with the default `method="linear"`: for an
+/// ascending, non-empty slice of length `n`, interpolate at the virtual index
+/// `q/100 * (n - 1)` between the two neighbouring samples. `q` is in `[0, 100]`.
+fn percentile_sorted(sorted: &[f32], q: f32) -> f32 {
+    let n = sorted.len();
+    debug_assert!(n > 0, "percentile_sorted requires a non-empty slice");
+    let virtual_index = (q / 100.0) * (n as f32 - 1.0);
+    let lo = virtual_index.floor() as usize;
+    let hi = (lo + 1).min(n - 1);
+    let frac = virtual_index - lo as f32;
+    sorted[lo] + frac * (sorted[hi] - sorted[lo])
 }
 
 /// PNG encoding entry point for the Array HTML serializer's try-then-fallback.
@@ -472,6 +515,80 @@ mod tests {
         assert_eq!(
             png_c, png_f,
             "complex image must render the real part only (numpy astype drops imaginary)"
+        );
+    }
+
+    /// numpy `percentile(sorted, q)` parity for the `method="linear"` default.
+    /// Reference values are what `numpy.percentile([0,1,2,3,4], q)` returns.
+    #[test]
+    fn percentile_sorted_matches_numpy_linear() {
+        let a = [0.0f32, 1.0, 2.0, 3.0, 4.0]; // n = 5, so virtual = q/100 * 4
+        assert_eq!(percentile_sorted(&a, 0.0), 0.0);
+        assert_eq!(percentile_sorted(&a, 100.0), 4.0);
+        assert_eq!(percentile_sorted(&a, 50.0), 2.0);
+        // q=1 → virtual index 0.04 → 0 + 0.04*(1-0) = 0.04.
+        assert!((percentile_sorted(&a, 1.0) - 0.04).abs() < 1e-5);
+        // q=99 → virtual index 3.96 → 3 + 0.96*(4-3) = 3.96.
+        assert!((percentile_sorted(&a, 99.0) - 3.96).abs() < 1e-5);
+        // Single element: every percentile is that element.
+        assert_eq!(percentile_sorted(&[7.5f32], 1.0), 7.5);
+        assert_eq!(percentile_sorted(&[7.5f32], 99.0), 7.5);
+    }
+
+    /// Finding 15 (meta-sweep): a single extreme outlier must be clipped by the
+    /// percentile(1,99) rule while the body of the image keeps its contrast —
+    /// the defect min/max scaling caused (the outlier sets `high`, crushing every
+    /// body pixel to 0). 199 body pixels valued 0..=198 plus one 1e9 outlier; the
+    /// outlier sits above p99 (n=200 ⇒ p99's virtual index 197.01 never reaches
+    /// index 199), so it is excluded from `high`.
+    #[test]
+    fn normalize_floats_clips_outlier_preserves_body_contrast() {
+        let mut values: Vec<f32> = (0..199).map(|i| i as f32).collect();
+        values.push(1e9); // outlier at index 199
+        let out = normalize_floats(&values);
+        // low = p1 ≈ 1.99, high = p99 ≈ 197.01, span ≈ 195.02.
+        assert_eq!(out[199], 255, "outlier must clip to white");
+        assert_eq!(out[198], 255, "brightest body pixel (≥ p99) clips to white");
+        assert_eq!(out[0], 0, "darkest body pixel (≤ p1) is black");
+        // Mid-body (value 100): (100 - 1.99)/195.02 ≈ 0.5026 → ~128, NOT crushed.
+        assert!(
+            (126..=130).contains(&out[100]),
+            "mid body pixel should keep contrast (~128), got {}",
+            out[100]
+        );
+        // Contrast is real: under the old min/max rule, high = 1e9 would map the
+        // same mid-body pixel to 0.
+        let minmax = ((100.0f32 - 0.0) / (1e9 - 0.0) * 255.0) as u8;
+        assert_eq!(minmax, 0, "sanity: min/max scaling washes the body out");
+    }
+
+    /// A uniform gradient (no outliers) still spans the full 0..255 range: the
+    /// bottom 1% clips to black, the top 1% to white, the middle to mid-grey.
+    #[test]
+    fn normalize_floats_uniform_gradient_spans_full_range() {
+        let values: Vec<f32> = (0..=255).map(|i| i as f32).collect();
+        let out = normalize_floats(&values);
+        assert_eq!(out[0], 0, "lowest value maps to black");
+        assert_eq!(out[255], 255, "highest value maps to white");
+        // Middle value ≈ mid-grey.
+        assert!(
+            (126..=130).contains(&out[128]),
+            "gradient midpoint should be mid-grey, got {}",
+            out[128]
+        );
+    }
+
+    /// All-equal-values image: p1 == p99, so `high - low == 0` and every pixel is
+    /// `(v - low)/0 = 0/0 = NaN` → clamp → NaN → cast → 0. numpy does the same
+    /// (`clip(nan,0,1)` = NaN, `astype(uint8)` of NaN = 0), so the preview is a
+    /// black frame rather than a crash or garbage.
+    #[test]
+    fn normalize_floats_all_equal_is_black() {
+        let out = normalize_floats(&[42.0f32; 64]);
+        assert_eq!(out.len(), 64);
+        assert!(
+            out.iter().all(|&b| b == 0),
+            "degenerate all-equal image must render as black (numpy NaN → 0)"
         );
     }
 
