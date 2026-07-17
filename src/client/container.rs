@@ -443,7 +443,7 @@ impl ContainerClient {
             )
             .await?;
         let client = self.get(&created_key).await?.into_array()?;
-        client.write(data).await?;
+        client.write(data, true).await?;
         Ok(client)
     }
 
