@@ -176,6 +176,7 @@ async fn tag_based_config_narrows_forbidden_node() {
         web_assets_dir: None,
         spec_views: Vec::new(),
         webhook_config: None,
+        webhook_dispatcher: None,
         request_timeout_secs: 30,
         expose_raw_assets: true,
         exact_count_limit: u64::MAX,

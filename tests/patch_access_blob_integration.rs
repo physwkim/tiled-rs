@@ -140,6 +140,7 @@ async fn build_app_with_echo_policy(seed_access_blob: serde_json::Value) -> axum
         web_assets_dir: None,
         spec_views: Vec::new(),
         webhook_config: None,
+        webhook_dispatcher: None,
         request_timeout_secs: 30,
         expose_raw_assets: true,
         exact_count_limit: u64::MAX,

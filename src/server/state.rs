@@ -119,6 +119,13 @@ pub struct AppState {
     /// `Some(_)` enables them with the per-field overrides in
     /// `WebhookConfig`.
     pub webhook_config: Option<crate::server::webhook_dispatch::WebhookConfig>,
+    /// Handle to the running webhook dispatcher, injected by
+    /// [`build_app`](crate::server::app::build_app) when `webhook_config` is
+    /// `Some` and a catalog is present. Write handlers call
+    /// `dispatch(...)` on it directly at each tree-event site (upstream's
+    /// direct-dispatch shape). `None` when webhooks are disabled — construction
+    /// sites set `None` and let `build_app` populate it.
+    pub webhook_dispatcher: Option<crate::server::webhook_dispatch::WebhookDispatcher>,
     /// Per-request timeout in seconds.  Requests that do not complete within
     /// this window receive HTTP 408.  Default: 30.  Python tiled delegates
     /// timeouts to the ASGI server (uvicorn) and has no in-app default;

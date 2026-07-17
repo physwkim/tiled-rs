@@ -5215,6 +5215,33 @@ pub async fn post_metadata(
     create_node_core(state, segments, base_url, auth, req, true).await
 }
 
+/// Hand a tree event to the webhook dispatcher when webhooks are enabled.
+/// Called alongside `streaming_bus.publish` at each catalog write site — the
+/// upstream shape where the write site independently notifies WS subscribers
+/// and dispatches webhooks (`tiled/catalog/adapter.py:877/1360/1370`).
+/// `event_type` is the wire event name and must agree with `kind`'s serialized
+/// `"type"` tag. Webhook matching is purely `path`-based (preserving the
+/// streaming-bus era's semantics exactly); `node_id` is carried for delivery
+/// correlation only, not used to widen matching.
+async fn dispatch_webhook_event(
+    state: &AppState,
+    event_type: &'static str,
+    node_id: i64,
+    path: &str,
+    kind: &crate::server::streaming::UpdateKind,
+) {
+    if let Some(dispatcher) = &state.webhook_dispatcher {
+        dispatcher
+            .dispatch(
+                event_type,
+                node_id,
+                path.to_string(),
+                serde_json::to_value(kind).unwrap_or_default(),
+            )
+            .await;
+    }
+}
+
 /// Shared node-creation core for `POST /register/{path}` and
 /// `POST /metadata/{path}` (Python `_create_node`, router.py:1852). Callers
 /// apply their own scope/asset gating before delegating here.
@@ -5402,13 +5429,14 @@ async fn create_node_core(
         // container hears about the new child) and the new node itself
         // (so any "watch this path" subscriber that connected first sees
         // the create event).
-        state.streaming_bus.publish(
-            &path,
-            crate::server::streaming::UpdateKind::ChildCreated {
-                key: node.key.clone(),
-                structure_family: structure_family.clone(),
-            },
-        );
+        let child_event = crate::server::streaming::UpdateKind::ChildCreated {
+            key: node.key.clone(),
+            structure_family: structure_family.clone(),
+        };
+        state.streaming_bus.publish(&path, child_event.clone());
+        // Webhooks fire on the *parent* path (matching the parent + ancestors),
+        // preserving the pre-PR2a bus-fanned behavior.
+        dispatch_webhook_event(&state, "child-created", node.id, &path, &child_event).await;
         let links =
             crate::core::links::links_for_node(req.structure_family, &base_url, &child_path);
         let resp = crate::core::schemas::PostMetadataResponse {
@@ -6030,13 +6058,12 @@ pub async fn patch_metadata(
         .await
         .map_err(map_catalog_err)?;
     let path = segments.join("/");
-    state.streaming_bus.publish(
-        &path,
-        crate::server::streaming::UpdateKind::MetadataUpdated {
-            metadata: updated.metadata.clone(),
-            specs: updated.specs.clone(),
-        },
-    );
+    let update_event = crate::server::streaming::UpdateKind::MetadataUpdated {
+        metadata: updated.metadata.clone(),
+        specs: updated.specs.clone(),
+    };
+    state.streaming_bus.publish(&path, update_event.clone());
+    dispatch_webhook_event(&state, "metadata-updated", node.id, &path, &update_event).await;
     let family = parse_structure_family(&updated.structure_family)?;
     let links = crate::core::links::links_for_node(family, &base_url, &path);
     Ok(Json(crate::core::schemas::PostMetadataResponse {
@@ -6176,13 +6203,12 @@ pub async fn put_metadata(
             .unwrap_or(false);
 
     let path = segments.join("/");
-    state.streaming_bus.publish(
-        &path,
-        crate::server::streaming::UpdateKind::MetadataUpdated {
-            metadata: updated.metadata.clone(),
-            specs: updated.specs.clone(),
-        },
-    );
+    let update_event = crate::server::streaming::UpdateKind::MetadataUpdated {
+        metadata: updated.metadata.clone(),
+        specs: updated.specs.clone(),
+    };
+    state.streaming_bus.publish(&path, update_event.clone());
+    dispatch_webhook_event(&state, "metadata-updated", node.id, &path, &update_event).await;
 
     // Response mirrors Python `json_or_msgpack(response_data)`: `{id}` plus
     // `access_blob` only when modified.
@@ -6751,9 +6777,9 @@ pub async fn delete_metadata(
         .await
         .map_err(map_catalog_err)?;
     let path = segments.join("/");
-    state
-        .streaming_bus
-        .publish(&path, crate::server::streaming::UpdateKind::NodeDeleted);
+    let delete_event = crate::server::streaming::UpdateKind::NodeDeleted;
+    state.streaming_bus.publish(&path, delete_event.clone());
+    dispatch_webhook_event(&state, "node-deleted", node.id, &path, &delete_event).await;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 

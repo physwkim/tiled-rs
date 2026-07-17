@@ -49,9 +49,10 @@ pub fn build_app(mut state: AppState) -> Router {
     }
 
     // Spawn the webhook dispatcher (upstream tiled #1353) when enabled
-    // by config + a catalog DB is present. The dispatcher subscribes to
-    // the streaming bus's root channel so it sees every event without
-    // touching request paths.
+    // by config + a catalog DB is present, and store its handle on the
+    // state so write handlers can `dispatch(...)` directly (the upstream
+    // shape — `webhook_dispatcher.dispatch(event, node_id)` at each write
+    // site, not a streaming-bus subscription).
     //
     // Registered via `state.background_tasks` rather than a bare
     // `tokio::spawn` (upstream tiled #1018): a detached handle would leave
@@ -59,13 +60,18 @@ pub fn build_app(mut state: AppState) -> Router {
     // graceful-shutdown path (`cli::mod::run`) could exit while it was
     // still running. `BackgroundTasks` is the single owner that signals
     // and awaits it exactly once, from `AppState::background_tasks`.
-    if let (Some(cfg), Some(catalog)) = (state.webhook_config.as_ref(), state.catalog.as_ref()) {
-        crate::server::webhook_dispatch::spawn(
-            catalog.clone(),
-            state.streaming_bus.clone(),
-            cfg.clone(),
-            &state.background_tasks,
-        );
+    //
+    // The handle is injected here (before `with_state` clones the state into
+    // the router) rather than at each AppState construction site, so the ~60
+    // literals only set `webhook_dispatcher: None`.
+    let webhook_setup = match (state.webhook_config.as_ref(), state.catalog.as_ref()) {
+        (Some(cfg), Some(catalog)) => Some((cfg.clone(), catalog.clone())),
+        _ => None,
+    };
+    if let Some((cfg, catalog)) = webhook_setup {
+        let dispatcher =
+            crate::server::webhook_dispatch::spawn(catalog, cfg, &state.background_tasks);
+        state.webhook_dispatcher = Some(dispatcher);
     }
 
     let cors = match &state.cors_policy {
