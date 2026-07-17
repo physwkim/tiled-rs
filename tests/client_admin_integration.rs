@@ -109,6 +109,7 @@ async fn admin_context(base: &str, auth_db: &AuthDb) -> (Context, String) {
             note: Some("admin-bootstrap".into()),
             scopes: ScopeSet::full(),
             expiration_time: None,
+            access_tags: None,
         })
         .await
         .unwrap();
@@ -127,6 +128,7 @@ async fn user_context(base: &str, auth_db: &AuthDb) -> Context {
             note: Some("user-bootstrap".into()),
             scopes: ScopeSet::for_role("user"),
             expiration_time: None,
+            access_tags: None,
         })
         .await
         .unwrap();

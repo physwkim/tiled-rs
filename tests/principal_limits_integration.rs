@@ -141,6 +141,7 @@ async fn api_key_creation_capped_at_limit() {
             note: None,
             scopes: ScopeSet::read_only(),
             expiration_time: None,
+            access_tags: None,
         })
         .await
         .expect("seeding below the limit must succeed");

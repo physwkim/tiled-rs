@@ -393,6 +393,8 @@ async fn api_keys_create(
             note,
             scopes,
             expiration_time: exp,
+            // The admin SPA key form does not accept a tag restriction.
+            access_tags: None,
         })
         .await
     {
