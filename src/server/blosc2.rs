@@ -69,6 +69,10 @@ pub async fn blosc2_compress_middleware(request: Request, next: Next) -> Respons
         })
         .unwrap_or(false);
 
+    // Grab the request-scoped Server-Timing accumulator before the request is
+    // consumed, so the compress phase can be recorded on the way back out.
+    let timing = crate::server::server_timing::timing_from_request(&request);
+
     let response = next.run(request).await;
 
     if !wants_blosc2 {
@@ -105,9 +109,16 @@ pub async fn blosc2_compress_middleware(request: Request, next: Next) -> Respons
         return Response::from_parts(parts, Body::from(body_bytes));
     }
 
-    match compress(&body_bytes) {
+    let t0 = std::time::Instant::now();
+    let compressed = compress(&body_bytes);
+    let dur = t0.elapsed().as_secs_f64();
+    match compressed {
         Some(compressed) => {
             let n = compressed.len();
+            if let Some(timing) = &timing {
+                let ratio = body_bytes.len() as f64 / n as f64;
+                timing.record("compress", &[("dur", dur), ("ratio", ratio)]);
+            }
             parts
                 .headers
                 .insert(header::CONTENT_ENCODING, "blosc2".parse().unwrap());
