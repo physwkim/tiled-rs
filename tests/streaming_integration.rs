@@ -16,6 +16,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use tiled_rs::access::{Scope, ScopeSet, TagBasedPolicy};
 use tiled_rs::catalog::node::RegisterRequest;
+use tiled_rs::catalog::webhook::WebhookCreate;
 use tiled_rs::catalog::{Catalog, adapter::UnresolvedLeaf};
 use tiled_rs::core::adapters::ContainerAdapter;
 use tiled_rs::core::dtype::{BuiltinDType, DType, Endianness, Kind};
@@ -1601,8 +1602,8 @@ async fn put_data_source_non_array_streams_nothing() {
 // ---------------------------------------------------------------------------
 
 /// Seed an external array node `key` with a single f64 data source — enough for
-/// the WS handler to build an `array-schema` first message.
-async fn seed_array_node(catalog: &Catalog, key: &str) {
+/// the WS handler to build an `array-schema` first message. Returns the node id.
+async fn seed_array_node(catalog: &Catalog, key: &str) -> i64 {
     let node = catalog
         .create_node(
             None,
@@ -1635,6 +1636,7 @@ async fn seed_array_node(catalog: &Catalog, key: &str) {
         )
         .await
         .unwrap();
+    node.id
 }
 
 /// Spawn a live server with a real dummy authenticator (user `alice`, default
@@ -1886,4 +1888,241 @@ async fn subscribe_no_policy_anonymous_receives_schema() {
         .await
         .expect("array-schema first message");
     assert_eq!(schema["type"], "array-schema", "schema: {schema}");
+}
+
+// ---------------------------------------------------------------------------
+// PR7: DELETE /stream/close/{path} — a producer ends a node's stream.
+//
+// Upstream `close_stream` (server/router.py:725-748), gated by write:data,
+// calls `entry.close_stream()` (catalog/adapter.py:1365-1380): it
+// `streaming_cache.close(node.id)` — emitting `end_of_stream` so live
+// subscribers disconnect (WS close 1000 "Producer ended stream") — and fires a
+// `stream-closed` webhook on the node's own id. StreamClosedEvent
+// (server/schemas.py:657-661) carries only the node key.
+// ---------------------------------------------------------------------------
+
+/// Read WebSocket frames until a Close arrives; return `(code, reason)`. Ignores
+/// any interleaved data frame. `None` on timeout / bodyless close. The producer
+/// end-of-stream close is `(1000, "Producer ended stream")` (streaming.rs).
+async fn next_close_frame<S>(ws: &mut S) -> Option<(u16, String)>
+where
+    S: futures::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+{
+    loop {
+        match tokio::time::timeout(Duration::from_millis(1500), ws.next()).await {
+            Ok(Some(Ok(Message::Close(Some(cf))))) => {
+                return Some((u16::from(cf.code), cf.reason.to_string()));
+            }
+            Ok(Some(Ok(Message::Close(None)))) | Ok(None) | Err(_) => return None,
+            // A stray data/ping frame before the close — keep reading.
+            Ok(Some(Ok(_))) => continue,
+            Ok(Some(Err(_))) => return None,
+        }
+    }
+}
+
+/// Spawn a live no-auth catalog server with a real webhook dispatcher wired and
+/// a pre-seeded external array node `arr`. No auth backend → the anonymous
+/// principal holds full scopes (incl. write:data), so DELETE /stream/close needs
+/// no credential. Returns the http base, an HTTP client, the catalog (to
+/// register webhooks), the `arr` node id, and the TempDir (keep alive).
+async fn spawn_webhook_stream_server() -> (String, reqwest::Client, Catalog, i64, tempfile::TempDir)
+{
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("sqlite://{}", dir.path().join("catalog.db").display());
+    let catalog = Catalog::connect(&uri).await.unwrap();
+    catalog.migrate().await.unwrap();
+    let node_id = seed_array_node(&catalog, "arr").await;
+
+    // A real dispatcher task, owned by this state's `BackgroundTasks`, delivers
+    // matching webhooks over HTTP. Default config (HTTPS-only / no private
+    // addresses) is irrelevant here: those checks run at the *register* route,
+    // and this test seeds the target directly via `create_webhook`.
+    let background = tiled_rs::server::state::BackgroundTasks::new();
+    let dispatcher = tiled_rs::server::webhook_dispatch::spawn(
+        catalog.clone(),
+        tiled_rs::server::webhook_dispatch::WebhookConfig::default(),
+        &background,
+    );
+
+    let resolver: Arc<dyn tiled_rs::catalog::adapter::LeafResolver> = Arc::new(UnresolvedLeaf);
+    let root_tree: Arc<dyn ContainerAdapter> = Arc::new(tiled_rs::catalog::CatalogAdapter::root(
+        catalog.clone(),
+        resolver,
+    ));
+    let state = tiled_rs::server::AppState {
+        root_tree,
+        serialization_registry: Arc::new(tiled_rs::serialization::default_registry()),
+        query_names: Query::all_query_names()
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        base_url: None,
+        cors_policy: tiled_rs::server::state::CorsOriginPolicy::Permissive,
+        trust_forwarded_headers: false,
+        api_key: None,
+        catalog: Some(catalog.clone()),
+        auth_db: None,
+        issuer: None,
+        authenticators: vec![],
+        proxied_header_auth: None,
+        external_oidc: None,
+        #[cfg(feature = "saml")]
+        saml_providers: vec![],
+        forwarded_allow_ips: None,
+        max_request_body_bytes: 10 * 1024 * 1024,
+        response_bytesize_limit: 300_000_000,
+        streaming_cache: test_cache(),
+        access_policy: None,
+        default_login_scopes: tiled_rs::auth::ScopeSet::full(),
+        enable_web: true,
+        web_assets_dir: None,
+        spec_views: Vec::new(),
+        webhook_config: None,
+        webhook_dispatcher: Some(dispatcher),
+        request_timeout_secs: 30,
+        expose_raw_assets: true,
+        exact_count_limit: u64::MAX,
+        background_tasks: background,
+    };
+    (
+        serve(state).await,
+        reqwest::Client::new(),
+        catalog,
+        node_id,
+        dir,
+    )
+}
+
+/// Spawn a local HTTP receiver that captures each delivered webhook body onto an
+/// mpsc channel. Returns the target URL (`http://127.0.0.1:PORT/hook`) and the
+/// receiver end.
+async fn spawn_webhook_receiver() -> (String, tokio::sync::mpsc::UnboundedReceiver<Value>) {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
+    let app = axum::Router::new().route(
+        "/hook",
+        axum::routing::post(move |axum::Json(body): axum::Json<Value>| {
+            let tx = tx.clone();
+            async move {
+                let _ = tx.send(body);
+                axum::http::StatusCode::OK
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    (format!("http://{addr}/hook"), rx)
+}
+
+/// The key end-to-end test: DELETE /stream/close on a node with write:data (a)
+/// disconnects a LIVE subscriber with the producer end-of-stream close
+/// (1000 / "Producer ended stream"), and (b) fires the `stream-closed` webhook
+/// registered on that node, carrying the node key.
+#[tokio::test]
+async fn close_stream_disconnects_subscriber_and_fires_webhook() {
+    let (hook_url, mut hook_rx) = spawn_webhook_receiver().await;
+    let (base, client, catalog, node_id, _dir) = spawn_webhook_stream_server().await;
+
+    // Register a webhook for `stream-closed` on the `arr` node (direct seed
+    // bypasses the register route's URL validation, so http/127.0.0.1 is fine).
+    catalog
+        .create_webhook(WebhookCreate {
+            node_id,
+            url: hook_url,
+            secret: None,
+            events: Some(vec!["stream-closed".into()]),
+        })
+        .await
+        .unwrap();
+
+    // A live subscriber on `arr`: consume the schema, then let the handler reach
+    // its live loop before we close.
+    let url = ws_url(&base, "arr");
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    assert_eq!(
+        next_text_json(&mut ws).await.expect("schema")["type"],
+        "array-schema"
+    );
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // Close the stream (anonymous → full scopes include write:data).
+    let resp = client
+        .delete(format!("{base}/api/v1/stream/close/arr"))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "close should succeed with write:data: {}",
+        resp.status()
+    );
+
+    // (a) The subscriber is disconnected with the producer end-of-stream close.
+    let close = next_close_frame(&mut ws).await;
+    assert_eq!(
+        close,
+        Some((1000, "Producer ended stream".to_string())),
+        "subscriber must receive the producer end-of-stream close"
+    );
+
+    // (b) The `stream-closed` webhook fires with the right envelope + key.
+    let payload = tokio::time::timeout(Duration::from_secs(5), hook_rx.recv())
+        .await
+        .expect("webhook must be delivered within 5s")
+        .expect("webhook payload");
+    assert_eq!(payload["event_type"], "stream-closed", "payload: {payload}");
+    // tiled-rs delivers `path` as the joined node path (existing webhook
+    // convention), where upstream StreamClosedEvent.path is a list[str].
+    assert_eq!(payload["path"], json!("arr"), "payload: {payload}");
+    assert_eq!(
+        payload["data"]["type"], "stream-closed",
+        "payload: {payload}"
+    );
+    assert_eq!(payload["data"]["key"], "arr", "payload: {payload}");
+}
+
+/// DELETE /stream/close without write:data is refused (403). An authenticated
+/// principal capped to read-only session scopes lacks write:data.
+#[tokio::test]
+async fn close_stream_without_write_data_is_forbidden() {
+    let (base, _dir) = spawn_auth_stream_server(ScopeSet::read_only(), None).await;
+    let client = reqwest::Client::new();
+    let token = login_token(&client, &base, "alice", "wonderland").await;
+
+    let resp = client
+        .delete(format!("{base}/api/v1/stream/close/arr"))
+        .header("authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        403,
+        "read-only principal must be forbidden from closing a stream"
+    );
+}
+
+/// DELETE /stream/close on a missing path returns 404 (the caller has write:data
+/// via the default `user` role, so the failure is path resolution, not scope).
+#[tokio::test]
+async fn close_stream_missing_path_is_not_found() {
+    let (base, _dir) = spawn_auth_stream_server(ScopeSet::full(), None).await;
+    let client = reqwest::Client::new();
+    let token = login_token(&client, &base, "alice", "wonderland").await;
+
+    let resp = client
+        .delete(format!("{base}/api/v1/stream/close/does-not-exist"))
+        .header("authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status().as_u16(),
+        404,
+        "closing a missing node must be 404"
+    );
 }

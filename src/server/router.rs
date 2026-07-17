@@ -7151,6 +7151,62 @@ pub async fn delete_metadata(
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
+/// `DELETE /api/v1/stream/close/{path}` — a producer ends a node's stream.
+///
+/// Upstream `close_stream` (router.py:725-748) is gated by `write:data`
+/// (`Security(check_scopes, ["write:data"])` + `get_entry(path, ["write:data"])`)
+/// and then calls `entry.close_stream()`, which (adapter.py:1365-1380):
+///   1. `streaming_cache.close(node.id)` — emits an `end_of_stream` marker so
+///      every live subscriber disconnects (the WS consumer closes with 1000
+///      "Producer ended stream"); the disabled cache is a no-op; and
+///   2. fires a `stream-closed` webhook on the node's *own* id (so webhooks
+///      registered directly on this node are included in the ancestor walk).
+///
+/// `StreamClosedEvent` (schemas.py:657-661) carries only the node key —
+/// path/timestamp/event_type are the dispatcher's common envelope fields.
+/// Returns 200 with no body (upstream returns `None`).
+pub async fn close_stream(
+    State(state): State<AppState>,
+    OriginalUri(uri): OriginalUri,
+    auth: crate::server::AuthContext,
+) -> Result<impl IntoResponse, ServerError> {
+    let segments = segments_from_uri(&uri, "/api/v1/stream/close/");
+    let catalog = state.catalog.as_ref().ok_or_else(|| {
+        ServerError::Validation("server has no catalog DB; stream close not supported".into())
+    })?;
+    if segments.is_empty() {
+        return Err(ServerError::Validation(
+            "DELETE /stream/close requires a node path".into(),
+        ));
+    }
+    // Ending a stream requires `write:data` on the node, matching upstream's
+    // `Security(check_scopes, ["write:data"])` + `get_entry(path, ["write:data"])`
+    // (router.py:734/735-747). `resolve_entry` 404s a missing/invisible node and
+    // 403s a caller lacking `write:data` on the narrowed node.
+    resolve_entry(&state, auth, &segments, crate::auth::Scope::WriteData).await?;
+    let node = catalog
+        .lookup(&segments)
+        .await
+        .map_err(map_catalog_err)?
+        .ok_or_else(|| ServerError::NotFound(format!("'{}' not found", segments.join("/"))))?;
+    // (1) End the stream: `close` emits an `end_of_stream` marker that the WS
+    // consumer turns into a clean close (1000 "Producer ended stream"),
+    // disconnecting live subscribers (adapter.py:1366-1367).
+    state.streaming_cache.close(node.id).await;
+    // (2) Fire the `stream-closed` webhook on the node's own id (adapter.py:
+    // 1368-1380). The body carries only the node key; the dispatcher stamps the
+    // common `event_type`/`path`/`sequence`/`timestamp` envelope fields.
+    dispatch_webhook_event(
+        &state,
+        "stream-closed",
+        node.id,
+        &segments.join("/"),
+        serde_json::json!({ "type": "stream-closed", "key": node.key }),
+    )
+    .await;
+    Ok(axum::http::StatusCode::OK)
+}
+
 /// Build a `Resource` for the catalog by reading the DB directly. Skips
 /// the `CatalogAdapter`'s in-memory cache so a same-request read after a
 /// write sees the latest state.

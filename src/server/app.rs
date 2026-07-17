@@ -327,6 +327,12 @@ pub fn build_app(mut state: AppState) -> Router {
             get(router::get_asset_manifest),
         )
         .route("/api/v1/data_source/{*path}", put(router::put_data_source))
+        // DELETE /stream/close/{path} ends a node's stream: emits end_of_stream
+        // (disconnecting live subscribers) and fires a `stream-closed` webhook.
+        // Gated by write:data (upstream router.py:725-748). On the auth-guarded
+        // `api` group (unlike the auth-exempt `/stream/single` WS route above),
+        // since it is a normal authenticated write request.
+        .route("/api/v1/stream/close/{*path}", delete(router::close_stream))
         .route("/documents/{*path}", get(router::get_documents))
         // Webhooks (upstream tiled #1353).
         .route(
