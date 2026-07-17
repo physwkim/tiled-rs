@@ -273,6 +273,64 @@ pub enum Command {
         api_key: Option<String>,
     },
 
+    /// Log in to an authenticated Tiled server.
+    ///
+    /// Resolves the target server from `--uri`, else the named `--profile`,
+    /// else the saved default profile, then runs the interactive credential
+    /// prompt and persists the resulting tokens (remember_me). Mirrors Python
+    /// `tiled login` (`commandline/main.py:login`), which resolves the profile
+    /// via `_utils.get_profile`; `--uri` is a tiled-rs escape hatch so login
+    /// works before any profile is created.
+    Login {
+        /// Use this profile instead of the saved default. Ignored when
+        /// `--uri` is given.
+        #[arg(long)]
+        profile: Option<String>,
+
+        /// Connect to this server URI directly, bypassing profile lookup.
+        /// tiled-rs extension over upstream (profile-only); wins over
+        /// `--profile` when both are supplied.
+        #[arg(long)]
+        uri: Option<String>,
+
+        /// Print the secret tokens as JSON after a successful login. Mirrors
+        /// upstream `--show-secret-tokens`.
+        #[arg(long)]
+        show_secret_tokens: bool,
+    },
+
+    /// Show the logged-in identity for a server.
+    ///
+    /// Loads cached tokens for the resolved server and prints the
+    /// comma-separated identity ids, or "Not authenticated." when no valid
+    /// session is available. Mirrors Python `tiled whoami`
+    /// (`commandline/main.py:whoami`).
+    Whoami {
+        /// Use this profile instead of the saved default. Ignored when
+        /// `--uri` is given.
+        #[arg(long)]
+        profile: Option<String>,
+
+        /// Connect to this server URI directly, bypassing profile lookup.
+        #[arg(long)]
+        uri: Option<String>,
+    },
+
+    /// Log out: revoke the session server-side and clear cached tokens.
+    ///
+    /// Idempotent — a no-op when there is no cached session. Mirrors Python
+    /// `tiled logout` (`commandline/main.py:logout`).
+    Logout {
+        /// Use this profile instead of the saved default. Ignored when
+        /// `--uri` is given.
+        #[arg(long)]
+        profile: Option<String>,
+
+        /// Connect to this server URI directly, bypassing profile lookup.
+        #[arg(long)]
+        uri: Option<String>,
+    },
+
     /// Database management commands (not yet implemented)
     #[command(hide = true)]
     Catalog {
@@ -421,6 +479,47 @@ fn redact_mongo_uri(uri: &str) -> String {
         return uri.to_string();
     }
     format!("{scheme}://{user}:***@{host_and_rest}")
+}
+
+/// Resolve the `(uri, verify)` a client command (`login`/`whoami`/`logout`)
+/// should connect to. `--uri` wins outright (tiled-rs escape hatch). Otherwise
+/// look up a profile: explicit `--profile`, else the saved default — mirroring
+/// Python `_utils.get_profile`, which aborts with guidance when no default is
+/// set, the named profile is missing, or the profile is `direct:` (an
+/// in-process server the CLI cannot reach).
+fn resolve_client_target(profile: Option<String>, uri: Option<String>) -> Result<(String, bool)> {
+    use crate::client::profiles::{Profile, get_default_profile_name};
+
+    if let Some(uri) = uri {
+        // No profile involved → default to TLS verification on, matching the
+        // `verify=True` default of upstream `Context.from_any_uri`.
+        return Ok((uri, true));
+    }
+
+    let name = match profile {
+        Some(n) => n,
+        None => get_default_profile_name().ok_or_else(|| {
+            anyhow::anyhow!(
+                "No profile specified and no default profile is set. Pass --uri URL, \
+                 --profile NAME, or run `tiled profile create ...` / \
+                 `tiled profile set-default ...` first."
+            )
+        })?,
+    };
+
+    let (_path, profile) =
+        Profile::lookup(&name).map_err(|e| anyhow::anyhow!("profile '{name}': {e}"))?;
+    if profile.direct.is_some() {
+        return Err(anyhow::anyhow!(
+            "profile '{name}' uses a direct (in-process) Tiled server and cannot be \
+             connected to from the CLI."
+        ));
+    }
+    let uri = profile
+        .uri
+        .ok_or_else(|| anyhow::anyhow!("profile '{name}' has no 'uri' field."))?;
+    let verify = profile.verify.unwrap_or(true);
+    Ok((uri, verify))
 }
 
 /// Resolve the serve bind host: CLI `--host` flag > config `uvicorn.host` >
@@ -1237,6 +1336,79 @@ pub async fn run(command: Command) -> Result<()> {
             }
             Ok(())
         }
+        Command::Login {
+            profile,
+            uri,
+            show_secret_tokens,
+        } => {
+            let (uri, verify) = resolve_client_target(profile, uri)?;
+            let opts = crate::client::ContextOptions::default().verify(verify);
+            let (ctx, _node_path) = crate::client::Context::from_uri_with_options(&uri, opts)
+                .map_err(|e| anyhow::anyhow!("connect to {uri}: {e}"))?;
+            // remember_me = true: persist tokens to disk, matching upstream
+            // `context.authenticate()` (default remember_me=True).
+            ctx.authenticate(true)
+                .await
+                .map_err(|e| anyhow::anyhow!("authenticate: {e}"))?;
+            if show_secret_tokens {
+                // Mirror `json.dumps(dict(context.tokens), indent=4)`: dump the
+                // three token slots the store holds.
+                let mut map = serde_json::Map::new();
+                if let Some(auth) = ctx.auth().await {
+                    let store = auth.tokens();
+                    for key in ["access_token", "refresh_token", "id_token"] {
+                        if let Some(v) = store
+                            .get(key, false)
+                            .await
+                            .map_err(|e| anyhow::anyhow!("read {key}: {e}"))?
+                        {
+                            map.insert(key.to_string(), serde_json::Value::String(v));
+                        }
+                    }
+                }
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::Value::Object(map))?
+                );
+            }
+            Ok(())
+        }
+        Command::Whoami { profile, uri } => {
+            let (uri, verify) = resolve_client_target(profile, uri)?;
+            let opts = crate::client::ContextOptions::default().verify(verify);
+            let (ctx, _node_path) = crate::client::Context::from_uri_with_options(&uri, opts)
+                .map_err(|e| anyhow::anyhow!("connect to {uri}: {e}"))?;
+            // Best-effort load of cached tokens (upstream ignores its return
+            // value here too); an invalid/absent session leaves the context
+            // unauthenticated and `whoami` then reports "Not authenticated.".
+            let _ = ctx.use_cached_tokens().await;
+            match ctx.whoami().await {
+                Ok(who) => {
+                    let ids: Vec<&str> = who.identities.iter().map(|i| i.id.as_str()).collect();
+                    println!("{}", ids.join(","));
+                }
+                Err(_) => println!("Not authenticated."),
+            }
+            Ok(())
+        }
+        Command::Logout { profile, uri } => {
+            let (uri, verify) = resolve_client_target(profile, uri)?;
+            let opts = crate::client::ContextOptions::default().verify(verify);
+            let (ctx, _node_path) = crate::client::Context::from_uri_with_options(&uri, opts)
+                .map_err(|e| anyhow::anyhow!("connect to {uri}: {e}"))?;
+            // Only revoke when there is a live cached session, matching
+            // upstream `if context.use_cached_tokens(): context.logout()`.
+            if ctx
+                .use_cached_tokens()
+                .await
+                .map_err(|e| anyhow::anyhow!("load cached tokens: {e}"))?
+            {
+                ctx.logout()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("logout: {e}"))?;
+            }
+            Ok(())
+        }
         Command::Catalog { command } => match command {
             CatalogCommand::Init { uri } => {
                 tracing::info!("Initialising catalog at {}", redact_mongo_uri(&uri));
@@ -1864,5 +2036,97 @@ mod tests {
                 "non-alphanumeric key {bad:?} must be rejected: {err}"
             );
         }
+    }
+
+    // cli-w27b2-F1: `tiled login` parses --profile / --uri / --show-secret-tokens.
+    #[test]
+    fn login_command_parses() {
+        let cli = TestCli::parse_from([
+            "tiled",
+            "login",
+            "--uri",
+            "http://localhost:8000",
+            "--show-secret-tokens",
+        ]);
+        let Command::Login {
+            profile,
+            uri,
+            show_secret_tokens,
+        } = cli.command
+        else {
+            panic!("expected Login variant");
+        };
+        assert_eq!(profile, None);
+        assert_eq!(uri.as_deref(), Some("http://localhost:8000"));
+        assert!(show_secret_tokens);
+
+        // Defaults: no flags → all None/false.
+        let cli = TestCli::parse_from(["tiled", "login"]);
+        let Command::Login {
+            profile,
+            uri,
+            show_secret_tokens,
+        } = cli.command
+        else {
+            panic!("expected Login variant");
+        };
+        assert_eq!(profile, None);
+        assert_eq!(uri, None);
+        assert!(!show_secret_tokens);
+    }
+
+    #[test]
+    fn login_command_parses_profile() {
+        let cli = TestCli::parse_from(["tiled", "login", "--profile", "prod"]);
+        let Command::Login { profile, uri, .. } = cli.command else {
+            panic!("expected Login variant");
+        };
+        assert_eq!(profile.as_deref(), Some("prod"));
+        assert_eq!(uri, None);
+    }
+
+    #[test]
+    fn whoami_command_parses() {
+        let cli = TestCli::parse_from(["tiled", "whoami", "--profile", "prod"]);
+        let Command::Whoami { profile, uri } = cli.command else {
+            panic!("expected Whoami variant");
+        };
+        assert_eq!(profile.as_deref(), Some("prod"));
+        assert_eq!(uri, None);
+    }
+
+    #[test]
+    fn logout_command_parses() {
+        let cli = TestCli::parse_from(["tiled", "logout", "--uri", "http://x"]);
+        let Command::Logout { profile, uri } = cli.command else {
+            panic!("expected Logout variant");
+        };
+        assert_eq!(profile, None);
+        assert_eq!(uri.as_deref(), Some("http://x"));
+    }
+
+    // `--uri` wins outright and never consults the profile store, so it
+    // resolves deterministically with TLS verification defaulted on.
+    #[test]
+    fn resolve_client_target_uri_wins() {
+        let (uri, verify) =
+            resolve_client_target(Some("ignored".into()), Some("http://localhost:8000".into()))
+                .expect("uri path must resolve");
+        assert_eq!(uri, "http://localhost:8000");
+        assert!(verify, "verify defaults to true on the --uri path");
+    }
+
+    // A named profile that does not exist is an error (mirrors upstream
+    // `get_profile` abort). Uses an implausible name so the result does not
+    // depend on the test machine's profile store.
+    #[test]
+    fn resolve_client_target_missing_profile_errors() {
+        let err = resolve_client_target(Some("tiled-rs-nonexistent-profile-x9q7z".into()), None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("tiled-rs-nonexistent-profile-x9q7z"),
+            "missing profile must be named in the error: {err}"
+        );
     }
 }
