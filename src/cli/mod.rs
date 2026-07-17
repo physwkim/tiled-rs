@@ -14,8 +14,9 @@ use crate::server::streaming_cache::{InMemoryStreamingCache, StreamingCache, dis
 
 /// Build the per-node data streaming cache from the optional `streaming:`
 /// config block. Absent (`None`) → the disabled no-op cache (the default).
-/// The `redis` backend is Wave-24 PR8; until then it warns and falls back to
-/// the disabled cache rather than failing startup.
+/// The `redis` backend needs the `streaming-redis` cargo feature (default OFF);
+/// without it, or when misconfigured, it warns and falls back to the disabled
+/// cache rather than failing startup.
 fn build_streaming_cache(cfg: Option<&config::StreamingConfig>) -> Arc<dyn StreamingCache> {
     match cfg {
         None => disabled(),
@@ -25,15 +26,45 @@ fn build_streaming_cache(cfg: Option<&config::StreamingConfig>) -> Arc<dyn Strea
                 std::time::Duration::from_secs(c.data_ttl),
                 c.maxsize,
             )),
-            config::StreamingBackend::Redis => {
-                tracing::warn!(
-                    "streaming.backend: redis is not yet implemented (Wave-24 PR8); \
-                     streaming disabled"
-                );
+            config::StreamingBackend::Redis => build_redis_streaming_cache(c),
+        },
+    }
+}
+
+/// Construct the Redis-backed streaming cache. Compiled only with the
+/// `streaming-redis` feature: requires `streaming.uri`, and falls back to the
+/// disabled cache (with a warning) when the URI is missing or unparseable
+/// rather than failing startup.
+#[cfg(feature = "streaming-redis")]
+fn build_redis_streaming_cache(c: &config::StreamingConfig) -> Arc<dyn StreamingCache> {
+    use crate::server::streaming_cache_redis::RedisStreamingCache;
+    match c.uri.as_deref() {
+        Some(uri) => match RedisStreamingCache::new(uri, c.seq_ttl, c.data_ttl) {
+            Ok(cache) => Arc::new(cache),
+            Err(e) => {
+                tracing::warn!("streaming.backend: redis URI invalid ({e}); streaming disabled");
                 disabled()
             }
         },
+        None => {
+            tracing::warn!(
+                "streaming.backend: redis selected but streaming.uri is not set; \
+                 streaming disabled"
+            );
+            disabled()
+        }
     }
+}
+
+/// Fallback when the `streaming-redis` feature is not compiled in: the `redis`
+/// backend cannot be constructed, so warn and disable streaming.
+#[cfg(not(feature = "streaming-redis"))]
+fn build_redis_streaming_cache(_c: &config::StreamingConfig) -> Arc<dyn StreamingCache> {
+    tracing::warn!(
+        "streaming.backend: redis selected but this binary was built without the \
+         `streaming-redis` feature; streaming disabled"
+    );
+    disabled()
 }
 
 // The `Serve` variant carries the full server configuration (~20 CLI flags),

@@ -107,8 +107,9 @@ pub fn default_exact_count_limit() -> u64 {
 ///
 /// Mirrors upstream tiled's streaming configuration (`tiled/streaming.py`): an
 /// in-process `memory` backend (a bounded TTL cache) or a shared `redis`
-/// backend for multi-process deployments. The Redis backend is Wave-24 PR8;
-/// selecting it before then parses but constructs the disabled cache.
+/// backend for multi-process deployments. The Redis backend requires the
+/// `streaming-redis` cargo feature (default OFF); a binary built without it
+/// warns and falls back to the disabled cache when `redis` is selected.
 ///
 /// ```yaml
 /// streaming:
@@ -145,7 +146,8 @@ pub enum StreamingBackend {
     /// In-process bounded TTL cache (default).
     #[default]
     Memory,
-    /// Shared Redis backend (Wave-24 PR8; disabled until then).
+    /// Shared Redis backend (requires the `streaming-redis` cargo feature;
+    /// disabled with a warning when the feature is absent).
     Redis,
 }
 
