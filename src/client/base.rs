@@ -445,7 +445,11 @@ impl BaseClient {
         if !external_only {
             url.query_pairs_mut().append_pair("external_only", "false");
         }
-        self.context.delete(&url).await.map(|_| ())
+        // Wrapped in `retry` to match upstream `BaseClient.delete`, which issues
+        // the DELETE inside `retry_context` (`base.py:931-936`).
+        retry(|| async { self.context.delete(&url).await })
+            .await
+            .map(|_| ())
     }
 
     /// Declare the end of this node's stream of writes via
@@ -500,7 +504,12 @@ impl BaseClient {
             "specs": specs,
             "access_blob": access_blob,
         });
-        self.context.patch_json(&url, &body).await.map(|_| ())
+        // Wrapped in `retry` to match upstream `BaseClient.patch_metadata`, which
+        // issues the PATCH inside `retry_context` (`base.py:800-834`). This also
+        // covers `update_metadata`, which delegates here.
+        retry(|| async { self.context.patch_json(&url, &body).await })
+            .await
+            .map(|_| ())
     }
 
     /// Replace this node's metadata, specs, and/or access_blob wholesale via
@@ -531,7 +540,11 @@ impl BaseClient {
             "specs": specs,
             "access_blob": access_blob,
         });
-        self.context.put_json(&url, &body).await.map(|_| ())
+        // Wrapped in `retry` to match upstream `BaseClient.replace_metadata`,
+        // which issues the PUT inside `retry_context` (`base.py:880-889`).
+        retry(|| async { self.context.put_json(&url, &body).await })
+            .await
+            .map(|_| ())
     }
 
     /// Build the RFC 6902 patches that [`update_metadata`](Self::update_metadata)
