@@ -12,7 +12,7 @@ use bytes::Bytes;
 
 use crate::core::adapters::{ArrayAdapterRead, ArrayAdapterWrite, BaseAdapter, BoxFuture};
 use crate::core::data_source::Asset;
-use crate::core::dtype::{BuiltinDType, DType, DynNDArray, Endianness, Kind};
+use crate::core::dtype::{BuiltinDType, DType, DynNDArray};
 use crate::core::error::{Result, TiledError};
 use crate::core::ndslice::NDSlice;
 use crate::core::structures::{ArrayStructure, Spec, StructureFamily};
@@ -367,7 +367,11 @@ fn parse_header(header: &str) -> Result<(BuiltinDType, Vec<usize>, bool)> {
     let descr = pick(header, "'descr':")
         .ok_or_else(|| TiledError::Validation("npy header missing descr".into()))?;
     let descr = descr.trim_matches(|c: char| c == '\'' || c.is_whitespace());
-    let dtype = parse_descr(descr)?;
+    // Parse the descr through the crate's single numpy-dtype parser so the
+    // header path accepts exactly what the rest of tiled-rs does — including
+    // datetime64/timedelta64, whose bracketed unit suffix (`<M8[ns]`,
+    // `<m8[us]`) a bespoke endianness+kind+size parser cannot see.
+    let dtype = BuiltinDType::from_numpy_str(descr)?;
 
     let shape_str = pick(header, "'shape':")
         .ok_or_else(|| TiledError::Validation("npy header missing shape".into()))?;
@@ -415,58 +419,27 @@ fn pick<'a>(s: &'a str, key: &str) -> Option<&'a str> {
     Some(&rest[..last])
 }
 
-fn parse_descr(descr: &str) -> Result<BuiltinDType> {
-    // NumPy descrs we cope with: '<f8', '<f4', '<i8', '<i4', '<u8', '<u4',
-    // '|i1', '|u1', '|b1'. Two-char form `<f8` is endianness + kind +
-    // itemsize.
-    let bytes = descr.as_bytes();
-    if bytes.len() < 3 {
-        return Err(TiledError::Validation(format!("bad descr: {descr}")));
-    }
-    let endian = match bytes[0] {
-        b'<' => Endianness::Little,
-        b'>' => Endianness::Big,
-        b'=' => {
-            if cfg!(target_endian = "big") {
-                Endianness::Big
-            } else {
-                Endianness::Little
-            }
-        }
-        b'|' => Endianness::NotApplicable,
-        other => {
-            return Err(TiledError::Validation(format!(
-                "bad endian byte in descr: {}",
-                other as char
-            )));
-        }
-    };
-    let kind = match bytes[1] {
-        b'f' => Kind::Float,
-        b'i' => Kind::Integer,
-        b'u' => Kind::UnsignedInteger,
-        b'b' => Kind::Boolean,
-        b'c' => Kind::ComplexFloat,
-        b'S' => Kind::String,
-        b'U' => Kind::Unicode,
-        other => {
-            return Err(TiledError::Validation(format!(
-                "unsupported descr kind: {}",
-                other as char
-            )));
-        }
-    };
-    let size: usize = std::str::from_utf8(&bytes[2..])
-        .map_err(|_| TiledError::Validation("descr size not utf8".into()))?
-        .parse()
-        .map_err(|_| TiledError::Validation(format!("descr size not int: {descr}")))?;
-    Ok(BuiltinDType::new(endian, kind, size))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::dtype::{Endianness, Kind};
     use crate::core::ndslice::NDSlice;
+
+    /// Build a v1 `.npy` file for a 1-D array with the given descr string and
+    /// raw little-endian element payload. `descr` is a numpy dtype string
+    /// (e.g. `<M8[ns]`), `n` the element count (shape `(n,)`), `elem_bytes`
+    /// the concatenated element bytes written verbatim as the file body.
+    fn make_npy_1d(descr: &str, n: usize, elem_bytes: &[u8]) -> Vec<u8> {
+        let header = format!("{{'descr': '{descr}', 'fortran_order': False, 'shape': ({n},), }}\n");
+        let mut raw = Vec::new();
+        raw.extend_from_slice(b"\x93NUMPY");
+        raw.push(1); // major
+        raw.push(0); // minor
+        raw.extend_from_slice(&(header.len() as u16).to_le_bytes());
+        raw.extend_from_slice(header.as_bytes());
+        raw.extend_from_slice(elem_bytes);
+        raw
+    }
 
     /// Build a v1 `.npy` file for a 3×4 little-endian f64 array.
     /// Values: arr[i][j] = (i * 4 + j) as f64  →  0.0 … 11.0.
@@ -521,6 +494,104 @@ mod tests {
         assert_eq!(shape, vec![3, 4]);
         assert!(!fortran);
         assert_eq!(dtype.element_size(), 8);
+    }
+
+    #[tokio::test]
+    async fn datetime64_ns_loads_with_units_and_serves_verbatim_bytes() {
+        // Three int64 nanosecond-since-epoch counts; the adapter treats the
+        // payload as opaque 8-byte elements. Before the descr parser was
+        // unified with `BuiltinDType::from_numpy_str`, `<M8[ns]` was rejected
+        // with "unsupported descr kind: M".
+        let vals: [i64; 3] = [0, 1_000_000_000, -5_000_000_000];
+        let payload: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let raw = make_npy_1d("<M8[ns]", 3, &payload);
+
+        let adapter = NpyAdapter::from_bytes(&raw, serde_json::json!({})).unwrap();
+        let expected = BuiltinDType {
+            endianness: Endianness::Little,
+            kind: Kind::Datetime,
+            itemsize: 8,
+            dt_units: Some("[ns]".into()),
+        };
+        assert_eq!(
+            adapter.structure().data_type,
+            DType::Builtin(expected.clone())
+        );
+        // Inverse mapping re-emits the exact descr.
+        assert_eq!(expected.to_numpy_str(), "<M8[ns]");
+        // Read serves the file payload bytes verbatim.
+        let slice = NDSlice::from_numpy_str("").unwrap();
+        let out = adapter.read(&slice).await.unwrap();
+        assert_eq!(out.shape, vec![3]);
+        assert_eq!(&out.data[..], &payload[..]);
+    }
+
+    #[tokio::test]
+    async fn timedelta64_us_loads_with_units() {
+        // Non-default `[us]` unit on the timedelta64 kind.
+        let vals: [i64; 2] = [42, -7];
+        let payload: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let raw = make_npy_1d("<m8[us]", 2, &payload);
+
+        let adapter = NpyAdapter::from_bytes(&raw, serde_json::json!({})).unwrap();
+        let dt = match &adapter.structure().data_type {
+            DType::Builtin(b) => b.clone(),
+            other => panic!("expected builtin dtype, got {other:?}"),
+        };
+        assert_eq!(dt.kind, Kind::Timedelta);
+        assert_eq!(dt.itemsize, 8);
+        assert_eq!(dt.dt_units.as_deref(), Some("[us]"));
+        assert_eq!(dt.to_numpy_str(), "<m8[us]");
+        let slice = NDSlice::from_numpy_str("").unwrap();
+        let out = adapter.read(&slice).await.unwrap();
+        assert_eq!(&out.data[..], &payload[..]);
+    }
+
+    #[tokio::test]
+    async fn datetime64_seconds_roundtrips_through_npy_bytes() {
+        // Non-`[ns]` unit exercised through the full inverse: parse a
+        // `<M8[s]` file, re-serialise via `npy_bytes`, and confirm dtype
+        // (kind + unit) and payload survive the round-trip.
+        let vals: [i64; 4] = [0, 60, 3600, 86_400];
+        let payload: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let raw = make_npy_1d("<M8[s]", 4, &payload);
+
+        let adapter = NpyAdapter::from_bytes(&raw, serde_json::json!({})).unwrap();
+        let slice = NDSlice::from_numpy_str("").unwrap();
+        let arr = adapter.read(&slice).await.unwrap();
+
+        let reserialised = npy_bytes(&arr);
+        let reopened = NpyAdapter::from_bytes(&reserialised, serde_json::json!({})).unwrap();
+        match &reopened.structure().data_type {
+            DType::Builtin(b) => {
+                assert_eq!(b.kind, Kind::Datetime);
+                assert_eq!(b.dt_units.as_deref(), Some("[s]"));
+            }
+            other => panic!("expected builtin dtype, got {other:?}"),
+        }
+        assert_eq!(&reopened.read(&slice).await.unwrap().data[..], &payload[..]);
+    }
+
+    #[test]
+    fn unicode_descr_reports_itemsize_in_bytes() {
+        // Collapsing the bespoke descr parser into `from_numpy_str` also
+        // corrects Unicode itemsize: numpy `<U3` is 3 UCS4 chars = 12 bytes,
+        // so a 1-element file has a 12-byte body. The old parser stored the
+        // char count (3), making the body-length check reject any real `<U*`
+        // file.
+        let payload = vec![0u8; 12];
+        let raw = make_npy_1d("<U3", 1, &payload);
+        let adapter = NpyAdapter::from_bytes(&raw, serde_json::json!({})).unwrap();
+        match &adapter.structure().data_type {
+            DType::Builtin(b) => {
+                assert_eq!(b.kind, Kind::Unicode);
+                assert_eq!(
+                    b.itemsize, 12,
+                    "Unicode itemsize must be bytes (3*4), not char count"
+                );
+            }
+            other => panic!("expected builtin dtype, got {other:?}"),
+        }
     }
 
     #[tokio::test]
