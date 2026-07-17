@@ -638,11 +638,10 @@ pub async fn validate_apikey(state: &AppState, key: &str) -> Result<AuthContext,
             .map_err(|_| "principal lookup failed".to_string())?
             .ok_or_else(|| "principal vanished".to_string())?;
         let scopes = resolve_api_key_scopes(&record.scopes, &principal, state);
-        let authn_access_tags = if record.access_tags.is_empty() {
-            None
-        } else {
-            Some(record.access_tags)
-        };
+        // Pass the key's restriction through unchanged: None = no restriction,
+        // Some([]) = deny all tagged access, Some(tags) = narrow. narrow_by_key
+        // intersects with an empty Some([]) to drop every tag (deny-all).
+        let authn_access_tags = record.access_tags;
         return Ok(AuthContext {
             principal: Some(Arc::new(principal)),
             scopes,
@@ -696,11 +695,11 @@ async fn resolve_auth_inner(
                 _ => return Err(unauthorized("principal vanished")),
             };
             let scopes = resolve_api_key_scopes(&record.scopes, &principal, state);
-            let authn_access_tags = if record.access_tags.is_empty() {
-                None
-            } else {
-                Some(record.access_tags)
-            };
+            // Pass the key's restriction through unchanged: None = no
+            // restriction, Some([]) = deny all tagged access, Some(tags) =
+            // narrow. narrow_by_key intersects with an empty Some([]) to drop
+            // every tag (deny-all).
+            let authn_access_tags = record.access_tags;
             return Ok(AuthContext {
                 principal: Some(principal),
                 scopes,

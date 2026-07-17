@@ -28,11 +28,16 @@ pub struct ApiKeyRecord {
     pub expiration_time: Option<chrono::DateTime<chrono::Utc>>,
     pub time_created: chrono::DateTime<chrono::Utc>,
     pub latest_activity: Option<chrono::DateTime<chrono::Utc>>,
-    /// Optional tag restriction for this key. When non-empty the key's
-    /// effective tag grant is the INTERSECTION of the principal's tags and
-    /// this set (authn_access_tags narrowing, Python access_policies.py:409).
-    /// An empty vec means "no restriction" — principal's full tag set applies.
-    pub access_tags: Vec<String>,
+    /// Optional tag restriction for this key, with one meaning per value
+    /// (authn_access_tags narrowing, Python access_policies.py:409;
+    /// get_access_tags_from_api_key, authentication.py:261-263):
+    /// - `None` — no restriction (stored SQL NULL); the principal's full tag
+    ///   set applies.
+    /// - `Some(vec![])` — deny ALL tagged access (stored '[]', upstream
+    ///   `set([])`); the intersection with an empty set is empty.
+    /// - `Some(tags)` — narrow the effective grant to the INTERSECTION of the
+    ///   principal's tags and `tags`.
+    pub access_tags: Option<Vec<String>>,
 }
 
 /// What the caller passes when creating a key.
@@ -46,8 +51,10 @@ pub struct ApiKeyCreate {
     /// `APIKeyRequestParams.access_tags`). `Some` — including `Some(vec![])` —
     /// means the caller supplied `access_tags`, which upstream forbids
     /// combining with the `inherit` / `admin:apikeys` scopes. `None` means the
-    /// field was omitted (no restriction). Stored as a JSON array; an empty
-    /// array reads back as "no restriction" (authn_access_tags).
+    /// field was omitted. Persisted with one meaning per value: `None` → SQL
+    /// NULL (no restriction); `Some(vec![])` → '[]' (deny ALL tagged access,
+    /// upstream `set([])`); `Some(tags)` → the JSON array (narrow to the
+    /// intersection). See [`ApiKeyRecord::access_tags`].
     pub access_tags: Option<Vec<String>>,
 }
 
@@ -122,10 +129,16 @@ impl AuthDb {
         let first_eight = secret.get(..8).unwrap_or(&secret).to_string();
         let scopes_json = req.scopes.to_json();
         let exp_iso = req.expiration_time.map(|t| t.to_rfc3339());
-        // Persist access_tags as a JSON array. `None` and `Some(vec![])` both
-        // serialize to "[]" — an empty restriction, which the read side treats
-        // as "no restriction" and which matches the column default.
-        let access_tags_json = serde_json::to_string(req.access_tags.as_deref().unwrap_or(&[]))?;
+        // Persist access_tags with one meaning per value: `None` → SQL NULL
+        // (no restriction), `Some(v)` → the JSON array `v` — INCLUDING
+        // `Some(vec![])` → '[]', which the read side surfaces as an explicit
+        // empty restriction (deny all tagged access, upstream `set([])`). No
+        // `unwrap_or(&[])` collapse: `None` and `Some([])` must stay distinct.
+        let access_tags_json: Option<String> = req
+            .access_tags
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
 
         let record = match self.pool() {
             AuthPool::Sqlite(pool) => {
@@ -143,7 +156,7 @@ impl AuthDb {
                 .bind(&req.note)
                 .bind(&scopes_json)
                 .bind(&exp_iso)
-                .bind(&access_tags_json)
+                .bind(access_tags_json.as_deref())
                 .fetch_one(pool)
                 .await?;
                 api_key_from_sqlite(&row)?
@@ -163,7 +176,7 @@ impl AuthDb {
                 .bind(&req.note)
                 .bind(&scopes_json)
                 .bind(&exp_iso)
-                .bind(&access_tags_json)
+                .bind(access_tags_json.as_deref())
                 .fetch_one(pool)
                 .await?;
                 api_key_from_postgres(&row)?
@@ -426,8 +439,14 @@ fn hex_encode(bytes: &[u8]) -> String {
 fn api_key_from_sqlite(row: &sqlx::sqlite::SqliteRow) -> Result<ApiKeyRecord> {
     use crate::auth::principal::parse_dt_sqlite;
     let scopes_text: String = row.get("scopes");
-    let access_tags_text: String = row.try_get("access_tags").unwrap_or_default();
-    let access_tags: Vec<String> = serde_json::from_str(&access_tags_text).unwrap_or_default();
+    // NULL → None (no restriction); '[]' → Some(empty) (deny-all); '[a,b]' →
+    // Some([a,b]) (narrow). A malformed value falls back to None to keep login
+    // working; it can only arise from out-of-band DB corruption.
+    let access_tags: Option<Vec<String>> = row
+        .try_get::<Option<String>, _>("access_tags")
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok());
     Ok(ApiKeyRecord {
         id: row.get("id"),
         principal_id: row.get("principal_id"),
@@ -450,11 +469,13 @@ fn api_key_from_sqlite(row: &sqlx::sqlite::SqliteRow) -> Result<ApiKeyRecord> {
 fn api_key_from_postgres(row: &sqlx::postgres::PgRow) -> Result<ApiKeyRecord> {
     let scopes_value: serde_json::Value = row.get("scopes");
     let scopes: ScopeSet = serde_json::from_value(scopes_value)?;
-    let access_tags: Vec<String> = row
-        .try_get::<serde_json::Value, _>("access_tags")
+    // NULL → None (no restriction); '[]' → Some(empty) (deny-all); '[a,b]' →
+    // Some([a,b]) (narrow). Mirrors the sqlite mapping.
+    let access_tags: Option<Vec<String>> = row
+        .try_get::<Option<serde_json::Value>, _>("access_tags")
         .ok()
-        .and_then(|v| serde_json::from_value(v).ok())
-        .unwrap_or_default();
+        .flatten()
+        .and_then(|v| serde_json::from_value::<Vec<String>>(v).ok());
     Ok(ApiKeyRecord {
         id: row.get("id"),
         principal_id: row.get("principal_id"),
@@ -569,10 +590,13 @@ mod tests {
         );
     }
 
-    /// Persistence: a supplied `access_tags` round-trips through the INSERT and
-    /// is readable back via `list_api_keys` (the same column the auth
-    /// middleware feeds into `authn_access_tags`). `None` persists as an empty
-    /// restriction.
+    /// Persistence, per invariant boundary: each of the three `access_tags`
+    /// values round-trips through the INSERT with one meaning, readable back via
+    /// `list_api_keys` (the same column the auth middleware feeds into
+    /// `authn_access_tags`):
+    /// - `None` (omitted)     → SQL NULL → `None` (no restriction)
+    /// - `Some(vec![])`       → '[]'     → `Some(empty)` (deny-all — the fix)
+    /// - `Some([team-a,...])` → JSON arr → `Some([team-a,...])` (narrow)
     #[tokio::test]
     async fn create_api_key_persists_access_tags() {
         let db = mem_db().await;
@@ -587,7 +611,24 @@ mod tests {
             .await
             .expect("create restricted key");
         // The returned record carries the tags immediately.
-        assert_eq!(restricted.record.access_tags, vec!["team-a", "team-b"]);
+        assert_eq!(
+            restricted.record.access_tags,
+            Some(vec!["team-a".to_string(), "team-b".to_string()])
+        );
+
+        let deny_all = db
+            .create_api_key(create(
+                p.id,
+                ScopeSet::from_iter([Scope::ReadMetadata]),
+                Some(vec![]),
+            ))
+            .await
+            .expect("create deny-all key");
+        assert_eq!(
+            deny_all.record.access_tags,
+            Some(Vec::<String>::new()),
+            "an explicit empty access_tags persists as Some(empty) (deny-all)"
+        );
 
         let unrestricted = db
             .create_api_key(create(
@@ -597,22 +638,139 @@ mod tests {
             ))
             .await
             .expect("create unrestricted key");
-        assert!(
-            unrestricted.record.access_tags.is_empty(),
-            "no access_tags persists as an empty (no-restriction) list"
+        assert_eq!(
+            unrestricted.record.access_tags, None,
+            "no access_tags persists as NULL (no restriction)"
         );
 
         // Read the tags back from the DB, not just the create return value.
         let keys = db.list_api_keys(Some(p.id)).await.expect("list keys");
-        let restricted_read = keys
+        let read_of = |first_eight: &str| {
+            keys.iter()
+                .find(|k| k.first_eight == first_eight)
+                .expect("key present")
+                .access_tags
+                .clone()
+        };
+        assert_eq!(
+            read_of(&restricted.record.first_eight),
+            Some(vec!["team-a".to_string(), "team-b".to_string()])
+        );
+        assert_eq!(
+            read_of(&deny_all.record.first_eight),
+            Some(Vec::<String>::new()),
+            "explicit [] reads back as Some(empty), not None"
+        );
+        assert_eq!(read_of(&unrestricted.record.first_eight), None);
+    }
+
+    /// Migration boundary (0010): a pre-migration `access_tags = '[]'` row —
+    /// written under the old `NOT NULL DEFAULT '[]'` collapse where `None` and
+    /// `Some([])` were indistinguishable — must relax to NULL (no restriction)
+    /// so no live key is retroactively locked out. A genuinely restricted
+    /// non-empty row survives verbatim. Exercises the real migration runner on
+    /// the actual 0010 SQL by seeding the pre-0010 world (0001..0009 marked
+    /// applied, api_keys in its old shape) so only 0010 runs.
+    #[tokio::test]
+    async fn migration_0010_relaxes_legacy_empty_access_tags_to_null() {
+        // Pin to a single connection so the raw pre-0010 setup, db.migrate(),
+        // and the read-back all share one in-memory database deterministically.
+        let db = AuthDb::connect_with_pool_size("sqlite::memory:", 1)
+            .await
+            .expect("in-memory sqlite");
+        let AuthPool::Sqlite(pool) = db.pool().clone() else {
+            unreachable!("a sqlite: uri yields a sqlite pool");
+        };
+
+        // Bookkeeping table with 0001..0009 already applied, so db.migrate()
+        // applies ONLY 0010.
+        sqlx::query("CREATE TABLE _tiled_auth_migrations (name TEXT PRIMARY KEY, applied_at TEXT)")
+            .execute(&pool)
+            .await
+            .expect("create bookkeeping table");
+        for name in [
+            "0001_initial",
+            "0002_add_principal_role",
+            "0003_add_session_refresh_count",
+            "0004_add_access_tags",
+            "0005_tag_registry",
+            "0006_add_session_state",
+            "0007_add_pending_sessions",
+            "0008_add_oidc_flow_states",
+            "0009_hash_device_code",
+        ] {
+            sqlx::query("INSERT INTO _tiled_auth_migrations (name) VALUES (?)")
+                .bind(name)
+                .execute(&pool)
+                .await
+                .expect("seed applied migration");
+        }
+
+        // Pre-0010 tables: a minimal principals FK target and api_keys in its
+        // old `access_tags TEXT NOT NULL DEFAULT '[]'` shape.
+        sqlx::query("CREATE TABLE principals (id INTEGER PRIMARY KEY AUTOINCREMENT)")
+            .execute(&pool)
+            .await
+            .expect("create principals");
+        sqlx::query(
+            "CREATE TABLE api_keys (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                principal_id INTEGER NOT NULL REFERENCES principals(id) ON DELETE CASCADE,
+                secret_hash TEXT NOT NULL,
+                first_eight TEXT NOT NULL,
+                note TEXT,
+                scopes TEXT NOT NULL DEFAULT '[]',
+                expiration_time TEXT,
+                time_created TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                latest_activity TEXT,
+                access_tags TEXT NOT NULL DEFAULT '[]'
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create old-shape api_keys");
+        sqlx::query("INSERT INTO principals DEFAULT VALUES")
+            .execute(&pool)
+            .await
+            .expect("seed principal");
+        // Legacy ambiguous '[]' row + a genuinely restricted row.
+        sqlx::query(
+            "INSERT INTO api_keys (principal_id, secret_hash, first_eight, scopes,
+                                   time_created, access_tags)
+             VALUES (1, 'h', 'legacy00', '[]', '2024-01-01T00:00:00.000Z', '[]')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed legacy [] key");
+        sqlx::query(
+            "INSERT INTO api_keys (principal_id, secret_hash, first_eight, scopes,
+                                   time_created, access_tags)
+             VALUES (1, 'h', 'teama000', '[]', '2024-01-01T00:00:00.000Z', '[\"team-a\"]')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed restricted key");
+
+        // Apply 0010 (and only 0010) through the real runner.
+        db.migrate().await.expect("apply migration 0010");
+
+        let keys = db.list_api_keys(Some(1)).await.expect("list keys");
+        let legacy = keys
             .iter()
-            .find(|k| k.first_eight == restricted.record.first_eight)
-            .expect("restricted key present");
-        assert_eq!(restricted_read.access_tags, vec!["team-a", "team-b"]);
-        let unrestricted_read = keys
+            .find(|k| k.first_eight == "legacy00")
+            .expect("legacy row present");
+        assert_eq!(
+            legacy.access_tags, None,
+            "a legacy '[]' row must relax to NULL (no restriction), not lock the key out"
+        );
+        let restricted = keys
             .iter()
-            .find(|k| k.first_eight == unrestricted.record.first_eight)
-            .expect("unrestricted key present");
-        assert!(unrestricted_read.access_tags.is_empty());
+            .find(|k| k.first_eight == "teama000")
+            .expect("restricted row present");
+        assert_eq!(
+            restricted.access_tags,
+            Some(vec!["team-a".to_string()]),
+            "a genuine non-empty restriction must survive the migration verbatim"
+        );
     }
 }

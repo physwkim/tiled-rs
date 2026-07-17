@@ -1136,10 +1136,14 @@ mod tests {
             .iter()
             .find(|k| k.first_eight == material.record.first_eight)
             .expect("key present");
-        assert_eq!(record.access_tags, vec!["team-a"], "access_tags persisted");
+        assert_eq!(
+            record.access_tags,
+            Some(vec!["team-a".to_string()]),
+            "access_tags persisted"
+        );
 
         // Drive TagBasedPolicy with the persisted restriction.
-        let key_tags: Vec<String> = record.access_tags.clone();
+        let key_tags: Option<Vec<String>> = record.access_tags.clone();
         let policy = TagBasedPolicy::new(Arc::new(db), ScopeSet::full());
         let session = ScopeSet::for_role("user");
         let meta = serde_json::json!({});
@@ -1150,7 +1154,7 @@ mod tests {
             .principal_decision(
                 &principal_from(&p),
                 &session,
-                Some(&key_tags),
+                key_tags.as_deref(),
                 ctx(&blob_b, &meta),
             )
             .await;
@@ -1165,13 +1169,102 @@ mod tests {
             .principal_decision(
                 &principal_from(&p),
                 &session,
-                Some(&key_tags),
+                key_tags.as_deref(),
                 ctx(&blob_a, &meta),
             )
             .await;
         assert!(
             d_a.scopes.contains(Scope::ReadMetadata),
             "a key restricted to team-a reaches a team-a node"
+        );
+    }
+
+    /// Boundary between the two empty-ish restrictions the old `NOT NULL
+    /// DEFAULT '[]'` schema collapsed onto one stored value. A key created with
+    /// `access_tags = None` (no restriction) reaches the principal's tagged
+    /// nodes; a key created with `access_tags = Some(vec![])` (deny-all,
+    /// upstream `set([])`) reaches NONE of them — the intersection with the
+    /// empty set. Both go through the real write side, are read back from the
+    /// DB, and are driven through `TagBasedPolicy`. This is the fix: `[]` must
+    /// NOT read back as "no restriction".
+    #[tokio::test]
+    async fn api_key_access_tags_none_vs_empty_narrow_through_policy() {
+        let db = setup_auth_db().await;
+        let p = principal_with_tags(&db, &["team-a"]).await;
+
+        // Unrestricted key: access_tags omitted → None.
+        let unrestricted = db
+            .create_api_key(crate::auth::ApiKeyCreate {
+                principal_id: p.id,
+                note: None,
+                scopes: read_metadata(),
+                expiration_time: None,
+                access_tags: None,
+            })
+            .await
+            .expect("create unrestricted key");
+        // Deny-all key: explicit empty access_tags → Some(vec![]).
+        let deny_all = db
+            .create_api_key(crate::auth::ApiKeyCreate {
+                principal_id: p.id,
+                note: None,
+                scopes: read_metadata(),
+                expiration_time: None,
+                access_tags: Some(vec![]),
+            })
+            .await
+            .expect("create deny-all key");
+
+        // Read both restrictions back from the DB — the exact values the auth
+        // middleware turns into `authn_access_tags`.
+        let keys = db.list_api_keys(Some(p.id)).await.expect("list keys");
+        let read_of = |first_eight: &str| {
+            keys.iter()
+                .find(|k| k.first_eight == first_eight)
+                .expect("key present")
+                .access_tags
+                .clone()
+        };
+        let none_tags = read_of(&unrestricted.record.first_eight);
+        let empty_tags = read_of(&deny_all.record.first_eight);
+        assert_eq!(none_tags, None, "omitted access_tags reads back as None");
+        assert_eq!(
+            empty_tags,
+            Some(Vec::<String>::new()),
+            "explicit [] reads back as Some(empty), not None"
+        );
+
+        let policy = TagBasedPolicy::new(Arc::new(db), ScopeSet::full());
+        let session = ScopeSet::for_role("user");
+        let meta = serde_json::json!({});
+        let blob_a = serde_json::json!({"tags": ["team-a"]});
+
+        // None → no restriction → the principal's team-a grant applies.
+        let d_none = policy
+            .principal_decision(
+                &principal_from(&p),
+                &session,
+                none_tags.as_deref(),
+                ctx(&blob_a, &meta),
+            )
+            .await;
+        assert!(
+            d_none.scopes.contains(Scope::ReadMetadata),
+            "an unrestricted (None) key reaches the principal's tagged node"
+        );
+
+        // Some([]) → deny-all → no tagged node is reachable.
+        let d_empty = policy
+            .principal_decision(
+                &principal_from(&p),
+                &session,
+                empty_tags.as_deref(),
+                ctx(&blob_a, &meta),
+            )
+            .await;
+        assert!(
+            !d_empty.scopes.contains(Scope::ReadMetadata),
+            "a deny-all (Some([])) key reaches NO tagged node"
         );
     }
 

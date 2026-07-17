@@ -1664,7 +1664,7 @@ async fn apikey_create_persists_access_tags_and_rejects_broad_scope() {
         .expect("created key present");
     assert_eq!(
         rec.access_tags,
-        vec!["team-a".to_string()],
+        Some(vec!["team-a".to_string()]),
         "access_tags must persist from the POST body"
     );
 

@@ -42,6 +42,10 @@ const SQLITE_MIGRATIONS: &[(&str, &str)] = &[
         "0009_hash_device_code",
         include_str!("migrations/sqlite/0009_hash_device_code.sql"),
     ),
+    (
+        "0010_access_tags_nullable",
+        include_str!("migrations/sqlite/0010_access_tags_nullable.sql"),
+    ),
 ];
 
 const POSTGRES_MIGRATIONS: &[(&str, &str)] = &[
@@ -80,6 +84,10 @@ const POSTGRES_MIGRATIONS: &[(&str, &str)] = &[
     (
         "0009_hash_device_code",
         include_str!("migrations/postgres/0009_hash_device_code.sql"),
+    ),
+    (
+        "0010_access_tags_nullable",
+        include_str!("migrations/postgres/0010_access_tags_nullable.sql"),
     ),
 ];
 
@@ -170,27 +178,41 @@ impl AuthDb {
     }
 }
 
+// Apply every statement of a migration on ONE connection inside a single
+// transaction. Two reasons this must not fan out across the pool:
+//   1. Intra-migration visibility. A SQLite table rebuild (CREATE new → copy →
+//      DROP old → RENAME new to the old name, as 0010 does to make a column
+//      nullable) needs the DROP to be visible to the RENAME. That only holds on
+//      the same connection: `.execute(pool)` re-acquires per statement, and on
+//      a file-backed WAL DB the RENAME then runs on a connection that has not
+//      yet seen the DROP and fails with "table already exists".
+//   2. Atomicity. A mid-migration failure rolls the whole migration back rather
+//      than leaving a half-applied schema that no retry can complete.
 async fn apply_multi_sqlite(pool: &sqlx::Pool<sqlx::Sqlite>, sql: &str) -> Result<()> {
+    let mut tx = pool.begin().await?;
     for stmt in split_statements(sql) {
         if stmt.trim().is_empty() {
             continue;
         }
-        sqlx::query(&stmt).execute(pool).await.map_err(|e| {
+        sqlx::query(&stmt).execute(&mut *tx).await.map_err(|e| {
             AuthError::Migration(format!("statement failed: {e}\n--- sql ---\n{stmt}"))
         })?;
     }
+    tx.commit().await?;
     Ok(())
 }
 
 async fn apply_multi_postgres(pool: &sqlx::Pool<sqlx::Postgres>, sql: &str) -> Result<()> {
+    let mut tx = pool.begin().await?;
     for stmt in split_statements(sql) {
         if stmt.trim().is_empty() {
             continue;
         }
-        sqlx::query(&stmt).execute(pool).await.map_err(|e| {
+        sqlx::query(&stmt).execute(&mut *tx).await.map_err(|e| {
             AuthError::Migration(format!("statement failed: {e}\n--- sql ---\n{stmt}"))
         })?;
     }
+    tx.commit().await?;
     Ok(())
 }
 
