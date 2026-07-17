@@ -201,6 +201,13 @@ npy = ["dep:ndarray"]
 # --- web admin UI / SPA ---
 web = []
 
+# --- streaming cache backends ---
+# Shared Redis backend for the per-node data-streaming cache (Wave-24 PR8).
+# Default OFF: pulls the `redis` client and its async connection stack, only
+# needed for multi-process deployments. The in-process `memory` backend and the
+# disabled no-op backend stay in the default build.
+streaming-redis = ["dep:redis"]
+
 # --- authentication ---
 # OIDC (external SSO: code/device flows) is always built in: it pulls no extra
 # dependencies (reqwest/jwt/serde are non-optional) and the server/CLI assume it
@@ -283,6 +290,7 @@ object_store = { workspace = true, optional = true }
 calamine = { workspace = true, optional = true }
 netcdf3 = { workspace = true, optional = true }
 ndarray = { workspace = true, optional = true }
+redis = { workspace = true, optional = true }
 ldap3 = { version = "0.12", default-features = false, features = ["tls-rustls", "tls-rustls-ring"], optional = true }
 samael = { version = "0.0.21", features = ["xmlsec"], optional = true }
 libc = { version = "0.2", optional = true }
