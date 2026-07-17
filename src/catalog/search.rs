@@ -795,6 +795,20 @@ impl Catalog {
                        FROM nodes WHERE {parent_clause} AND {where_clause}{cursor_clause}
                        ORDER BY {order_by} LIMIT ?"
                 );
+                if self.explain_sql() {
+                    // Bind order mirrors the real query below: parent_id?,
+                    // WHERE binds, cursor?, then the fetch limit.
+                    let mut ex: Vec<Bind> = Vec::new();
+                    if let Some(pid) = parent_id {
+                        ex.push(Bind::Int(pid));
+                    }
+                    ex.extend(bindings.iter().cloned());
+                    if let Some(c) = cursor {
+                        ex.push(Bind::Int(c));
+                    }
+                    ex.push(Bind::Int(fetch));
+                    explain_query(self.pool(), &select_sql, &ex).await;
+                }
                 let mut q = sqlx::query(&select_sql);
                 if parent_present {
                     q = q.bind(parent_id);
@@ -848,6 +862,20 @@ impl Catalog {
                        FROM nodes WHERE {parent_clause} AND {where_clause}{cursor_clause}
                        ORDER BY {order_by} LIMIT {limit_p}"
                 );
+                if self.explain_sql() {
+                    // Bind order mirrors the real query below: WHERE binds
+                    // ($1..$N), parent_id?, cursor?, then the fetch limit.
+                    let mut ex: Vec<Bind> = Vec::new();
+                    ex.extend(bindings.iter().cloned());
+                    if let Some(pid) = parent_id {
+                        ex.push(Bind::Int(pid));
+                    }
+                    if let Some(c) = cursor {
+                        ex.push(Bind::Int(c));
+                    }
+                    ex.push(Bind::Int(fetch));
+                    explain_query(self.pool(), &select_sql, &ex).await;
+                }
                 let mut q = sqlx::query(&select_sql);
                 for b in &bindings {
                     q = match b {
@@ -927,6 +955,18 @@ impl Catalog {
                        FROM nodes WHERE {parent_clause} AND {where_clause}
                        ORDER BY {order_by} LIMIT ? OFFSET ?"
                 );
+                if self.explain_sql() {
+                    // Bind order mirrors the real query below: parent_id?,
+                    // WHERE binds, then LIMIT / OFFSET.
+                    let mut ex: Vec<Bind> = Vec::new();
+                    if let Some(pid) = parent_id {
+                        ex.push(Bind::Int(pid));
+                    }
+                    ex.extend(bindings.iter().cloned());
+                    ex.push(Bind::Int(limit));
+                    ex.push(Bind::Int(offset));
+                    explain_query(self.pool(), &select_sql, &ex).await;
+                }
                 let mut q = sqlx::query(&select_sql);
                 if parent_id.is_some() {
                     q = q.bind(parent_id);
@@ -968,6 +1008,18 @@ impl Catalog {
                        FROM nodes WHERE {parent_clause} AND {where_clause}
                        ORDER BY {order_by} LIMIT {limit_p} OFFSET {offset_p}"
                 );
+                if self.explain_sql() {
+                    // Bind order mirrors the real query below: WHERE binds
+                    // ($1..$N), parent_id?, then LIMIT / OFFSET.
+                    let mut ex: Vec<Bind> = Vec::new();
+                    ex.extend(bindings.iter().cloned());
+                    if let Some(pid) = parent_id {
+                        ex.push(Bind::Int(pid));
+                    }
+                    ex.push(Bind::Int(limit));
+                    ex.push(Bind::Int(offset));
+                    explain_query(self.pool(), &select_sql, &ex).await;
+                }
                 let mut q = sqlx::query(&select_sql);
                 for b in &bindings {
                     q = match b {
@@ -1122,6 +1174,27 @@ impl Catalog {
              WHERE {parent_clause} AND {where_clause} GROUP BY {group_expr}"
         );
         let mut out = Vec::new();
+        if self.explain_sql() {
+            // Bind order mirrors the real per-dialect query below: SQLite binds
+            // parent_id? first then the WHERE binds; Postgres binds the WHERE
+            // binds ($1..$N) first then parent_id?.
+            let mut ex: Vec<Bind> = Vec::new();
+            match self.pool() {
+                DbPool::Sqlite(_) => {
+                    if let Some(pid) = parent_id {
+                        ex.push(Bind::Int(pid));
+                    }
+                    ex.extend(bindings.iter().cloned());
+                }
+                DbPool::Postgres(_) => {
+                    ex.extend(bindings.iter().cloned());
+                    if let Some(pid) = parent_id {
+                        ex.push(Bind::Int(pid));
+                    }
+                }
+            }
+            explain_query(self.pool(), &sql, &ex).await;
+        }
         match self.pool() {
             DbPool::Sqlite(pool) => {
                 let mut q = sqlx::query(&sql);
@@ -1208,6 +1281,74 @@ fn bind_all_postgres<'q>(
         };
     }
     q
+}
+
+/// `TILED_EXPLAIN_SQL` debug aid: run `sql` (with its ordered bound parameters
+/// `binds`) through the backend's plan explainer and emit the plan via tracing
+/// before the caller executes the real query. `EXPLAIN QUERY PLAN` on SQLite,
+/// `EXPLAIN` on PostgreSQL — mirroring upstream `tiled/catalog/explain.py`.
+///
+/// Called only when [`Catalog::explain_sql`] is on, so it never touches the
+/// disabled hot path. Best-effort: an EXPLAIN failure is warn-logged and
+/// swallowed — the aid must never turn a search that would succeed into an
+/// error. `binds` must be listed in the same order the real query binds them,
+/// so placeholder numbering matches.
+async fn explain_query(pool: &DbPool, sql: &str, binds: &[Bind]) {
+    match pool {
+        DbPool::Sqlite(pool) => {
+            let explain_sql = format!("EXPLAIN QUERY PLAN {sql}");
+            let mut q = sqlx::query(&explain_sql);
+            for b in binds {
+                q = match b {
+                    Bind::Text(s) => q.bind(s.clone()),
+                    Bind::Int(i) => q.bind(*i),
+                    Bind::Real(f) => q.bind(*f),
+                };
+            }
+            match q.fetch_all(pool).await {
+                Ok(rows) => {
+                    // EXPLAIN QUERY PLAN columns are (id, parent, notused, detail);
+                    // `detail` is the human-readable plan step.
+                    let plan = rows
+                        .iter()
+                        .map(|r| r.try_get::<String, _>("detail").unwrap_or_default())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    tracing::info!(target: "tiled.catalog.explain", sql = %sql, plan = %plan, "EXPLAIN QUERY PLAN");
+                }
+                Err(e) => tracing::warn!(
+                    target: "tiled.catalog.explain",
+                    sql = %sql, error = %e, "EXPLAIN QUERY PLAN failed"
+                ),
+            }
+        }
+        DbPool::Postgres(pool) => {
+            let explain_sql = format!("EXPLAIN {sql}");
+            let mut q = sqlx::query(&explain_sql);
+            for b in binds {
+                q = match b {
+                    Bind::Text(s) => q.bind(s.clone()),
+                    Bind::Int(i) => q.bind(*i),
+                    Bind::Real(f) => q.bind(*f),
+                };
+            }
+            match q.fetch_all(pool).await {
+                Ok(rows) => {
+                    // EXPLAIN returns one text column named "QUERY PLAN".
+                    let plan = rows
+                        .iter()
+                        .map(|r| r.try_get::<String, _>("QUERY PLAN").unwrap_or_default())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    tracing::info!(target: "tiled.catalog.explain", sql = %sql, plan = %plan, "EXPLAIN");
+                }
+                Err(e) => tracing::warn!(
+                    target: "tiled.catalog.explain",
+                    sql = %sql, error = %e, "EXPLAIN failed"
+                ),
+            }
+        }
+    }
 }
 
 /// Trim a keyset fetch (which pulled `limit + 1` rows to peek ahead) down to

@@ -79,6 +79,13 @@ pub struct Catalog {
     /// CLI wires this from `--writable-storage`, and these dirs are also
     /// folded into the read allow-list so a freshly-created file is readable.
     writable_storage: Vec<std::path::PathBuf>,
+    /// `TILED_EXPLAIN_SQL` debug aid (upstream `tiled/catalog/explain.py`).
+    /// When set, each catalog search query's plan is emitted via tracing
+    /// before the query runs. Read once from the environment at construction
+    /// (see [`crate::catalog::explain::env_flag`]) so the disabled query hot
+    /// path is a single bool check. Tests override it with
+    /// [`Catalog::with_explain_sql`].
+    explain_sql: bool,
 }
 
 impl Catalog {
@@ -88,6 +95,7 @@ impl Catalog {
             pool,
             delete_scope: DeleteScope::Unrestricted,
             writable_storage: Vec::new(),
+            explain_sql: crate::catalog::explain::env_flag(),
         }
     }
 
@@ -181,10 +189,27 @@ impl Catalog {
             pool,
             delete_scope: DeleteScope::Unrestricted,
             writable_storage: Vec::new(),
+            explain_sql: crate::catalog::explain::env_flag(),
         })
     }
 
     pub fn pool(&self) -> &DbPool {
         &self.pool
+    }
+
+    /// Force the `TILED_EXPLAIN_SQL` debug aid on or off, overriding the
+    /// environment gate read at construction. Consuming builder so it composes
+    /// with [`Catalog::connect`]/[`Catalog::from_pool`]; used by tests to
+    /// exercise both the enabled and disabled plan-emission paths
+    /// deterministically.
+    pub fn with_explain_sql(mut self, on: bool) -> Self {
+        self.explain_sql = on;
+        self
+    }
+
+    /// Whether the `TILED_EXPLAIN_SQL` debug aid is active for this catalog.
+    /// Read by the search query methods before emitting a plan.
+    pub(crate) fn explain_sql(&self) -> bool {
+        self.explain_sql
     }
 }

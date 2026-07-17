@@ -18,6 +18,7 @@ pub mod adapter;
 pub mod data_source;
 pub mod db;
 pub mod error;
+pub mod explain;
 pub mod migrate;
 pub mod node;
 pub mod orm;
