@@ -26,6 +26,7 @@ pub mod catalog;
 pub mod cli;
 pub mod client;
 pub mod core;
+pub mod env_expand;
 pub mod mongo;
 pub mod serialization;
 pub mod server;
