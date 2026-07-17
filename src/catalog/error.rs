@@ -58,11 +58,52 @@ impl From<CatalogError> for crate::core::TiledError {
             // The direct `map_catalog_err` route already maps this to 409; this
             // `?`/`TiledError` bridge previously flattened it to 422.
             CatalogError::Conflict(m) => TE::Conflict(m),
-            CatalogError::WouldDeleteData(m) => TE::Validation(m),
+            // A would-delete-data refusal must surface as HTTP 409 no matter
+            // which bridge carries it — parity with Python tiled, whose
+            // `WouldDeleteData` handler answers HTTP_409_CONFLICT
+            // (server/app.py:368-374). The live delete path already maps this
+            // to 409 via `map_catalog_err` -> `ServerError::Conflict`; this
+            // `?`/`TiledError` bridge previously flattened it to 422, a latent
+            // divergence. Unified to `TE::Conflict` (-> 409) so both agree by
+            // construction even though no route currently routes a delete
+            // through this bridge.
+            CatalogError::WouldDeleteData(m) => TE::Conflict(m),
             CatalogError::Validation(m) => TE::Validation(m),
             CatalogError::UnsupportedQuery(m) => TE::UnsupportedQuery(m),
             CatalogError::Json(e) => TE::Json(e),
             CatalogError::Io(e) => TE::Io(e),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::TiledError as TE;
+
+    /// The changed mapping: a would-delete-data refusal bridges to
+    /// `TE::Conflict`, which the server maps to HTTP 409
+    /// (`server/error.rs`: `TiledError::Conflict -> ServerError::Conflict`),
+    /// agreeing with the live delete path and upstream's `WouldDeleteData`
+    /// handler.
+    #[test]
+    fn would_delete_data_bridges_to_conflict() {
+        let te: TE = CatalogError::WouldDeleteData("blocked".into()).into();
+        assert!(
+            matches!(te, TE::Conflict(_)),
+            "expected Conflict, got {te:?}"
+        );
+    }
+
+    /// The neighboring genuine-validation arm is untouched: a catalog
+    /// validation error still bridges to `TE::Validation` (HTTP 422), so the
+    /// unification narrowed only the would-delete-data arm.
+    #[test]
+    fn validation_still_bridges_to_validation() {
+        let te: TE = CatalogError::Validation("bad input".into()).into();
+        assert!(
+            matches!(te, TE::Validation(_)),
+            "expected Validation, got {te:?}"
+        );
     }
 }
