@@ -52,7 +52,12 @@ impl From<CatalogError> for crate::core::TiledError {
             CatalogError::Database(e) => TE::Database(e.to_string()),
             CatalogError::Migration(m) => TE::Internal(m),
             CatalogError::NotFound(m) => TE::NotFound(m),
-            CatalogError::Conflict(m) => TE::Validation(m),
+            // A catalog conflict (e.g. a duplicate `(parent_id, key)` create)
+            // must surface as HTTP 409 no matter which bridge carries it —
+            // parity with Python's `Collision(Conflicts)` → HTTP_409_CONFLICT.
+            // The direct `map_catalog_err` route already maps this to 409; this
+            // `?`/`TiledError` bridge previously flattened it to 422.
+            CatalogError::Conflict(m) => TE::Conflict(m),
             CatalogError::WouldDeleteData(m) => TE::Validation(m),
             CatalogError::Validation(m) => TE::Validation(m),
             CatalogError::UnsupportedQuery(m) => TE::UnsupportedQuery(m),

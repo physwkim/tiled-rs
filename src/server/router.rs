@@ -6292,7 +6292,11 @@ fn map_catalog_err(e: crate::catalog::CatalogError) -> ServerError {
     match e {
         CE::NotFound(m) => ServerError::NotFound(m),
         CE::Validation(m) => ServerError::Validation(m),
-        CE::Conflict(m) => ServerError::Validation(m),
+        // A duplicate `(parent_id, key)` create → 409, matching Python tiled,
+        // which raises `Collision(Conflicts)` on the unique-constraint failure
+        // (catalog/adapter.py:740-745) and answers HTTP_409_CONFLICT via the
+        // `Conflicts` handler (app.py:350-354). Previously mislabeled as 422.
+        CE::Conflict(m) => ServerError::Conflict(m),
         // Deleting a subtree with internally-managed data sources → 409,
         // matching Python's WouldDeleteData handler (app.py:367-374).
         CE::WouldDeleteData(m) => ServerError::Conflict(m),

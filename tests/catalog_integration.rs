@@ -885,8 +885,13 @@ async fn patch_duplicate_specs_returns_422() {
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
 }
 
+/// A duplicate `(parent_id, key)` create is a conflict, not a validation
+/// error: upstream raises `Collision(Conflicts)` and answers HTTP 409
+/// (catalog/adapter.py:740-745, app.py:350-354). Distinct from
+/// [`patch_duplicate_specs_returns_422`], which is a genuine validation error
+/// (422) — the fix narrowed only the conflict arm, leaving 422 intact.
 #[tokio::test]
-async fn duplicate_key_at_same_level_returns_422() {
+async fn duplicate_container_create_returns_409() {
     let (app, _dir) = build_test_app().await;
     let body = serde_json::json!({
         "key": "dup",
@@ -897,8 +902,37 @@ async fn duplicate_key_at_same_level_returns_422() {
     });
     let (status, _) = json_request(&app, Method::POST, "/api/v1/register/", body.clone()).await;
     assert_eq!(status, StatusCode::CREATED);
-    let (status, _) = json_request(&app, Method::POST, "/api/v1/register/", body).await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    let (status, resp) = json_request(&app, Method::POST, "/api/v1/register/", body).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    // The 409 body carries the conflict message (not a generic error).
+    let message = resp["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("already exists"),
+        "409 body must carry the conflict message, got: {resp}"
+    );
+}
+
+/// The conflict is keyed on `(parent_id, key)` in `create_node`, before any
+/// structure/data-source handling, so a duplicate leaf (array/table) create is
+/// a 409 exactly like a duplicate container — the mapping is family-agnostic.
+#[tokio::test]
+async fn duplicate_leaf_create_returns_409() {
+    let (app, _dir) = build_test_app().await;
+    let body = serde_json::json!({
+        "key": "leaf",
+        "structure_family": "array",
+        "metadata": {},
+        "specs": [],
+        "data_sources": [],
+    });
+    let (status, resp) = json_request(&app, Method::POST, "/api/v1/register/", body.clone()).await;
+    assert_eq!(status, StatusCode::CREATED, "first leaf create: {resp}");
+    let (status, resp) = json_request(&app, Method::POST, "/api/v1/register/", body).await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "duplicate leaf create: {resp}"
+    );
 }
 
 #[tokio::test]
