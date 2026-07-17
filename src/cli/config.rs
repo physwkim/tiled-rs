@@ -613,6 +613,18 @@ pub struct OidcProviderArgs {
     /// `EntraAuthenticator(extra_scopes=...)`.
     #[serde(default)]
     pub extra_scopes: Vec<String>,
+    /// Upstream `ProxiedOIDCAuthenticator.scopes` — a global required-scope list
+    /// (`authenticators.py:300`) that upstream's `check_scopes` enforces on
+    /// EVERY request instead of the per-route scopes, delegating fine-grained
+    /// authorization to an external policy decision point
+    /// (`authentication.py:542-570`). tiled-rs does NOT implement that
+    /// delegation mode — it always enforces its own per-route scopes derived
+    /// from the principal's role. The field is captured here (rather than
+    /// silently dropped by serde) so [`OidcProviderArgs::assemble`] can warn at
+    /// startup that it has no effect; wiring the delegation mode itself is
+    /// blocked on sign-off.
+    #[serde(default)]
+    pub scopes: Option<Vec<String>>,
 }
 
 /// `args` for a SAML provider. Mirrors the constructor kwargs of Python's
@@ -1017,6 +1029,23 @@ impl OidcProviderArgs {
         name: &str,
         discovery: Option<OidcDiscovery>,
     ) -> anyhow::Result<OidcProvider> {
+        // Upstream ProxiedOIDCAuthenticator's `scopes` list drives a global,
+        // external-PDP scope-delegation mode (check_scopes enforces this set on
+        // every request in lieu of per-route scopes). tiled-rs does not
+        // implement that mode; it always enforces per-route scopes from the
+        // principal's role. Surface the ignored field loudly rather than
+        // silently dropping it, so an operator who configured it is not misled
+        // into thinking authorization was delegated.
+        if self.scopes.as_ref().is_some_and(|s| !s.is_empty()) {
+            tracing::warn!(
+                provider = %name,
+                "authentication.providers '{name}': a global `scopes` list was configured \
+                 (upstream ProxiedOIDCAuthenticator external-PDP delegation mode); tiled-rs does \
+                 not implement scope delegation and enforces per-route scopes from the principal's \
+                 role. This field has no effect."
+            );
+        }
+
         let audience = self.audience.clone().ok_or_else(|| {
             anyhow::anyhow!(
                 "authentication.providers '{name}': 'audience' is required (token 'aud' validation)"
@@ -2016,6 +2045,35 @@ authentication:
             pp.extra_scopes.is_empty(),
             "a provider without extra_scopes config gets an empty list"
         );
+    }
+
+    #[test]
+    fn assemble_captures_and_ignores_proxied_scopes() {
+        // Upstream ProxiedOIDCAuthenticator's global `scopes` list must be
+        // captured into the typed struct (not silently dropped as an unknown
+        // YAML key) so assemble can warn that tiled-rs ignores it. Parse from
+        // YAML to prove the field lands in `OidcProviderArgs::scopes` rather than
+        // vanishing.
+        let args: OidcProviderArgs =
+            serde_yaml::from_str("audience: tiled\nscopes:\n  - read:metadata\n  - read:data\n")
+                .expect("proxied_oidc args carrying a `scopes:` list must deserialize");
+        assert_eq!(
+            args.scopes,
+            Some(vec!["read:metadata".to_string(), "read:data".to_string()]),
+            "the global `scopes` list must be captured into the typed field"
+        );
+
+        // assemble runs the warn branch and still builds a working provider; the
+        // ignored `scopes` has no bearing on the resulting OidcProvider (it has
+        // no such field — per-route enforcement stands).
+        let p = args.assemble("proxied", Some(discovery_doc())).unwrap();
+        assert_eq!(p.name, "proxied");
+        assert_eq!(p.audiences, vec!["tiled".to_string()]);
+
+        // A provider that omits `scopes:` leaves the field None (no warn fires).
+        let plain: OidcProviderArgs =
+            serde_yaml::from_str("audience: tiled\n").expect("plain oidc args must deserialize");
+        assert_eq!(plain.scopes, None);
     }
 
     #[test]
