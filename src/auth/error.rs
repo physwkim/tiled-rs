@@ -23,6 +23,12 @@ pub enum AuthError {
     #[error("forbidden: {0}")]
     Forbidden(String),
 
+    /// A per-principal resource cap was hit (too many API keys or sessions).
+    /// Mirrors Python tiled's `HTTPException(400, ...)` at the key/session
+    /// limits (authentication.py:817-823, 1215-1221); maps to HTTP 400.
+    #[error("limit exceeded: {0}")]
+    LimitExceeded(String),
+
     #[error("expired")]
     Expired,
 

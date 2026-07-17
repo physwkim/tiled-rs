@@ -37,6 +37,11 @@ pub struct SessionRecord {
 pub trait SessionStore: Send + Sync {}
 impl SessionStore for AuthDb {}
 
+/// Max sessions allowed per principal. Matches Python tiled's `SESSION_LIMIT`
+/// (authentication.py:85). The route that lists sessions is unpaginated, so
+/// this bounds its response size and guards against session-table abuse.
+const SESSION_LIMIT: i64 = 200;
+
 impl AuthDb {
     pub async fn create_session(
         &self,
@@ -45,6 +50,22 @@ impl AuthDb {
         expires_at: DateTime<Utc>,
         state: serde_json::Value,
     ) -> Result<SessionRecord> {
+        // Enforce the per-principal cap BEFORE insert (Python parity:
+        // authentication.py:809-823). Counting lives here — the sole
+        // INSERT-owner for sessions — so every caller path (login, device,
+        // OIDC callback, OIDC device, SAML ACS, admin SPA) is bounded by
+        // construction. Count ALL rows for the principal: upstream's
+        // `session_count` query filters on principal.id alone, with no
+        // expiration/revoked exclusion, so expired and revoked sessions still
+        // count until deleted.
+        let existing = self.count_sessions(principal_id).await?;
+        if existing >= SESSION_LIMIT {
+            return Err(AuthError::LimitExceeded(format!(
+                "This Principal already has {existing} sessions which is greater \
+                 than or equal to the maximum number allowed, {SESSION_LIMIT}. \
+                 Some Sessions must be closed before creating new ones."
+            )));
+        }
         let new_uuid = Uuid::new_v4().to_string();
         let scopes_json = scopes.to_json();
         let expires_iso = expires_at.to_rfc3339();
@@ -84,6 +105,27 @@ impl AuthDb {
                 session_from_postgres(&row)
             }
         }
+    }
+
+    /// Count every session row owned by `principal_id`. Matches Python tiled's
+    /// `session_count` query (authentication.py:809-816): no expiration/revoked
+    /// filter, so those rows count against [`SESSION_LIMIT`] until deleted.
+    async fn count_sessions(&self, principal_id: i64) -> Result<i64> {
+        let n: i64 = match self.pool() {
+            AuthPool::Sqlite(pool) => {
+                sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE principal_id = ?")
+                    .bind(principal_id)
+                    .fetch_one(pool)
+                    .await?
+            }
+            AuthPool::Postgres(pool) => {
+                sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE principal_id = $1")
+                    .bind(principal_id)
+                    .fetch_one(pool)
+                    .await?
+            }
+        };
+        Ok(n)
     }
 
     pub async fn lookup_session(&self, uuid: &str) -> Result<SessionRecord> {

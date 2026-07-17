@@ -1454,6 +1454,9 @@ fn map_auth_err(e: crate::auth::AuthError) -> ServerError {
         AE::Conflict(m) => ServerError::Validation(m),
         AE::Unauthorized(m) => ServerError::Unauthorized(m),
         AE::Forbidden(m) => ServerError::Forbidden(m),
+        // Per-principal key/session cap — HTTP 400, matching Python tiled's
+        // HTTPException(400) at the limits (authentication.py:817, 1215).
+        AE::LimitExceeded(m) => ServerError::BadRequest(m),
         AE::Expired => ServerError::Unauthorized("expired".into()),
         AE::Revoked => ServerError::Unauthorized("revoked".into()),
         // JWT verification failures (bad signature, expired, wrong iss/aud,
