@@ -122,6 +122,14 @@ pub enum Command {
         #[arg(long, env = "TILED_SINGLE_USER_API_KEY")]
         api_key: Option<String>,
 
+        /// Turn off the API-key requirement for *reading*: admit unauthenticated
+        /// requests as the public principal with read-only scopes. Writing still
+        /// requires the API key, so data cannot be modified. Forces
+        /// `authentication.allow_anonymous_access = true`, overriding the config
+        /// value. Mirrors upstream `tiled serve ... --public` (_serve.py).
+        #[arg(long)]
+        public: bool,
+
         /// MongoDB URI for Bluesky data (e.g. mongodb://localhost:27017/my_database)
         #[arg(long)]
         mongo_uri: Option<String>,
@@ -521,6 +529,7 @@ pub async fn run(command: Command) -> Result<()> {
             allow_origins,
             trust_proxy,
             api_key,
+            public,
             mongo_uri,
             catalog_uri,
             auth_db_uri,
@@ -965,12 +974,16 @@ pub async fn run(command: Command) -> Result<()> {
                 // read-only scopes. Honored on a server that has auth
                 // configured; `no_auth_configured()` (dev mode) already grants
                 // full anonymous access regardless. See
-                // `AppState::anonymous_scopes`.
-                allow_anonymous_access: file_config
-                    .as_ref()
-                    .and_then(|c| c.authentication.as_ref())
-                    .map(|a| a.allow_anonymous_access)
-                    .unwrap_or(false),
+                // `AppState::anonymous_scopes`. The `--public` flag forces this
+                // on, overriding the config value (Python _serve.py serve_config
+                // `if public: ...allow_anonymous_access = True`); absent, the
+                // config value stands.
+                allow_anonymous_access: public
+                    || file_config
+                        .as_ref()
+                        .and_then(|c| c.authentication.as_ref())
+                        .map(|a| a.allow_anonymous_access)
+                        .unwrap_or(false),
                 catalog: catalog_handle,
                 auth_db: auth_db_handle,
                 issuer: issuer_handle,
@@ -1521,6 +1534,23 @@ mod tests {
             resolved.iter().any(|a| a.is_ipv6() && a.port() == 8000),
             "tuple form must resolve ::1 to an IPv6 socket addr; got {resolved:?}"
         );
+    }
+
+    // cli-w27-F2: `serve --public` forces anonymous read access. The flag
+    // parses to a bool; absent it defaults to false (config value stands).
+    #[test]
+    fn serve_public_flag_parses() {
+        let cli = TestCli::parse_from(["tiled", "serve", "--demo", "--public"]);
+        let Command::Serve { public, .. } = cli.command else {
+            panic!("expected Serve variant");
+        };
+        assert!(public, "--public must parse to true");
+
+        let cli = TestCli::parse_from(["tiled", "serve", "--demo"]);
+        let Command::Serve { public, .. } = cli.command else {
+            panic!("expected Serve variant");
+        };
+        assert!(!public, "absent --public must default to false");
     }
 
     #[test]
