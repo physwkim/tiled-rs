@@ -120,8 +120,16 @@ pub async fn lz4_compress_middleware(request: Request, next: Next) -> Response {
     let t0 = std::time::Instant::now();
     let compressed = compress(&body_bytes);
     let dur = t0.elapsed().as_secs_f64();
-
     let n = compressed.len();
+
+    // Only keep the compression if it saves enough to be worth the client's
+    // decompression cost (upstream compression.py:87-93). Otherwise send the
+    // original body identity-encoded, with no Content-Encoding and no compress
+    // Server-Timing phase recorded.
+    if !crate::server::compression::worth_compressing(body_bytes.len(), n) {
+        return Response::from_parts(parts, Body::from(body_bytes));
+    }
+
     if let Some(timing) = &timing {
         let ratio = body_bytes.len() as f64 / n as f64;
         timing.record("compress", &[("dur", dur), ("ratio", ratio)]);
