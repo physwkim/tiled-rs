@@ -390,6 +390,13 @@ pub fn build_app(mut state: AppState) -> Router {
         .layer(axum::middleware::from_fn(
             crate::server::blosc2::blosc2_compress_middleware,
         ))
+        // lz4 runs on the response after blosc2 (which handles octet-stream/
+        // arrow first) and before tower-http's gzip/zstd CompressionLayer,
+        // reproducing upstream's blosc2 > lz4 > zstd > gzip negotiation order
+        // (tiled/media_type_registration.py registration order, reversed).
+        .layer(axum::middleware::from_fn(
+            crate::server::lz4::lz4_compress_middleware,
+        ))
         .layer(CompressionLayer::new())
         // L2: the default request span records the full URI, including the
         // query string — so a credential passed as `?api_key=...` (a supported
