@@ -1371,3 +1371,218 @@ async fn ragged_patch_persist_false_still_streams() {
     assert_eq!(ev["block"], Value::Null);
     assert_eq!(ev["payload"], json!([[7.5]]));
 }
+
+// ---------------------------------------------------------------------------
+// PR5: array-ref slice-URI streaming events (Wave-24).
+//
+// Registering/rewriting a data source via PUT /data_source on an ARRAY node
+// publishes a metadata-only `array-ref` event on that node's own stream. At WS
+// send time the deliverable `?slice=` URI is derived from the event's
+// patch/shape: with a patch each axis is `offset:offset+shape`, otherwise each
+// full dimension is `:dim`. Non-array families emit nothing.
+// ---------------------------------------------------------------------------
+
+/// GET the node's metadata (with data sources) and return its single data
+/// source id — the target of a PUT /data_source rewrite.
+async fn data_source_id(client: &reqwest::Client, base: &str, key: &str) -> i64 {
+    let meta: Value = client
+        .get(format!(
+            "{base}/api/v1/metadata/{key}?include_data_sources=true"
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    meta["data"]["attributes"]["data_sources"][0]["id"]
+        .as_i64()
+        .unwrap_or_else(|| panic!("no data_source id in metadata: {meta}"))
+}
+
+/// A 2-D float64 array structure as the PUT /data_source rewrite carries it.
+fn f64_2d_structure() -> Value {
+    json!({
+        "shape": [4, 3],
+        "data_type": {"endianness": "little", "kind": "f", "itemsize": 8},
+        "chunks": [[4], [3]],
+    })
+}
+
+/// A `PUT /data_source` rewrite (no patch) on an array node streams an
+/// `array-ref`: patch null, the request's shape, a metadata-only frame (no
+/// payload), and a delivered `?slice=` URI of the full array (`:dim` per axis).
+#[tokio::test]
+async fn put_data_source_array_no_patch_streams_array_ref() {
+    let (base, client, _wdir, _dbdir) = spawn_write_server().await;
+    create_managed_array(
+        &client,
+        &base,
+        "arr",
+        "application/x-npy",
+        f64_array_structure(4, vec![4]),
+    )
+    .await;
+    let ds_id = data_source_id(&client, &base, "arr").await;
+
+    let url = ws_url(&base, "arr");
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    assert_eq!(
+        next_text_json(&mut ws).await.expect("schema")["type"],
+        "array-schema"
+    );
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let resp = client
+        .put(format!("{base}/api/v1/data_source/arr"))
+        .json(&json!({
+            "data_source": {"id": ds_id, "structure": f64_2d_structure(), "parameters": {}}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "put_data_source: {}",
+        resp.status()
+    );
+
+    let ev = next_text_json(&mut ws).await.expect("array-ref");
+    assert_eq!(ev["type"], "array-ref");
+    assert_eq!(ev["patch"], Value::Null);
+    assert_eq!(ev["shape"], json!([4, 3]));
+    // No patch -> each full dimension as `:dim`.
+    assert_eq!(
+        ev["uri"],
+        Value::from(format!("{base}/api/v1/array/full/arr?slice=:4,:3"))
+    );
+    // `array-ref` is metadata-only.
+    assert!(
+        ev.get("payload").is_none(),
+        "array-ref must carry no payload, got {:?}",
+        ev.get("payload")
+    );
+    // The event echoes the request's data-source object.
+    assert_eq!(ev["data_source"]["id"], json!(ds_id));
+}
+
+/// A `PUT /data_source` rewrite WITH `patch_shape`+`patch_offset` streams an
+/// `array-ref` whose patch is `{shape, offset}` and whose delivered slice is the
+/// per-axis `offset:offset+shape` window.
+#[tokio::test]
+async fn put_data_source_array_with_patch_streams_slice() {
+    let (base, client, _wdir, _dbdir) = spawn_write_server().await;
+    create_managed_array(
+        &client,
+        &base,
+        "arr",
+        "application/x-npy",
+        f64_array_structure(4, vec![4]),
+    )
+    .await;
+    let ds_id = data_source_id(&client, &base, "arr").await;
+
+    let url = ws_url(&base, "arr");
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    assert_eq!(
+        next_text_json(&mut ws).await.expect("schema")["type"],
+        "array-schema"
+    );
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let resp = client
+        .put(format!(
+            "{base}/api/v1/data_source/arr?patch_shape=2,3&patch_offset=1,0"
+        ))
+        .json(&json!({
+            "data_source": {"id": ds_id, "structure": f64_2d_structure(), "parameters": {}}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "put_data_source: {}",
+        resp.status()
+    );
+
+    let ev = next_text_json(&mut ws).await.expect("array-ref");
+    assert_eq!(ev["type"], "array-ref");
+    assert_eq!(ev["patch"], json!({"shape": [2, 3], "offset": [1, 0]}));
+    assert_eq!(ev["shape"], json!([4, 3]));
+    // With a patch -> per-axis `offset:offset+shape` => `1:3,0:3`.
+    assert_eq!(
+        ev["uri"],
+        Value::from(format!("{base}/api/v1/array/full/arr?slice=1:3,0:3"))
+    );
+    assert!(ev.get("payload").is_none());
+}
+
+/// Exactly one of `patch_shape`/`patch_offset` is a 400 — they go together.
+#[tokio::test]
+async fn put_data_source_one_sided_patch_returns_400() {
+    let (base, client, _wdir, _dbdir) = spawn_write_server().await;
+    create_managed_array(
+        &client,
+        &base,
+        "arr",
+        "application/x-npy",
+        f64_array_structure(4, vec![4]),
+    )
+    .await;
+    let ds_id = data_source_id(&client, &base, "arr").await;
+
+    let resp = client
+        .put(format!("{base}/api/v1/data_source/arr?patch_shape=2"))
+        .json(&json!({
+            "data_source": {"id": ds_id, "structure": f64_2d_structure(), "parameters": {}}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "a one-sided patch must be 400"
+    );
+}
+
+/// A `PUT /data_source` on a NON-array node (table) emits no `array-ref`.
+#[tokio::test]
+async fn put_data_source_non_array_streams_nothing() {
+    let (base, client, _wdir, _dbdir) = spawn_write_server().await;
+    create_managed_table(&client, &base, "t").await;
+    let ds_id = data_source_id(&client, &base, "t").await;
+
+    let url = ws_url(&base, "t");
+    let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    assert_eq!(
+        next_text_json(&mut ws).await.expect("schema")["type"],
+        "table-schema"
+    );
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let resp = client
+        .put(format!("{base}/api/v1/data_source/t"))
+        .json(&json!({
+            "data_source": {
+                "id": ds_id,
+                "structure": {"arrow_schema": "", "npartitions": 1, "columns": ["x", "y"]},
+                "parameters": {},
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "put_data_source table: {}",
+        resp.status()
+    );
+
+    // A non-array family must not stream an `array-ref` (nothing arrives).
+    assert!(
+        next_text_json(&mut ws).await.is_none(),
+        "non-array put_data_source must not stream an event"
+    );
+}
