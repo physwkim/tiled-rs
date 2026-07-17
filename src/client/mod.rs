@@ -38,6 +38,7 @@ pub mod profiles;
 pub mod queries;
 pub mod ragged;
 pub mod register;
+pub mod smoke;
 pub mod sparse;
 pub mod stream;
 pub mod sync;
@@ -74,6 +75,7 @@ pub use register::{
     RegistrationAdapter, Settings as RegisterSettings, WatchHandle, default_filter,
     default_mimetypes, list_files, register, resolve_mimetype, strip_suffixes, watch,
 };
+pub use smoke::{FaultyLeaf, read as smoke_read};
 pub use sparse::{SparseBlock, SparseClient};
 pub use stream::{
     ArrayData, ArrayPatch, ArrayRef, ChildCreated, ChildMetadataUpdated, Schema, Subscription,
