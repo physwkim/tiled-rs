@@ -1783,11 +1783,8 @@ pub async fn array_patch(
         .map_err(ServerError::from)?;
     let persisted = persist_array_patch(&state, &segments, &new_shape, &new_chunks).await?;
 
-    let path = segments.join("/");
-    state.streaming_bus.publish(
-        &path,
-        crate::server::streaming::UpdateKind::DataAppended { partition: None },
-    );
+    // Data-appended streaming events (with payloads) are re-added in PR3–PR5 on
+    // the per-node streaming cache; the transient gap is accepted (Wave-24 PR2b).
     Ok(Json(persisted))
 }
 
@@ -1882,11 +1879,6 @@ pub async fn array_full_put(
         ensure_sparse_data_dtype(sparse.structure(), &data)?;
         writable.write(data).await.map_err(ServerError::from)?;
 
-        let path = segments.join("/");
-        state.streaming_bus.publish(
-            &path,
-            crate::server::streaming::UpdateKind::DataAppended { partition: None },
-        );
         return Ok(Json(serde_json::json!({ "ok": true })));
     }
 
@@ -1926,12 +1918,6 @@ pub async fn array_full_put(
     let payload = crate::core::dtype::DynNDArray::new(body, dtype, shape);
     writable.write(payload).await.map_err(ServerError::from)?;
 
-    let path = segments.join("/");
-    // Signal subscribers that the node's data changed (closest existing event).
-    state.streaming_bus.publish(
-        &path,
-        crate::server::streaming::UpdateKind::DataAppended { partition: None },
-    );
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -2016,11 +2002,6 @@ pub async fn array_block_put(
             .await
             .map_err(ServerError::from)?;
 
-        let path = segments.join("/");
-        state.streaming_bus.publish(
-            &path,
-            crate::server::streaming::UpdateKind::DataAppended { partition: None },
-        );
         return Ok(Json(serde_json::json!({ "ok": true })));
     }
 
@@ -2079,11 +2060,6 @@ pub async fn array_block_put(
         .await
         .map_err(ServerError::from)?;
 
-    let path = segments.join("/");
-    state.streaming_bus.publish(
-        &path,
-        crate::server::streaming::UpdateKind::DataAppended { partition: None },
-    );
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -3878,16 +3854,6 @@ async fn resolve_writable_ragged(
     Ok(ragged)
 }
 
-/// Signal subscribers that a ragged node's data changed (closest existing
-/// event), mirroring the array write routes' streaming notification.
-fn publish_ragged_change(state: &AppState, segments: &[String], partition: Option<usize>) {
-    let path = segments.join("/");
-    state.streaming_bus.publish(
-        &path,
-        crate::server::streaming::UpdateKind::DataAppended { partition },
-    );
-}
-
 /// Persist a ragged `patch`'s grown structure to the catalog and return the
 /// structure to send back. Faithful to Python `CatalogRaggedAdapter.patch`
 /// (catalog/adapter.py:1736-1777): only `shape` and `chunks` are written back,
@@ -3967,7 +3933,6 @@ pub async fn ragged_full_put(
     if persist {
         let data = deserialize_ragged_body(&content_type_of(&headers), &body)?;
         writable.write(&data).await.map_err(ServerError::from)?;
-        publish_ragged_change(&state, &segments, None);
     }
     Ok(Json(serde_json::json!({ "ok": true })))
 }
@@ -4014,7 +3979,6 @@ pub async fn ragged_block_put(
             .write_block(&data, chunk_index)
             .await
             .map_err(ServerError::from)?;
-        publish_ragged_change(&state, &segments, Some(chunk_index));
     }
     Ok(Json(serde_json::json!({ "ok": true })))
 }
@@ -4082,7 +4046,6 @@ pub async fn ragged_full_patch(
         .await
         .map_err(ServerError::from)?;
     let persisted = persist_ragged_patch(&state, &segments, &new_structure).await?;
-    publish_ragged_change(&state, &segments, None);
     Ok(Json(persisted))
 }
 
@@ -4301,11 +4264,6 @@ pub async fn put_awkward_full(
 
     writable.write(buffers).await.map_err(ServerError::from)?;
 
-    let path = segments.join("/");
-    state.streaming_bus.publish(
-        &path,
-        crate::server::streaming::UpdateKind::DataAppended { partition: None },
-    );
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -4873,12 +4831,6 @@ pub async fn table_full_put(
 
     writable.write(table).await.map_err(ServerError::from)?;
 
-    let path = segments.join("/");
-    // Signal subscribers that the node's data changed (closest existing event).
-    state.streaming_bus.publish(
-        &path,
-        crate::server::streaming::UpdateKind::DataAppended { partition: None },
-    );
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -4974,13 +4926,6 @@ pub async fn table_partition_put(
         .await
         .map_err(ServerError::from)?;
 
-    let path = segments.join("/");
-    state.streaming_bus.publish(
-        &path,
-        crate::server::streaming::UpdateKind::DataAppended {
-            partition: Some(partition),
-        },
-    );
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -5037,13 +4982,6 @@ pub async fn table_partition_patch(
         .await
         .map_err(ServerError::from)?;
 
-    let path = segments.join("/");
-    state.streaming_bus.publish(
-        &path,
-        crate::server::streaming::UpdateKind::DataAppended {
-            partition: Some(partition),
-        },
-    );
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -5216,30 +5154,44 @@ pub async fn post_metadata(
 }
 
 /// Hand a tree event to the webhook dispatcher when webhooks are enabled.
-/// Called alongside `streaming_bus.publish` at each catalog write site — the
+/// Called alongside the streaming-cache publish at each catalog write site — the
 /// upstream shape where the write site independently notifies WS subscribers
-/// and dispatches webhooks (`tiled/catalog/adapter.py:877/1360/1370`).
-/// `event_type` is the wire event name and must agree with `kind`'s serialized
-/// `"type"` tag. Webhook matching is purely `path`-based (preserving the
-/// streaming-bus era's semantics exactly); `node_id` is carried for delivery
-/// correlation only, not used to widen matching.
+/// (via the streaming cache) and dispatches webhooks
+/// (`tiled/catalog/adapter.py:877/1360`). `event_type` is the wire event name;
+/// `data` is the webhook-specific event body (its own `"type"` tag agrees with
+/// `event_type`) — kept identical to the pre-PR2b payload so webhook delivery
+/// semantics are unchanged. Webhook matching is purely `path`-based; `node_id`
+/// is carried for delivery correlation only, not used to widen matching.
 async fn dispatch_webhook_event(
     state: &AppState,
     event_type: &'static str,
     node_id: i64,
     path: &str,
-    kind: &crate::server::streaming::UpdateKind,
+    data: serde_json::Value,
 ) {
     if let Some(dispatcher) = &state.webhook_dispatcher {
         dispatcher
-            .dispatch(
-                event_type,
-                node_id,
-                path.to_string(),
-                serde_json::to_value(kind).unwrap_or_default(),
-            )
+            .dispatch(event_type, node_id, path.to_string(), data)
             .await;
     }
+}
+
+/// Build the `metadata-updated` webhook body, byte-identical to the pre-PR2b
+/// `UpdateKind::MetadataUpdated` serialization: `{type, metadata, specs}` with
+/// `specs` omitted when it is JSON null (upstream tiled PR #1176 publishes
+/// `specs` alongside `metadata`). Shared by PATCH and PUT metadata.
+fn metadata_updated_webhook_data(
+    metadata: &serde_json::Value,
+    specs: &serde_json::Value,
+) -> serde_json::Value {
+    let mut data = serde_json::json!({
+        "type": "metadata-updated",
+        "metadata": metadata.clone(),
+    });
+    if !specs.is_null() {
+        data["specs"] = specs.clone();
+    }
+    data
 }
 
 /// Shared node-creation core for `POST /register/{path}` and
@@ -5425,18 +5377,45 @@ async fn create_node_core(
         } else {
             format!("{path}/{}", node.key)
         };
-        // Notify subscribers — both the parent (so a watcher of the
-        // container hears about the new child) and the new node itself
-        // (so any "watch this path" subscriber that connected first sees
-        // the create event).
-        let child_event = crate::server::streaming::UpdateKind::ChildCreated {
-            key: node.key.clone(),
-            structure_family: structure_family.clone(),
-        };
-        state.streaming_bus.publish(&path, child_event.clone());
-        // Webhooks fire on the *parent* path (matching the parent + ancestors),
-        // preserving the pre-PR2a bus-fanned behavior.
-        dispatch_webhook_event(&state, "child-created", node.id, &path, &child_event).await;
+        // Publish a `container-child-created` event on the *parent* node's
+        // stream so a subscriber watching the container learns of the new child
+        // (upstream `adapter.py:858-873`), enriched with the child's specs /
+        // metadata / data_sources / access_blob. The cache is node_id-keyed —
+        // there is no ancestor fan-out (D4), and a root-level create (no parent
+        // node id) does not stream, since the root has no subscribable node id.
+        if let Some(parent_id) = parent_id {
+            let seq = state.streaming_cache.incr_seq(parent_id).await;
+            state
+                .streaming_cache
+                .set(
+                    parent_id,
+                    seq,
+                    crate::server::streaming_cache::StreamEvent::child_created(
+                        seq,
+                        &node.key,
+                        &structure_family,
+                        node.specs.clone(),
+                        node.metadata.clone(),
+                        serde_json::to_value(&req.data_sources).unwrap_or_default(),
+                        node.access_blob.clone(),
+                    ),
+                )
+                .await;
+        }
+        // Webhooks fire on the *parent* path (matching the parent + ancestors);
+        // the body is the pre-PR2b `{type, key, structure_family}`, unchanged.
+        dispatch_webhook_event(
+            &state,
+            "child-created",
+            node.id,
+            &path,
+            serde_json::json!({
+                "type": "child-created",
+                "key": node.key.clone(),
+                "structure_family": structure_family.clone(),
+            }),
+        )
+        .await;
         let links =
             crate::core::links::links_for_node(req.structure_family, &base_url, &child_path);
         let resp = crate::core::schemas::PostMetadataResponse {
@@ -6053,17 +6032,41 @@ pub async fn patch_metadata(
         None
     };
 
-    let updated = catalog
+    let (updated, revision_number) = catalog
         .update_metadata(node.id, metadata, specs, new_access_blob, drop_revision)
         .await
         .map_err(map_catalog_err)?;
     let path = segments.join("/");
-    let update_event = crate::server::streaming::UpdateKind::MetadataUpdated {
-        metadata: updated.metadata.clone(),
-        specs: updated.specs.clone(),
-    };
-    state.streaming_bus.publish(&path, update_event.clone());
-    dispatch_webhook_event(&state, "metadata-updated", node.id, &path, &update_event).await;
+    // Publish `container-child-metadata-updated` on the *parent* node's stream
+    // (upstream publishes on `self.node.parent`, adapter.py:1319-1334), keyed by
+    // the child's key, carrying the new specs / metadata and — unless
+    // `drop_revision` — the freshly-created revision number. A node with no
+    // parent (root) has no subscribable parent id, so it does not stream.
+    if let Some(parent_id) = node.parent_id {
+        let seq = state.streaming_cache.incr_seq(parent_id).await;
+        state
+            .streaming_cache
+            .set(
+                parent_id,
+                seq,
+                crate::server::streaming_cache::StreamEvent::child_metadata_updated(
+                    seq,
+                    &updated.key,
+                    updated.specs.clone(),
+                    updated.metadata.clone(),
+                    revision_number,
+                ),
+            )
+            .await;
+    }
+    dispatch_webhook_event(
+        &state,
+        "metadata-updated",
+        node.id,
+        &path,
+        metadata_updated_webhook_data(&updated.metadata, &updated.specs),
+    )
+    .await;
     let family = parse_structure_family(&updated.structure_family)?;
     let links = crate::core::links::links_for_node(family, &base_url, &path);
     Ok(Json(crate::core::schemas::PostMetadataResponse {
@@ -6180,7 +6183,7 @@ pub async fn put_metadata(
         None
     };
 
-    let updated = catalog
+    let (updated, revision_number) = catalog
         .update_metadata(
             node.id,
             metadata,
@@ -6203,12 +6206,36 @@ pub async fn put_metadata(
             .unwrap_or(false);
 
     let path = segments.join("/");
-    let update_event = crate::server::streaming::UpdateKind::MetadataUpdated {
-        metadata: updated.metadata.clone(),
-        specs: updated.specs.clone(),
-    };
-    state.streaming_bus.publish(&path, update_event.clone());
-    dispatch_webhook_event(&state, "metadata-updated", node.id, &path, &update_event).await;
+    // Publish `container-child-metadata-updated` on the *parent* node's stream
+    // (upstream publishes on `self.node.parent`, adapter.py:1319-1334), keyed by
+    // the child's key, with the new specs / metadata and — unless
+    // `drop_revision` — the freshly-created revision number. A root node has no
+    // subscribable parent id, so it does not stream.
+    if let Some(parent_id) = node.parent_id {
+        let seq = state.streaming_cache.incr_seq(parent_id).await;
+        state
+            .streaming_cache
+            .set(
+                parent_id,
+                seq,
+                crate::server::streaming_cache::StreamEvent::child_metadata_updated(
+                    seq,
+                    &updated.key,
+                    updated.specs.clone(),
+                    updated.metadata.clone(),
+                    revision_number,
+                ),
+            )
+            .await;
+    }
+    dispatch_webhook_event(
+        &state,
+        "metadata-updated",
+        node.id,
+        &path,
+        metadata_updated_webhook_data(&updated.metadata, &updated.specs),
+    )
+    .await;
 
     // Response mirrors Python `json_or_msgpack(response_data)`: `{id}` plus
     // `access_blob` only when modified.
@@ -6677,14 +6704,6 @@ pub async fn put_data_source(
         .update_data_source(id, structure, parameters)
         .await
         .map_err(map_catalog_err)?;
-    // Notify subscribers — a new partition / chunk likely became
-    // available. tiled#1339 made the Python server emit DataAppended on
-    // the same path for the same reason.
-    let path = segments.join("/");
-    state.streaming_bus.publish(
-        &path,
-        crate::server::streaming::UpdateKind::DataAppended { partition: None },
-    );
     Ok(Json(serde_json::json!({"data_source": {
         "id": updated.id,
         "structure_family": updated.structure_family,
@@ -6777,9 +6796,27 @@ pub async fn delete_metadata(
         .await
         .map_err(map_catalog_err)?;
     let path = segments.join("/");
-    let delete_event = crate::server::streaming::UpdateKind::NodeDeleted;
-    state.streaming_bus.publish(&path, delete_event.clone());
-    dispatch_webhook_event(&state, "node-deleted", node.id, &path, &delete_event).await;
+    // Publish `node-deleted` on the deleted node's own stream (tiled-rs
+    // extension, D9 — upstream's `delete()` emits no streaming event). A live
+    // subscriber on this node learns it is gone; the event is then followed by
+    // the stream closing when the node id is dropped.
+    let seq = state.streaming_cache.incr_seq(node.id).await;
+    state
+        .streaming_cache
+        .set(
+            node.id,
+            seq,
+            crate::server::streaming_cache::StreamEvent::node_deleted(seq),
+        )
+        .await;
+    dispatch_webhook_event(
+        &state,
+        "node-deleted",
+        node.id,
+        &path,
+        serde_json::json!({ "type": "node-deleted" }),
+    )
+    .await;
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 

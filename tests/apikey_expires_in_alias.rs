@@ -85,7 +85,6 @@ async fn build_app() -> (axum::Router, String) {
         forwarded_allow_ips: None,
         max_request_body_bytes: 10 * 1024 * 1024,
         response_bytesize_limit: 300_000_000,
-        streaming_bus: tiled_rs::server::streaming::StreamingBus::new(),
         streaming_cache: tiled_rs::server::streaming_cache::disabled(),
         access_policy: None,
         default_login_scopes: ScopeSet::full(),

@@ -43,7 +43,10 @@ pub struct WebState {
     pub default_login_scopes: ScopeSet,
     /// Provider name shown on the login form (e.g. "dummy", "entra").
     pub login_provider: String,
-    /// Closure that reports the current StreamingBus channel count.
+    /// Closure that reports the current live streaming channel count. The
+    /// notification bus that once backed this metric was retired in Wave-24
+    /// PR2b; the per-node streaming cache keeps no global channel count, so
+    /// the host wires a closure that reports 0 until a metric is re-added.
     pub channel_count_fn: Arc<dyn Fn() -> usize + Send + Sync>,
     /// Whether this server may honor a fronting proxy's `X-Forwarded-Proto`
     /// header to decide the session cookie's `Secure` flag. Set by the host

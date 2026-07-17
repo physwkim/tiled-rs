@@ -868,7 +868,6 @@ pub async fn run(command: Command) -> Result<()> {
                     .as_ref()
                     .map(|c| c.response_bytesize_limit)
                     .unwrap_or_else(config::default_response_bytesize_limit),
-                streaming_bus: crate::server::streaming::StreamingBus::new(),
                 streaming_cache: build_streaming_cache(
                     file_config.as_ref().and_then(|c| c.streaming.as_ref()),
                 ),

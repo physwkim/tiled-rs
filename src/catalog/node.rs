@@ -866,6 +866,11 @@ impl Catalog {
     /// atomically with the metadata update — matching Python's combined
     /// `replace_metadata(... access_blob=...)`. When `None`, the stored blob
     /// is left unchanged.
+    ///
+    /// Returns the updated node plus the newly-created revision number, or
+    /// `None` for that number when `drop_revision` skipped the revision. The
+    /// number feeds the `container-child-metadata-updated` streaming event
+    /// (upstream includes it unless `drop_revision`, `adapter.py:1333`).
     pub async fn update_metadata(
         &self,
         node_id: i64,
@@ -873,10 +878,11 @@ impl Catalog {
         specs: Value,
         new_access_blob: Option<Value>,
         drop_revision: bool,
-    ) -> Result<Node> {
+    ) -> Result<(Node, Option<i64>)> {
         validate_payload(&metadata, &specs)?;
         match self.pool() {
             DbPool::Sqlite(pool) => {
+                let mut revision_number: Option<i64> = None;
                 if !drop_revision {
                     let prev: (String, String, String) = sqlx::query_as(
                         "SELECT metadata, specs, access_blob FROM nodes WHERE id = ?",
@@ -902,6 +908,7 @@ impl Catalog {
                     .bind(prev.2)
                     .execute(pool)
                     .await?;
+                    revision_number = Some(next_revision);
                 }
                 let row = if let Some(blob) = new_access_blob {
                     sqlx::query(
@@ -933,9 +940,10 @@ impl Catalog {
                     .fetch_one(pool)
                     .await?
                 };
-                node_from_sqlite_row(&row)
+                Ok((node_from_sqlite_row(&row)?, revision_number))
             }
             DbPool::Postgres(pool) => {
+                let mut revision_number: Option<i64> = None;
                 if !drop_revision {
                     let row = sqlx::query(
                         "SELECT metadata::text AS metadata, specs::text AS specs,
@@ -966,6 +974,7 @@ impl Catalog {
                     .bind(prev_access)
                     .execute(pool)
                     .await?;
+                    revision_number = Some(next_revision);
                 }
                 let row = if let Some(blob) = new_access_blob {
                     sqlx::query(
@@ -996,7 +1005,7 @@ impl Catalog {
                     .fetch_one(pool)
                     .await?
                 };
-                node_from_postgres_row(&row)
+                Ok((node_from_postgres_row(&row)?, revision_number))
             }
         }
     }
