@@ -5986,13 +5986,25 @@ pub async fn patch_metadata(
         }
     }
 
-    // access_blob patch: extract any proposed access_blob from the request
-    // body and run it through policy.modify_node. Mirrors Python
-    // router.py:2401-2404: modify_node is called when the policy exposes it;
-    // if no policy is wired (or the policy's default impl keeps the current
-    // blob), the stored access_blob is unchanged. Errors from the policy map
-    // to 422 (matching Python's ValueError path).
-    let proposed_access_blob = req.get("access_blob").filter(|v| !v.is_null()).cloned();
+    // access_blob patch: apply the SAME json-patch / merge-patch step to the
+    // stored access_blob that `metadata` and `specs` already get above (see the
+    // `match mode` block), then hand the RESULT — not the raw patch document —
+    // to policy.modify_node. Mirrors Python router.py:2351 (json-patch) /
+    // :2364-2367 (merge-patch), with the policy call at :2397. A null/absent
+    // access_blob field means "no change": no patched blob is produced and
+    // modify_node is not consulted, so the stored blob is preserved. Errors
+    // from the policy map to 422 (matching Python's ValueError path).
+    let proposed_access_blob = match req.get("access_blob").filter(|v| !v.is_null()) {
+        None => None,
+        Some(patch_doc) => Some(match mode {
+            PatchMode::JsonPatch => apply_json_patch_field(&node.access_blob, Some(patch_doc))?,
+            PatchMode::MergePatch => {
+                let mut blob = node.access_blob.clone();
+                merge_patch_apply(&mut blob, patch_doc);
+                blob
+            }
+        }),
+    };
     let new_access_blob = if let (Some(policy), Some(principal), Some(proposed)) = (
         state.access_policy.as_deref(),
         auth.principal.as_deref(),
