@@ -320,6 +320,150 @@ Intentional divergences / parity notes (recorded explicitly):
     upstream `event.model_dump()`, and `path` is a joined string vs upstream's
     `list[str]`.
 
+## Wave-25: spec-conformance + config-wiring landings
+
+A heterogeneous batch of six PRs (`07a6acc`..`ba4d2bf` on main) — unlike
+wave-24 these do not form one feature. They close spec-conformance gaps (the
+`X`-series: singular apikey routes, API-key access-tag restriction), a
+data-loss bug (multi-sheet Excel), a wave-24 streaming follow-up (plain-array
+`persist`), two missing client methods, and a config-wiring gap (SAML). Each
+is recorded below with its commit(s) and upstream reference.
+
+Landed work:
+
+* **Singular `/auth/apikey` = POST+GET+DELETE, and API-key `access_tags`
+  accepted + guarded at creation** (`13c0e3c` + `8f7114d`, PR #81, fixes
+  `X1`/`X4`). The About document advertises `links.apikey` at
+  `.../auth/apikey`, and python-tiled hits that singular path for create,
+  info, and revoke; tiled-rs registered only `GET` there (create lived at the
+  plural `/apikeys`, revoke at `/apikeys/{first_eight}`), so a spec-conformant
+  client got 405 on create and revoke. `13c0e3c` mounts the singular route
+  with all three verbs — `POST` (reuses `api_key_create`), `GET`
+  (`current_apikey_info`), `DELETE` (`current_apikey_revoke`, `first_eight`
+  as the `?first_eight=` query param, own-key only: 404 on a key the caller
+  does not own, no admin bypass) — mirroring upstream `new_apikey` /
+  `current_apikey_info` / `revoke_apikey` (`authentication.py:1554`/`:1584`/
+  `:1621`); the plural routes stay for backward compatibility. `8f7114d` then
+  adds the write side of tag restriction: `ApiKeyCreateRequest`/`ApiKeyCreate`
+  gain `access_tags: Option<Vec<String>>` (upstream
+  `APIKeyRequestParams.access_tags`), the user route threads it, and the INSERT
+  persists it (sqlite + postgres) — previously the read side existed but
+  nothing ever wrote the column. It ports upstream's `scopes_no_tag_restrict`
+  guard (`authentication.py:1188-1198`): a key whose scopes contain `inherit`
+  or `admin:apikeys` may not be tag-restricted (403), enforced in
+  `create_api_key` (the sole INSERT owner) so every create path is bound by
+  construction; a supplied `access_tags` (`Some`, including an empty list)
+  triggers the check, matching upstream's `is not None`. The admin-principal,
+  SPA, and CLI create paths pass `None`.
+* **Client `close_stream()` + `export()` on awkward/sparse/ragged**
+  (`07a6acc` + `163f6dd`, PR #82). `07a6acc`: `BaseClient::close_stream`
+  gives a producer a client-side way to end a node's stream — the
+  `DELETE /api/v1/stream/close/{path}` route existed server-side with no
+  caller. It rewrites the node's self `/metadata` link to `/stream/close`
+  (first occurrence, like revisions) and issues the `DELETE` with retry,
+  mirroring upstream `client/base.py:940`; the server ends the stream (live
+  subscribers close with 1000 "Producer ended stream") and fires the
+  stream-closed webhook. `163f6dd`: `export(path, format)` — present only on
+  the array/dataframe/container clients — is added to the awkward, sparse, and
+  ragged clients, which upstream exposes on all (`client/awkward.py:81`,
+  `sparse.py:146`, `ragged.py:222`); it reuses `resolve_export_format` and the
+  existing export shape (resolve the format, `GET` the node's full link with
+  `?format=`, stream the bytes to the file), with no slice filter (matching
+  the existing Rust array/container export).
+* **Multi-sheet Excel served as a container of per-sheet tables**
+  (`283cdcb`, PR #83, fixes `X3` data loss). The Excel adapter read only
+  `sheet_names().next()` and served that one worksheet as a lone `table`,
+  silently dropping every other sheet — a multi-sheet `.xlsx` lost all data
+  past sheet 0, and the node's family diverged from upstream (`container` vs
+  `table`). Upstream `ExcelAdapter(MapAdapter[TableAdapter])`
+  (`adapters/excel.py:14`/`:52-57`) maps a workbook **unconditionally** onto a
+  container — no single-vs-multi special case; a one-sheet workbook is a
+  one-child container, never a bare table. `ExcelAdapter::from_path` now
+  returns a `MapAdapter` container of per-sheet `ExcelSheetAdapter` tables
+  keyed by sheet name in workbook order, and the file resolver wires the
+  workbook as `AnyAdapter::Container`; node metadata lands on the container
+  (upstream passes `metadata=node`), per-sheet tables carry none (upstream
+  builds each as a bare `DataFrameAdapter`), and the `xlsx` spec now identifies
+  the container node. **Behavior change**: reading an `.xlsx` node directly as
+  a table (`/table/full/<excel>`) no longer returns sheet 0 — read a sheet at
+  `/table/full/<excel>/<sheet>`. **Known limitation (stands)**: full
+  catalog-serving parity for the Excel node itself — reporting
+  `structure_family=container` on its own `/metadata` and descending sheets
+  when the node is DB-stored as `container` (e.g. a Python-written shared
+  catalog) — needs a *data-source-backed container* concept the catalog
+  adapter does not have (adapter-synthesized children are reachable only
+  through the hardcoded table-column gate); that is a separate structural
+  change, not attempted here.
+* **`api_keys.access_tags` made NULLABLE + transactional migration runner**
+  (`c8e12fd`, PR #84). Migration `0010` (sqlite + postgres) makes the column
+  nullable so one stored value carries one meaning, matching upstream's
+  nullable `JSONList` (`orm.py:192`) read by `get_access_tags_from_api_key`
+  (`authentication.py:261-263`): `NULL → None →` no restriction (the
+  principal's full tag set applies); `'[]' → Some([]) →` deny **all** tagged
+  access; `'[a,b]' → Some([..]) →` narrow to the intersection. Previously the
+  column was `NOT NULL DEFAULT '[]'` and both the write (`unwrap_or(&[])`) and
+  read (`is_empty() → None`) sides collapsed `None` and `Some([])` onto the
+  same `'[]'`, so a caller who sent `access_tags: []` intending deny-all
+  silently received an **unrestricted** key. The fix removes the dual meaning
+  end to end (write: `None → SQL NULL`, `Some(v) →` JSON array including
+  `Some([]) → '[]'`; read: `ApiKeyRecord.access_tags: Option<Vec<String>>`
+  surfacing `NULL → None` / `'[]' → Some(empty)`; `TagBasedPolicy::narrow_by_key`
+  already drops every tag on an empty `Some`). SQLite cannot drop `NOT NULL`
+  in place, so `0010` rebuilds the table (nothing `REFERENCES api_keys`);
+  existing `'[]'` rows — written under the old collapse, intent ambiguous —
+  migrate to `NULL` to avoid retroactively locking out live keys, while
+  non-empty arrays are kept verbatim. The change also makes the **auth
+  migration runner** apply each migration's statements on a single connection
+  inside one transaction: the prior per-statement `.execute(pool)` re-acquired
+  a connection each time, so the `0010` rebuild's `DROP` was not visible to the
+  `RENAME` on a file-backed WAL DB ("table already exists") — one connection
+  also makes each migration atomic.
+* **`persist` flag on plain array `write` / `write_block`** (`eab7104`,
+  PR #85). Threads a `persist` flag (default true) through the plain-array
+  write path so a producer can stream a write to live subscribers without
+  committing it to storage — wave-24 already supported this on the ragged
+  client and the array-`PATCH` path but not on plain array `write`/
+  `write_block`. Client: `ArrayClient::write`/`write_block` take `persist:
+  bool` and append `persist=false` only for the non-default, mirroring
+  `client/array.py:299-339`. Server: `array_full_put`/`array_block_put` read
+  `persist` (default true) and stream the payload **before** the persist gate
+  — upstream `write`/`write_block` call `_stream` ahead of `if not persist:
+  return` (`catalog/adapter.py:1665-1699`) — then skip the deserialize +
+  storage write when `persist=false`. The gate is applied uniformly to both
+  the sparse and dense branches of each handler, matching `put_array_full`/
+  `put_array_block` threading one `persist` over `{array, sparse}`
+  (`router.py:2018-2099`), so a stream-only write on either family reaches
+  subscribers without a dual-meaning commit.
+* **`SAMLAuthenticator` wired from YAML config** (`ba4d2bf`, PR #86). The
+  SAML implementation and routes were already complete, but
+  `AppState.saml_providers` was hardcoded empty and SAML config entries fell
+  through to the "not modeled; skipping" warning, leaving the authenticator
+  unreachable. The CLI now parses the `saml_settings` block (python3-saml
+  shape, matching upstream `example_configs/saml.yml` and
+  `SAMLAuthenticator.__init__`, `authenticators.py:549`) into
+  `SamlProviderArgs`, maps it to `auth::SamlConfig`, and builds one
+  `auth::SamlProvider` per SAML-family entry via a new
+  `AuthConfig::build_saml_providers` (mirroring the OIDC-from-config path),
+  populating `AppState.saml_providers` with fail-fast on a bad block;
+  `is_saml_authenticator` routes SAML entries away from the "not modeled"
+  warning and, when the `saml` feature is off, warns "requires the 'saml'
+  build feature" (like the LDAP/PAM skip). The parse layer (`SamlProviderArgs`,
+  `is_saml_authenticator`) is feature-independent and unit-tested in the
+  default build; the provider-construction path is gated on `saml`.
+  **Caveat (owed):** the `saml` cargo feature is **not** built by CI and
+  cannot compile in this environment (libxml2 / xmlsec1 / libssl absent), so
+  the feature-gated construction path is verified **by reading only** — a
+  saml-enabled build remains owed.
+
+Open / in flight — wave-25 roadmap (not yet landed, tracked as `P`-items):
+
+* **In progress:** `P10` (`root_path` config), `P12` (dictionary authenticator
+  from config), `P13` (`database:` / `webhooks:` YAML config blocks).
+* **In flight this round:** `P7` (`allow_anonymous_access`), `P15` (client
+  `update_metadata` diff-builder).
+* **Blocked on user sign-off:** `P6` (bytes structure family), `P8` (xarray
+  spec-dispatch), `P14` (`/metrics` endpoint).
+
 ## N/A (Python-specific or feature not in our port)
 
 A non-exhaustive sample of PRs that don't apply because the corresponding
