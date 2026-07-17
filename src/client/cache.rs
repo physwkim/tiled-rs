@@ -1,8 +1,8 @@
 //! HTTP response cache with `Cache-Control` and `ETag`/`Last-Modified` validators.
 //!
 //! Mirrors `tiled/client/cache.py` (`Cache`) and `tiled/client/cache_control.py`
-//! (`CacheControl`, validators, `apply_request_for_cache`,
-//! `apply_response_for_cache`, `make_request_conditional`).
+//! (`CacheControl`, `is_response_fresh`, `is_response_cacheable`,
+//! `parse_cache_control_headers`, `parse_headers_date`).
 //!
 //! ## Storage
 //!
@@ -13,28 +13,34 @@
 //!   Use [`HttpCache::sqlite_with_load`] to also bootstrap the in-memory index
 //!   from the existing database file.
 //!
-//! ## Cache-Control honored fields (request)
+//! ## Request handling
 //!
-//! - `no-cache`: skip cache, force revalidation.
-//! - `no-store`: don't read or write cache.
-//! - `max-age=N`, `min-fresh=N`, `max-stale[=N]`: freshness gating.
-//! - `only-if-cached`: return cached or 504.
+//! No request-side `Cache-Control` directive is applied (`no-cache`,
+//! `no-store`, `max-age`, `min-fresh`, `max-stale`, `only-if-cached`). The
+//! only cache behavior on an outgoing request is attaching conditional
+//! validators (`If-None-Match` / `If-Modified-Since`) from a stored entry.
+//! `Cache-Control` is parsed and honored only from **responses** (below).
 //!
 //! ## Response handling
 //!
-//! - `no-store`: do not persist.
-//! - `private`/`public`: respected — we only persist `public` or
-//!   no-directive responses.
-//! - `max-age=N` / `s-maxage=N`: store freshness lifetime.
+//! - `no-store` / `private`: response is not persisted.
+//! - `no-cache`: response is stored but never served without revalidating
+//!   against the origin first.
+//! - `max-age=N` / `s-maxage=N`: freshness lifetime.
 //! - `Expires`: freshness lifetime when no `max-age`/`s-maxage` is present
 //!   (honored only alongside a valid `Date` header).
-//! - `must-revalidate`: store and force revalidate after expiry.
-//! - `Vary`: keys by listed request headers.
+//! - `must-revalidate`: stored; note this cache never serves stale — it
+//!   revalidates every expired entry regardless of the directive.
+//! - `Vary`: an entry advertising a `Vary` beyond `Accept`/`Accept-Encoding`
+//!   is treated as a miss (lookup keys only on `(url, Accept)`).
 //! - `ETag`/`Last-Modified` → `If-None-Match` / `If-Modified-Since` on
-//!   conditional requests.
+//!   conditional revalidation requests.
 //! - Only responses with status in {200, 203, 300, 301, 308} are cached.
 //! - Response bodies larger than `max_item_size` (default 500 KB) are not
 //!   cached.
+//!
+//! `min-fresh`, `max-stale`, and `only-if-cached` are parsed into
+//! [`CacheControl`] but are currently not enforced anywhere.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
