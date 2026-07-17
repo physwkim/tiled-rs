@@ -3236,6 +3236,262 @@ async fn floor_boundary_blosc2_compresses_at_1000_identity_below() {
 }
 
 // ---------------------------------------------------------------------------
+// gzip / zstd content-encoding (Finding 5): these two encodings previously went
+// through tower-http's CompressionLayer, which floored at 32 bytes, had no
+// compression-ratio gate, recorded no `compress` Server-Timing phase, and
+// compressed a broader content-type set than upstream. They now flow through
+// the same `compression::apply_encoding` owner as blosc2/lz4, so the floor,
+// ratio gate, and compress phase apply identically to all four encodings.
+// ---------------------------------------------------------------------------
+
+/// Round-trip: client advertises gzip, server compresses the 1 600-byte array
+/// at gzip level 1 (the bulk-media-type level), the same flate2 gzip decoder
+/// restores the original bytes.
+#[tokio::test]
+async fn gzip_round_trip_decode_with_flate2() {
+    let base = spawn_blosc2_server().await;
+    let resp = reqwest::Client::new()
+        .get(format!("{base}/api/v1/array/block/big?block=0"))
+        .header("Accept", "application/octet-stream")
+        .header("Accept-Encoding", "gzip")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers().get("content-encoding").unwrap(), "gzip");
+    // reqwest is built without the gzip decode feature, so the body arrives
+    // compressed and we decode it ourselves.
+    let compressed = resp.bytes().await.unwrap();
+    let decoded = tiled_rs::server::gzip::decompress(&compressed).expect("gzip decode");
+    assert_eq!(decoded.len(), 200 * 8, "decoded length must match original");
+    let values: Vec<f64> = decoded
+        .chunks_exact(8)
+        .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    let expected: Vec<f64> = (0..200).map(|i| i as f64 * 1.5).collect();
+    assert_eq!(values, expected, "decoded values must equal originals");
+}
+
+/// Round-trip: client advertises zstd, server compresses the 1 600-byte array
+/// into a standard zstd frame, the same zstd decoder restores the original.
+#[tokio::test]
+async fn zstd_round_trip_decode() {
+    let base = spawn_blosc2_server().await;
+    let resp = reqwest::Client::new()
+        .get(format!("{base}/api/v1/array/block/big?block=0"))
+        .header("Accept", "application/octet-stream")
+        .header("Accept-Encoding", "zstd")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers().get("content-encoding").unwrap(), "zstd");
+    let compressed = resp.bytes().await.unwrap();
+    let decoded = tiled_rs::server::zstd::decompress(&compressed).expect("zstd decode");
+    assert_eq!(decoded.len(), 200 * 8, "decoded length must match original");
+    let values: Vec<f64> = decoded
+        .chunks_exact(8)
+        .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    let expected: Vec<f64> = (0..200).map(|i| i as f64 * 1.5).collect();
+    assert_eq!(values, expected, "decoded values must equal originals");
+}
+
+/// gzip now records a `compress` Server-Timing phase (via the shared owner);
+/// tower-http's CompressionLayer recorded none.
+#[tokio::test]
+async fn gzip_emits_compress_server_timing_phase() {
+    let base = spawn_blosc2_server().await;
+    let resp = reqwest::Client::new()
+        .get(format!("{base}/api/v1/array/block/big?block=0"))
+        .header("Accept", "application/octet-stream")
+        .header("Accept-Encoding", "gzip")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.headers().get("content-encoding").unwrap(), "gzip");
+    assert!(
+        has_compress_phase(&resp),
+        "gzip-compressed response must carry a compress phase"
+    );
+}
+
+/// zstd now records a `compress` Server-Timing phase.
+#[tokio::test]
+async fn zstd_emits_compress_server_timing_phase() {
+    let base = spawn_blosc2_server().await;
+    let resp = reqwest::Client::new()
+        .get(format!("{base}/api/v1/array/block/big?block=0"))
+        .header("Accept", "application/octet-stream")
+        .header("Accept-Encoding", "zstd")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.headers().get("content-encoding").unwrap(), "zstd");
+    assert!(
+        has_compress_phase(&resp),
+        "zstd-compressed response must carry a compress phase"
+    );
+}
+
+/// Ratio gate: the incompressible `noise` body (3 200 bytes, high entropy) must
+/// be served identity under gzip — no Content-Encoding, no compress phase.
+/// tower-http had no such gate and would have gzip-wrapped it regardless.
+#[tokio::test]
+async fn gzip_ratio_gate_incompressible_served_identity() {
+    let base = spawn_blosc2_server().await;
+    let resp = reqwest::Client::new()
+        .get(format!("{base}/api/v1/array/block/noise?block=0"))
+        .header("Accept", "application/octet-stream")
+        .header("Accept-Encoding", "gzip")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(
+        resp.headers().get("content-encoding").is_none(),
+        "sub-ratio gzip compression must not set Content-Encoding"
+    );
+    assert!(
+        !has_compress_phase(&resp),
+        "skipped gzip compression must NOT record a compress phase"
+    );
+    assert_eq!(resp.bytes().await.unwrap().len(), 3200, "raw 400×f64 body");
+}
+
+/// Ratio gate: the incompressible `noise` body must be served identity under
+/// zstd — no Content-Encoding, no compress phase.
+#[tokio::test]
+async fn zstd_ratio_gate_incompressible_served_identity() {
+    let base = spawn_blosc2_server().await;
+    let resp = reqwest::Client::new()
+        .get(format!("{base}/api/v1/array/block/noise?block=0"))
+        .header("Accept", "application/octet-stream")
+        .header("Accept-Encoding", "zstd")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(
+        resp.headers().get("content-encoding").is_none(),
+        "sub-ratio zstd compression must not set Content-Encoding"
+    );
+    assert!(
+        !has_compress_phase(&resp),
+        "skipped zstd compression must NOT record a compress phase"
+    );
+    assert_eq!(resp.bytes().await.unwrap().len(), 3200, "raw 400×f64 body");
+}
+
+/// Floor boundary for gzip: a 1000-byte body (`at_floor`) compresses; the
+/// 992-byte body (`below_floor`) is served identity. Under tower-http's 32-byte
+/// floor the 992-byte body would have been gzip-wrapped — this guards the raise.
+#[tokio::test]
+async fn gzip_floor_boundary_compresses_at_1000_identity_below() {
+    let base = spawn_blosc2_server().await;
+
+    let resp = reqwest::Client::new()
+        .get(format!("{base}/api/v1/array/block/at_floor?block=0"))
+        .header("Accept", "application/octet-stream")
+        .header("Accept-Encoding", "gzip")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.headers()
+            .get("content-encoding")
+            .and_then(|v| v.to_str().ok()),
+        Some("gzip"),
+        "1000-byte body (== floor) must be gzip-encoded"
+    );
+
+    let resp = reqwest::Client::new()
+        .get(format!("{base}/api/v1/array/block/below_floor?block=0"))
+        .header("Accept", "application/octet-stream")
+        .header("Accept-Encoding", "gzip")
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.headers().get("content-encoding").is_none(),
+        "992-byte body (< 1000 floor) must NOT be gzip-encoded"
+    );
+    assert_eq!(resp.bytes().await.unwrap().len(), 992, "raw 124×f64 body");
+}
+
+/// Floor boundary for zstd: 1000 bytes compresses, 992 bytes is identity.
+#[tokio::test]
+async fn zstd_floor_boundary_compresses_at_1000_identity_below() {
+    let base = spawn_blosc2_server().await;
+
+    let resp = reqwest::Client::new()
+        .get(format!("{base}/api/v1/array/block/at_floor?block=0"))
+        .header("Accept", "application/octet-stream")
+        .header("Accept-Encoding", "zstd")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.headers()
+            .get("content-encoding")
+            .and_then(|v| v.to_str().ok()),
+        Some("zstd"),
+        "1000-byte body (== floor) must be zstd-encoded"
+    );
+
+    let resp = reqwest::Client::new()
+        .get(format!("{base}/api/v1/array/block/below_floor?block=0"))
+        .header("Accept", "application/octet-stream")
+        .header("Accept-Encoding", "zstd")
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.headers().get("content-encoding").is_none(),
+        "992-byte body (< 1000 floor) must NOT be zstd-encoded"
+    );
+    assert_eq!(resp.bytes().await.unwrap().len(), 992, "raw 124×f64 body");
+}
+
+/// Negotiation priority: zstd is registered after gzip upstream, so it is
+/// preferred. A client accepting both must get zstd (blosc2 > lz4 > zstd > gzip).
+#[tokio::test]
+async fn zstd_negotiation_priority_beats_gzip() {
+    let base = spawn_blosc2_server().await;
+    let resp = reqwest::Client::new()
+        .get(format!("{base}/api/v1/array/block/big?block=0"))
+        .header("Accept", "application/octet-stream")
+        .header("Accept-Encoding", "gzip, zstd")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.headers().get("content-encoding").unwrap(),
+        "zstd",
+        "zstd must win over gzip (registered later → preferred)"
+    );
+}
+
+/// Negotiation priority: blosc2 outranks both zstd and gzip for octet-stream. A
+/// client accepting all three must get blosc2.
+#[tokio::test]
+async fn blosc2_beats_zstd_and_gzip_for_octet_stream() {
+    let base = spawn_blosc2_server().await;
+    let resp = reqwest::Client::new()
+        .get(format!("{base}/api/v1/array/block/big?block=0"))
+        .header("Accept", "application/octet-stream")
+        .header("Accept-Encoding", "gzip, zstd, blosc2")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.headers().get("content-encoding").unwrap(),
+        "blosc2",
+        "blosc2 must outrank zstd and gzip for octet-stream"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Server-level sparse managed create + resolve: create a sparse node over a
 // catalog (exercising default_creation_mimetype(Sparse) +
 // managed_init_storage's sparse arm + init_storage_sparse_parquet), then

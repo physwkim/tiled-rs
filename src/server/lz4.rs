@@ -23,11 +23,10 @@
 //! lz4 is registered after gzip and zstd but before blosc2. So the priority is
 //! `blosc2 > lz4 > zstd > gzip`. This middleware is layered so it runs on the
 //! response **after** the blosc2 middleware (which sets `Content-Encoding` first
-//! for the octet-stream/arrow types it handles) and **before** tower-http's
-//! `CompressionLayer` (gzip/zstd) — reproducing that ordering: lz4 yields to an
-//! already-set blosc2 encoding and preempts gzip/zstd.
+//! for the octet-stream/arrow types it handles) and **before** the zstd and gzip
+//! middlewares — reproducing that ordering: lz4 yields to an already-set blosc2
+//! encoding and preempts zstd/gzip.
 
-use axum::body::Body;
 use axum::extract::Request;
 use axum::http::header;
 use axum::middleware::Next;
@@ -35,12 +34,6 @@ use axum::response::Response;
 
 use crate::core::media_type::mime;
 use crate::server::server_timing::timing_from_request;
-
-/// Minimum response body size (bytes) to trigger lz4 compression.
-/// The running app overrides `CompressionMiddleware`'s 500-byte class default
-/// (`compression.py:11`) with `minimum_size=1000` in `app.add_middleware(...)`
-/// (`tiled/server/app.py:760-764`), so the effective floor is 1000, not 500.
-pub const MINIMUM_SIZE: usize = 1000;
 
 /// Media types for which lz4 is offered. Matches the set registered for lz4 in
 /// Python's `media_type_registration.py:333-342` exactly.
@@ -109,44 +102,9 @@ pub async fn lz4_compress_middleware(request: Request, next: Next) -> Response {
         return response;
     }
 
-    let (mut parts, body) = response.into_parts();
-    let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
-        Ok(b) => b,
-        Err(_) => return Response::from_parts(parts, Body::empty()),
-    };
-
-    if body_bytes.len() < MINIMUM_SIZE {
-        return Response::from_parts(parts, Body::from(body_bytes));
-    }
-
-    let t0 = std::time::Instant::now();
-    let compressed = compress(&body_bytes);
-    let dur = t0.elapsed().as_secs_f64();
-    let n = compressed.len();
-
-    // Only keep the compression if it saves enough to be worth the client's
-    // decompression cost (upstream compression.py:87-93). Otherwise send the
-    // original body identity-encoded, with no Content-Encoding and no compress
-    // Server-Timing phase recorded.
-    if !crate::server::compression::worth_compressing(body_bytes.len(), n) {
-        return Response::from_parts(parts, Body::from(body_bytes));
-    }
-
-    if let Some(timing) = &timing {
-        let ratio = body_bytes.len() as f64 / n as f64;
-        timing.record("compress", &[("dur", dur), ("ratio", ratio)]);
-    }
-
-    parts
-        .headers
-        .insert(header::CONTENT_ENCODING, "lz4".parse().unwrap());
-    parts
-        .headers
-        .insert(header::CONTENT_LENGTH, n.to_string().parse().unwrap());
-    if let Ok(v) = "Accept-Encoding".parse() {
-        parts.headers.append(header::VARY, v);
-    }
-    Response::from_parts(parts, Body::from(compressed))
+    // Floor, ratio gate, compress timing, and header emission all live in the
+    // shared owner. lz4's compress is infallible, so it always yields `Some`.
+    crate::server::compression::apply_encoding(response, timing, "lz4", |b| Some(compress(b))).await
 }
 
 #[cfg(test)]

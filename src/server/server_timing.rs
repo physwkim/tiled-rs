@@ -16,8 +16,9 @@
 //! <https://w3c.github.io/server-timing/#the-server-timing-header-field>.
 //!
 //! Phases the Rust request path can measure honestly today: `app` (total
-//! application time, measured here) and `compress` (measured in the blosc2 and
-//! lz4 content-encoding middlewares, which record `dur` and `ratio`). Phases
+//! application time, measured here) and `compress` (recorded by the shared
+//! `compression::apply_encoding` owner that the blosc2, lz4, zstd, and gzip
+//! content-encoding middlewares route through, with `dur` and `ratio`). Phases
 //! that upstream also emits but that have no clean Rust middleware seam yet
 //! (`acl`, `read`, `pack`, `tok`) are deliberately NOT faked — they live
 //! inside handlers/serialization with no request-scoped seam here.
