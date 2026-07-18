@@ -11,6 +11,8 @@
 //!
 //! Each `to_sql_*` method picks the right shape.
 
+use std::collections::HashMap;
+
 use serde_json::Value;
 
 use crate::core::queries::{Operator, Query};
@@ -1034,6 +1036,91 @@ impl Catalog {
                 let rows = q.bind(limit).bind(offset).fetch_all(pool).await?;
                 let nodes: Result<Vec<Node>> = rows.iter().map(node_from_postgres_row).collect();
                 Ok((nodes?, total))
+            }
+        }
+    }
+
+    /// Access-filtered analogue of [`Catalog::count_children_batch`]: the exact
+    /// child count of each parent in `parent_ids`, but restricted to the
+    /// children an [`AccessBlobFilter`](crate::core::queries::AccessBlobFilter)
+    /// permits — the same `push_access_blob_filter` conditions
+    /// `search_children` applies to a `/search` listing. Each returned count
+    /// therefore matches that parent's own `/search` `meta.count` under this
+    /// filter, so a `/search` per-entry count and a direct read agree.
+    ///
+    /// One round trip (`GROUP BY parent_id`, batched exactly as the unfiltered
+    /// method), always exact: a filtered caller's caller-facing count is the
+    /// principal-scoped cardinality, not an estimate (see the router's
+    /// `caller_facing_child_count`), so there is no Postgres approximation to
+    /// preserve. Empty input short-circuits without a query; a `parent_id`
+    /// absent from the map has zero *visible* children.
+    pub async fn count_children_batch_filtered(
+        &self,
+        parent_ids: &[i64],
+        filter: &crate::core::queries::AccessBlobFilter,
+    ) -> Result<HashMap<i64, i64>> {
+        if parent_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let dialect = Dialect::for_pool(self.pool());
+        // Build the access-blob predicate through the shared owner. Its binds
+        // occupy positions 1..=N; the `parent_id IN (…)` list follows at N+1…,
+        // so the two clauses never collide on placeholder numbering.
+        let mut builder = WhereBuilder::new(dialect);
+        builder.push_access_blob_filter(filter);
+        let (access_clause, bindings) = builder.finish();
+        let n = bindings.len();
+        match self.pool() {
+            DbPool::Sqlite(pool) => {
+                let placeholders = vec!["?"; parent_ids.len()].join(", ");
+                let sql = format!(
+                    "SELECT parent_id, COUNT(*) AS cnt FROM nodes \
+                     WHERE {access_clause} AND parent_id IN ({placeholders}) \
+                     GROUP BY parent_id"
+                );
+                let mut query = sqlx::query(&sql);
+                for b in &bindings {
+                    query = match b {
+                        Bind::Text(s) => query.bind(s.clone()),
+                        Bind::Int(i) => query.bind(*i),
+                        Bind::Real(f) => query.bind(*f),
+                    };
+                }
+                for id in parent_ids {
+                    query = query.bind(id);
+                }
+                let rows = query.fetch_all(pool).await?;
+                Ok(rows
+                    .iter()
+                    .map(|r| (r.get::<i64, _>("parent_id"), r.get::<i64, _>("cnt")))
+                    .collect())
+            }
+            DbPool::Postgres(pool) => {
+                let placeholders: Vec<String> = (0..parent_ids.len())
+                    .map(|i| format!("${}", n + i + 1))
+                    .collect();
+                let sql = format!(
+                    "SELECT parent_id, COUNT(*) AS cnt FROM nodes \
+                     WHERE {access_clause} AND parent_id IN ({}) \
+                     GROUP BY parent_id",
+                    placeholders.join(", ")
+                );
+                let mut query = sqlx::query(&sql);
+                for b in &bindings {
+                    query = match b {
+                        Bind::Text(s) => query.bind(s.clone()),
+                        Bind::Int(i) => query.bind(*i),
+                        Bind::Real(f) => query.bind(*f),
+                    };
+                }
+                for id in parent_ids {
+                    query = query.bind(id);
+                }
+                let rows = query.fetch_all(pool).await?;
+                Ok(rows
+                    .iter()
+                    .map(|r| (r.get::<i64, _>("parent_id"), r.get::<i64, _>("cnt")))
+                    .collect())
             }
         }
     }
