@@ -451,12 +451,51 @@ async fn create_container(parent: &ContainerClient, key: &str) -> Result<()> {
         "id": key,
     });
     let url = build_register_url(parent)?;
-    // Wrapped in `retry` to match upstream, which issues this container create
-    // via `node.new` → `Container.new` inside `retry_context` (register.py:168,
-    // 240 → create_node_or_drop_collision:634 → container.py:735-745). A 409
-    // collision stays non-transient, so it surfaces immediately as before.
-    retry(|| async { parent.base().context().post_json(&url, &body).await }).await?;
-    Ok(())
+    // Routed through the drop-collision helper (register.py:168, 240 →
+    // create_node_or_drop_collision:623-648): a 409 removes the offending node
+    // and returns `Ok`; a non-409 error propagates.
+    create_node_or_drop_collision(parent, key, &url, &body).await
+}
+
+/// A create POST returned HTTP 409 — the target key is already occupied. The
+/// server surfaces a duplicate `(parent, key)` create as 409 (PR #106).
+fn is_conflict(err: &ClientError) -> bool {
+    matches!(err, ClientError::Server { status: 409, .. })
+}
+
+/// Create a node, or drop the collision. Mirrors upstream
+/// `create_node_or_drop_collision` (register.py:623-648): POST the create; on a
+/// `409 Conflict` remove the pre-existing node occupying the key
+/// (`node.get(key)` → `delete(recursive = true)`) and log a `COLLISION`
+/// warning, then return `Ok` so the walk continues — neither the original nor
+/// the new node remains, avoiding the ambiguity of two source items mapping to
+/// one node. Any non-409 error propagates, matching upstream's `else: raise`.
+///
+/// The create itself stays wrapped in `retry` (transient 5xx/429/connect), so a
+/// genuine transient blip is retried before a real collision is ever observed.
+async fn create_node_or_drop_collision(
+    node: &ContainerClient,
+    key: &str,
+    url: &Url,
+    body: &serde_json::Value,
+) -> Result<()> {
+    match retry(|| async { node.base().context().post_json(url, body).await }).await {
+        Ok(_) => Ok(()),
+        Err(e) if is_conflict(&e) => {
+            // The offender exists (it just caused the 409); fetch and remove it.
+            let offender = node.get(key).await?;
+            if let Some(base) = offender.base() {
+                base.delete(true, true).await?;
+            }
+            tracing::warn!(
+                target: "tiled.register",
+                key,
+                "COLLISION: multiple items would result in this node. Skipping all."
+            );
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
 }
 
 fn build_register_url(parent: &ContainerClient) -> Result<Url> {
@@ -538,16 +577,14 @@ async fn walk_and_register(node: &ContainerClient, path: &Path, settings: &Setti
                 .and_then(|n| n.to_str())
                 .unwrap_or("unnamed"),
         );
-        if let Err(_e) = create_container(node, &key).await {
-            // Likely 409 — the container already exists.
-        }
-        match node.get(&key).await {
-            Ok(child) => {
-                let child = child.into_container()?;
-                Box::pin(walk_and_register(&child, &dir, settings)).await?;
-            }
-            Err(e) => return Err(e),
-        }
+        // `create_container` drops a 409 collision (deleting the offender) and
+        // propagates any non-409 error, mirroring upstream `_walk`'s
+        // `create_node_or_drop_collision` (register.py:240). After a collision
+        // the offender is gone, so the following `get` 404s and the walk aborts
+        // — exactly upstream's shape (it likewise `get`s the key, then recurses).
+        create_container(node, &key).await?;
+        let child = node.get(&key).await?.into_container()?;
+        Box::pin(walk_and_register(&child, &dir, settings)).await?;
     }
     Ok(())
 }
@@ -606,10 +643,11 @@ async fn try_register_single(
         }],
         "id": key,
     });
-    // Wrapped in `retry` to match upstream `register_single_item`, which issues
-    // this create via `node.new` → `Container.new` inside `retry_context`
-    // (register.py:349 → create_node_or_drop_collision:634 → container.py:735-745).
-    retry(|| async { node.base().context().post_json(&url, &body).await }).await?;
+    // Routed through the drop-collision helper (register.py:349 →
+    // create_node_or_drop_collision:623-648): a 409 (e.g. a sibling file with
+    // the same stem, or a re-run over this node) removes the offender and skips;
+    // a non-409 error aborts the walk.
+    create_node_or_drop_collision(node, &key, &url, &body).await?;
     Ok(Some(()))
 }
 
@@ -734,11 +772,10 @@ async fn register_image_sequence(
         }],
         "id": key,
     });
-    // Wrapped in `retry` to match upstream `register_image_sequence`, which
-    // issues this create via `node.new` → `Container.new` inside `retry_context`
-    // (register.py:437 → create_node_or_drop_collision:634 → container.py:735-745).
-    retry(|| async { node.base().context().post_json(&url, &body).await }).await?;
-    Ok(())
+    // Routed through the drop-collision helper (register.py:437 →
+    // create_node_or_drop_collision:623-648): a 409 removes the offender and
+    // skips; a non-409 error aborts the walk.
+    create_node_or_drop_collision(node, &key, &url, &body).await
 }
 
 // ---------------------------------------------------------------------------
@@ -994,6 +1031,142 @@ mod tests {
         walk_and_register(&node, dir.path(), &settings)
             .await
             .expect("an inspect failure is a logged skip, not a walk abort");
+    }
+
+    // -----------------------------------------------------------------------
+    // Finding 1 (wave-30): two source files that map to the same node key must
+    // NOT abort the walk. Upstream `create_node_or_drop_collision`
+    // (register.py:623-648) removes the offending node on a 409 and continues,
+    // logging a COLLISION warning; neither the original nor the new node
+    // remains. Previously the Rust client propagated the 409 via `?`, aborting
+    // the entire registration on the second same-key file.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn walk_drops_collision_and_continues() {
+        use std::collections::HashSet;
+        use std::sync::Mutex;
+
+        #[derive(Clone)]
+        struct St {
+            base: String,
+            created: Arc<Mutex<HashSet<String>>>,
+            deletes: Arc<Mutex<Vec<String>>>,
+        }
+
+        // POST create: first create of a key succeeds; a repeat create of the
+        // same key is a 409 collision (the server's duplicate-(parent,key) shape).
+        async fn post_register(
+            axum::extract::State(st): axum::extract::State<St>,
+            axum::extract::Path(_path): axum::extract::Path<String>,
+            axum::Json(body): axum::Json<serde_json::Value>,
+        ) -> axum::response::Response {
+            use axum::response::IntoResponse;
+            let id = body
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let mut created = st.created.lock().unwrap();
+            if created.contains(&id) {
+                return (axum::http::StatusCode::CONFLICT, "already exists").into_response();
+            }
+            created.insert(id.clone());
+            axum::Json(serde_json::json!({ "id": id })).into_response()
+        }
+
+        // GET the offender: return a minimal container item whose `self` link
+        // points back here so the follow-up DELETE lands on this server.
+        async fn get_meta(
+            axum::extract::State(st): axum::extract::State<St>,
+            axum::extract::Path(path): axum::extract::Path<String>,
+        ) -> axum::response::Response {
+            use axum::response::IntoResponse;
+            let key = path.rsplit('/').next().unwrap_or_default().to_string();
+            axum::Json(serde_json::json!({
+                "data": {
+                    "id": key,
+                    "attributes": { "ancestors": ["mydir"], "structure_family": "container" },
+                    "links": { "self": format!("{}/api/v1/metadata/{}", st.base, path) },
+                }
+            }))
+            .into_response()
+        }
+
+        // DELETE the offender: record it and drop it from the created set.
+        async fn delete_meta(
+            axum::extract::State(st): axum::extract::State<St>,
+            axum::extract::Path(path): axum::extract::Path<String>,
+        ) -> axum::http::StatusCode {
+            let key = path.rsplit('/').next().unwrap_or_default().to_string();
+            st.deletes.lock().unwrap().push(key.clone());
+            st.created.lock().unwrap().remove(&key);
+            axum::http::StatusCode::OK
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base = format!("http://{addr}");
+        let st = St {
+            base: base.clone(),
+            created: Arc::new(Mutex::new(HashSet::new())),
+            deletes: Arc::new(Mutex::new(Vec::new())),
+        };
+        let app = axum::Router::new()
+            .route(
+                "/api/v1/register/{*path}",
+                axum::routing::post(post_register),
+            )
+            .route(
+                "/api/v1/metadata/{*path}",
+                axum::routing::get(get_meta).delete(delete_meta),
+            )
+            .with_state(st.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let node = container_at(&base);
+
+        // Two files, same stem, different extensions → both strip to key `data`.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("data.aaa"), b"x").unwrap();
+        std::fs::write(dir.path().join("data.bbb"), b"y").unwrap();
+
+        // Both extensions resolve to the passthrough adapter, so both files are
+        // registered (and thus collide on `data`).
+        let adapter: Arc<dyn RegistrationAdapter> = Arc::new(PassthroughAdapter {
+            mimetype: "application/x-stub".into(),
+            family: StructureFamily::Array,
+        });
+        let mut settings = Settings::default();
+        settings.adapters.clear();
+        settings
+            .adapters
+            .insert("application/x-stub".into(), adapter);
+        settings
+            .mimetypes_by_ext
+            .insert(".aaa".into(), "application/x-stub".into());
+        settings
+            .mimetypes_by_ext
+            .insert(".bbb".into(), "application/x-stub".into());
+
+        walk_and_register(&node, dir.path(), &settings)
+            .await
+            .expect("a same-key collision must be dropped, not abort the walk");
+
+        // The second create collided → the offender `data` was deleted.
+        assert_eq!(
+            *st.deletes.lock().unwrap(),
+            vec!["data".to_string()],
+            "the offending node must be deleted exactly once on collision"
+        );
+        // Neither the original nor the new node survives (deleted-on-collision).
+        assert!(
+            !st.created.lock().unwrap().contains("data"),
+            "no `data` node may remain after the collision is dropped"
+        );
     }
 
     // -----------------------------------------------------------------------
