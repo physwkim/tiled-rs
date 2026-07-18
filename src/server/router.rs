@@ -2583,13 +2583,31 @@ fn negotiate_container_full(
         return crate::serialization::negotiate_media_type(Some(fmt), "", Container, registry)
             .map(ContainerFullFormat::Family);
     }
+    // A truly-absent / whole-blank Accept header expresses no preference → the
+    // container family default, resolved ONCE here. This must NOT be delegated to
+    // the per-part loop below: `resolve_media_type`'s blank→default rule is
+    // WHOLE-HEADER semantics (registry.rs, "no Accept ⇒ family default",
+    // core.py:391-394), so feeding it an empty *segment* would misread a
+    // leading/trailing/doubled comma as "no preference" and serve the default
+    // over a later serviceable type (or where the request should 406).
+    if accept.trim().is_empty() {
+        return crate::serialization::resolve_media_type(accept, Container, registry)
+            .map(ContainerFullFormat::Family);
+    }
     // Accept header: iterate in listed order. Consider the spec (wide-table)
     // serializers first for each entry — upstream checks the specs before the
     // structure family (core.py:407) — then the container family via the shared
-    // `resolve_media_type` (so wildcard / blank-Accept / default handling stays
-    // identical to the plain container path).
+    // `resolve_media_type`.
     for part in accept.split(',') {
         let base = part.split(';').next().unwrap_or("").trim();
+        // Skip empty list entries (leading/trailing/doubled comma). Upstream lets
+        // an empty entry match nothing and moves to the next (core.py:400-416); it
+        // must never fall through to the family default (that default is only for
+        // a MISSING header, core.py:391-394). Delegating an empty segment to
+        // `resolve_media_type` would hit its whole-header blank→default rule.
+        if base.is_empty() {
+            continue;
+        }
         if is_xarray_dataset && let Some(target) = wide_table_media_type(base) {
             return Some(ContainerFullFormat::WideTable(target));
         }
@@ -2719,6 +2737,34 @@ mod negotiate_container_full_tests {
                 "text/html"
             );
         }
+    }
+
+    /// F-1: an EMPTY Accept-list segment (leading/trailing/doubled comma) must be
+    /// SKIPPED, never treated as "no preference → container default". The default
+    /// is only for a MISSING header (upstream core.py:391-394); an empty *segment*
+    /// matches nothing and moves on (core.py:400-416). A leading empty segment
+    /// must therefore not pre-empt a later serviceable type: `,application/json`
+    /// serves json, not the html default.
+    #[test]
+    fn leading_empty_accept_segment_does_not_default_over_later_type() {
+        let reg = default_registry();
+        assert_eq!(
+            family(negotiate_container_full(
+                None,
+                ",application/json",
+                false,
+                &reg
+            )),
+            "application/json"
+        );
+    }
+
+    /// F-1: a trailing empty segment after an UNSERVICEABLE type must 406 (None),
+    /// not fall back to the container default. `application/xml,` → None.
+    #[test]
+    fn trailing_empty_accept_segment_does_not_default_to_html() {
+        let reg = default_registry();
+        assert!(negotiate_container_full(None, "application/xml,", false, &reg).is_none());
     }
 }
 
