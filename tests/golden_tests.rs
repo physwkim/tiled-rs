@@ -363,10 +363,16 @@ async fn test_search_root() {
     // meta should have count
     assert_eq!(body["meta"]["count"], 2);
 
-    // links should have pagination format with page[offset] and page[limit]
+    // links carry pagination format. offset 0 omits the page[offset] segment
+    // (upstream `offset_or_cursor = ""` for offset 0, core.py:126-129); only
+    // page[limit] is present on the first page's self.
     let links = &body["links"];
-    assert!(links["self"].as_str().unwrap().contains("page[offset]"));
-    assert!(links["self"].as_str().unwrap().contains("page[limit]"));
+    let self_link = links["self"].as_str().unwrap();
+    assert!(self_link.contains("page[limit]"));
+    assert!(
+        !self_link.contains("page[offset]"),
+        "offset-0 self must omit page[offset]: {self_link}"
+    );
 }
 
 /// `?omit_links=true` on /metadata drops the per-node `links` key entirely
@@ -413,12 +419,13 @@ async fn test_search_omit_links() {
         );
     }
 
-    // Envelope pagination links are unaffected.
+    // Envelope pagination links are unaffected by omit_links. offset 0 → the
+    // self link carries page[limit] but omits page[offset] (upstream parity).
+    let self_link = body["links"]["self"].as_str().unwrap();
+    assert!(self_link.contains("page[limit]"));
     assert!(
-        body["links"]["self"]
-            .as_str()
-            .unwrap()
-            .contains("page[offset]")
+        !self_link.contains("page[offset]"),
+        "offset-0 self must omit page[offset]: {self_link}"
     );
 }
 
