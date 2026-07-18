@@ -7845,7 +7845,16 @@ async fn catalog_metadata_resource(
         attributes: NodeAttributes {
             ancestors,
             structure_family: Some(family),
-            specs: serde_json::from_value(node.specs).unwrap_or_default(),
+            // Parse stored specs leniently through the single owner: a persisted
+            // bare-string element normalizes to `{name, version: null}` instead
+            // of collapsing the WHOLE list to None (the old
+            // `from_value::<Option<Vec<Spec>>>` was all-or-nothing). `None` stays
+            // reserved for a null/absent specs column — matching the prior decode
+            // — by gating on `as_array` before parsing.
+            specs: node
+                .specs
+                .as_array()
+                .map(|_| crate::core::structures::Spec::parse_stored_list(&node.specs)),
             metadata: Some(node.metadata),
             structure: structure_value,
             access_blob: Some(node.access_blob),
@@ -8071,30 +8080,17 @@ fn spec_identity(spec: &serde_json::Value) -> serde_json::Value {
 /// forms identically, so EVERY persisted spec — not only the object form —
 /// reaches the validation registry.
 ///
-/// The previous `serde_json::from_value::<Vec<Spec>>(..).unwrap_or_default()`
-/// was all-or-nothing: because `Spec` deserializes only from an object, a
-/// single bare-string element made the whole array fail to parse and collapse
-/// to empty, so `validate_specs` saw no specs and an undeclared bare-string
-/// spec was persisted WITHOUT being rejected under `reject_undeclared_specs`.
-/// Parsing element-by-element closes that bypass; an element that is neither a
-/// string nor an object carrying a string `name` contributes no `Spec` (there
-/// is no name to validate against), exactly as it contributed none before.
+/// Delegates to [`Spec::parse_stored_list`](crate::core::structures::Spec::parse_stored_list),
+/// the single owner for lenient stored-spec parsing shared with the metadata /
+/// search read-back sites — so the write-validation parse and the read-back
+/// parse cannot drift. The previous
+/// `serde_json::from_value::<Vec<Spec>>(..).unwrap_or_default()` was
+/// all-or-nothing: because `Spec` deserializes only from an object, a single
+/// bare-string element made the whole array fail to parse and collapse to
+/// empty, so `validate_specs` saw no specs and an undeclared bare-string spec
+/// was persisted WITHOUT being rejected under `reject_undeclared_specs`.
 fn specs_for_validation(specs: &serde_json::Value) -> Vec<crate::core::structures::Spec> {
-    let Some(arr) = specs.as_array() else {
-        return Vec::new();
-    };
-    arr.iter()
-        .filter_map(|element| {
-            if let Some(name) = element.as_str() {
-                Some(crate::core::structures::Spec::new(name))
-            } else {
-                // Object form: keep the exact per-element semantics of the old
-                // `Vec<Spec>` deserialize (requires a string `name`; `version`
-                // optional string), just without the all-or-nothing collapse.
-                serde_json::from_value::<crate::core::structures::Spec>(element.clone()).ok()
-            }
-        })
-        .collect()
+    crate::core::structures::Spec::parse_stored_list(specs)
 }
 
 /// RFC 7396 merge-patch: recursively merge `patch` into `target`. A

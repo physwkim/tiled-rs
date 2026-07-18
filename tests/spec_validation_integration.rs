@@ -663,3 +663,187 @@ async fn no_spec_node_unaffected_either_way() {
         );
     }
 }
+
+/// Task #119 (w31) — READ-BACK normalization, router single-node path
+/// (`GET /api/v1/metadata/{path}` → `catalog_metadata_resource`). A persisted
+/// bare-string spec element (reachable with `reject_undeclared_specs` off) must
+/// come back normalized to `{name, version: null}`, NOT collapse the whole
+/// `specs` list to `None`. Before the fix the read decoded with an
+/// all-or-nothing `serde_json::from_value::<Option<Vec<Spec>>>(..)`, so one
+/// bare-string element made the ENTIRE list deserialize fail and vanish.
+#[tokio::test]
+async fn get_metadata_normalizes_persisted_bare_string_spec() {
+    let (app, _dir) = build_app(validation_config(false)).await;
+
+    // Seed a no-spec node, then PATCH a BARE-STRING spec. With reject off the
+    // undeclared spec is accepted and the merge-patch stores the raw
+    // `["mystery"]` array verbatim (a bare string, the shape that broke read).
+    let (status, _) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/metadata/",
+        serde_json::json!({
+            "key": "rb",
+            "structure_family": "container",
+            "metadata": {},
+            "specs": [],
+            "data_sources": [],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) = json_request(
+        &app,
+        Method::PATCH,
+        "/api/v1/metadata/rb",
+        serde_json::json!({
+            "content-type": "application/merge-patch+json",
+            "specs": ["mystery"],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "persist bare-string spec: {body}");
+
+    // Read it back: the bare string is normalized to an object, the list is
+    // present (not None), and `version` is omitted (Spec serializes `None`
+    // versions away — the same shape an object-form spec with no version gets).
+    let (status, body) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/metadata/rb",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "read back: {body}");
+    let specs = body["data"]["attributes"]["specs"]
+        .as_array()
+        .unwrap_or_else(|| {
+            panic!("specs must be a present array, not None: {body}");
+        });
+    assert_eq!(
+        specs,
+        &vec![serde_json::json!({"name": "mystery"})],
+        "bare-string spec must read back normalized as an object: {body}"
+    );
+}
+
+/// Task #119 (w31) — a MIXED list of bare-string and object specs must read
+/// back FULLY and IN ORDER through the router path: no element is dropped, the
+/// object element keeps its `version`, and the ordering is preserved. This is
+/// the boundary the old all-or-nothing decode could not represent — one bad
+/// element took every sibling with it.
+#[tokio::test]
+async fn get_metadata_preserves_mixed_string_and_object_specs_in_order() {
+    let (app, _dir) = build_app(validation_config(false)).await;
+
+    let (status, _) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/metadata/",
+        serde_json::json!({
+            "key": "mix",
+            "structure_family": "container",
+            "metadata": {},
+            "specs": [],
+            "data_sources": [],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // Persist string, versioned-object, string — interleaved, so a stable
+    // element-wise parse is the only way the order and the middle version
+    // survive.
+    let (status, body) = json_request(
+        &app,
+        Method::PATCH,
+        "/api/v1/metadata/mix",
+        serde_json::json!({
+            "content-type": "application/merge-patch+json",
+            "specs": ["alpha", {"name": "beta", "version": "2"}, "gamma"],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "persist mixed specs: {body}");
+
+    let (status, body) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/metadata/mix",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "read back mixed: {body}");
+    let specs = &body["data"]["attributes"]["specs"];
+    assert_eq!(
+        specs,
+        &serde_json::json!([
+            {"name": "alpha"},
+            {"name": "beta", "version": "2"},
+            {"name": "gamma"},
+        ]),
+        "mixed specs must read back fully and in order: {body}"
+    );
+}
+
+/// Task #119 (w31) — READ-BACK normalization, catalog-adapter SEARCH path
+/// (`GET /api/v1/search/{path}` → `CatalogAdapter::search_page` → `SearchEntry`).
+/// This is the second read site that decoded stored specs; before the fix it
+/// deliberately mirrored the metadata endpoint's all-or-nothing decode, so it
+/// dropped the whole list on a bare-string element too. A search row must now
+/// carry the same normalized specs its metadata row does.
+#[tokio::test]
+async fn search_normalizes_persisted_bare_string_specs() {
+    let (app, _dir) = build_app(validation_config(false)).await;
+
+    let (status, _) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/metadata/",
+        serde_json::json!({
+            "key": "sc",
+            "structure_family": "container",
+            "metadata": {},
+            "specs": [],
+            "data_sources": [],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) = json_request(
+        &app,
+        Method::PATCH,
+        "/api/v1/metadata/sc",
+        serde_json::json!({
+            "content-type": "application/merge-patch+json",
+            "specs": ["alpha", {"name": "beta", "version": "2"}],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "persist search specs: {body}");
+
+    // Search root's children and locate the seeded node's entry. No `fields`
+    // query means the full entry (specs included).
+    let (status, body) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/search/",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "search: {body}");
+    let entry = body["data"]
+        .as_array()
+        .and_then(|rows| rows.iter().find(|r| r["id"] == "sc"))
+        .unwrap_or_else(|| panic!("search must return the seeded node: {body}"));
+    assert_eq!(
+        entry["attributes"]["specs"],
+        serde_json::json!([
+            {"name": "alpha"},
+            {"name": "beta", "version": "2"},
+        ]),
+        "search row must carry the same normalized specs as its metadata row: {body}"
+    );
+}

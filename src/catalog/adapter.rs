@@ -102,7 +102,7 @@ impl CatalogAdapter {
             catalog: self.catalog.clone(),
             node_id: Some(node.id),
             metadata: node.metadata.clone(),
-            specs: parse_specs(&node.specs),
+            specs: Spec::parse_stored_list(&node.specs),
             leaf_resolver: self.leaf_resolver.clone(),
             exact_count_limit: self.exact_count_limit,
         }
@@ -398,10 +398,12 @@ impl ContainerAdapter for CatalogAdapter {
                 entries.push(SearchEntry {
                     key: node.key,
                     structure_family: family,
-                    // Specs are stored as `[{name, version}]`; mirror the
-                    // metadata endpoint's `from_value` decode (not the lenient
-                    // `parse_specs`) so a search row matches its metadata row.
-                    specs: serde_json::from_value(node.specs).unwrap_or_default(),
+                    // Parse stored specs through the single lenient owner —
+                    // the same one the metadata endpoint uses — so a persisted
+                    // bare-string element normalizes to `{name, version: null}`
+                    // instead of collapsing the whole list, and a search row
+                    // still matches its metadata row.
+                    specs: Spec::parse_stored_list(&node.specs),
                     metadata: node.metadata,
                     structure,
                     access_blob: Some(node.access_blob),
@@ -528,28 +530,6 @@ fn matches_access_blob_filter(
         return true;
     }
     false
-}
-
-fn parse_specs(value: &serde_json::Value) -> Vec<Spec> {
-    value
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| {
-                    if let Some(s) = v.as_str() {
-                        Some(Spec::new(s))
-                    } else {
-                        let name = v.get("name").and_then(|n| n.as_str())?;
-                        let version = v.get("version").and_then(|n| n.as_str());
-                        match version {
-                            Some(ver) => Some(Spec::with_version(name, ver)),
-                            None => Some(Spec::new(name)),
-                        }
-                    }
-                })
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 /// Minimal placeholder leaf resolver — returns an error on every leaf so

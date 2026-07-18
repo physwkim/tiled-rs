@@ -106,6 +106,37 @@ impl Spec {
             version: Some(version.into()),
         }
     }
+
+    /// Parse a persisted/stored `specs` JSON array into `Vec<Spec>`, accepting
+    /// BOTH wire encodings of each element: a bare string `"name"` (normalized
+    /// to `Spec { name, version: None }`, matching upstream tiled's `Spec`,
+    /// which accepts a plain string) or an object `{name, version?}`.
+    ///
+    /// The single owner for lenient stored-spec parsing. Element-wise and
+    /// fault-isolating: an element that is neither a string nor a well-formed
+    /// spec object is skipped, never collapsing the whole list. A blanket
+    /// `serde_json::from_value::<Vec<Spec>>` is all-or-nothing — one persisted
+    /// bare-string element made the ENTIRE list decode fail and come back
+    /// empty/None on read-back. A non-array (or `null`) value yields an empty
+    /// vec; callers that must distinguish "absent" from "empty" check
+    /// `Value::as_array` themselves before calling.
+    pub fn parse_stored_list(value: &serde_json::Value) -> Vec<Spec> {
+        let Some(arr) = value.as_array() else {
+            return Vec::new();
+        };
+        arr.iter()
+            .filter_map(|element| {
+                if let Some(name) = element.as_str() {
+                    Some(Spec::new(name))
+                } else {
+                    // Object form: keep the exact per-element semantics of a
+                    // `Vec<Spec>` deserialize (string `name` required, optional
+                    // string `version`), just without the all-or-nothing collapse.
+                    serde_json::from_value::<Spec>(element.clone()).ok()
+                }
+            })
+            .collect()
+    }
 }
 
 // ---------------------------------------------------------------------------
