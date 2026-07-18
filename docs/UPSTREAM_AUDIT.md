@@ -871,6 +871,203 @@ Landed work:
   generic body so DB internals do not leak, and the bridge's exhaustive `From` turns
   a future variant into a compile error rather than a silent 500.
 
+## Wave-30: leaf-gap batch + adversarial-review fixes
+
+Two parts on main: a minor leaf-gap batch from the wave-28 meta-sweep (PR #117),
+then an adversarial review of those server/CLI/client landings that surfaced 14
+defects across three PRs (#118–#120), each fixed at source, one commit per finding.
+
+Leaf-gap batch:
+
+* **`SparseBlock::to_dense`, `get_asset_filepaths` + `path_from_uri`, in-memory
+  `?sort=`** (`a7bf525` + `16db9b9` + `1a595ab`, PR #117). (`a7bf525`) Client-side
+  COO → row-major dense buffer (`client/sparse.rs`, upstream `todense`). (`16db9b9`)
+  `get_asset_filepaths` client utility (`client/utils.rs:324`) over a core
+  `path_from_uri` (`core/file_uri.rs:84`) — file/sqlite/duckdb schemes, query-suffix
+  stripping, unsupported-scheme error. (`1a595ab`) the default `search_page`
+  silently dropped `?sort=`; structural fix at the shared listing primitive — new
+  `ContainerAdapter::sort_matched_keys` (`core/adapters.rs:567`, default no-op = the
+  analog of upstream's `hasattr(tree, "sort")` gate) invoked before windowing,
+  overridden by `MapAdapter` (`adapters/map_adapter.rs:159`); the SQL catalog keeps
+  its own `search_page`, other adapters stay no-op. Deviation: upstream Python raises
+  `TypeError` (→500) on unsortable/heterogeneous metadata; the port uses a
+  non-panicking total order (type-rank, missing-last) so a user-supplied sort cannot
+  take down the request (flagged in code). **Not ported, with evidence:**
+  `fetch_count` N/A (feeds only the rich progress bar the port omits); awkward
+  `project_form` (needs typetracer/touch_data, large reimplementation); sequence
+  `force_reshape` already structurally present (`from_paths_reshaped`); `arrow.py`
+  write side (ArrowIpc read-only by design); in-memory `get_distinct` (deliberately
+  catalog-only, endpoint rework recorded not scheduled). **Supersedes** the wave-27
+  PR #95 premise that the in-memory `search_page` ignores sort — its negative-index
+  slicing omission still stands, but that stated justification is now stale.
+
+Review fixes (each finding one commit):
+
+* **CLI api-key scope clamp (HIGH) + auth/spec-validation family** (`913e366` +
+  `4be73e4` + `f90e6de` + `1647745` + `6d816d3`, PR #118). (`913e366`, HIGH) `tiled
+  api-key create` / `admin api-key create` minted `ScopeSet::full()` when `--scope`
+  was omitted and never checked an explicit set against the principal's ceiling; now
+  fetches the target principal, defaults to `{inherit}`, and rejects any set not ⊆
+  `for_role(role) ∪ {inherit}` — parity with the HTTP route's 403
+  (`auth_router.rs:428`), one owner binding both CLI entry points. (`4be73e4`)
+  `DummyAuthenticator::add_user` (`auth/authenticator.rs:101`) refuses an empty
+  configured password (upstream `if not true_password: return`). (`f90e6de`)
+  PATCH/PUT accepted bare-string specs unvalidated — new single `specs_for_validation`
+  owner (`router.rs:8365`) parses each element (string or object) for both. (`1647745`)
+  node create accepted duplicate specs; now 422 via a `spec_identity` (name, version)
+  uniqueness check before registry validation. (`6d816d3`) create validated specs
+  before resolving the parent, so a missing parent surfaced as spec-400 not 404;
+  `validate_specs` now runs after `resolve_entry`. UNFIXED at the time — bare-string
+  spec read-back drop — folded in by wave-31 PR #121 (below).
+* **Single-encoding negotiation + xarray wide-table family** (`5541d31` + `178f3e8` +
+  `e6e9852` + `c331956` + `2643084` + `ceda6aa`, PR #119). (`5541d31`) four stacked
+  encoder middlewares could compress an incompressible body up to four times and a
+  blosc2 ratio-decline fell through to zstd; replaced with a single
+  `compress_middleware` (`server/compression.rs:118`) negotiating ONE encoding up
+  front (blosc2 > lz4 > zstd > gzip) and applying it at most once (per-module
+  middlewares deleted). (`178f3e8`) `serve_xarray_wide_table` enumerated raw
+  `keys()`/`get()` with no access filter (violating the container-listing invariant);
+  `list_filter` (read:data) now threads into both enumeration and per-`?field=`
+  fetch. (`e6e9852`) csv/parquet export 406'd on int8/16, uint8/16, bool — a
+  `ColumnDtypePolicy::Full` (`router.rs:3044`) opens them on the table path while the
+  arrow-wire path keeps the six-primitive cap (client decoder is the constraint).
+  (`c331956`) unknown `?field=` → 400 `No such field {key}.` (upstream
+  router.py:1444), access-denied exists-but-hidden stays 404. (`2643084`) empty
+  xarray_dataset 422'd/500'd on argless `RecordBatch::try_new`; both sites carry the
+  source row count (`try_new_with_options`/`with_row_count`), now 200. (`ceda6aa`)
+  `text/comma-separated-values` and `text/plain` now map to the canonical csv target
+  (upstream xarray.py:80). Documented quirk: the empty-table CSV body is arrow's
+  zero-column `""\n`, not pandas' bare `\n` — a pre-existing arrow CSV-writer quirk,
+  pinned by `csv_zero_column_table_serializes_empty`.
+* **Register drop-collision + `get()` 404→KeyNotFound + cache freshness parity**
+  (`aab5efb` + `6996a5a` + `4f86472`, PR #120). (`aab5efb`) register aborted the walk
+  on a 409 key collision; ported upstream `create_node_or_drop_collision`
+  (`client/register.rs:476`, register.py:623-648) — on 409 `get(key)` the offender,
+  `delete(recursive, external_only)`, log COLLISION, skip; non-409 re-raises.
+  (`6996a5a`) plain `Container.get(key)` surfaced a raw `Server{404}` while the
+  filtered path raised `KeyNotFound`; now maps 404 → `KeyNotFound(key)` (upstream
+  `__getitem__`'s uniform `KeyError`), other raw-404 fetch sites classified distinct.
+  (`4f86472`) cache treated a no-directive / no-Expires response as immediately
+  stale; upstream `is_response_fresh` treats it as fresh and 301/308 as always fresh
+  ahead of any header check — both arms mirrored (`client/cache.rs`).
+
+## Wave-31: cross-review fixes of the wave-30 landings
+
+An adversarial cross-review of the wave-30 batch (#117 leaf gaps + #118–#120 fixes)
+surfaced 11 defects across four PRs (#121–#124), each fixed at source, one commit
+per finding.
+
+* **Bare-string spec read-back — single `parse_stored_list` owner** (`c08f1a6` +
+  `f0f3357`, PR #121). A persisted bare-string spec element made typed spec decodes
+  collapse the WHOLE list (all-or-nothing `from_value`), silently omitting specs from
+  responses (reachable with `reject_undeclared_specs` off, or a declared spec
+  submitted in string form). (`c08f1a6`) new lenient owner `Spec::parse_stored_list(&
+  Value) -> Vec<Spec>` (`core/structures.rs:123`, element-wise fault-isolating:
+  string → `{name}`, object → `{name, version?}`, malformed skipped — wave-32
+  PR #126 sharpens the object arm, see below) routed through
+  BOTH the GET-single-node and search read sites; write-side `specs_for_validation`
+  now delegates to it so validate-parse and read-back cannot drift, and the duplicate
+  `parse_specs` was deleted. (`f0f3357`) same normalization at the revisions emit site
+  (`GET /api/v1/revisions/{path}` was passing raw JSON; upstream `Revision.specs` is
+  typed `List[Spec]`). Closes the wave-30 PR #118 UNFIXED read-back item.
+* **bool-as-int sort interleaving + sort-param validation** (`0462743` + `690f08f`,
+  PR #122). (`0462743`) `json_sort_cmp` (`adapters/map_adapter.rs:351`) ranked Bool
+  and Number as separate types, sorting ALL booleans before ALL numbers; Python's
+  `sorted` treats bool as int and interleaves (`{true,0,2}` → `[0,true(=1),2]`). Bool
+  and Number now share one numeric rank (false→0.0, true→1.0), upstream mapping.py:365.
+  (`690f08f`) `parse_sort` (`router.rs:555`) lacked upstream `sorting_param`'s
+  validations (dependencies.py:239-252): a duplicate sort key (sign-stripped identity)
+  → 400 and the `""` natural-order sentinel must be last → 400; returns `Result<_,
+  ServerError>` with upstream's detail strings. Deviation ledger: the non-panicking
+  heterogeneous-sort deviation still stands (genuinely-unorderable mixes are untouched),
+  but bool-vs-number is now **parity** — interleaves as int, no longer grouped-by-type.
+* **Listed-order container/full negotiation + xarray wide-table edges** (`dfe97ff` +
+  `51872e8` + `bbda09e`, PR #123). (`dfe97ff`) `wants_xarray_wide_table` scanned the
+  ENTIRE Accept list with `find_map` and committed to the wide-table path wherever a
+  wide-table type appeared, so a plain container with `Accept: text/html, text/plain`
+  regressed 200-HTML → 406 and an xarray_dataset served CSV where upstream serves
+  earlier-listed HTML; replaced with a single `negotiate_container_full` owner
+  (`router.rs:2566`) iterating media types in listed order over the union of
+  container-family serializers + (only for xarray candidates) wide-table types,
+  first-match dispatch (upstream core.py:381-427); `?format=text/plain` /
+  `text/comma-separated-values` now resolve to CSV. (`51872e8`) float16 data-vars
+  406'd on csv/parquet; `arrow_column_from_ndarray` (`router.rs:3104`) gains a
+  `(Float,2)` arm with lossless f16→f32 widening — the arrow-wire path still correctly
+  406s (no native client Float16). (`bbda09e`) an explicit `?field=` naming an
+  access-hidden child returned 404 on the wide-table path but was silently dropped
+  (200) on container json/html projection; made uniform in the single
+  `apply_child_projection` owner (`router.rs:2764`) all formats route through.
+  Deviation: upstream applies no per-child access filter to these serializers at all —
+  the filtering itself is the documented hardening deviation, and this makes it uniform.
+  (**Superseded in wave-32 PR #125**: the interim hidden→404 still left hidden ≠
+  absent — a 404-vs-400 presence oracle, since an absent field gets 400 — so wave-32
+  collapses hidden ≡ absent to one 400 `No such field`; see the wave-32 section below.)
+* **Client hardening — redirect freshness, delete-family closure, `to_dense`
+  validation** (`551e41e` + `f193f05` + `5ca52b9` + `021bb37`, PR #124). (`551e41e`)
+  a 301/308 also carrying `Cache-Control: no-cache` was never served fresh — `is_fresh`
+  (`client/cache.rs:116`) checked `no_cache` before the permanent-redirect pin; the
+  301/308 always-fresh short-circuit now runs ahead of ALL header checks, status-scoped
+  (upstream cache_control.py:180-185). (`f193f05`) the 409 collision offender was
+  deleted via `if let Some(base) = offender.base()`, and `AnyClient::base()` is `None`
+  for the `Custom` variant, so a resolver-produced offender was silently not deleted;
+  upstream register.py:640-642 deletes unconditionally. (`5ca52b9`) `to_dense` did an
+  unchecked scatter (out-of-range coord → wrong cell or panic); now validates block
+  shape + every coord ∈ `[0, extent)` → `ClientError::Invalid`, signature
+  `Result<Vec<f64>>`. (`021bb37`) the mandated `base()`-gate audit found the same
+  silent-skip in `ContainerClient::delete_contents`; structural closure — single-owner
+  `ContainerClient::delete_child(key, recursive, external_only)`
+  (`client/container.rs:834`) builds the child URL from the parent's `self` link and
+  deletes via `retry`, and BOTH `delete_contents` and the register collision handler
+  route through it, retiring the `base()`-gated delete at both sites. UNFIXED (open
+  item): `to_dense` duplicate-coordinate semantics are last-write-wins here, but pydata
+  `sparse.COO` sums duplicates by default — UNVERIFIED locally (package not installed),
+  documented in the doc comment and pinned by `to_dense_duplicate_coords_last_write_wins`.
+
+## Wave-32: sort wire-format parity + cross-review corrections
+
+Three sibling PRs (#125–#127), rebase-merged onto main. One pre-existing
+wire-format divergence the wave-31 sort work did not touch, plus two corrections
+to divergences the wave-30/31 batch itself introduced.
+
+* **Sort wire-format parity — repeated `?sort=` params, comma → 422** (`67021cb`
+  server + `d2d353f` client, PR #127). Upstream expresses multi-key
+  sort as REPEATED `?sort=` params (`List[SortField]`, dependencies.py:219) and its
+  `SortField` `constr` pattern (dependencies.py:26) rejects a comma-bearing field
+  with a pydantic 422 — while the port's `parse_sort` split ONE param on commas and
+  the client comma-joined (`formatted.join(",")`). Server (`67021cb`): each `?sort=`
+  param is now one field validated against the exact upstream regex
+  (`SORT_FIELD_PATTERN`, `router.rs:555`) — a comma (or any char outside
+  `[a-zA-Z0-9_.]` past an optional sign) is a `Validation` → 422 quoting pydantic's
+  `String should match pattern '...'`; the wave-31 #122 dup-key + sentinel-last 400s
+  are unchanged, now layered on the per-param fields. Client (`d2d353f`): one
+  `?sort=` param per key in `search_url_with` (`container.rs`, mirroring
+  container.py:121-128). A client↔server e2e test
+  (`two_key_sort_round_trips_client_to_server`) proves a `group asc, rank desc` sort
+  round-trips into the correct child order. Client + server ship in lockstep in this
+  crate — no back-compat shim.
+* **Access-hidden `?field=` child ≡ absent → 400** (`b244201`, PR #125;
+  **supersedes wave-31 #123's hidden→404**). The wave-31
+  #123 interim answered an explicit `?field=` naming an access-hidden child with 404
+  while an absent field gets 400 `No such field {key}.` — so hidden ≠ absent still
+  leaked child presence as a 404-vs-400 oracle. `apply_child_projection`
+  (`router.rs`) now collapses both to one check: a field not in `visible_keys`
+  (truly absent OR access-hidden) is the same 400 `No such field {key}.` (upstream
+  `KeyError`, router.py:1442-1449). The "uniform explicit-hidden-?field=→404"
+  deviation-ledger line is retired — the hardening is now existence-hiding (hidden
+  indistinguishable from absent), not a distinct 404. Listings (no `?field=`) still
+  filter silently.
+* **`Spec::parse_stored_list` keeps name-bearing objects name-only, drops nameless
+  garbage** (`f55e734`, PR #126; refines wave-31 #121). The wave-31
+  #121 owner is sharpened: an object whose full typed `Spec` parse fails (e.g. a
+  non-string `version`) but which carries a string `name` is kept NAME-ONLY (`Spec {
+  name, version: None }`) — element PRESENCE is the load-bearing property and no
+  conformant write path can store a non-string version; only a number/array/
+  object-with-no-string-name is DROPPED. Deliberate defensive deviation: upstream
+  RAISES (500) on such a stored row (`Spec(**123)` / `List[Spec]` validation error),
+  whereas the port skips it and serves the readable siblings (a nameless spec is
+  already rejected at write time, so the drop path is reachable only via a corrupt/
+  out-of-band row).
+
 ## N/A (Python-specific or feature not in our port)
 
 A non-exhaustive sample of PRs that don't apply because the corresponding
