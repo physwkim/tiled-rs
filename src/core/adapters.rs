@@ -539,12 +539,13 @@ pub trait ContainerAdapter: BaseAdapter {
     ///
     /// The default impl is the in-memory one: it runs [`search`](Self::search)
     /// (which enforces the adapter's query-support matrix → HTTP 400 on an
-    /// unevaluable variant), pages the matched keys by offset, and builds each
-    /// row from the child adapter. `sorting` and `cursor` are ignored — an
-    /// in-memory tree preserves insertion order and cannot keyset-page, so it
-    /// always returns `next_cursor: None` (matching Python's offset slice for
-    /// trees without `keys_page`). The SQL catalog overrides this to push
-    /// filter + sort + keyset/OFFSET down to the database and to carry each
+    /// unevaluable variant), orders the matched keys via
+    /// [`sort_matched_keys`](Self::sort_matched_keys) (a no-op unless the adapter
+    /// supports sorting), pages them by offset, and builds each row from the
+    /// child adapter. `cursor` is ignored — an in-memory tree cannot keyset-page,
+    /// so it always returns `next_cursor: None` (matching Python's offset slice
+    /// for a sorted, non-`keys_page` tree). The SQL catalog overrides this to
+    /// push filter + sort + keyset/OFFSET down to the database and to carry each
     /// node's `access_blob` and `data_source` structure without resolving the
     /// leaf adapter.
     ///
@@ -555,17 +556,33 @@ pub trait ContainerAdapter: BaseAdapter {
     /// leaves every entry's `data_sources` at `None` — matching Python, where a
     /// tree adapter without `data_sources` simply omits the field
     /// (core.py:483, `hasattr(entry, "data_sources")`).
+    /// Order the keys returned by [`search`](Self::search) according to
+    /// `sorting`, before the `search_page` window is applied. The default is a
+    /// no-op (matched order preserved) — the Rust analog of Python's
+    /// `hasattr(tree, "sort")` gate (server/core.py:235): a tree that does not
+    /// override this simply ignores `?sort=`. [`MapAdapter`](crate::adapters::MapAdapter)
+    /// overrides it to order by child metadata. The SQL catalog does not reach
+    /// this path — it overrides [`search_page`](Self::search_page) to push
+    /// `ORDER BY` into the query.
+    fn sort_matched_keys(
+        &self,
+        keys: Vec<String>,
+        _sorting: &[(String, SortDirection)],
+    ) -> Vec<String> {
+        keys
+    }
+
     fn search_page<'a>(
         &'a self,
         queries: &'a [crate::core::queries::Query],
-        _sorting: &'a [(String, SortDirection)],
+        sorting: &'a [(String, SortDirection)],
         _cursor: Option<i64>,
         offset: usize,
         limit: usize,
         _include_data_sources: bool,
     ) -> BoxFuture<'a, Result<SearchPage>> {
         Box::pin(async move {
-            let matched = self.search(queries).await?;
+            let matched = self.sort_matched_keys(self.search(queries).await?, sorting);
             let total = matched.len();
             let mut entries = Vec::new();
             for key in matched.into_iter().skip(offset).take(limit) {

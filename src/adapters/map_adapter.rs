@@ -146,6 +146,35 @@ impl ContainerAdapter for MapAdapter {
                 .collect())
         })
     }
+
+    /// Order matched keys by child metadata, mirroring Python `MapAdapter.sort`
+    /// (adapters/mapping.py:353). The sort terms form a stable chain applied
+    /// right-to-left: the `"_"` sentinel re-sorts nothing — it only reverses the
+    /// running order when its direction is descending; every other key orders by
+    /// the literal top-level metadata value at `key` (`metadata().get(key)`, not
+    /// a dotted descent — matching upstream), with a missing value sorted last
+    /// (`_HIGH_SORTER`). A key dropped between `search` and here also sorts as
+    /// missing metadata. Reads only in-memory `metadata()`, so the extra passes
+    /// over the matched keys stay cheap.
+    fn sort_matched_keys(
+        &self,
+        mut keys: Vec<String>,
+        sorting: &[(String, SortDirection)],
+    ) -> Vec<String> {
+        for (key, direction) in sorting.iter().rev() {
+            if key != "_" {
+                keys.sort_by(|a, b| {
+                    let va = self.mapping.get(a).and_then(|ad| ad.metadata().get(key));
+                    let vb = self.mapping.get(b).and_then(|ad| ad.metadata().get(key));
+                    json_sort_cmp(va, vb)
+                });
+            }
+            if *direction == SortDirection::Descending {
+                keys.reverse();
+            }
+        }
+        keys
+    }
 }
 
 /// Single source of truth for which query variants this in-memory adapter can
@@ -302,6 +331,47 @@ fn compare_json(
             | (Operator::Le, Ordering::Less | Ordering::Equal)
             | (Operator::Ge, Ordering::Greater | Ordering::Equal)
     )
+}
+
+/// Total order over an optional metadata value for [`MapAdapter::sort_matched_keys`].
+/// `None` (the key is absent from a child's metadata) is greatest, so missing
+/// keys sort last in ascending order — the Rust analog of Python's `_HIGH_SORTER`
+/// sentinel (adapters/mapping.py:851). Present values order by JSON type rank
+/// then by value; unorderable or heterogeneous types (null / array / object, or
+/// a number-vs-string pair) compare as their type rank and otherwise Equal, so a
+/// stable sort leaves them in input order rather than panicking (Python raises
+/// `TypeError` on such a mix — an error path no real sorted listing hits).
+fn json_sort_cmp(
+    a: Option<&serde_json::Value>,
+    b: Option<&serde_json::Value>,
+) -> std::cmp::Ordering {
+    use serde_json::Value;
+    use std::cmp::Ordering;
+    fn rank(v: Option<&Value>) -> u8 {
+        match v {
+            Some(Value::Null) => 0,
+            Some(Value::Bool(_)) => 1,
+            Some(Value::Number(_)) => 2,
+            Some(Value::String(_)) => 3,
+            Some(Value::Array(_)) => 4,
+            Some(Value::Object(_)) => 5,
+            None => 6, // _HIGH_SORTER: an absent key sorts last (ascending).
+        }
+    }
+    let (ra, rb) = (rank(a), rank(b));
+    if ra != rb {
+        return ra.cmp(&rb);
+    }
+    match (a, b) {
+        (Some(Value::Bool(x)), Some(Value::Bool(y))) => x.cmp(y),
+        // Compare numbers as f64 (same widening `compare_json` uses above).
+        (Some(Value::Number(x)), Some(Value::Number(y))) => x
+            .as_f64()
+            .partial_cmp(&y.as_f64())
+            .unwrap_or(Ordering::Equal),
+        (Some(Value::String(x)), Some(Value::String(y))) => x.cmp(y),
+        _ => Ordering::Equal,
+    }
 }
 
 fn sql_like_to_regex(pat: &str) -> String {
@@ -599,5 +669,136 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    // --- sort_matched_keys (MapAdapter sort; Python adapters/mapping.py:353) ---
+
+    /// Build a MapAdapter from ordered `(key, metadata)` pairs; insertion order
+    /// is preserved (IndexMap), matching a Python dict.
+    fn map_of(children: &[(&str, serde_json::Value)]) -> MapAdapter {
+        let mut mapping = IndexMap::new();
+        for (k, meta) in children {
+            mapping.insert((*k).to_string(), leaf(meta.clone()));
+        }
+        MapAdapter::new(mapping, serde_json::json!({}), vec![])
+    }
+
+    fn term(key: &str, dir: SortDirection) -> (String, SortDirection) {
+        (key.to_string(), dir)
+    }
+
+    #[test]
+    fn sort_ascending_by_numeric_key_missing_last() {
+        let map = map_of(&[
+            ("a", serde_json::json!({"n": 3})),
+            ("b", serde_json::json!({})), // missing "n" → sorts last
+            ("c", serde_json::json!({"n": 1})),
+            ("d", serde_json::json!({"n": 2})),
+        ]);
+        let keys = vec!["a".into(), "b".into(), "c".into(), "d".into()];
+        let out = map.sort_matched_keys(keys, &[term("n", SortDirection::Ascending)]);
+        assert_eq!(out, vec!["c", "d", "a", "b"]);
+    }
+
+    #[test]
+    fn sort_descending_reverses_order() {
+        let map = map_of(&[
+            ("a", serde_json::json!({"n": 3})),
+            ("c", serde_json::json!({"n": 1})),
+            ("d", serde_json::json!({"n": 2})),
+        ]);
+        let keys = vec!["a".into(), "c".into(), "d".into()];
+        let out = map.sort_matched_keys(keys, &[term("n", SortDirection::Descending)]);
+        // Ascending would be c,d,a; descending reverses to a,d,c.
+        assert_eq!(out, vec!["a", "d", "c"]);
+    }
+
+    #[test]
+    fn sort_by_string_key() {
+        let map = map_of(&[
+            ("x", serde_json::json!({"name": "cherry"})),
+            ("y", serde_json::json!({"name": "apple"})),
+            ("z", serde_json::json!({"name": "banana"})),
+        ]);
+        let keys = vec!["x".into(), "y".into(), "z".into()];
+        let out = map.sort_matched_keys(keys, &[term("name", SortDirection::Ascending)]);
+        assert_eq!(out, vec!["y", "z", "x"]);
+    }
+
+    #[test]
+    fn sort_underscore_sentinel() {
+        let map = map_of(&[
+            ("a", serde_json::json!({})),
+            ("b", serde_json::json!({})),
+            ("c", serde_json::json!({})),
+        ]);
+        let keys = vec!["a".into(), "b".into(), "c".into()];
+        // "_" ascending: leave the given order untouched.
+        let out = map.sort_matched_keys(keys.clone(), &[term("_", SortDirection::Ascending)]);
+        assert_eq!(out, vec!["a", "b", "c"]);
+        // "_" descending: reverse the given order without re-sorting.
+        let out = map.sort_matched_keys(keys, &[term("_", SortDirection::Descending)]);
+        assert_eq!(out, vec!["c", "b", "a"]);
+    }
+
+    #[test]
+    fn sort_multi_key_stable_chain() {
+        // Primary "grp" ascending, secondary "n" ascending. Terms are applied
+        // right-to-left as a stable chain, so ties on "grp" break by "n".
+        let map = map_of(&[
+            ("a", serde_json::json!({"grp": "y", "n": 2})),
+            ("b", serde_json::json!({"grp": "x", "n": 2})),
+            ("c", serde_json::json!({"grp": "x", "n": 1})),
+            ("d", serde_json::json!({"grp": "y", "n": 1})),
+        ]);
+        let keys = vec!["a".into(), "b".into(), "c".into(), "d".into()];
+        let out = map.sort_matched_keys(
+            keys,
+            &[
+                term("grp", SortDirection::Ascending),
+                term("n", SortDirection::Ascending),
+            ],
+        );
+        // grp=x {c(n1), b(n2)}, then grp=y {d(n1), a(n2)}.
+        assert_eq!(out, vec!["c", "b", "d", "a"]);
+    }
+
+    #[test]
+    fn sort_empty_terms_is_no_op() {
+        let map = map_of(&[
+            ("b", serde_json::json!({"n": 1})),
+            ("a", serde_json::json!({"n": 2})),
+        ]);
+        let keys = vec!["b".into(), "a".into()];
+        let out = map.sort_matched_keys(keys.clone(), &[]);
+        assert_eq!(out, keys, "no sort terms preserves matched order");
+    }
+
+    #[tokio::test]
+    async fn search_page_applies_sort_and_windows() {
+        // End-to-end through the default search_page: it calls sort_matched_keys
+        // then windows by offset/limit. Sort by "n" ascending, take rows [1,3).
+        let map = map_of(&[
+            ("a", serde_json::json!({"n": 40})),
+            ("b", serde_json::json!({"n": 10})),
+            ("c", serde_json::json!({"n": 30})),
+            ("d", serde_json::json!({"n": 20})),
+        ]);
+        // Ascending order: b(10), d(20), c(30), a(40). Window [1,3) → d, c.
+        let page = map
+            .search_page(
+                &[],
+                &[term("n", SortDirection::Ascending)],
+                None,
+                1,
+                2,
+                false,
+            )
+            .await
+            .unwrap();
+        let keys: Vec<&str> = page.entries.iter().map(|e| e.key.as_str()).collect();
+        assert_eq!(keys, vec!["d", "c"]);
+        assert_eq!(page.total, 4, "total is the full match count, pre-window");
+        assert!(page.next_cursor.is_none());
     }
 }
