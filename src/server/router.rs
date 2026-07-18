@@ -3119,6 +3119,28 @@ fn arrow_column_from_ndarray(
         (Kind::Integer, 4) => (DataType::Int32, decode!(i32, 4, Int32Array)),
         (Kind::UnsignedInteger, 8) => (DataType::UInt64, decode!(u64, 8, UInt64Array)),
         (Kind::UnsignedInteger, 4) => (DataType::UInt32, decode!(u32, 4, UInt32Array)),
+        // float16: arrow's csv/parquet writers have no native Float16 path, so
+        // widen to f32 at column build (lossless — 11→24 significand bits, so
+        // every f16 is exactly representable). Upstream `to_dataframe().to_csv()`
+        // serialises the same stored value; this matches the established
+        // f16→f32 widening (serialization/array.rs, dyn_ndarray_to_arrow). csv/
+        // parquet only — the arrow-wire client decoder handles neither Float16
+        // nor a silently-widened f32 for a declared-f16 var.
+        (Kind::Float, 2) if full => {
+            let mut v: Vec<f32> = Vec::with_capacity(n);
+            for chunk in bytes.chunks_exact(2) {
+                let a: [u8; 2] = chunk
+                    .try_into()
+                    .expect("chunks_exact yields fixed-size chunks");
+                let bits = if big {
+                    u16::from_be_bytes(a)
+                } else {
+                    u16::from_le_bytes(a)
+                };
+                v.push(half::f16::from_bits(bits).to_f32());
+            }
+            (DataType::Float32, Arc::new(Float32Array::from(v)) as ArrayRef)
+        }
         // Extended dtypes: csv/parquet only (server-side table serializer reads
         // any Arrow dtype; the arrow-wire client decoder cannot). numpy stores
         // bool as one byte per element (0/1), so a nonzero byte is `true`.
