@@ -1343,3 +1343,110 @@ async fn put_spec_version_length_bounded_at_255() {
         "256-char version must be rejected 422: {body}"
     );
 }
+
+/// Wave-35 (F3) — a spec `name`/`version` length bound must count CHARACTERS
+/// (Unicode code points), not BYTES. Upstream `StringConstraints(max_length=255)`
+/// counts code points (Python `len(str)`, `structures/core.py:29-30`), so a
+/// 200-CHARACTER multibyte string (≤255 chars) is accepted even though its UTF-8
+/// encoding is 600 bytes. The port compared `str::len()` (bytes) at
+/// `catalog/node.rs:317` (name) and `:327` (version), so a 200-char CJK name or
+/// version was wrongly 422'd (RED before this fix). The ASCII 256-char boundary
+/// still rejects.
+#[tokio::test]
+async fn spec_name_and_version_bounded_by_chars_not_bytes() {
+    let (app, _dir) = build_app(validation_config(false)).await;
+
+    let (status, _) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/metadata/",
+        serde_json::json!({
+            "key": "mb",
+            "structure_family": "container",
+            "metadata": {},
+            "specs": [],
+            "data_sources": [],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // 200 CJK code points = 200 chars (≤255) but 600 UTF-8 bytes (>255). Upstream
+    // accepts on char count; the port must too. RED before: byte length 600 > 255.
+    let name_mb = "가".repeat(200);
+    let ver_mb = "나".repeat(200);
+    assert_eq!(name_mb.chars().count(), 200);
+    assert!(
+        name_mb.len() > 255,
+        "precondition: 200 CJK chars must exceed 255 UTF-8 bytes"
+    );
+
+    // Multibyte NAME (≤255 chars) must be accepted.
+    let (status, body) = json_request(
+        &app,
+        Method::PUT,
+        "/api/v1/metadata/mb",
+        serde_json::json!({
+            "metadata": {},
+            "specs": [{"name": name_mb}],
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "200-char multibyte name (≤255 chars, >255 bytes) must be accepted: {body}"
+    );
+
+    // Multibyte VERSION (≤255 chars) must be accepted.
+    let (status, body) = json_request(
+        &app,
+        Method::PUT,
+        "/api/v1/metadata/mb",
+        serde_json::json!({
+            "metadata": {},
+            "specs": [{"name": "x", "version": ver_mb}],
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "200-char multibyte version (≤255 chars, >255 bytes) must be accepted: {body}"
+    );
+
+    // Boundary guard: a 256-CHAR ASCII name (256 chars) still 422s.
+    let ascii256 = "a".repeat(256);
+    let (status, body) = json_request(
+        &app,
+        Method::PUT,
+        "/api/v1/metadata/mb",
+        serde_json::json!({
+            "metadata": {},
+            "specs": [{"name": ascii256}],
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "256-char name must still be rejected 422: {body}"
+    );
+
+    // Boundary guard: a 256-CHAR ASCII version still 422s.
+    let (status, body) = json_request(
+        &app,
+        Method::PUT,
+        "/api/v1/metadata/mb",
+        serde_json::json!({
+            "metadata": {},
+            "specs": [{"name": "x", "version": "a".repeat(256)}],
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "256-char version must still be rejected 422: {body}"
+    );
+}
