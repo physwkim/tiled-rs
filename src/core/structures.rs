@@ -136,14 +136,22 @@ impl Spec {
     ///   (`server/schemas.py`). So this fallback is reached only by a corrupt/
     ///   out-of-band row, and dropping just the unrepresentable `version` while
     ///   keeping the name loses nothing a conformant client could observe.
-    /// * anything else — a number, an array, or an object with no string `name`
-    ///   → DROPPED. This is a deliberate defensive deviation: upstream RAISES
-    ///   (500) on such a stored row (`Spec(**123)` TypeError / `List[Spec]`
-    ///   validation error), whereas we skip it and serve the rest. For all
-    ///   well-formed data the results are identical; the deviation only changes
-    ///   corrupt/out-of-band rows (a nameless spec is rejected at write time by
-    ///   `validate_payload` with 422, so it cannot arise through the API), where
-    ///   returning the readable siblings beats a 500 on read.
+    /// * an object whose `name` is PRESENT but not a string (e.g. `{"name": 5}`)
+    ///   → DROPPED, a deliberate deviation. Upstream KEEPS it: `Spec` is a stdlib
+    ///   frozen `@dataclass` whose `StringConstraints` are inert at read time, so
+    ///   `Spec(**{"name": 5})` returns `Spec(5, None)` WITHOUT raising
+    ///   (`structures/core.py:28-37`, `catalog/adapter.py:307`). A non-string name
+    ///   is not representable in our `Spec { name: String }`; no API write path can
+    ///   store one (POST's typed `Vec<Spec>`, and PUT/PATCH's
+    ///   `validate_writable_specs`, both 422 it), so only a corrupt/out-of-band row
+    ///   reaches this drop.
+    /// * a number, an array, or an object with NO `name` key → DROPPED. Here
+    ///   upstream genuinely RAISES (500): `Spec(**123)` / `Spec(**{"version":"1"})`
+    ///   is a `TypeError` / `List[Spec]` validation error. We skip it and serve the
+    ///   readable siblings — a 500 on read helps no one, and such a row is likewise
+    ///   unreachable through the API (`validate_payload` rejects a nameless spec at
+    ///   write time with 422). For all well-formed data the results are identical;
+    ///   only corrupt/out-of-band rows differ.
     pub fn parse_stored_list(value: &serde_json::Value) -> Vec<Spec> {
         let Some(arr) = value.as_array() else {
             return Vec::new();
