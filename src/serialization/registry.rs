@@ -173,9 +173,36 @@ pub fn negotiate_media_type(
         // nothing serviceable and simply fails resolution — the loop moves on. An
         // empty token (leading/trailing/doubled comma) likewise resolves to
         // nothing and is skipped.
-        return fmt
-            .split(',')
-            .find_map(|token| resolve_format_token(token, family, registry));
+        //
+        // First-serviceable-wins vs. optimistic single-token resolution
+        // (Wave-34 F4): [`resolve_format_token`] resolves a bare registry alias
+        // OPTIMISTICALLY — it returns the aliased media type without a dispatch
+        // check, because some aliases (`.zip`, `.h5`) name formats the ROUTER
+        // produces outside the serializer registry, and producibility is the
+        // router's concern for a lone `?format=`. In a multi-token PRIORITY LIST
+        // that optimism is wrong: upstream skips an unserviceable media type and
+        // tries the next token, so an optimistic-but-unserviceable alias (e.g.
+        // `zip` on an array) must FALL THROUGH rather than steal the slot ahead of
+        // a later serviceable token. A multi-token list only ever reaches here
+        // from the array/table/sparse/ragged/awkward callers — the Container
+        // caller (`negotiate_container_full`) splits the list itself and passes
+        // single tokens — and for exactly those families `dispatch` is a COMPLETE
+        // serviceability oracle (no router-produced-outside-registry formats;
+        // awkward's `application/zip` IS registered). So a resolved token wins the
+        // list slot only when the family can actually produce it. A single token
+        // (no comma) keeps the optimistic contract: the Container path depends on
+        // it, and for the direct-caller families it is observationally equivalent
+        // to the router's own 406.
+        if fmt.contains(',') {
+            return fmt.split(',').find_map(|token| {
+                let media_type = resolve_format_token(token, family, registry)?;
+                registry
+                    .dispatch(family, &media_type)
+                    .is_some()
+                    .then_some(media_type)
+            });
+        }
+        return resolve_format_token(fmt, family, registry);
     }
     resolve_media_type(accept, family, registry)
 }
@@ -500,6 +527,53 @@ mod tests {
             )
             .as_deref(),
             Some(crate::core::media_type::mime::CSV),
+        );
+    }
+
+    /// Wave-34 (F4): in a COMMA-SEPARATED `?format=` priority list, a token that
+    /// resolves only OPTIMISTICALLY (registry alias, no serializer for this
+    /// family) must NOT steal the slot — upstream's first-serviceable-wins loop
+    /// (core.py:400-418) skips an unserviceable media type and tries the next
+    /// token. `zip,csv` on an array must fall through `application/zip` (which the
+    /// array family cannot serialize) to the serviceable `csv`.
+    #[test]
+    fn format_comma_list_unserviceable_optimistic_alias_falls_through() {
+        // Full registry: `.zip` is a globally-registered alias → `application/zip`,
+        // but the array family has no `application/zip` serializer.
+        let reg = crate::serialization::default_registry();
+        assert!(
+            reg.dispatch(StructureFamily::Array, "application/zip")
+                .is_none(),
+            "precondition: array cannot serialize application/zip",
+        );
+        // `zip,csv`: `zip` resolves optimistically but is unserviceable for the
+        // array family → fall through → `csv` (serviceable) wins.
+        assert_eq!(
+            negotiate_media_type(Some("zip,csv"), "", StructureFamily::Array, &reg).as_deref(),
+            Some(crate::core::media_type::mime::CSV),
+            "unserviceable optimistic `zip` must fall through to serviceable `csv`",
+        );
+        // A SINGLE token keeps the optimistic contract unchanged: the router (not
+        // negotiate) enforces producibility, and the Container path (zip/hdf5 are
+        // router-produced outside the registry) depends on this. `zip` alone still
+        // resolves to `application/zip` even though the array family can't serve it.
+        assert_eq!(
+            negotiate_media_type(Some("zip"), "", StructureFamily::Array, &reg).as_deref(),
+            Some("application/zip"),
+            "single-token optimistic resolution must be preserved",
+        );
+        // Where the optimistic alias IS serviceable for the family, it still wins
+        // the list slot: the awkward family HAS an `application/zip` serializer, so
+        // `zip,csv` resolves to `application/zip` (first serviceable).
+        assert!(
+            reg.dispatch(StructureFamily::Awkward, "application/zip")
+                .is_some(),
+            "precondition: awkward can serialize application/zip",
+        );
+        assert_eq!(
+            negotiate_media_type(Some("zip,csv"), "", StructureFamily::Awkward, &reg).as_deref(),
+            Some("application/zip"),
+            "serviceable `zip` still wins the list slot for the awkward family",
         );
     }
 
