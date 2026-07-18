@@ -1,6 +1,9 @@
 //! F4: an EXPLICIT `?field=` projection naming an access-hidden child is
-//! rejected with 404 (uniform with a direct node fetch and every output
-//! format), while an unfiltered LISTING still silently drops hidden children.
+//! rejected IDENTICALLY to one naming a truly-absent child — same status, same
+//! body (400 `No such field {key}.`) — so the response cannot be used to
+//! enumerate hidden children; an unfiltered LISTING still silently drops them.
+//! (Supersedes the interim hidden→404, which left hidden ≠ absent and leaked
+//! presence via the 404-vs-400 distinction.)
 //!
 //! Exercises the `application/json` path end-to-end with a catalog +
 //! TagBasedPolicy — the only backend that produces a per-child visible/hidden
@@ -71,7 +74,7 @@ fn json_seq_ids(bytes: &[u8]) -> Vec<String> {
 }
 
 #[tokio::test]
-async fn explicit_hidden_field_is_404_but_listing_filters_silently() {
+async fn explicit_hidden_field_matches_absent_but_listing_filters_silently() {
     let dir = tempfile::tempdir().unwrap();
     let cat_uri = format!("sqlite://{}", dir.path().join("catalog.db").display());
     let auth_uri = format!("sqlite://{}", dir.path().join("auth.db").display());
@@ -112,6 +115,18 @@ async fn explicit_hidden_field_is_404_but_listing_filters_silently() {
             vec!["ds".into()],
             node("hid", json!({"tags": ["team-b"]})),
         )
+        .await
+        .unwrap();
+    // A sibling container `ds2` with NO `hid` child at all — the "truly absent"
+    // reference point. `?field=hid` on `ds2` is a genuinely-missing field; its
+    // response must be byte-identical to `?field=hid` on `ds` (where `hid` is
+    // merely access-hidden), so the two cases are indistinguishable.
+    let ds2 = catalog
+        .create_node(None, vec![], node("ds2", json!({})))
+        .await
+        .unwrap();
+    catalog
+        .create_node(Some(ds2.id), vec!["ds2".into()], node("vis2", json!({})))
         .await
         .unwrap();
 
@@ -169,31 +184,59 @@ async fn explicit_hidden_field_is_404_but_listing_filters_silently() {
     let token = login(&app, "alice", "wonderland").await;
     let bearer = format!("Bearer {token}");
 
-    // Explicit ?field=hid (access-hidden) → 404, NOT a silent drop.
-    let (status, _) = get(
+    // Existence-hiding: an explicit `?field=hid` on `ds` (where `hid` is
+    // access-hidden) must be BYTE-IDENTICAL to `?field=hid` on `ds2` (where `hid`
+    // is genuinely absent) — same status, same body — so the response is not a
+    // presence oracle. Probing the SAME name in both keeps the echoed field name
+    // identical, so any residual difference would be a real leak. The absent case
+    // keeps upstream parity (KeyError → 400 "No such field hid."), so the hidden
+    // case returns that SAME 400 — NOT a silent drop and NOT a distinguishable 404.
+    let (hidden_status, hidden_body) = get(
         &app,
         "/api/v1/container/full/ds?format=application/json-seq&field=hid",
         &bearer,
     )
     .await;
+    let (absent_status, absent_body) = get(
+        &app,
+        "/api/v1/container/full/ds2?format=application/json-seq&field=hid",
+        &bearer,
+    )
+    .await;
     assert_eq!(
-        status,
-        StatusCode::NOT_FOUND,
-        "an explicit field naming an access-hidden child must 404"
+        hidden_status,
+        StatusCode::BAD_REQUEST,
+        "an access-hidden field must 400, matching a truly-absent one"
+    );
+    assert_eq!(
+        (hidden_status, &hidden_body),
+        (absent_status, &absent_body),
+        "access-hidden `hid` on ds must be byte-identical to absent `hid` on ds2"
     );
 
-    // The same explicit projection on the `application/json` tree also 404s
-    // (uniform across output formats — the single apply_child_projection owner).
-    let (status, _) = get(
+    // Uniform across output formats (single apply_child_projection owner): the
+    // application/json tree path also collapses hidden ≡ absent to the same 400.
+    let (hidden_status, hidden_body) = get(
         &app,
         "/api/v1/container/full/ds?format=application/json&field=hid",
         &bearer,
     )
     .await;
+    let (absent_status, absent_body) = get(
+        &app,
+        "/api/v1/container/full/ds2?format=application/json&field=hid",
+        &bearer,
+    )
+    .await;
     assert_eq!(
-        status,
-        StatusCode::NOT_FOUND,
-        "the json-tree path must 404 on the same hidden field"
+        hidden_status,
+        StatusCode::BAD_REQUEST,
+        "the json-tree path must 400 on the hidden field"
+    );
+    assert_eq!(
+        (hidden_status, &hidden_body),
+        (absent_status, &absent_body),
+        "the json-tree path must make hidden byte-identical to absent"
     );
 
     // Explicit ?field=vis (visible) → 200 with just vis.
