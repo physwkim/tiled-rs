@@ -2624,10 +2624,12 @@ fn negotiate_container_full(
         // token (`?format=csv,application/json` on a plain container → json),
         // never short-circuit to 406. A non-wide-table token resolves through the
         // container family. The first token that resolves wins; `None` (→ 406)
-        // only when every token fails. Empty tokens (leading/trailing/doubled
-        // comma) match nothing and are skipped.
+        // only when every token fails. Tokens are used VERBATIM — upstream splits
+        // `?format=` with no whitespace strip (core.py:381; only the `Accept`
+        // branch lstrips, core.py:388-390), so a padded token (` json`) names
+        // nothing serviceable and falls through. Empty tokens (leading/trailing/
+        // doubled comma) match nothing and are skipped.
         for token in fmt.split(',') {
-            let token = token.trim();
             if token.is_empty() {
                 continue;
             }
@@ -2897,6 +2899,23 @@ mod negotiate_container_full_tests {
     fn format_comma_list_all_unresolvable_is_none() {
         let reg = default_registry();
         assert!(negotiate_container_full(Some("badA,badB"), "", false, &reg).is_none());
+    }
+
+    /// Wave-34 (F1): the `?format=` branch must NOT strip token whitespace —
+    /// upstream splits `?format=` on commas with no strip (core.py:381; only the
+    /// `Accept` branch lstrips, core.py:388-390). A whitespace-padded token
+    /// (` application/json`) resolves to nothing serviceable, so a list whose
+    /// tokens are all whitespace-padded/unserviceable is None (406), never a
+    /// space-trimmed match.
+    #[test]
+    fn format_comma_list_does_not_strip_token_whitespace() {
+        let reg = default_registry();
+        // `unknownfmt, application/json`: second token is ` application/json`
+        // (leading space, NOT stripped) → unserviceable → None (406), not json.
+        assert!(
+            negotiate_container_full(Some("unknownfmt, application/json"), "", false, &reg)
+                .is_none()
+        );
     }
 }
 

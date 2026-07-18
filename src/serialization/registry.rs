@@ -166,17 +166,24 @@ pub fn negotiate_media_type(
         // the FIRST that resolves to a serviceable media type wins. `None` (→ 406)
         // only when EVERY token fails — `?format=` keeps hard priority over Accept
         // and never falls back to it (Python raises `UnsupportedMediaTypes`).
+        //
+        // Tokens are passed VERBATIM (no whitespace strip): upstream splits
+        // `?format=` on commas with no strip and only the `Accept` branch lstrips
+        // (core.py:381 vs core.py:388-390), so ` csv` (leading space) names
+        // nothing serviceable and simply fails resolution — the loop moves on. An
+        // empty token (leading/trailing/doubled comma) likewise resolves to
+        // nothing and is skipped.
         return fmt
             .split(',')
-            .find_map(|token| resolve_format_token(token.trim(), family, registry));
+            .find_map(|token| resolve_format_token(token, family, registry));
     }
     resolve_media_type(accept, family, registry)
 }
 
-/// Resolve ONE `?format=` token (already split off the comma priority list and
-/// trimmed) to a serviceable media type for `family`, or `None` when it names
-/// nothing this family can produce (so the priority-list loop tries the next
-/// token).
+/// Resolve ONE `?format=` token (already split off the comma priority list,
+/// VERBATIM — upstream does not strip format tokens) to a serviceable media type
+/// for `family`, or `None` when it names nothing this family can produce (so the
+/// priority-list loop tries the next token).
 ///
 /// Resolution order (returns the first that applies):
 ///  1. Verbatim full MIME type (e.g. `"text/csv"`) — accepted only when a
@@ -195,9 +202,10 @@ pub fn negotiate_media_type(
 ///     (e.g. `"csv"` → `"text/csv"`). Accepted only when a serializer is registered
 ///     for this `family`.
 ///
-/// An empty token (leading/trailing/doubled comma) matches none of these and
-/// returns `None`, so the priority-list loop skips it — matching upstream, where
-/// an empty split entry resolves to nothing serviceable and the loop continues.
+/// An empty token (leading/trailing/doubled comma) — or a whitespace-padded one,
+/// since tokens are not stripped — matches none of these and returns `None`, so
+/// the priority-list loop skips it, matching upstream, where such a split entry
+/// resolves to nothing serviceable and the loop continues.
 fn resolve_format_token(
     fmt: &str,
     family: StructureFamily,
@@ -462,6 +470,36 @@ mod tests {
                 &reg,
             ),
             None,
+        );
+    }
+
+    /// Wave-34 (F1): upstream splits `?format=` on commas with NO whitespace
+    /// strip — only the `Accept` branch lstrips (core.py:381 vs core.py:388-390).
+    /// So a whitespace-padded `?format=` token (` csv`) resolves to nothing
+    /// serviceable and the list falls through, exactly as upstream's loop does.
+    /// A leading/trailing space must NOT be trimmed into a serviceable token.
+    #[test]
+    fn format_comma_list_does_not_strip_token_whitespace() {
+        let reg = array_registry();
+        // `badfmt, csv`: `badfmt` is unserviceable and the second token is
+        // ` csv` (leading space, NOT stripped) → also unserviceable → None (406),
+        // NOT csv. Upstream never strips a `?format=` token.
+        assert_eq!(
+            negotiate_media_type(Some("badfmt, csv"), "", StructureFamily::Array, &reg),
+            None,
+        );
+        // A whitespace-padded first token is skipped, and a later CLEAN token
+        // (no surrounding space) still wins — the empty/unserviceable-token
+        // fall-through is untouched.
+        assert_eq!(
+            negotiate_media_type(
+                Some(" application/json,csv"),
+                "",
+                StructureFamily::Array,
+                &reg
+            )
+            .as_deref(),
+            Some(crate::core::media_type::mime::CSV),
         );
     }
 
