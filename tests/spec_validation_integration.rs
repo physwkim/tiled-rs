@@ -546,6 +546,80 @@ async fn create_allows_same_name_distinct_versions() {
     );
 }
 
+/// Finding 9 (w30): a POST under a NON-EXISTENT parent path is a 404, even when
+/// the request also carries an undeclared spec that `reject_undeclared_specs`
+/// would otherwise 400. Upstream resolves the parent `entry` before
+/// `_create_node` runs `validate_specs`, so parent-missing precedes spec
+/// validation; tiled-rs now validates specs only after parent resolution.
+#[tokio::test]
+async fn create_under_missing_parent_is_404_not_spec_400() {
+    let (app, _dir) = build_app(validation_config(true)).await;
+    let (status, body) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/metadata/does_not_exist",
+        serde_json::json!({
+            "key": "child",
+            "structure_family": "container",
+            "metadata": {},
+            "specs": [{"name": "mystery"}],
+            "data_sources": [],
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "missing parent must 404 before undeclared-spec 400: {body}"
+    );
+}
+
+/// Finding 9 companion: when the parent DOES exist, an undeclared spec still
+/// 400s under reject-on — sequencing spec validation after parent resolution
+/// does not disable it.
+#[tokio::test]
+async fn create_under_existing_parent_still_400s_undeclared_spec() {
+    let (app, _dir) = build_app(validation_config(true)).await;
+
+    let (status, _) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/metadata/",
+        serde_json::json!({
+            "key": "parent",
+            "structure_family": "container",
+            "metadata": {},
+            "specs": [],
+            "data_sources": [],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/metadata/parent",
+        serde_json::json!({
+            "key": "child",
+            "structure_family": "container",
+            "metadata": {},
+            "specs": [{"name": "mystery"}],
+            "data_sources": [],
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "undeclared spec under an existing parent → 400: {body}"
+    );
+    assert_eq!(
+        body["error"]["message"].as_str().unwrap_or_default(),
+        "Unrecognized spec: mystery"
+    );
+}
+
 /// A node carrying NO specs is unaffected whether `reject_undeclared_specs` is
 /// on or off — nothing to validate, nothing to reject.
 #[tokio::test]

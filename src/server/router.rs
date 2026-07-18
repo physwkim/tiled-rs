@@ -5699,13 +5699,14 @@ async fn create_node_core(
         }
     }
 
-    // Validate the node's specs against the server's validation registry before
-    // creating it (upstream `_create_node` → `validate_specs`, router.py:1876;
-    // `entry=None` because the node does not exist yet). A registered validator
-    // may reject the node (→ 400) or return a normalized metadata document; an
-    // undeclared spec is rejected only when `reject_undeclared_specs` is set.
-    // Runs on both the catalog and the no-catalog fallback paths, exactly as
-    // upstream validates before either branch.
+    // The registry `validate_specs` call (upstream `_create_node` →
+    // `validate_specs`, router.py:1876; `entry=None` because the node does not
+    // exist yet) is issued PER BRANCH below, AFTER the parent path is resolved
+    // on the catalog path — so a POST under a non-existent parent is a 404, not
+    // a spec-validation 400/400-family error. Upstream resolves the parent
+    // `entry` in the route before `_create_node` runs, so parent-missing 404
+    // likewise precedes `validate_specs`. `create_structure` is computed once
+    // here and shared by both branch calls.
     let create_structure = if matches!(
         req.structure_family,
         crate::core::structures::StructureFamily::Container
@@ -5717,19 +5718,15 @@ async fn create_node_core(
             .and_then(|ds| ds.structure.as_ref())
             .and_then(|s| serde_json::to_value(s).ok())
     };
-    let (_meta_modified, metadata) = crate::server::validation::validate_specs(
-        &state.validation.registry,
-        state.validation.reject_undeclared_specs,
-        &req.specs,
-        req.metadata.clone(),
-        crate::server::validation::ValidationTarget::Create {
-            structure_family: req.structure_family,
-            structure: create_structure.as_ref(),
-        },
-    )?;
+    let validation_target = crate::server::validation::ValidationTarget::Create {
+        structure_family: req.structure_family,
+        structure: create_structure.as_ref(),
+    };
 
     if let Some(ref catalog) = state.catalog {
-        // Per-ancestor auth gate on the parent container path.
+        // Per-ancestor auth gate on the parent container path. A non-existent
+        // parent path 404s here (resolve_entry_catalog), before any spec
+        // validation runs.
         let auth = if !segments.is_empty() {
             resolve_entry(&state, auth, &segments, crate::auth::Scope::CreateNode).await?
         } else {
@@ -5749,6 +5746,17 @@ async fn create_node_core(
                 })?;
             Some(parent.id)
         };
+
+        // Parent resolved → NOW validate the specs (a registered validator may
+        // reject → 400, or return a normalized metadata document; an undeclared
+        // spec is rejected only when `reject_undeclared_specs` is set).
+        let (_meta_modified, metadata) = crate::server::validation::validate_specs(
+            &state.validation.registry,
+            state.validation.reject_undeclared_specs,
+            &req.specs,
+            req.metadata.clone(),
+            validation_target,
+        )?;
 
         // Compute the initial access_blob. The client may supply one in the
         // request; otherwise derive it from the creator principal. Then let
@@ -5936,7 +5944,15 @@ async fn create_node_core(
     }
 
     // No catalog wired — accept-only fallback (synthetic id, no persistence).
-    // Useful for development against a Mongo-backed read tree.
+    // Useful for development against a Mongo-backed read tree. There is no
+    // parent path to resolve here, so `validate_specs` runs unconditionally.
+    let (_meta_modified, metadata) = crate::server::validation::validate_specs(
+        &state.validation.registry,
+        state.validation.reject_undeclared_specs,
+        &req.specs,
+        req.metadata.clone(),
+        validation_target,
+    )?;
     let child_path = if path.is_empty() {
         id.clone()
     } else {
