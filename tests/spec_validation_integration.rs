@@ -492,6 +492,60 @@ async fn patch_bare_string_undeclared_spec_accepted_when_reject_off() {
     );
 }
 
+/// Finding 7 (w30): CREATE rejects duplicate specs with 422, matching upstream
+/// `PostMetadataRequest.specs_uniqueness_validator` (schemas.py:471-478). The
+/// catalog's `validate_payload` caps the spec COUNT but not uniqueness, so the
+/// handler must — and it does so before registry validation, so the duplicate
+/// is a 422 even with `reject_undeclared_specs` off (specs "a" are undeclared).
+#[tokio::test]
+async fn create_rejects_duplicate_specs() {
+    let (app, _dir) = build_app(validation_config(false)).await;
+    let (status, body) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/metadata/",
+        serde_json::json!({
+            "key": "dup",
+            "structure_family": "container",
+            "metadata": {},
+            "specs": [{"name": "a"}, {"name": "a"}],
+            "data_sources": [],
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "duplicate specs must be 422: {body}"
+    );
+}
+
+/// Finding 7 boundary: the same spec NAME with DISTINCT versions is not a
+/// duplicate — uniqueness is by `(name, version)`, matching upstream `Spec`
+/// equality and the `spec_identity` the PATCH/PUT handlers use.
+#[tokio::test]
+async fn create_allows_same_name_distinct_versions() {
+    let (app, _dir) = build_app(validation_config(false)).await;
+    let (status, body) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/metadata/",
+        serde_json::json!({
+            "key": "ver",
+            "structure_family": "container",
+            "metadata": {},
+            "specs": [{"name": "a", "version": "1"}, {"name": "a", "version": "2"}],
+            "data_sources": [],
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "same name with distinct versions is unique: {body}"
+    );
+}
+
 /// A node carrying NO specs is unaffected whether `reject_undeclared_specs` is
 /// on or off — nothing to validate, nothing to reject.
 #[tokio::test]

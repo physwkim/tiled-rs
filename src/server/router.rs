@@ -5678,6 +5678,27 @@ async fn create_node_core(
     }
     .to_string();
 
+    // Reject duplicate specs before any other work (upstream
+    // `PostMetadataRequest.specs_uniqueness_validator`, schemas.py:471-478 —
+    // a request field_validator that raises → HTTP 422). Uniqueness is by the
+    // same `(name, version)` identity `spec_identity` gives the PATCH/PUT
+    // handlers, so all three write paths agree; the catalog's `validate_payload`
+    // caps the spec COUNT but does not check uniqueness. Runs before parent
+    // resolution and registry validation so a duplicate-spec request is a 422
+    // regardless of whether the parent exists or a validator would fire.
+    {
+        let mut seen: Vec<serde_json::Value> = Vec::with_capacity(req.specs.len());
+        for spec in &req.specs {
+            let identity = spec_identity(&serde_json::to_value(spec).unwrap_or_default());
+            if seen.contains(&identity) {
+                return Err(ServerError::Validation(
+                    "Cannot create a node with non-unique specs".into(),
+                ));
+            }
+            seen.push(identity);
+        }
+    }
+
     // Validate the node's specs against the server's validation registry before
     // creating it (upstream `_create_node` → `validate_specs`, router.py:1876;
     // `entry=None` because the node does not exist yet). A registered validator
