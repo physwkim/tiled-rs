@@ -848,16 +848,18 @@ async fn search_normalizes_persisted_bare_string_specs() {
     );
 }
 
-/// Task #121-followup (w32) — READ-BACK, router single-node path: an object
-/// spec whose `version` is present but NOT a string (e.g. `5`) must read back
-/// NAME-ONLY (`{name}`), not vanish. The full typed `Spec` parse fails because
-/// our `version` is `Option<String>`, but element PRESENCE is load-bearing: the
-/// deleted catalog `parse_specs` kept such an element (name-only), and upstream
-/// `Spec(**{"name":"x","version":5})` keeps it too (`catalog/adapter.py:307`,
-/// `structures/core.py:29`). Before the fix `serde_json::from_value::<Spec>`
-/// returned `Err` and the element was dropped entirely.
+/// Wave-33 (A1) — WRITE-SIDE TIGHTENING, merge-patch flavor. A spec whose
+/// `version` is present but NOT a string cannot round-trip losslessly through
+/// `Spec::parse_stored_list` (the version is dropped on read-back), so the write
+/// is now rejected with 422 at the request boundary — mirroring upstream's typed
+/// `PatchMetadataRequest.specs: Specs` (`List[Spec]`, schemas.py:575) and our own
+/// POST path (`PostMetadataRequest.specs: Vec<Spec>`). Before the fix this PATCH
+/// returned 200 and the node silently stored `version: 5`, which then vanished on
+/// every parsed read. The read-back-name-only behavior for a genuinely
+/// out-of-band row stays pinned at the `parse_stored_list` unit level
+/// (`src/core/structures.rs` tests); it is no longer reachable through the API.
 #[tokio::test]
-async fn get_metadata_keeps_object_spec_name_only_when_version_non_string() {
+async fn patch_merge_rejects_non_string_version() {
     let (app, _dir) = build_app(validation_config(false)).await;
 
     let (status, _) = json_request(
@@ -875,9 +877,6 @@ async fn get_metadata_keeps_object_spec_name_only_when_version_non_string() {
     .await;
     assert_eq!(status, StatusCode::CREATED);
 
-    // Persist a single object spec with a NON-STRING version via merge-patch
-    // (raw storage keeps `version: 5` verbatim — a shape a valid typed write
-    // path can never produce, but a hand-crafted PATCH can).
     let (status, body) = json_request(
         &app,
         Method::PATCH,
@@ -890,10 +889,11 @@ async fn get_metadata_keeps_object_spec_name_only_when_version_non_string() {
     .await;
     assert_eq!(
         status,
-        StatusCode::OK,
-        "persist non-string-version spec: {body}"
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "merge-patch with a non-string version must be 422: {body}"
     );
 
+    // The rejected write must not have landed: specs stay empty.
     let (status, body) = json_request(
         &app,
         Method::GET,
@@ -904,26 +904,19 @@ async fn get_metadata_keeps_object_spec_name_only_when_version_non_string() {
     assert_eq!(status, StatusCode::OK, "read back: {body}");
     assert_eq!(
         body["data"]["attributes"]["specs"],
-        // Name-only: the non-portable `version: 5` is dropped, the element stays.
-        serde_json::json!([{"name": "x"}]),
-        "object spec with a non-string version must read back name-only, not vanish: {body}"
+        serde_json::json!([]),
+        "a rejected non-string-version PATCH must not mutate specs: {body}"
     );
 }
 
-/// Task #121-followup (w32) — READ-BACK, catalog SEARCH path: a MIXED list of a
-/// bare string and an object spec with a NON-STRING version must read back
-/// keeping BOTH name-bearing elements (the string, and the object name-only) IN
-/// ORDER. This is the storable end-to-end shape of the name-only-keep fix on the
-/// search path.
-///
-/// The NAMELESS-garbage element (`123`) from the brief's fixture is intentionally
-/// NOT in this list: `validate_payload` (`catalog/node.rs:316`) rejects a spec
-/// with no string `name` at WRITE time (422 "spec missing name"), so garbage is
-/// unreachable through the API. The garbage-DROP read-back is therefore pinned at
-/// the `parse_stored_list` unit level (`src/core/structures.rs` tests), the only
-/// level a corrupt/out-of-band row can exercise it.
+/// Wave-33 (A1) — WRITE-SIDE TIGHTENING, json-patch flavor. The same invariant
+/// on the RFC 6902 path: an `add`/`replace` op whose value carries a non-string
+/// `version` is rejected with 422, mirroring upstream `List[JSONPatchSpec]` whose
+/// op `value` is typed as `Spec` (schemas.py:557/575). A name-bearing sibling in
+/// the same op batch does not rescue it — the whole write is rejected and the
+/// node's specs stay untouched.
 #[tokio::test]
-async fn search_keeps_name_only_object_spec_in_order() {
+async fn patch_json_patch_rejects_non_string_version() {
     let (app, _dir) = build_app(validation_config(false)).await;
 
     let (status, _) = json_request(
@@ -941,39 +934,38 @@ async fn search_keeps_name_only_object_spec_in_order() {
     .await;
     assert_eq!(status, StatusCode::CREATED);
 
-    // string (kept), object w/ non-string version (kept name-only). Both carry a
-    // name, so both survive `validate_payload`; order must be preserved.
     let (status, body) = json_request(
         &app,
         Method::PATCH,
         "/api/v1/metadata/gv",
         serde_json::json!({
-            "content-type": "application/merge-patch+json",
-            "specs": ["good", {"name": "y", "version": 5}],
+            "content-type": "application/json-patch+json",
+            "specs": [
+                {"op": "add", "path": "/-", "value": "good"},
+                {"op": "add", "path": "/-", "value": {"name": "y", "version": 5}},
+            ],
         }),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "persist mixed specs: {body}");
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "json-patch adding a non-string version must be 422: {body}"
+    );
 
+    // The rejected write must not have landed: specs stay empty.
     let (status, body) = json_request(
         &app,
         Method::GET,
-        "/api/v1/search/",
+        "/api/v1/metadata/gv",
         serde_json::Value::Null,
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "search: {body}");
-    let entry = body["data"]
-        .as_array()
-        .and_then(|rows| rows.iter().find(|r| r["id"] == "gv"))
-        .unwrap_or_else(|| panic!("search must return the seeded node: {body}"));
+    assert_eq!(status, StatusCode::OK, "read back: {body}");
     assert_eq!(
-        entry["attributes"]["specs"],
-        serde_json::json!([
-            {"name": "good"},
-            {"name": "y"},
-        ]),
-        "mixed list must keep name-bearing elements (object name-only) in order: {body}"
+        body["data"]["attributes"]["specs"],
+        serde_json::json!([]),
+        "a rejected non-string-version json-patch must not mutate specs: {body}"
     );
 }
 
@@ -1053,5 +1045,156 @@ async fn revisions_normalize_persisted_bare_string_specs() {
             {"name": "beta", "version": "2"},
         ]),
         "revision specs must read back normalized and in order: {body}"
+    );
+}
+
+/// Wave-33 (A1) — WRITE-SIDE TIGHTENING, PUT (wholesale replace). A non-string
+/// version in the replacement specs is rejected with 422, mirroring upstream
+/// `PutMetadataRequest.specs: Optional[Specs]` (schemas.py:528). The prior specs
+/// must be preserved.
+#[tokio::test]
+async fn put_rejects_non_string_version() {
+    let (app, _dir) = build_app(validation_config(false)).await;
+
+    let (status, _) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/metadata/",
+        serde_json::json!({
+            "key": "pv",
+            "structure_family": "container",
+            "metadata": {},
+            "specs": [{"name": "keep"}],
+            "data_sources": [],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) = json_request(
+        &app,
+        Method::PUT,
+        "/api/v1/metadata/pv",
+        serde_json::json!({
+            "metadata": {},
+            "specs": [{"name": "x", "version": 5}],
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "PUT with a non-string version must be 422: {body}"
+    );
+
+    // The rejected replacement must not have landed: the original spec stays.
+    let (status, body) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/metadata/pv",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "read back: {body}");
+    assert_eq!(
+        body["data"]["attributes"]["specs"],
+        serde_json::json!([{"name": "keep"}]),
+        "a rejected PUT must not mutate specs: {body}"
+    );
+}
+
+/// Wave-33 (A1) — a CONFORMANT bare-string spec on PUT/PATCH is STILL accepted:
+/// it round-trips losslessly through `parse_stored_list` (arm 1), so the write
+/// tightening must not reject it (only non-string name/version is rejected). This
+/// guards the tiled-rs bare-string back-compat the w30 tests established.
+#[tokio::test]
+async fn put_bare_string_spec_still_accepted_after_tightening() {
+    let (app, _dir) = build_app(validation_config(false)).await;
+
+    let (status, _) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/metadata/",
+        serde_json::json!({
+            "key": "bs",
+            "structure_family": "container",
+            "metadata": {},
+            "specs": [],
+            "data_sources": [],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) = json_request(
+        &app,
+        Method::PUT,
+        "/api/v1/metadata/bs",
+        serde_json::json!({
+            "metadata": {},
+            "specs": ["legacy"],
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a lossless bare-string spec must remain writable: {body}"
+    );
+}
+
+/// Wave-33 (A1) — regression guard + read-path agreement. A CONFORMANT
+/// string-version spec is stored and read back byte-identically, and the parsed
+/// metadata read agrees with the raw `distinct` facet for API-written data (the
+/// cross-endpoint inconsistency the version-drop bug caused can no longer arise,
+/// because a non-string version is now unwritable).
+#[tokio::test]
+async fn conformant_version_round_trips_and_distinct_agrees() {
+    let (app, _dir) = build_app(validation_config(false)).await;
+
+    let (status, body) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/metadata/",
+        serde_json::json!({
+            "key": "ok",
+            "structure_family": "container",
+            "metadata": {},
+            "specs": [{"name": "x", "version": "1"}],
+            "data_sources": [],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "create: {body}");
+
+    // Parsed metadata read: byte-identical to what was written.
+    let (status, meta) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/metadata/ok",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "read back: {meta}");
+    let metadata_specs = meta["data"]["attributes"]["specs"].clone();
+    assert_eq!(
+        metadata_specs,
+        serde_json::json!([{"name": "x", "version": "1"}]),
+        "conformant version must round-trip identically: {meta}"
+    );
+
+    // Raw `distinct` facet must carry the SAME specs value.
+    let (status, dist) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/distinct/?specs=true",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "distinct: {dist}");
+    let distinct_value = dist["specs"][0]["value"].clone();
+    assert_eq!(
+        distinct_value, metadata_specs,
+        "distinct facet and parsed metadata read must agree for API-written data: {dist}"
     );
 }
