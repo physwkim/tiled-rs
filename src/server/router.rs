@@ -449,6 +449,11 @@ pub async fn metadata(
     auth: crate::server::AuthContext,
 ) -> Result<impl IntoResponse, ServerError> {
     auth.require(crate::auth::Scope::ReadMetadata)?;
+    // Validate `?max_depth=` up front (Query(None, ge=0, le=DEPTH_LIMIT),
+    // router.py:460) so an out-of-range/non-integer value is a 422 that
+    // pre-empts the node walk's 404, matching FastAPI's query-gate precedence.
+    // The parsed value is not yet threaded into inlining (commit 3).
+    parse_max_depth(params.get("max_depth").map(String::as_str))?;
     // Use the raw URI path so a key containing `%2F` survives as one
     // segment rather than being split apart by axum's `Path<String>` (which
     // percent-decodes before splitting).
@@ -632,6 +637,44 @@ fn parse_sort(params: &[(String, String)]) -> Result<Vec<(String, SortDirection)
     Ok(sorting)
 }
 
+/// Parse and validate the `?max_depth=` query value, mirroring upstream's
+/// `max_depth: Optional[int] = Query(None, ge=0, le=DEPTH_LIMIT)` on both the
+/// search and metadata routes (router.py:322/460). Absent ⇒ `None` (inline to
+/// the `DEPTH_LIMIT` bound). Present values are validated with the SAME
+/// precedence FastAPI/pydantic applies before the route body runs, and the 422
+/// messages mirror pydantic v2 verbatim so the error body matches:
+///
+/// - not an integer          → "Input should be a valid integer, unable to parse
+///   string as an integer"
+/// - `< 0` (violates `ge=0`)  → "Input should be greater than or equal to 0"
+/// - `> DEPTH_LIMIT` (`le`)   → "Input should be less than or equal to 5"
+///
+/// A negative value is a signed integer first (so it fails `ge=0`, NOT integer
+/// parsing) — matching pydantic, which parses `-1` as an int and only then
+/// applies the bound. On success returns the clamped-in-range depth.
+fn parse_max_depth(raw: Option<&str>) -> Result<Option<usize>, ServerError> {
+    let Some(s) = raw else {
+        return Ok(None);
+    };
+    let n: i64 = s.parse().map_err(|_| {
+        ServerError::Validation(
+            "Input should be a valid integer, unable to parse string as an integer".into(),
+        )
+    })?;
+    if n < 0 {
+        return Err(ServerError::Validation(
+            "Input should be greater than or equal to 0".into(),
+        ));
+    }
+    if n > links::DEPTH_LIMIT as i64 {
+        return Err(ServerError::Validation(format!(
+            "Input should be less than or equal to {}",
+            links::DEPTH_LIMIT
+        )));
+    }
+    Ok(Some(n as usize))
+}
+
 pub async fn search_root(
     state: State<AppState>,
     // Vec<(K,V)> preserves repeated keys so multiple same-type filters all survive.
@@ -658,6 +701,15 @@ pub async fn search(
     auth: crate::server::AuthContext,
 ) -> Result<impl IntoResponse, ServerError> {
     auth.require(crate::auth::Scope::ReadMetadata)?;
+    // Validate `?max_depth=` up front (Query(None, ge=0, le=DEPTH_LIMIT),
+    // router.py:322), same precedence as the metadata route. The parsed value
+    // is not yet threaded into inlining (commit 3).
+    parse_max_depth(
+        params
+            .iter()
+            .find(|(k, _)| k == "max_depth")
+            .map(|(_, v)| v.as_str()),
+    )?;
     let segments = segments_from_uri(&uri, "/api/v1/search/");
 
     let offset: usize = params
@@ -3543,7 +3595,7 @@ pub async fn container_full(
         let max_depth: Option<usize> = params
             .get("max_depth")
             .and_then(|s| s.parse::<usize>().ok())
-            .map(|d| d.min(DEPTH_LIMIT));
+            .map(|d| d.min(links::DEPTH_LIMIT));
         let mut entries: Vec<ZipEntry> = Vec::new();
         // The zip export carries metadata in the JSON tree, not per-entry, so the
         // collected group metadata is discarded here.
@@ -3851,7 +3903,7 @@ async fn container_full_hdf5(
     let max_depth: Option<usize> = params
         .get("max_depth")
         .and_then(|s| s.parse::<usize>().ok())
-        .map(|d| d.min(DEPTH_LIMIT));
+        .map(|d| d.min(links::DEPTH_LIMIT));
 
     // The export root's metadata becomes the HDF5 file (root group) attributes —
     // Python `file.attrs.update(metadata)`.
@@ -4005,10 +4057,6 @@ async fn container_full_hdf5(
 
     Ok(h5)
 }
-
-/// Maximum walk depth for zip export — mirrors Python `DEPTH_LIMIT = 5`
-/// (`tiled/server/core.py:62`).
-const DEPTH_LIMIT: usize = 5;
 
 /// Phase 1 of the deep-export: recursively collect every visible leaf below
 /// `container` into a flat, ordered `out` list. Runs on the executor — the
