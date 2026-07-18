@@ -358,6 +358,99 @@ async fn arrow_child_without_coord_or_data_var_spec_is_422() {
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
 }
 
+// ---------------------------------------------------------------------------
+// F1 — listed-order Accept negotiation. A wide-table media type (or its csv
+// alias) must not pre-empt an EARLIER-listed container-servable type: the FIRST
+// serviceable type in the Accept list wins (upstream core.py:396-425).
+// ---------------------------------------------------------------------------
+
+/// GET returning `(status, content-type, body)` for an explicit Accept header.
+async fn get_accept_ct(
+    app: &axum::Router,
+    uri: &str,
+    accept: &str,
+) -> (StatusCode, String, Vec<u8>) {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .header("accept", accept)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (status, ct, bytes.to_vec())
+}
+
+/// Regression: `Accept: text/html, text/plain` on a NON-xarray container was
+/// 200 HTML before the csv-alias commit; scanning the whole Accept for a
+/// wide-table type then committed to the csv export (text/plain is a csv alias)
+/// and 406'd the plain container. Listed-order negotiation serves the
+/// earlier-listed, container-servable text/html.
+#[tokio::test]
+async fn accept_html_before_plain_alias_serves_html_on_plain_container() {
+    let plain = container(
+        vec![("a", f64_var(&[1.0, 2.0], "xarray_data_var", json!({})))],
+        vec![], // not an xarray_dataset
+    );
+    let app = app_for_root(root_with(vec![("plain", plain)]));
+    let (status, ct, _body) =
+        get_accept_ct(&app, "/api/v1/container/full/plain", "text/html, text/plain").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        ct.starts_with("text/html"),
+        "content-type should be text/html, got {ct:?}"
+    );
+}
+
+/// On an xarray_dataset the same header must serve the earlier-listed HTML, not
+/// CSV — the csv alias (text/plain) is listed AFTER text/html and must not win.
+#[tokio::test]
+async fn accept_html_before_plain_alias_serves_html_on_xarray_dataset() {
+    let app = app_for_root(root_with(vec![("weather", weather())]));
+    let (status, ct, body) =
+        get_accept_ct(&app, "/api/v1/container/full/weather", "text/html, text/plain").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        ct.starts_with("text/html"),
+        "content-type should be text/html, got {ct:?}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&body).starts_with("time,temp,pressure"),
+        "must NOT serve the csv wide table when html is listed first"
+    );
+}
+
+/// When the csv alias is listed FIRST it wins: the container family cannot serve
+/// csv, the xarray_dataset spec can, so the first serviceable type in order is
+/// the wide-table csv.
+#[cfg(feature = "csv")]
+#[tokio::test]
+async fn accept_csv_before_html_serves_csv_on_xarray_dataset() {
+    let app = app_for_root(root_with(vec![("weather", weather())]));
+    let (status, ct, body) =
+        get_accept_ct(&app, "/api/v1/container/full/weather", "text/csv, text/html").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        ct.starts_with("text/csv"),
+        "content-type should be text/csv, got {ct:?}"
+    );
+    assert!(String::from_utf8_lossy(&body).starts_with("time,temp,pressure"));
+}
+
 // The non-arrow container listing is unaffected by the arrow interception.
 #[tokio::test]
 async fn non_arrow_container_full_still_lists_children() {
@@ -456,6 +549,47 @@ mod csv_export {
                 .unwrap()
                 .starts_with("time,temp,pressure\n"),
             "Accept: text/csv serves the flattened wide table"
+        );
+    }
+
+    /// F2: `?format=text/plain` is one of the three csv aliases upstream
+    /// registers for the dataset (serialization/xarray.py:80-81); it must serve
+    /// the csv wide table, not fall through to container negotiation → 406.
+    #[tokio::test]
+    async fn format_text_plain_serves_csv_on_xarray_dataset() {
+        let app = app_for_root(root_with(vec![("weather", weather())]));
+        let (status, body) = get_accept(
+            &app,
+            "/api/v1/container/full/weather?format=text/plain",
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            String::from_utf8(body)
+                .unwrap()
+                .starts_with("time,temp,pressure"),
+            "?format=text/plain serves the flattened wide table"
+        );
+    }
+
+    /// F2: `?format=text/comma-separated-values` (the second csv alias) likewise
+    /// serves the csv wide table.
+    #[tokio::test]
+    async fn format_comma_separated_values_serves_csv_on_xarray_dataset() {
+        let app = app_for_root(root_with(vec![("weather", weather())]));
+        let (status, body) = get_accept(
+            &app,
+            "/api/v1/container/full/weather?format=text/comma-separated-values",
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            String::from_utf8(body)
+                .unwrap()
+                .starts_with("time,temp,pressure"),
+            "?format=text/comma-separated-values serves the flattened wide table"
         );
     }
 
