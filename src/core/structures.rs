@@ -129,10 +129,13 @@ impl Spec {
     ///   keeps the element (`catalog/adapter.py:307`, `structures/core.py:29`),
     ///   and the deleted catalog `parse_specs` kept it too. Exact passthrough of
     ///   a non-string `version` is not portable to our `Option<String>`, and no
-    ///   valid write path can store one (upstream types `version: Optional[str]`,
-    ///   `server/schemas.py`; the catalog `validate_payload` accepts it only as a
-    ///   string), so dropping just the unrepresentable `version` while keeping
-    ///   the name loses nothing a conformant client could observe.
+    ///   API write path can store one: POST types `specs` as `Vec<Spec>`
+    ///   (`core/schemas.rs`) and PUT/PATCH run `validate_writable_specs`
+    ///   (`server/router.rs`), each rejecting a non-string `version` with 422 —
+    ///   mirroring upstream's typed `Specs` / `JSONPatchSpec` request bodies
+    ///   (`server/schemas.py`). So this fallback is reached only by a corrupt/
+    ///   out-of-band row, and dropping just the unrepresentable `version` while
+    ///   keeping the name loses nothing a conformant client could observe.
     /// * anything else — a number, an array, or an object with no string `name`
     ///   → DROPPED. This is a deliberate defensive deviation: upstream RAISES
     ///   (500) on such a stored row (`Spec(**123)` TypeError / `List[Spec]`

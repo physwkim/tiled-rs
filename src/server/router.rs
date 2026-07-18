@@ -7036,6 +7036,18 @@ pub async fn patch_metadata(
         }
     };
 
+    // Wave-33 (A1): a write may modify specs only into shapes the read path can
+    // round-trip losslessly, so `Spec::parse_stored_list`'s "no API write path
+    // can store a non-string version" premise holds by construction. Gated on the
+    // request actually carrying a `specs` field — a metadata-only patch leaves a
+    // node's stored specs untouched and is never re-validated (upstream type-
+    // checks `body.specs` and trusts `entry.specs`). Mirrors the typed
+    // `PatchMetadataRequest.specs` request body (merge-patch `Specs`; json-patch
+    // op `value: Spec`, schemas.py:557/575).
+    if req.get("specs").is_some_and(|v| !v.is_null()) {
+        validate_writable_specs(&specs)?;
+    }
+
     // Limits that bypass register-time schema validation when reached via
     // patch — Python validates the FINAL specs in the handler before writing
     // (server router.py:2370-2380; both return HTTP 422). The catalog also
@@ -7223,6 +7235,15 @@ pub async fn put_metadata(
         _ if node.specs.is_null() => serde_json::Value::Array(Vec::new()),
         _ => node.specs.clone(),
     };
+
+    // Wave-33 (A1): the wholesale replacement may only introduce specs the read
+    // path can round-trip losslessly (see `validate_writable_specs`). Gated on a
+    // present, non-null `specs` field so a metadata-only PUT never re-validates
+    // the node's untouched stored specs. Mirrors the typed
+    // `PutMetadataRequest.specs: Optional[Specs]` request body (schemas.py:528).
+    if req.get("specs").is_some_and(|v| !v.is_null()) {
+        validate_writable_specs(&specs)?;
+    }
 
     // Validate the FINAL specs (count ≤ 20, uniqueness) before writing — the
     // same limits the PATCH handler and Python `validate_specs` enforce (422).
@@ -8538,6 +8559,53 @@ fn spec_identity(spec: &serde_json::Value) -> serde_json::Value {
 /// was persisted WITHOUT being rejected under `reject_undeclared_specs`.
 fn specs_for_validation(specs: &serde_json::Value) -> Vec<crate::core::structures::Spec> {
     crate::core::structures::Spec::parse_stored_list(specs)
+}
+
+/// Reject a metadata write that would persist a spec element
+/// [`Spec::parse_stored_list`](crate::core::structures::Spec::parse_stored_list)
+/// cannot round-trip losslessly — the structural guarantee behind that parser's
+/// "no API write path can store a non-string `version`" premise. Mirrors
+/// upstream's typed request bodies, where the PUT and merge-patch specs are
+/// `Specs` = `List[Spec]` (`server/schemas.py:119`/`:528`/`:575`) and every
+/// json-patch op `value` is a `Spec` (`JSONPatchSpec`, `schemas.py:557`): an
+/// element whose `name` is non-string, or whose `version` is present but neither
+/// `null` nor a string, is rejected with 422 — exactly as the POST path already
+/// rejects it through the typed `PostMetadataRequest.specs: Vec<Spec>`
+/// (`src/core/schemas.rs:300`).
+///
+/// A bare string, and a `{name, version?}` object with a string name and a
+/// string/absent/`null` version, round-trip losslessly and are accepted (the
+/// bare-string form is tiled-rs read-back back-compat, `parse_stored_list`
+/// arm 1). The caller applies this only to the specs a write actually MODIFIES,
+/// so a metadata-only update never re-validates a node's untouched stored specs
+/// — matching upstream, which type-checks `body.specs` and trusts `entry.specs`.
+fn validate_writable_specs(specs: &serde_json::Value) -> Result<(), ServerError> {
+    let Some(arr) = specs.as_array() else {
+        return Err(ServerError::Validation(
+            "specs must be a JSON array of string names or {name, version?} objects".into(),
+        ));
+    };
+    for el in arr {
+        let lossless = if el.is_string() {
+            true
+        } else if let Some(obj) = el.as_object() {
+            let name_ok = obj.get("name").is_some_and(serde_json::Value::is_string);
+            let version_ok = match obj.get("version") {
+                None => true,
+                Some(v) => v.is_null() || v.is_string(),
+            };
+            name_ok && version_ok
+        } else {
+            false
+        };
+        if !lossless {
+            return Err(ServerError::Validation(format!(
+                "invalid spec {el}: each spec must be a string name or a {{name, version?}} \
+                 object with a string name and a string or null version"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// RFC 7396 merge-patch: recursively merge `patch` into `target`. A
