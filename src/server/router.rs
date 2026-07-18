@@ -2846,14 +2846,19 @@ enum ColumnDtypePolicy {
 /// Pack `(name, array)` columns into one Arrow IPC FILE record batch. Each array
 /// is flattened to its element sequence and becomes one primitive column; the
 /// accepted dtypes are governed by `policy` (see [`ColumnDtypePolicy`]).
-/// Columns must share length (the wide-table invariant) — `RecordBatch::try_new`
-/// enforces it and a mismatch surfaces as 422, which the client treats as a
-/// signal to fall back to per-array reads.
+/// Columns must share length (the wide-table invariant) — a mismatch surfaces as
+/// 422, which the client treats as a signal to fall back to per-array reads.
+///
+/// An empty dataset (no columns) yields a zero-row batch with an empty schema:
+/// `RecordBatch::try_new` cannot infer a row count from zero columns, so the
+/// count is pinned to 0 explicitly. Upstream serves an empty `to_dataframe`
+/// export as an empty 200, not an error.
 fn build_container_arrow_ipc(
     columns: Vec<(String, crate::core::dtype::DynNDArray)>,
     policy: ColumnDtypePolicy,
 ) -> Result<Vec<u8>, ServerError> {
     use arrow::datatypes::Schema;
+    use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 
     let mut fields = Vec::with_capacity(columns.len());
     let mut arrays = Vec::with_capacity(columns.len());
@@ -2863,11 +2868,18 @@ fn build_container_arrow_ipc(
         arrays.push(values);
     }
     let schema = Arc::new(Schema::new(fields));
-    let batch = arrow::record_batch::RecordBatch::try_new(schema.clone(), arrays).map_err(|e| {
-        ServerError::Validation(format!(
-            "cannot assemble wide-table arrow batch (columns must share length): {e}"
-        ))
-    })?;
+    // Pin the row count from the first column (0 when there are no columns), so a
+    // zero-column empty dataset builds a zero-row batch instead of erroring. A
+    // column whose length differs from this count still fails validation → the
+    // 422 "columns must share length" the client uses as a fallback signal.
+    let row_count = arrays.first().map(|a| a.len()).unwrap_or(0);
+    let options = RecordBatchOptions::new().with_row_count(Some(row_count));
+    let batch =
+        RecordBatch::try_new_with_options(schema.clone(), arrays, &options).map_err(|e| {
+            ServerError::Validation(format!(
+                "cannot assemble wide-table arrow batch (columns must share length): {e}"
+            ))
+        })?;
 
     let mut ipc = Vec::new();
     {

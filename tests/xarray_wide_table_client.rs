@@ -613,3 +613,36 @@ async fn wide_table_unknown_field_is_400() {
         "body must carry the upstream message: {text}"
     );
 }
+
+/// An `xarray_dataset` with no variables.
+fn empty_dataset() -> AnyAdapter {
+    AnyAdapter::Container(Arc::new(MapAdapter::new(
+        IndexMap::new(),
+        json!({}),
+        vec![Spec::new("xarray_dataset")],
+    )))
+}
+
+/// Finding 8: an empty xarray_dataset builds a zero-row batch instead of a
+/// `RecordBatch::try_new` error, so every wide-table format serves an empty 200
+/// — matching upstream's empty `to_dataframe` export, not the previous 422.
+#[tokio::test]
+async fn wide_table_empty_dataset_serves_200() {
+    let base = spawn(root_with(vec![("empty", empty_dataset())])).await;
+    let client = reqwest::Client::new();
+    for format in ["csv", "arrow", "parquet"] {
+        let resp = client
+            .get(format!(
+                "{base}/api/v1/container/full/empty?format={format}"
+            ))
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = String::from_utf8_lossy(&resp.bytes().await.unwrap()).into_owned();
+        assert_eq!(
+            status, 200,
+            "empty dataset must serve an empty 200 for {format}, not a RecordBatch error; body={body}"
+        );
+    }
+}

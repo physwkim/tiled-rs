@@ -61,7 +61,7 @@ use arrow::array::{
 use arrow::csv::writer::WriterBuilder;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::ipc::reader::FileReader;
-use arrow::record_batch::RecordBatch;
+use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use bytes::Bytes;
 use chrono::{NaiveDateTime, NaiveTime, Timelike};
 
@@ -372,7 +372,14 @@ fn normalize_batches_for_pandas_csv(
         let cols: Result<Vec<ArrayRef>, SerializeError> = (0..ncols)
             .map(|c| apply_plan(b.column(c), &plans[c]))
             .collect();
-        let rb = RecordBatch::try_new(out_schema.clone(), cols?)
+        // Carry the source batch's row count onto the rebuilt batch. For a
+        // populated batch this equals every column's length (unchanged
+        // behaviour); for a zero-column batch (an empty dataset) it is what lets
+        // arrow build a zero-row batch at all — `try_new` cannot infer a row
+        // count from zero columns and fails with "must either specify a row
+        // count or at least one column", surfacing as a 500 on an empty export.
+        let options = RecordBatchOptions::new().with_row_count(Some(b.num_rows()));
+        let rb = RecordBatch::try_new_with_options(out_schema.clone(), cols?, &options)
             .map_err(|e| -> SerializeError { format!("csv normalize batch: {e}").into() })?;
         out_batches.push(rb);
     }
@@ -859,6 +866,44 @@ mod tests {
         assert!(
             !text.starts_with("x"),
             "header=absent CSV must NOT start with column name: got {text:?}"
+        );
+    }
+
+    /// A zero-column table (an empty dataset) must serialize to an empty CSV, not
+    /// error. The normalize pass rebuilds each batch, and `RecordBatch::try_new`
+    /// cannot infer a row count from zero columns; carrying the source batch's
+    /// row count is what keeps the rebuild valid.
+    #[test]
+    fn csv_zero_column_table_serializes_empty() {
+        use arrow::record_batch::RecordBatchOptions;
+        let schema = Arc::new(Schema::new(Vec::<Field>::new()));
+        let batch = RecordBatch::try_new_with_options(
+            schema.clone(),
+            vec![],
+            &RecordBatchOptions::new().with_row_count(Some(0)),
+        )
+        .unwrap();
+        let mut ipc = Vec::new();
+        {
+            let mut w = FileWriter::try_new(&mut ipc, &schema).unwrap();
+            w.write(&batch).unwrap();
+            w.finish().unwrap();
+        }
+        let reg = table_registry();
+        let ser = reg
+            .dispatch(StructureFamily::Table, mime::CSV)
+            .expect("text/csv registered");
+        let out = ser(&ipc, &serde_json::Value::Null)
+            .expect("zero-column table must serialize, not error");
+        // The point of the fix is that this no longer errors. Arrow's CSV writer
+        // emits `""\n` for a zero-column batch (pandas would print a bare `\n`);
+        // that byte-level divergence is a pre-existing arrow-writer quirk, not
+        // what finding 8 is about — it only requires the empty export to be a
+        // 200 rather than a 500.
+        assert_eq!(
+            String::from_utf8(out.to_vec()).unwrap(),
+            "\"\"\n",
+            "empty table CSV is arrow's zero-column form"
         );
     }
 }
