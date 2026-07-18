@@ -1075,6 +1075,59 @@ async fn search_cursor_pagination_walks_keyset() {
     );
 }
 
+/// Wire parity: on a single-page (terminal) `/search` listing the `links`
+/// object MUST still carry an explicit `"next": null` key (and `"first"`).
+/// The Python client bracket-indexes `content["links"]["next"]`
+/// (client/container.py:255/480/547), so a *missing* `next` key raises
+/// `KeyError` on the last page of every listing — this test locks the key's
+/// presence, not merely its null-ness (`Value::Null` also results from an
+/// absent key, so `.contains_key` is the real discriminator). Upstream
+/// `pagination_links` seeds `{"self", "first", "next": None}`.
+#[tokio::test]
+async fn search_single_page_emits_explicit_null_next_key() {
+    let (app, _dir) = build_test_app().await;
+
+    // Two containers, requested with a limit that swallows them in one page:
+    // offset 0, count 2, limit 10 → no next page, so `next` is null.
+    for key in ["a", "b"] {
+        let body = serde_json::json!({
+            "key": key,
+            "structure_family": "container",
+            "metadata": {},
+            "specs": [],
+            "data_sources": [],
+        });
+        let (status, _) = json_request(&app, Method::POST, "/api/v1/register/", body).await;
+        assert_eq!(status, StatusCode::CREATED);
+    }
+
+    let (status, body) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/search/?page[limit]=10",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "single page: {body}");
+    assert_eq!(body["data"].as_array().unwrap().len(), 2);
+
+    let links = body["links"].as_object().expect("links is a JSON object");
+    // The bug: `skip_serializing_if` dropped `next` entirely on the last page.
+    assert!(
+        links.contains_key("next"),
+        "next key must be present even on the terminal page: {body}"
+    );
+    assert!(
+        links["next"].is_null(),
+        "next is explicit null when there is no next page: {body}"
+    );
+    assert!(
+        links.contains_key("first"),
+        "first key must be present: {body}"
+    );
+    assert!(links["first"].is_string(), "first is a URL: {body}");
+}
+
 /// N3: keyset cursors are valid only under the default sort (the id tiebreaker
 /// is what makes them stable). A `page[cursor]` combined with an explicit
 /// `sort` must be rejected with HTTP 400 — mirrors Python, which only mints
