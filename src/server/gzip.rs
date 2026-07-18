@@ -19,22 +19,18 @@
 //!
 //! gzip is the *first-registered* (thus least preferred) encoding upstream —
 //! `CompressionRegistry.encodings` reverses registration order — so the priority
-//! is `blosc2 > lz4 > zstd > gzip`. This middleware is the outermost of the four
-//! content-encoding layers, so it runs *last* on the response: it yields to any
-//! `Content-Encoding` that blosc2, lz4, or zstd already set and compresses only
-//! when none of them did.
+//! is `blosc2 > lz4 > zstd > gzip`. The single
+//! [`compress_middleware`](crate::server::compression::compress_middleware)
+//! owner reaches gzip only after blosc2, lz4, and zstd have all been declined
+//! for the media type. This module supplies gzip's per-media-type level
+//! (doubling as its eligibility check) and (de)compression.
 
 use std::io::Write;
 
-use axum::extract::Request;
-use axum::http::header;
-use axum::middleware::Next;
-use axum::response::Response;
 use flate2::Compression;
 use flate2::write::GzEncoder;
 
 use crate::core::media_type::mime;
-use crate::server::server_timing::timing_from_request;
 
 /// gzip level for `application/json` / `application/x-msgpack`
 /// (`media_type_registration.py:214-218`).
@@ -46,8 +42,9 @@ const GZIP_LEVEL_BULK: u32 = 1;
 
 /// The gzip compression level for `media_type`, or `None` if gzip is not offered
 /// for it. Doubles as the eligibility check: upstream registers gzip for exactly
-/// these eight media types.
-fn gzip_level(media_type: &str) -> Option<u32> {
+/// these eight media types. Consulted by the single negotiation owner
+/// (`compression::negotiate`).
+pub(crate) fn gzip_level(media_type: &str) -> Option<u32> {
     match media_type {
         mime::JSON | mime::MSGPACK => Some(GZIP_LEVEL_JSON),
         mime::OCTET_STREAM
@@ -81,51 +78,6 @@ pub fn decompress(src: &[u8]) -> Result<Vec<u8>, String> {
         .read_to_end(&mut out)
         .map_err(|e| format!("gzip decompress: {e}"))?;
     Ok(out)
-}
-
-/// Axum middleware that applies gzip content-encoding to eligible responses.
-pub async fn gzip_compress_middleware(request: Request, next: Next) -> Response {
-    let wants_gzip = request
-        .headers()
-        .get(header::ACCEPT_ENCODING)
-        .and_then(|v| v.to_str().ok())
-        .map(|v| {
-            v.split(',')
-                .any(|enc| enc.trim().eq_ignore_ascii_case("gzip"))
-        })
-        .unwrap_or(false);
-
-    // Grab the request-scoped Server-Timing accumulator before the request is
-    // consumed, so the compress phase can be recorded on the way back out.
-    let timing = timing_from_request(&request);
-
-    let response = next.run(request).await;
-
-    if !wants_gzip {
-        return response;
-    }
-
-    // Skip if a higher-priority encoding (blosc2/lz4/zstd) already set one.
-    if response.headers().contains_key(header::CONTENT_ENCODING) {
-        return response;
-    }
-
-    // The level lookup is also the eligibility check: `None` means gzip is not
-    // offered for this media type.
-    let level = response
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| gzip_level(v.split(';').next().unwrap_or("").trim()));
-
-    let Some(level) = level else {
-        return response;
-    };
-
-    crate::server::compression::apply_encoding(response, timing, "gzip", |b| {
-        Some(compress(b, level))
-    })
-    .await
 }
 
 #[cfg(test)]

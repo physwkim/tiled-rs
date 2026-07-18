@@ -2604,6 +2604,27 @@ fn build_large_array_catalog() -> MapAdapter {
         .collect();
     let noise_arr = ArrayAdapter::from_f64_1d(&noise, serde_json::json!({}));
 
+    // Deterministic body that blosc2 (and lz4/gzip) DECLINE but zstd KEEPS:
+    // 4000 bytes drawn pseudo-randomly from a 17-symbol alphabet. blosclz/lz4
+    // find no exploitable repeats (ratio ~0.99) and low-level gzip ~1.03, all
+    // below the 1/0.9 gate; zstd's entropy coder reaches ~1.87. Reinterpreted as
+    // 500 f64 so the octet-stream block body is exactly these bytes. Exercises
+    // the negotiation cascade fix: blosc2 is negotiated first, declines, and the
+    // body must be served identity — NOT fall through to zstd (which the old
+    // four-layer cascade did).
+    let decline_bytes: Vec<u8> = (0..4000u32)
+        .map(|i| {
+            let mut s = i.wrapping_mul(2654435761);
+            s ^= s >> 13;
+            ((s % 17) as u8) + b'A'
+        })
+        .collect();
+    let decline_f64: Vec<f64> = decline_bytes
+        .chunks_exact(8)
+        .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+        .collect();
+    let blosc_decline = ArrayAdapter::from_f64_1d(&decline_f64, serde_json::json!({}));
+
     let mut mapping = IndexMap::new();
     mapping.insert("big".into(), AnyAdapter::Array(Arc::new(arr)));
     mapping.insert("noise".into(), AnyAdapter::Array(Arc::new(noise_arr)));
@@ -2611,6 +2632,10 @@ fn build_large_array_catalog() -> MapAdapter {
     mapping.insert(
         "below_floor".into(),
         AnyAdapter::Array(Arc::new(below_floor)),
+    );
+    mapping.insert(
+        "blosc_decline".into(),
+        AnyAdapter::Array(Arc::new(blosc_decline)),
     );
     MapAdapter::new(mapping, serde_json::json!({}), vec![])
 }
@@ -3233,6 +3258,101 @@ async fn floor_boundary_blosc2_compresses_at_1000_identity_below() {
         "992-byte body (< 1000 floor) must NOT be blosc2-encoded"
     );
     assert_eq!(resp.bytes().await.unwrap().len(), 992, "raw 124×f64 body");
+}
+
+// ===========================================================================
+// Single-owner negotiation cascade (Finding 2): the four encoders are no longer
+// layered so that a decline by one falls through to the next. Exactly one
+// encoding is negotiated up front (the highest-priority accepted candidate) and
+// compressed at most once, matching upstream's CompressionResponder, which
+// picks the first accepted encoding and breaks.
+// ===========================================================================
+
+/// An incompressible octet-stream body with ALL four encodings accepted is
+/// served identity — and, because a single encoding is negotiated, the body is
+/// compressed at most once (there is no compress phase to record). The old
+/// four-layer cascade compressed and discarded such a body up to four times.
+#[tokio::test]
+async fn cascade_incompressible_all_accepted_served_identity() {
+    let base = spawn_blosc2_server().await;
+    let resp = reqwest::Client::new()
+        .get(format!("{base}/api/v1/array/block/noise?block=0"))
+        .header("Accept", "application/octet-stream")
+        .header("Accept-Encoding", "blosc2, lz4, zstd, gzip")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(
+        resp.headers().get("content-encoding").is_none(),
+        "incompressible body must be served identity even with all encodings accepted"
+    );
+    assert!(
+        !has_compress_phase(&resp),
+        "identity response must record no compress phase (compressed at most once, kept none)"
+    );
+    let bytes = resp.bytes().await.unwrap();
+    assert_eq!(bytes.len(), 400 * 8, "body must be the raw f64 bytes");
+}
+
+/// The core cascade regression: a body that blosc2 DECLINES (ratio ~0.99) but
+/// zstd would KEEP (ratio ~1.87). With all four encodings accepted, blosc2 is
+/// negotiated first (highest priority for octet-stream), declines, and the body
+/// is served identity — it must NOT fall through to zstd. The old cascade
+/// returned `Content-Encoding: zstd` here.
+#[tokio::test]
+async fn cascade_blosc2_decline_does_not_fall_through_to_zstd() {
+    let base = spawn_blosc2_server().await;
+    let resp = reqwest::Client::new()
+        .get(format!("{base}/api/v1/array/block/blosc_decline?block=0"))
+        .header("Accept", "application/octet-stream")
+        .header("Accept-Encoding", "blosc2, lz4, zstd, gzip")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers()
+            .get("content-encoding")
+            .and_then(|v| v.to_str().ok()),
+        None,
+        "blosc2 decline must yield identity, not fall through to zstd"
+    );
+    assert!(
+        !has_compress_phase(&resp),
+        "the declined single attempt records no compress phase"
+    );
+    // Body is intact (the original 4000 raw bytes).
+    let bytes = resp.bytes().await.unwrap();
+    assert_eq!(bytes.len(), 4000, "body must be the raw 500×f64 bytes");
+}
+
+/// Sanity anchor for the previous test: with ONLY zstd accepted, the same
+/// blosc2-declining body IS zstd-compressed — confirming zstd genuinely keeps
+/// this body, so the identity result above is the cascade fix at work, not zstd
+/// also declining.
+#[tokio::test]
+async fn cascade_decline_body_is_zstd_compressible_when_zstd_negotiated() {
+    let base = spawn_blosc2_server().await;
+    let resp = reqwest::Client::new()
+        .get(format!("{base}/api/v1/array/block/blosc_decline?block=0"))
+        .header("Accept", "application/octet-stream")
+        .header("Accept-Encoding", "zstd")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers()
+            .get("content-encoding")
+            .and_then(|v| v.to_str().ok()),
+        Some("zstd"),
+        "with only zstd accepted, this body compresses and is zstd-encoded"
+    );
+    assert!(
+        has_compress_phase(&resp),
+        "kept compression records a phase"
+    );
 }
 
 // ---------------------------------------------------------------------------

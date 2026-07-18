@@ -21,19 +21,12 @@
 //! Upstream's registry prefers the *last-registered* encoding for a media type
 //! (`CompressionRegistry.encodings` returns the registrations reversed), and
 //! lz4 is registered after gzip and zstd but before blosc2. So the priority is
-//! `blosc2 > lz4 > zstd > gzip`. This middleware is layered so it runs on the
-//! response **after** the blosc2 middleware (which sets `Content-Encoding` first
-//! for the octet-stream/arrow types it handles) and **before** the zstd and gzip
-//! middlewares — reproducing that ordering: lz4 yields to an already-set blosc2
-//! encoding and preempts zstd/gzip.
-
-use axum::extract::Request;
-use axum::http::header;
-use axum::middleware::Next;
-use axum::response::Response;
+//! `blosc2 > lz4 > zstd > gzip`. That ordering is enforced by the single
+//! [`compress_middleware`](crate::server::compression::compress_middleware)
+//! owner, which tries blosc2 first, then lz4, then zstd, then gzip. This module
+//! supplies lz4's eligibility set and (de)compression.
 
 use crate::core::media_type::mime;
-use crate::server::server_timing::timing_from_request;
 
 /// Media types for which lz4 is offered. Matches the set registered for lz4 in
 /// Python's `media_type_registration.py:333-342` exactly.
@@ -48,6 +41,12 @@ const LZ4_ELIGIBLE: &[&str] = &[
     mime::PLAIN,
 ];
 
+/// Whether lz4 is offered for `media_type`. Consulted by the single negotiation
+/// owner (`compression::negotiate`).
+pub(crate) fn eligible(media_type: &str) -> bool {
+    LZ4_ELIGIBLE.contains(&media_type)
+}
+
 /// Compress `src` into an lz4 block with a 4-byte little-endian uncompressed
 /// size prefix, matching python-lz4's `lz4.block.compress(data)` default.
 pub fn compress(src: &[u8]) -> Vec<u8> {
@@ -58,53 +57,6 @@ pub fn compress(src: &[u8]) -> Vec<u8> {
 /// `lz4.block.compress`). Returns an error string on malformed input.
 pub fn decompress(src: &[u8]) -> Result<Vec<u8>, String> {
     lz4_flex::block::decompress_size_prepended(src).map_err(|e| format!("lz4 decompress: {e}"))
-}
-
-/// Axum middleware that applies lz4 content-encoding to eligible responses.
-pub async fn lz4_compress_middleware(request: Request, next: Next) -> Response {
-    let wants_lz4 = request
-        .headers()
-        .get(header::ACCEPT_ENCODING)
-        .and_then(|v| v.to_str().ok())
-        .map(|v| {
-            v.split(',')
-                .any(|enc| enc.trim().eq_ignore_ascii_case("lz4"))
-        })
-        .unwrap_or(false);
-
-    // Grab the request-scoped Server-Timing accumulator before the request is
-    // consumed, so the compress phase can be recorded on the way back out.
-    let timing = timing_from_request(&request);
-
-    let response = next.run(request).await;
-
-    if !wants_lz4 {
-        return response;
-    }
-
-    // Skip if the response is already content-encoded (e.g. the blosc2
-    // middleware, which runs first, already set an encoding).
-    if response.headers().contains_key(header::CONTENT_ENCODING) {
-        return response;
-    }
-
-    let eligible = response
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .map(|v| {
-            let media_type = v.split(';').next().unwrap_or("").trim();
-            LZ4_ELIGIBLE.contains(&media_type)
-        })
-        .unwrap_or(false);
-
-    if !eligible {
-        return response;
-    }
-
-    // Floor, ratio gate, compress timing, and header emission all live in the
-    // shared owner. lz4's compress is infallible, so it always yields `Some`.
-    crate::server::compression::apply_encoding(response, timing, "lz4", |b| Some(compress(b))).await
 }
 
 #[cfg(test)]

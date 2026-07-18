@@ -11,13 +11,16 @@
 //! per-encoder `minimum_size` had already diverged (500 vs the app's 1000)
 //! before this single owner existed.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use axum::body::Body;
+use axum::extract::Request;
 use axum::http::header;
+use axum::middleware::Next;
 use axum::response::Response;
 
-use crate::server::server_timing::ServerTiming;
+use crate::server::server_timing::{ServerTiming, timing_from_request};
 
 /// Minimum response body size (bytes) below which no encoder compresses. The
 /// running app overrides `CompressionMiddleware`'s 500-byte class default
@@ -95,6 +98,101 @@ pub(crate) async fn apply_encoding(
     Response::from_parts(parts, Body::from(compressed))
 }
 
+/// Boxed one-shot compressor for a negotiated encoding. `Send` so the future
+/// that holds it across `apply_encoding`'s body-buffering await stays `Send`,
+/// as axum's `from_fn` requires.
+type Compressor = Box<dyn FnOnce(&[u8]) -> Option<Vec<u8>> + Send>;
+
+/// The single content-encoding negotiation middleware — the one owner of the
+/// blosc2/lz4/zstd/gzip content-negotiation decision.
+///
+/// It replaces the four per-encoder middlewares that previously layered
+/// blosc2→lz4→zstd→gzip. Because each of those attempted compression whenever
+/// no `Content-Encoding` was set, an incompressible >= [`MINIMUM_SIZE`] body was
+/// compressed and discarded up to FOUR times, and a blosc2 ratio-gate decline
+/// fell through to zstd — where upstream sends identity. Upstream's
+/// `CompressionResponder` picks the FIRST accepted encoding, breaks, and
+/// compresses at most once (`compression.py:60-107`); this owner reproduces that
+/// exactly by negotiating one encoding up front and calling [`apply_encoding`]
+/// once.
+pub async fn compress_middleware(request: Request, next: Next) -> Response {
+    let accepted = accepted_encodings(&request);
+    // Grab the request-scoped Server-Timing accumulator before the request is
+    // consumed, so the compress phase can be recorded on the way back out.
+    let timing = timing_from_request(&request);
+
+    let response = next.run(request).await;
+
+    // A handler that already set its own Content-Encoding wins; never
+    // double-encode. Also short-circuit when the client accepts nothing.
+    if accepted.is_empty() || response.headers().contains_key(header::CONTENT_ENCODING) {
+        return response;
+    }
+
+    // Strip off any MIME arguments, as in 'text/plain; charset=utf-8'
+    // (compression.py:57).
+    let media_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.split(';').next().unwrap_or("").trim().to_string())
+        .unwrap_or_default();
+
+    let Some((encoding, compress)) = negotiate(&media_type, &accepted) else {
+        return response;
+    };
+
+    apply_encoding(response, timing, encoding, compress).await
+}
+
+/// Parse `Accept-Encoding` into the lowercased set of tokens the client accepts.
+/// Matches the encodings by their (lowercase) wire names case-insensitively,
+/// preserving the prior per-encoder `eq_ignore_ascii_case` behavior.
+fn accepted_encodings(request: &Request) -> HashSet<String> {
+    request
+        .headers()
+        .get(header::ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| {
+            v.split(',')
+                .map(|s| s.trim().to_ascii_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Negotiate the single content encoding to apply, mirroring upstream's
+/// `CompressionResponder` selection loop (`compression.py:60-68`): walk the
+/// encodings offered for `media_type` in server-preference order (highest
+/// first: `blosc2 > lz4 > zstd > gzip`, upstream's reversed registration order)
+/// and return the first one the client accepts, together with its compressor.
+///
+/// Each arm consults its encoder module's own eligibility set, so the
+/// per-media-type registration sets stay single-sourced. Exactly one encoding
+/// is chosen and (via [`apply_encoding`]) compressed at most once; a ratio-gate
+/// decline sends identity and does NOT fall through to a lower-priority
+/// encoding — upstream breaks out of this loop before ever compressing.
+fn negotiate(media_type: &str, accepted: &HashSet<String>) -> Option<(&'static str, Compressor)> {
+    use crate::server::{blosc2, gzip, lz4, zstd};
+
+    if accepted.contains("blosc2") && blosc2::eligible(media_type) {
+        return Some(("blosc2", Box::new(blosc2::compress)));
+    }
+    if accepted.contains("lz4") && lz4::eligible(media_type) {
+        return Some(("lz4", Box::new(|b| Some(lz4::compress(b)))));
+    }
+    if accepted.contains("zstd") && zstd::eligible(media_type) {
+        return Some(("zstd", Box::new(|b| Some(zstd::compress(b)))));
+    }
+    if accepted.contains("gzip")
+        && let Some(level) = gzip::gzip_level(media_type)
+    {
+        return Some(("gzip", Box::new(move |b| Some(gzip::compress(b, level)))));
+    }
+    None
+}
+
 /// Decide whether a just-computed compression is worth keeping.
 ///
 /// Upstream (`tiled/server/compression.py:87-93`) always compresses first, then
@@ -114,6 +212,47 @@ pub fn worth_compressing(original_len: usize, compressed_len: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn accepted(items: &[&str]) -> HashSet<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The negotiation owner picks exactly ONE encoding — the highest-priority
+    /// accepted candidate for the media type — so `apply_encoding` runs once and
+    /// the body is compressed at most once. This is the structural guarantee the
+    /// four-layer cascade lacked (each layer retried compression independently).
+    #[test]
+    fn negotiate_picks_single_highest_priority_encoding() {
+        // octet-stream offers all four; blosc2 (highest) wins when all accepted.
+        let all = accepted(&["blosc2", "lz4", "zstd", "gzip"]);
+        assert_eq!(
+            negotiate("application/octet-stream", &all).map(|(e, _)| e),
+            Some("blosc2")
+        );
+        // Drop blosc2 → lz4 is next in priority for octet-stream.
+        let no_blosc2 = accepted(&["lz4", "zstd", "gzip"]);
+        assert_eq!(
+            negotiate("application/octet-stream", &no_blosc2).map(|(e, _)| e),
+            Some("lz4")
+        );
+        // Drop blosc2 + lz4 → zstd. This is the exact selection that the cascade
+        // reached by *falling through* after a blosc2 ratio decline; here it is
+        // reached only when the client does not accept blosc2/lz4 at all.
+        let only_zstd_gzip = accepted(&["zstd", "gzip"]);
+        assert_eq!(
+            negotiate("application/octet-stream", &only_zstd_gzip).map(|(e, _)| e),
+            Some("zstd")
+        );
+        // JSON does not offer blosc2 → lz4 is the highest offered.
+        assert_eq!(
+            negotiate("application/json", &all).map(|(e, _)| e),
+            Some("lz4")
+        );
+        // An ineligible media type offers nothing.
+        assert!(negotiate("image/png", &all).is_none());
+        // No accepted encoding → nothing negotiated.
+        assert!(negotiate("application/octet-stream", &accepted(&[])).is_none());
+    }
 
     #[test]
     fn threshold_boundary() {
