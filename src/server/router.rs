@@ -457,16 +457,42 @@ pub async fn metadata(
     // segment rather than being split apart by axum's `Path<String>` (which
     // percent-decodes before splitting).
     let segments = segments_from_uri(&uri, "/api/v1/metadata/");
-    // H2: per-node access policy check at each path segment.
-    if !segments.is_empty() {
-        let _ = resolve_entry(
+    // H2: per-node access policy check at each path segment. Capture the
+    // node-narrowed context — the inline walk's access filter is computed from
+    // it (Wave-35 Finding 1), mirroring the search route's node-narrowed auth.
+    let node_auth = if !segments.is_empty() {
+        resolve_entry(
             &state,
             auth.clone(),
             &segments,
             crate::auth::Scope::ReadMetadata,
         )
-        .await?;
-    }
+        .await?
+    } else {
+        auth.clone()
+    };
+    // The caller's list filter for the recursive `structure.contents` inline
+    // walk. The in-memory `/metadata` branch enumerates a node's children, so it
+    // MUST route through the same access filter `/search` uses, never raw
+    // `keys()` (zarr-fix invariant). In-memory adapters carry no per-node
+    // `access_blob`, so this is a no-op there today; passing it closes the
+    // invariant by construction for any adapter that ever does. The catalog
+    // `/metadata` path builds via `catalog_metadata_resource`, which does not
+    // inline, so the filter is consulted only on the in-memory branch below.
+    let inline_access_filter: Option<crate::core::queries::AccessBlobFilter> =
+        if let Some(ref policy) = state.access_policy {
+            let requested = crate::auth::ScopeSet::from_iter([crate::auth::Scope::ReadMetadata]);
+            policy
+                .list_filter(
+                    node_auth.principal.as_deref(),
+                    &node_auth.scopes,
+                    &requested,
+                    node_auth.authn_access_tags.as_deref(),
+                )
+                .await
+        } else {
+            None
+        };
     let include_data_sources = params
         .get("include_data_sources")
         .map(|v| matches!(v.as_str(), "true" | "True" | "1"))
@@ -513,7 +539,16 @@ pub async fn metadata(
         let adapter = core::walk_tree(state.root_tree.as_ref(), &segments).await?;
         let id = segments.last().cloned().unwrap_or_default();
         let path = segments.join("/");
-        core::construct_resource(&adapter, &id, &path, &base_url, max_depth, 0).await?
+        core::construct_resource(
+            &adapter,
+            &id,
+            &path,
+            &base_url,
+            max_depth,
+            0,
+            inline_access_filter.as_ref(),
+        )
+        .await?
     };
 
     resource.attributes.metadata =
@@ -783,20 +818,22 @@ pub async fn search(
     // only returns nodes the principal is permitted to see. A listing/search
     // needs read:metadata (parity with Python get_entry's filter_for_access
     // scopes=["read:metadata"], dependencies.py:78).
-    if let Some(ref policy) = state.access_policy {
-        let principal_ref = auth.principal.as_deref();
-        let requested = crate::auth::ScopeSet::from_iter([crate::auth::Scope::ReadMetadata]);
-        if let Some(f) = policy
-            .list_filter(
-                principal_ref,
-                &auth.scopes,
-                &requested,
-                auth.authn_access_tags.as_deref(),
-            )
-            .await
-        {
-            queries.insert(0, crate::core::queries::Query::AccessBlobFilter(f));
-        }
+    let access_filter: Option<crate::core::queries::AccessBlobFilter> =
+        if let Some(ref policy) = state.access_policy {
+            let requested = crate::auth::ScopeSet::from_iter([crate::auth::Scope::ReadMetadata]);
+            policy
+                .list_filter(
+                    auth.principal.as_deref(),
+                    &auth.scopes,
+                    &requested,
+                    auth.authn_access_tags.as_deref(),
+                )
+                .await
+        } else {
+            None
+        };
+    if let Some(ref f) = access_filter {
+        queries.insert(0, crate::core::queries::Query::AccessBlobFilter(f.clone()));
     }
 
     // One listing path for both backends. Resolve the container (root, or via
@@ -832,6 +869,7 @@ pub async fn search(
         state.exact_count_limit,
         include_data_sources,
         max_depth,
+        access_filter.as_ref(),
     )
     .await?;
     // `select_metadata` only applies within `metadata in fields` (core.py:479-485):
@@ -3833,9 +3871,12 @@ pub async fn container_full(
             };
             // `Some(0)` disables recursive inlining: the container/full JSON
             // export is a flat one-level listing of child Resources, not the
-            // metadata inline tree.
+            // metadata inline tree. Because inlining never runs here the access
+            // filter is unused (`None`); the visible child set is already
+            // access-filtered upstream (`visible_keys`).
             children.push(
-                core::construct_resource(&child, k, &child_path, &base_url, Some(0), 0).await?,
+                core::construct_resource(&child, k, &child_path, &base_url, Some(0), 0, None)
+                    .await?,
             );
         }
         serde_json::to_vec(&children).map_err(|e| ServerError::Internal(format!("encode: {e}")))?
@@ -8256,9 +8297,18 @@ async fn catalog_metadata_resource(
                     let id = segments.last().cloned().unwrap_or_default();
                     let path = segments.join("/");
                     // A synthesized table-column array leaf: `Some(0)` — inlining
-                    // never applies to a leaf, this is the no-inline default.
-                    return core::construct_resource(&adapter, &id, &path, base_url, Some(0), 0)
-                        .await;
+                    // never applies to a leaf, this is the no-inline default, so
+                    // the access filter is unused (`None`).
+                    return core::construct_resource(
+                        &adapter,
+                        &id,
+                        &path,
+                        base_url,
+                        Some(0),
+                        0,
+                        None,
+                    )
+                    .await;
                 }
             }
             return Err(ServerError::NotFound(format!(

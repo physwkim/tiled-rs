@@ -9,6 +9,7 @@ use crate::core::adapters::{
 };
 use crate::core::dtype::{ArrowTable, BuiltinDType, Endianness, Kind};
 use crate::core::links;
+use crate::core::queries::AccessBlobFilter;
 use crate::core::schemas::{
     ContainerMeta, NodeAttributes, NodeStructure, Resource, Response, SortDirection, SortingItem,
 };
@@ -479,6 +480,13 @@ const INLINED_CONTENTS_LIMIT: usize = 500;
 /// level (0 at the addressed node) and `max_depth` the client's `?max_depth=`
 /// bound (`None` ⇒ inline down to `DEPTH_LIMIT`). A leaf ignores both and simply
 /// carries its own structure.
+///
+/// `access_filter` is the caller's list filter (the same `AccessBlobFilter`
+/// `/search` injects at the top level). It is **required** — every caller must
+/// pass it — so the inline walk can never enumerate children the caller may not
+/// see (Wave-35 Finding 1; see [`build_container_structure`]). `None` means "no
+/// access policy is in force" (inline every child); a leaf never enumerates
+/// children, so it ignores the argument.
 pub fn construct_resource<'a>(
     adapter: &'a AnyAdapter,
     id: &'a str,
@@ -486,6 +494,7 @@ pub fn construct_resource<'a>(
     base_url: &'a str,
     max_depth: Option<usize>,
     depth: usize,
+    access_filter: Option<&'a AccessBlobFilter>,
 ) -> BoxFuture<'a, Result<Resource, ServerError>> {
     Box::pin(async move {
         let family = adapter.structure_family();
@@ -500,9 +509,17 @@ pub fn construct_resource<'a>(
         // gate passes, the children's full Resources under `contents`; a leaf
         // carries its own array/table structure unchanged.
         let structure = match adapter {
-            AnyAdapter::Container(c) => {
-                Some(build_container_structure(c.as_ref(), path, base_url, max_depth, depth).await?)
-            }
+            AnyAdapter::Container(c) => Some(
+                build_container_structure(
+                    c.as_ref(),
+                    path,
+                    base_url,
+                    max_depth,
+                    depth,
+                    access_filter,
+                )
+                .await?,
+            ),
             _ => adapter.structure_json().await?,
         };
 
@@ -540,12 +557,35 @@ pub fn construct_resource<'a>(
 ///   (upstream `BrokenLink`) or a concurrent delete — is kept as an explicit
 ///   `null` value under its key (upstream `contents[key] = None`); a genuine
 ///   lookup error (DB/IO) propagates.
+///
+/// # Access filter (Wave-35 Finding 1)
+///
+/// This is a **caller-facing child enumeration**, and the project invariant
+/// (zarr fix 82a7041) is: every such enumeration MUST route through the caller's
+/// access filter — no inline path may enumerate children the caller's
+/// `list_filter` would hide. `build_container_structure` is the single owner of
+/// that gate for the whole inline family (`/search` entry inlining, in-memory
+/// `/metadata` inlining, and the held container/full top-node branch).
+///
+/// When `access_filter` is `Some`, the permitted child set is taken from the
+/// same filtered listing `/search` uses — `container.search(&[AccessBlobFilter])`
+/// — and a child absent from it is skipped (never resolved, absent from
+/// `contents`), exactly as if it were not listed. When `access_filter` is `None`
+/// (no policy configured) every child is inlined, preserving the prior behaviour
+/// for policy-free deployments and in-memory trees.
+///
+/// `count` is deliberately **unchanged** by the filter: it stays the full child
+/// count the walk produces (upstream reports the filtered-view count instead, so
+/// on a policy server with hidden children the port's `count` can exceed the
+/// number of `contents` entries — a preserved port count-semantic, not the
+/// upstream one).
 async fn build_container_structure(
     container: &dyn ContainerAdapter,
     path: &str,
     base_url: &str,
     max_depth: Option<usize>,
     depth: usize,
+    access_filter: Option<&AccessBlobFilter>,
 ) -> Result<serde_json::Value, ServerError> {
     let mut count = container.len().await?;
 
@@ -562,6 +602,20 @@ async fn build_container_structure(
             None
         } else {
             let keys = container.keys().await?;
+            // The caller-visible child set. With an access filter in force, only
+            // keys the filter admits may be inlined — resolved via the SAME
+            // filtered listing `/search` injects (`AccessBlobFilter`), never raw
+            // `keys()` (zarr-fix invariant). `None` (no policy) inlines all.
+            let permitted: Option<std::collections::HashSet<String>> = match access_filter {
+                Some(f) => Some(
+                    container
+                        .search(&[crate::core::queries::Query::AccessBlobFilter(f.clone())])
+                        .await?
+                        .into_iter()
+                        .collect(),
+                ),
+                None => None,
+            };
             let mut map = serde_json::Map::new();
             let mut walked = 0usize;
             let mut too_large = false;
@@ -571,6 +625,15 @@ async fn build_container_structure(
                     // The estimate was low or the container grew while walking.
                     too_large = true;
                     break;
+                }
+                // Access gate: a child the caller's filter hides is absent from
+                // `contents` (as if unlisted) and is never resolved. It is still
+                // counted in `walked` above, so `count` stays the full child
+                // count.
+                if let Some(ref permitted) = permitted
+                    && !permitted.contains(&key)
+                {
+                    continue;
                 }
                 let child_path = if path.is_empty() {
                     key.clone()
@@ -586,6 +649,7 @@ async fn build_container_structure(
                             base_url,
                             max_depth,
                             depth + 1,
+                            access_filter,
                         )
                         .await?;
                         map.insert(
@@ -666,6 +730,11 @@ pub async fn construct_root_resource(
 /// into `structure.contents` when `(max_depth is None || 0 < max_depth)` — i.e.
 /// unless `?max_depth=0` (upstream builds each entry via `construct_resource`
 /// with `depth=0`, core.py:290).
+///
+/// `access_filter` is the caller's list filter — the SAME `AccessBlobFilter` the
+/// caller injects into `queries` for the top-level `search_page`. It is threaded
+/// into [`build_container_structure`] so an inlined entry's children are
+/// enumerated through the filter too, never raw `keys()` (Wave-35 Finding 1).
 #[allow(clippy::too_many_arguments)]
 pub async fn construct_entries_response(
     container: &dyn ContainerAdapter,
@@ -679,6 +748,7 @@ pub async fn construct_entries_response(
     exact_count_limit: u64,
     include_data_sources: bool,
     max_depth: Option<usize>,
+    access_filter: Option<&AccessBlobFilter>,
 ) -> Result<Response<Vec<Resource>>, ServerError> {
     let page = container
         .search_page(
@@ -723,8 +793,15 @@ pub async fn construct_entries_response(
                 && let Some(child_container) = child.as_container()
             {
                 resource.attributes.structure = Some(
-                    build_container_structure(child_container, &child_path, base_url, max_depth, 0)
-                        .await?,
+                    build_container_structure(
+                        child_container,
+                        &child_path,
+                        base_url,
+                        max_depth,
+                        0,
+                        access_filter,
+                    )
+                    .await?,
                 );
             }
         }
