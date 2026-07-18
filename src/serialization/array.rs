@@ -76,6 +76,52 @@ fn ensure_decimal(s: String) -> String {
     }
 }
 
+/// Format a float exactly as `str(numpy.float64(x))` / Python `repr(float)`,
+/// the string `numpy.savetxt(fmt="%s")` writes for each cell (array.py:41-46).
+///
+/// Notation choice matches CPython's `format_float_short` for the `'r'` code:
+/// use scientific notation iff the decimal exponent `E` (value = m × 10^E with
+/// 1 ≤ |m| < 10) satisfies `E < -4 || E >= 16` (equivalently dtoa `decpt <= -4
+/// || decpt > 16`); otherwise positional. Rust's `Display` is ALWAYS positional
+/// and its `LowerExp` is always scientific — both emit the SHORTEST round-trip
+/// digits (`flt2dec`), so we reuse std's digits rather than reimplementing
+/// dtoa: read `E` (and the shortest mantissa) from `{:e}`, then either emit the
+/// Python scientific form or fall back to positional `Display`.
+///
+/// Python scientific form: shortest mantissa (no trailing `.0`; a decimal point
+/// only when there is a fractional part), lowercase `e`, an ALWAYS-present
+/// exponent sign, and the exponent zero-padded to a minimum of two digits
+/// (`1e-05`, `1e+16`, `6.022e+23`, `1.5e-08`, `1e-10`, `1e+100`).
+///
+/// Generic over `f32`/`f64` so each dtype's own shortest repr is used (the f16
+/// arm widens to f32 first — a documented divergence, see its call site).
+/// NaN/inf are Display's `NaN`/`inf`/`-inf` and are passed through unchanged.
+fn py_float_repr<T: std::fmt::Display + std::fmt::LowerExp>(v: T) -> String {
+    let display = v.to_string();
+    // Non-finite: Display yields "NaN"/"inf"/"-inf" (letters); a finite float's
+    // Display is only `[-.0-9]`. LowerExp of a non-finite value has no 'e' to
+    // split on, so handle it here and pass the Display text through unchanged.
+    if display.bytes().any(|b| b.is_ascii_alphabetic()) {
+        return display;
+    }
+    // Finite: `{:e}` is "<mantissa>e<exponent>"; the mantissa is the shortest
+    // round-trip digits, the exponent is the decimal exponent E.
+    let exp = format!("{v:e}");
+    let (mantissa, e) = exp
+        .split_once('e')
+        .expect("LowerExp of a finite float always contains 'e'");
+    let e: i32 = e.parse().expect("LowerExp exponent is a valid integer");
+    // Scientific iff E ∉ [-4, 16) — i.e. E < -4 || E >= 16 (CPython 'r' rule).
+    if !(-4..16).contains(&e) {
+        let sign = if e < 0 { '-' } else { '+' };
+        format!("{mantissa}e{sign}{:02}", e.abs())
+    } else {
+        // Positional range: reuse Display, adding the trailing ".0" numpy keeps
+        // on whole numbers.
+        ensure_decimal(display)
+    }
+}
+
 /// Decode one fixed-width numpy unicode (`U`, UCS-4 / UTF-32) element to a
 /// `String`. `bytes` is a single element (itemsize = 4 × n_chars); each 4-byte
 /// code unit is read little- or big-endian per `big_endian`. Trailing U+0000
@@ -161,14 +207,14 @@ fn serialize_array_csv(
                 if big_endian {
                     b.reverse();
                 }
-                ensure_decimal(f64::from_le_bytes(b).to_string())
+                py_float_repr(f64::from_le_bytes(b))
             }
             ("f", 4) => {
                 let mut b: [u8; 4] = bytes.try_into().unwrap_or([0u8; 4]);
                 if big_endian {
                     b.reverse();
                 }
-                ensure_decimal(f32::from_le_bytes(b).to_string())
+                py_float_repr(f32::from_le_bytes(b))
             }
             // numpy half-precision (float16): widen to f32 (lossless — 11→24
             // significand bits) and format like the `f4` arm. numpy `savetxt`
@@ -180,11 +226,7 @@ fn serialize_array_csv(
                 if big_endian {
                     b.reverse();
                 }
-                ensure_decimal(
-                    half::f16::from_bits(u16::from_le_bytes(b))
-                        .to_f32()
-                        .to_string(),
-                )
+                py_float_repr(half::f16::from_bits(u16::from_le_bytes(b)).to_f32())
             }
             ("i", 8) => {
                 let mut b: [u8; 8] = bytes.try_into().unwrap_or([0u8; 8]);
@@ -774,6 +816,60 @@ mod tests {
         )
         .unwrap();
         assert_eq!(std::str::from_utf8(&out_frac).unwrap(), "1.5");
+    }
+
+    /// Finding 1: the array CSV serializer must match `str(np.float64(x))` /
+    /// Python `repr(float)` — which switches to scientific notation when the
+    /// decimal exponent is `< -4` or `>= 16` (equivalently the dtoa `decpt`
+    /// `<= -4` or `> 16`). numpy `savetxt(fmt="%s")` prints exactly that string
+    /// (array.py:41-46). Rust `f64::to_string()` is ALWAYS positional (Ryū
+    /// Display never uses exponents), so the scientific cases diverged. The
+    /// scientific form is: shortest mantissa, lowercase `e`, exponent sign
+    /// ALWAYS present, exponent zero-padded to >= 2 digits. Verified against
+    /// CPython 3.12 `repr` / numpy 2.x `str`. Both f64 and f32 must match.
+    #[test]
+    fn csv_float_scientific_notation_matches_python_repr() {
+        let ser = csv_serializer();
+        // Serialize a single float element and return its CSV cell.
+        let cell_f64 = |v: f64| -> String {
+            let out = ser(
+                &v.to_le_bytes(),
+                &serde_json::json!({"itemsize": 8, "kind": "f", "shape": [1]}),
+            )
+            .unwrap();
+            String::from_utf8(out.to_vec()).unwrap()
+        };
+        let cell_f32 = |v: f32| -> String {
+            let out = ser(
+                &v.to_le_bytes(),
+                &serde_json::json!({"itemsize": 4, "kind": "f", "shape": [1]}),
+            )
+            .unwrap();
+            String::from_utf8(out.to_vec()).unwrap()
+        };
+
+        // (value, expected str(np.float64(value)) == expected str(np.float32(value)))
+        // Scientific cases (the ones that diverged on origin/main) plus the
+        // agreeing fixed-notation cases from the round-1 table.
+        let cases: &[(f64, &str)] = &[
+            (1e-10, "1e-10"),
+            (1e-5, "1e-05"),
+            (6.022e23, "6.022e+23"),
+            (1e16, "1e+16"),
+            (1.5e-8, "1.5e-08"),
+            (1e10, "10000000000.0"),
+            (1.0, "1.0"),
+            (0.5, "0.5"),
+        ];
+        for (v, expected) in cases {
+            assert_eq!(cell_f64(*v), *expected, "f64 {v}");
+            assert_eq!(cell_f32(*v as f32), *expected, "f32 {v}");
+        }
+
+        // Sign carries onto the mantissa in scientific form, exponent sign is
+        // still explicit and >= 2 digits.
+        assert_eq!(cell_f64(-6.022e23), "-6.022e+23");
+        assert_eq!(cell_f32(-6.022e23f32), "-6.022e+23");
     }
 
     /// Finding 4: a >2-D array must error like Python `serialize_csv`
