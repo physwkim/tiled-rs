@@ -2754,8 +2754,17 @@ async fn serve_xarray_wide_table(
         columns.push((key, data));
     }
 
-    // Column packing + IPC encode is CPU-bound → run off the async executor.
-    let ipc = tokio::task::spawn_blocking(move || build_container_arrow_ipc(columns))
+    // Column packing + IPC encode is CPU-bound → run off the async executor. The
+    // Arrow *wire* export is capped to the six primitives the Rust client's
+    // wide-table decoder handles; csv/parquet run the batch through a
+    // server-side table serializer that reads any Arrow dtype, so they carry the
+    // full dtype set upstream `to_dataframe` serves (int8/16, uint8/16, bool).
+    let dtype_policy = if target_media_type == crate::core::media_type::mime::ARROW_FILE {
+        ColumnDtypePolicy::ArrowWire
+    } else {
+        ColumnDtypePolicy::Full
+    };
+    let ipc = tokio::task::spawn_blocking(move || build_container_arrow_ipc(columns, dtype_policy))
         .await
         .map_err(|e| ServerError::Internal(format!("arrow build task failed: {e}")))??;
 
@@ -2803,22 +2812,39 @@ async fn serve_xarray_wide_table(
     ))
 }
 
+/// Which dtypes [`arrow_column_from_ndarray`] accepts.
+///
+/// The Arrow *wire* export is served verbatim to the Rust client, whose
+/// wide-table decoder (`xarray_client.rs::arrow_dtype_to_tiled_dtype`) only
+/// handles the six primitives f64/f32/i64/i32/u64/u32 — so [`ArrowWire`] caps to
+/// exactly those. csv/parquet instead run the batch through a server-side table
+/// serializer that reads any Arrow dtype (mirroring upstream `to_dataframe`),
+/// so [`Full`] additionally accepts int8/16, uint8/16, and bool.
+///
+/// [`ArrowWire`]: ColumnDtypePolicy::ArrowWire
+/// [`Full`]: ColumnDtypePolicy::Full
+#[derive(Clone, Copy)]
+enum ColumnDtypePolicy {
+    ArrowWire,
+    Full,
+}
+
 /// Pack `(name, array)` columns into one Arrow IPC FILE record batch. Each array
 /// is flattened to its element sequence and becomes one primitive column; the
-/// supported dtypes mirror the client's wide-table decoder
-/// (`xarray_client.rs::arrow_dtype_to_tiled_dtype`): f64/f32/i64/i32/u64/u32.
+/// accepted dtypes are governed by `policy` (see [`ColumnDtypePolicy`]).
 /// Columns must share length (the wide-table invariant) — `RecordBatch::try_new`
 /// enforces it and a mismatch surfaces as 422, which the client treats as a
 /// signal to fall back to per-array reads.
 fn build_container_arrow_ipc(
     columns: Vec<(String, crate::core::dtype::DynNDArray)>,
+    policy: ColumnDtypePolicy,
 ) -> Result<Vec<u8>, ServerError> {
     use arrow::datatypes::Schema;
 
     let mut fields = Vec::with_capacity(columns.len());
     let mut arrays = Vec::with_capacity(columns.len());
     for (name, arr) in &columns {
-        let (field, values) = arrow_column_from_ndarray(name, arr)?;
+        let (field, values) = arrow_column_from_ndarray(name, arr, policy)?;
         fields.push(field);
         arrays.push(values);
     }
@@ -2844,15 +2870,17 @@ fn build_container_arrow_ipc(
 }
 
 /// Convert one flattened [`DynNDArray`] into an Arrow field + primitive column,
-/// honouring the array's declared endianness. Unsupported dtypes → 406 (the
-/// client only decodes the six primitive types below).
+/// honouring the array's declared endianness. The accepted dtype set depends on
+/// `policy` (see [`ColumnDtypePolicy`]); an unaccepted dtype → 406.
 fn arrow_column_from_ndarray(
     name: &str,
     arr: &crate::core::dtype::DynNDArray,
+    policy: ColumnDtypePolicy,
 ) -> Result<(arrow::datatypes::Field, arrow::array::ArrayRef), ServerError> {
     use crate::core::dtype::{Endianness, Kind};
     use arrow::array::{
-        ArrayRef, Float32Array, Float64Array, Int32Array, Int64Array, UInt32Array, UInt64Array,
+        ArrayRef, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
+        Int64Array, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
     };
     use arrow::datatypes::{DataType, Field};
 
@@ -2868,6 +2896,7 @@ fn arrow_column_from_ndarray(
     }
     let big = matches!(arr.dtype.endianness, Endianness::Big);
     let bytes = &arr.data;
+    let full = matches!(policy, ColumnDtypePolicy::Full);
 
     macro_rules! decode {
         ($t:ty, $sz:literal, $ArrowArr:ty) => {{
@@ -2887,15 +2916,31 @@ fn arrow_column_from_ndarray(
     }
 
     let (dt, values): (DataType, ArrayRef) = match (arr.dtype.kind, itemsize) {
+        // The six primitives the Rust client's wide-table decoder handles —
+        // accepted by every policy (arrow-wire AND csv/parquet).
         (Kind::Float, 8) => (DataType::Float64, decode!(f64, 8, Float64Array)),
         (Kind::Float, 4) => (DataType::Float32, decode!(f32, 4, Float32Array)),
         (Kind::Integer, 8) => (DataType::Int64, decode!(i64, 8, Int64Array)),
         (Kind::Integer, 4) => (DataType::Int32, decode!(i32, 4, Int32Array)),
         (Kind::UnsignedInteger, 8) => (DataType::UInt64, decode!(u64, 8, UInt64Array)),
         (Kind::UnsignedInteger, 4) => (DataType::UInt32, decode!(u32, 4, UInt32Array)),
+        // Extended dtypes: csv/parquet only (server-side table serializer reads
+        // any Arrow dtype; the arrow-wire client decoder cannot). numpy stores
+        // bool as one byte per element (0/1), so a nonzero byte is `true`.
+        (Kind::Integer, 2) if full => (DataType::Int16, decode!(i16, 2, Int16Array)),
+        (Kind::Integer, 1) if full => (DataType::Int8, decode!(i8, 1, Int8Array)),
+        (Kind::UnsignedInteger, 2) if full => (DataType::UInt16, decode!(u16, 2, UInt16Array)),
+        (Kind::UnsignedInteger, 1) if full => (DataType::UInt8, decode!(u8, 1, UInt8Array)),
+        (Kind::Boolean, 1) if full => {
+            let v: Vec<bool> = bytes.iter().map(|&b| b != 0).collect();
+            (
+                DataType::Boolean,
+                Arc::new(BooleanArray::from(v)) as ArrayRef,
+            )
+        }
         (kind, sz) => {
             return Err(ServerError::NotAcceptable(format!(
-                "xarray wide-table arrow export does not support dtype (kind={kind:?}, itemsize={sz}) for variable '{name}'"
+                "xarray wide-table export does not support dtype (kind={kind:?}, itemsize={sz}) for variable '{name}'"
             )));
         }
     };
