@@ -201,15 +201,23 @@ pub struct Resource<A = NodeAttributes> {
 // ---------------------------------------------------------------------------
 
 /// Pagination links (Python lines 53-58).
+///
+/// Key-presence contract mirrors upstream `pagination_links`
+/// (tiled/server/core.py:122-147), which seeds `{"self", "first", "next"}` as
+/// always-present keys (value `null` when there is no next/first page) and
+/// only conditionally adds `last`/`prev`. The Python client bracket-indexes
+/// `content["links"]["next"]` (client/container.py:255/480/547, base.py:108,
+/// composite.py:42), so `next` and `first` MUST always serialize — an explicit
+/// `null` on the terminal page, never a dropped key, or the client raises
+/// `KeyError: 'next'`. `last`/`prev` keep `skip_serializing_if` because
+/// upstream never seeds those keys (they are absent, not null, when unset).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PaginationLinks {
     #[serde(rename = "self")]
     pub self_link: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub first: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub next: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prev: Option<String>,
@@ -501,5 +509,59 @@ mod tests {
         let json = serde_json::to_value(&links).unwrap();
         assert!(json["self"].is_string());
         assert!(json["prev"].is_null());
+    }
+
+    /// Wire-contract boundary: which keys are *present* in the serialized
+    /// `links` object. Upstream `pagination_links`
+    /// (tiled/server/core.py:122-147) seeds `{"self", "first", "next"}` as
+    /// always-present keys (value `null` when there is no next/first page) and
+    /// only conditionally adds `last`/`prev`. The Python client bracket-indexes
+    /// `content["links"]["next"]` (client/container.py:255/480/547,
+    /// base.py:108, composite.py:42), so a missing `next` key raises
+    /// `KeyError` on the terminal page. `next` and `first` must therefore
+    /// serialize an explicit `null`, never be dropped; `last`/`prev` stay
+    /// omitted-when-None (upstream never seeds those keys).
+    #[test]
+    fn test_pagination_links_key_presence() {
+        // Offset single/last page: next=None, prev=None. `next` MUST be an
+        // explicit null key; `prev` MUST be absent.
+        let offset_page = PaginationLinks {
+            self_link: "http://x/api/v1/search/?page[offset]=0&page[limit]=10".into(),
+            first: Some("http://x/api/v1/search/?page[offset]=0&page[limit]=10".into()),
+            last: Some("http://x/api/v1/search/?page[offset]=0&page[limit]=10".into()),
+            next: None,
+            prev: None,
+        };
+        let obj = serde_json::to_value(&offset_page).unwrap();
+        let obj = obj.as_object().unwrap();
+        assert!(obj.contains_key("next"), "next key must always be present");
+        assert!(obj["next"].is_null(), "next is explicit null on last page");
+        assert!(
+            obj.contains_key("first"),
+            "first key must always be present"
+        );
+        assert!(obj["first"].is_string());
+        assert!(obj.contains_key("last"), "last present when Some");
+        assert!(!obj.contains_key("prev"), "prev omitted when None");
+
+        // Cursor (forward-only) page: last=None, prev=None. `next`/`first`
+        // still present; `last`/`prev` absent.
+        let cursor_page = PaginationLinks {
+            self_link: "http://x/api/v1/search/?page[cursor]=7&page[limit]=10".into(),
+            first: Some("http://x/api/v1/search/?page[limit]=10".into()),
+            last: None,
+            next: None,
+            prev: None,
+        };
+        let obj = serde_json::to_value(&cursor_page).unwrap();
+        let obj = obj.as_object().unwrap();
+        assert!(obj.contains_key("next"), "next key present on cursor page");
+        assert!(obj["next"].is_null());
+        assert!(
+            obj.contains_key("first"),
+            "first key present on cursor page"
+        );
+        assert!(!obj.contains_key("last"), "last omitted on cursor page");
+        assert!(!obj.contains_key("prev"), "prev omitted on cursor page");
     }
 }
