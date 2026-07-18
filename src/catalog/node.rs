@@ -320,6 +320,17 @@ pub fn validate_payload(metadata: &Value, specs: &Value) -> Result<()> {
                     name.len()
                 )));
             }
+            // Bound the version string the same way name is bounded — upstream
+            // Spec bounds both name and version to max_length=255
+            // (tiled/structures/core.py:29-30).
+            if let Some(version) = s.get("version").and_then(|v| v.as_str())
+                && version.len() > MAX_SPEC_CHARS
+            {
+                return Err(CatalogError::Validation(format!(
+                    "spec version length {} > {MAX_SPEC_CHARS}",
+                    version.len()
+                )));
+            }
         }
     }
     // tiled#342: reference list cap (when callers nest references inside

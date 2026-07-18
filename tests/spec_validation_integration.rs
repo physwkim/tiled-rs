@@ -1282,3 +1282,64 @@ async fn put_extra_key_spec_is_normalized_and_distinct_agrees() {
          leak into the raw stored specs: {dist}"
     );
 }
+
+/// Wave-34 (F3) — upstream bounds a spec `version` to `max_length=255`, exactly
+/// as it bounds `name` (`StringConstraints`, `structures/core.py:29-30`). The
+/// port bounded only the NAME length (`validate_payload`, `catalog/node.rs:317`)
+/// and never the version, so a 256-char version was accepted (a validation
+/// strictness divergence). Boundary: 255 chars accepted, 256 rejected with 422.
+#[tokio::test]
+async fn put_spec_version_length_bounded_at_255() {
+    let (app, _dir) = build_app(validation_config(false)).await;
+
+    let (status, _) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/metadata/",
+        serde_json::json!({
+            "key": "vl",
+            "structure_family": "container",
+            "metadata": {},
+            "specs": [],
+            "data_sources": [],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // Boundary: a 255-char version is accepted.
+    let v255 = "a".repeat(255);
+    let (status, body) = json_request(
+        &app,
+        Method::PUT,
+        "/api/v1/metadata/vl",
+        serde_json::json!({
+            "metadata": {},
+            "specs": [{"name": "x", "version": v255}],
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "255-char version must be accepted: {body}"
+    );
+
+    // A 256-char version exceeds the upstream bound → 422.
+    let v256 = "a".repeat(256);
+    let (status, body) = json_request(
+        &app,
+        Method::PUT,
+        "/api/v1/metadata/vl",
+        serde_json::json!({
+            "metadata": {},
+            "specs": [{"name": "x", "version": v256}],
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "256-char version must be rejected 422: {body}"
+    );
+}
