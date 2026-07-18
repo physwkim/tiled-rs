@@ -42,17 +42,62 @@ impl SparseBlock {
     /// Mirrors `SparseClient.todense` (`tiled/client/sparse.py:44`), which is
     /// `self.read().todense()` — i.e. `sparse.COO(coords, data, shape).todense()`.
     /// The caller owns any reshaping into an N-D array; the flat buffer here is
-    /// the C-order layout numpy produces. Coordinates are assumed in-range for
-    /// `shape` (the sparse-node contract the server upholds), matching
-    /// `sparse.COO`, which validates coords against shape on construction.
-    pub fn to_dense(&self) -> Vec<f64> {
+    /// the C-order layout numpy produces.
+    ///
+    /// Every coordinate is validated against `shape` *before* it is written, so
+    /// a malformed block — a missing index vector for some dimension, an index
+    /// vector not parallel to `data`, or a coordinate out of range for its axis
+    /// — yields a [`ClientError::Invalid`] instead of panicking or silently
+    /// scattering a value into the wrong cell (an out-of-range coordinate on a
+    /// non-last axis can land on a different, in-bounds flat index). This
+    /// mirrors `sparse.COO`, which validates coords against shape on
+    /// construction.
+    ///
+    /// Duplicate coordinates (the same cell listed more than once in `coords`)
+    /// resolve last-write-wins: the later entry in `data` overwrites the earlier
+    /// one. `sparse.COO` instead *sums* duplicate coordinates by default; that
+    /// divergence is unverified against upstream here (pydata `sparse` is not
+    /// available locally) and is left as an open follow-up rather than silently
+    /// assumed equivalent.
+    pub fn to_dense(&self) -> Result<Vec<f64>> {
+        let ndim = self.shape.len();
+        // One index vector per dimension, each parallel to `data`. Checked up
+        // front so the coordinate and scatter loops below cannot panic on a
+        // malformed block (`SparseBlock` fields are public).
+        if self.coords.len() != ndim {
+            return Err(ClientError::Invalid(format!(
+                "sparse block has {} index vector(s) but shape is {ndim}-D",
+                self.coords.len()
+            )));
+        }
+        for (axis, col) in self.coords.iter().enumerate() {
+            if col.len() != self.data.len() {
+                return Err(ClientError::Invalid(format!(
+                    "sparse block index vector for axis {axis} has {} entries but data has {}",
+                    col.len(),
+                    self.data.len()
+                )));
+            }
+        }
+        // Validate every coordinate against its axis extent before writing.
+        for (axis, col) in self.coords.iter().enumerate() {
+            let extent = self.shape[axis];
+            for &coord in col {
+                if coord < 0 || coord as usize >= extent {
+                    return Err(ClientError::Invalid(format!(
+                        "sparse coordinate {coord} on axis {axis} is out of range for extent {extent}"
+                    )));
+                }
+            }
+        }
         let size: usize = self.shape.iter().product();
         let mut out = vec![0.0f64; size];
         if size == 0 {
-            return out;
+            // A zero-sized axis admits no in-range coordinate, so the loop above
+            // has already rejected any non-empty `data`. Nothing to scatter.
+            return Ok(out);
         }
         // Row-major (C-order) strides for `shape`: the last axis is contiguous.
-        let ndim = self.shape.len();
         let mut strides = vec![1usize; ndim];
         for axis in (0..ndim.saturating_sub(1)).rev() {
             strides[axis] = strides[axis + 1] * self.shape[axis + 1];
@@ -64,7 +109,7 @@ impl SparseBlock {
             }
             out[flat] = value;
         }
-        out
+        Ok(out)
     }
 }
 
@@ -553,7 +598,7 @@ mod tests {
         let mut expected = vec![0.0f64; 12];
         expected[6] = 5.0;
         expected[3] = 9.0;
-        assert_eq!(block.to_dense(), expected);
+        assert_eq!(block.to_dense().unwrap(), expected);
     }
 
     /// A 1-D COO densifies by placing each value at its coordinate.
@@ -565,7 +610,7 @@ mod tests {
             shape: vec![10],
         };
         assert_eq!(
-            block.to_dense(),
+            block.to_dense().unwrap(),
             vec![1.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 3.0, 0.0, 0.0]
         );
     }
@@ -578,7 +623,7 @@ mod tests {
             data: vec![],
             shape: vec![2, 3],
         };
-        assert_eq!(block.to_dense(), vec![0.0f64; 6]);
+        assert_eq!(block.to_dense().unwrap(), vec![0.0f64; 6]);
     }
 
     /// A zero-sized dimension yields an empty dense buffer without indexing.
@@ -589,6 +634,83 @@ mod tests {
             data: vec![],
             shape: vec![0, 4],
         };
-        assert!(block.to_dense().is_empty());
+        assert!(block.to_dense().unwrap().is_empty());
+    }
+
+    /// An out-of-range coordinate whose flat index still lands inside the buffer
+    /// (`(0, 2)` on a `[3, 2]` shape → flat `0*2 + 2 = 2`, the cell `(1, 0)`)
+    /// must be rejected, not silently scattered into the wrong cell.
+    #[test]
+    fn to_dense_rejects_out_of_range_coord_silent_wrong_cell() {
+        let block = SparseBlock {
+            coords: vec![vec![0i64], vec![2i64]],
+            data: vec![9.0f64],
+            shape: vec![3, 2],
+        };
+        let err = block.to_dense();
+        assert!(matches!(err, Err(ClientError::Invalid(_))), "got {err:?}");
+    }
+
+    /// An out-of-range coordinate whose flat index overflows the buffer
+    /// (`(5, 0)` on a `[2, 2]` shape → flat `10` > size `4`) must be rejected,
+    /// not panic with an index-out-of-bounds.
+    #[test]
+    fn to_dense_rejects_out_of_range_coord_overflow() {
+        let block = SparseBlock {
+            coords: vec![vec![5i64], vec![0i64]],
+            data: vec![9.0f64],
+            shape: vec![2, 2],
+        };
+        let err = block.to_dense();
+        assert!(matches!(err, Err(ClientError::Invalid(_))), "got {err:?}");
+    }
+
+    /// A negative coordinate is out of range and must be rejected rather than
+    /// wrapping to a huge `usize` under `as usize`.
+    #[test]
+    fn to_dense_rejects_negative_coord() {
+        let block = SparseBlock {
+            coords: vec![vec![-1i64], vec![0i64]],
+            data: vec![9.0f64],
+            shape: vec![2, 2],
+        };
+        let err = block.to_dense();
+        assert!(matches!(err, Err(ClientError::Invalid(_))), "got {err:?}");
+    }
+
+    /// An index vector that is not parallel to `data` (or a missing one) is a
+    /// malformed block and must error instead of panicking on the inner index.
+    #[test]
+    fn to_dense_rejects_nonparallel_coords() {
+        let short = SparseBlock {
+            coords: vec![vec![0i64, 1], vec![0i64]],
+            data: vec![1.0f64, 2.0],
+            shape: vec![2, 2],
+        };
+        assert!(matches!(short.to_dense(), Err(ClientError::Invalid(_))));
+
+        let wrong_ndim = SparseBlock {
+            coords: vec![vec![0i64]],
+            data: vec![1.0f64],
+            shape: vec![2, 2],
+        };
+        assert!(matches!(
+            wrong_ndim.to_dense(),
+            Err(ClientError::Invalid(_))
+        ));
+    }
+
+    /// Duplicate coordinates resolve last-write-wins: `(0, 0)` appears twice and
+    /// the second value (`7.0`) overwrites the first (`3.0`). Documents the
+    /// current semantics; `sparse.COO` sums duplicates by default, an unverified
+    /// divergence tracked as an open follow-up.
+    #[test]
+    fn to_dense_duplicate_coords_last_write_wins() {
+        let block = SparseBlock {
+            coords: vec![vec![0i64, 0], vec![0i64, 0]],
+            data: vec![3.0f64, 7.0],
+            shape: vec![2, 2],
+        };
+        assert_eq!(block.to_dense().unwrap(), vec![7.0, 0.0, 0.0, 0.0]);
     }
 }
