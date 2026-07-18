@@ -2009,6 +2009,22 @@ async fn connect_ws_bearer(
     ws
 }
 
+/// Connect a WS subscription to `path` presenting the bearer JWT as an
+/// `?access_token=` query param and NO Authorization header — the browser
+/// transport upstream decodes at connect time (`get_decoded_access_token_websocket`,
+/// authentication.py:297-311; wired via `get_current_scopes_websocket`, :449-455).
+/// The upgrade always succeeds (HTTP 101); any denial arrives as a text frame
+/// after it. A JWT is URL-safe base64url, so it needs no percent-encoding.
+async fn connect_ws_access_token_query(
+    base: &str,
+    path: &str,
+    token: &str,
+) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
+    let url = format!("{}?access_token={token}", ws_url(base, path));
+    let (ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+    ws
+}
+
 /// Read the next frame as raw text (no JSON parse), or `None` on close/timeout.
 /// Used for the plain-text `forbidden:` / `subscription denied:` rejection
 /// frames the handler sends before closing (which `next_text_json` would panic
@@ -2056,6 +2072,27 @@ async fn subscribe_with_both_read_scopes_proceeds() {
     let schema = next_text_json(&mut ws)
         .await
         .expect("array-schema first message");
+    assert_eq!(schema["type"], "array-schema", "schema: {schema}");
+}
+
+/// A bearer JWT presented via the `?access_token=` query param (and NO
+/// Authorization header) authenticates the subscription — upstream's WS query
+/// transport for a token, since a browser cannot set Authorization on a WS
+/// upgrade (`get_decoded_access_token_websocket`, authentication.py:297-311;
+/// resolved by `get_current_scopes_websocket`, :449-455). With anonymous access
+/// OFF, a token carrying both read scopes must yield the array-schema first
+/// message; before the query transport was wired the connect fell through to the
+/// (empty) first-message handshake and no schema arrived.
+#[tokio::test]
+async fn subscribe_via_access_token_query_authenticates() {
+    let (base, _dir) = spawn_auth_stream_server(ScopeSet::read_only(), None).await;
+    let client = reqwest::Client::new();
+    let token = login_token(&client, &base, "alice", "wonderland").await;
+
+    let mut ws = connect_ws_access_token_query(&base, "arr", &token).await;
+    let schema = next_text_json(&mut ws)
+        .await
+        .expect("array-schema first message via ?access_token=");
     assert_eq!(schema["type"], "array-schema", "schema: {schema}");
 }
 

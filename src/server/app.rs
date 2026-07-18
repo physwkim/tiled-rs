@@ -564,11 +564,16 @@ async fn resolve_auth_owned(
 }
 
 /// Header-based auth resolution shared with the WebSocket handler so it
-/// can honour an `Authorization: Bearer ...` or `?api_key=` upgrade
-/// without going through the HTTP middleware (the WS routes are
-/// mounted outside the middleware to support tiled#1351 first-message
-/// auth). Returns `None` when no header credential was supplied or the
-/// presented one was rejected; the caller falls back to the in-band
+/// can honour an `Authorization: Bearer ...` or `Authorization: Apikey ...`
+/// header without going through the HTTP middleware (the WS routes are
+/// mounted outside the middleware to support tiled#1351 first-message auth).
+/// Only the header is consulted: `resolve_auth_inner` is called with an EMPTY
+/// query string, so no query-param credential is read here. The WebSocket
+/// handler resolves the `?access_token=` query JWT itself (see
+/// `run_subscription`); `api_key` is header-only for WS
+/// (authentication.py:283-294), so there is no `?api_key=` query transport.
+/// Returns `None` when no header credential was supplied or the presented one
+/// was rejected; the caller falls back to the query token or the in-band
 /// handshake.
 pub async fn resolve_header_auth(
     state: &AppState,
