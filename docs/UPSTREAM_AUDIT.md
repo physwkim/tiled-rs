@@ -1056,17 +1056,149 @@ to divergences the wave-30/31 batch itself introduced.
   deviation-ledger line is retired — the hardening is now existence-hiding (hidden
   indistinguishable from absent), not a distinct 404. Listings (no `?field=`) still
   filter silently.
+* **Skip empty `Accept` segments in container/full negotiation** (`8e9cb87`,
+  PR #125 — the second behavioral change in #125, previously missing from this
+  ledger). `negotiate_container_full` delegated each `Accept` list segment to
+  `resolve_media_type`, whose blank→default rule is WHOLE-HEADER semantics (a
+  MISSING `Accept` header → the container family default, `text/html`). Applied per
+  segment, that rule misfired on any empty list entry (leading/trailing/doubled
+  comma): `Accept: ,application/json` served 200 `text/html` (masking the client's
+  later `application/json`, which upstream serves) and `Accept: application/xml,`
+  served 200 `text/html` instead of 406. Fix: resolve the truly-absent / whole-blank
+  header once up front (→ family default), then skip empty segments inside the
+  per-part loop so an empty entry matches nothing and moves on — mirroring upstream
+  `core.py:391-394` (default only for a MISSING header) and `core.py:400-416` (an
+  unmatched/empty entry continues; all-unmatched → 406). Tests: a leading empty
+  segment does not pre-empt a later serviceable type; a trailing empty segment after
+  an unserviceable type → 406.
 * **`Spec::parse_stored_list` keeps name-bearing objects name-only, drops nameless
   garbage** (`f55e734`, PR #126; refines wave-31 #121). The wave-31
   #121 owner is sharpened: an object whose full typed `Spec` parse fails (e.g. a
   non-string `version`) but which carries a string `name` is kept NAME-ONLY (`Spec {
-  name, version: None }`) — element PRESENCE is the load-bearing property and no
-  conformant write path can store a non-string version; only a number/array/
-  object-with-no-string-name is DROPPED. Deliberate defensive deviation: upstream
-  RAISES (500) on such a stored row (`Spec(**123)` / `List[Spec]` validation error),
-  whereas the port skips it and serves the readable siblings (a nameless spec is
-  already rejected at write time, so the drop path is reachable only via a corrupt/
-  out-of-band row).
+  name, version: None }`) — element PRESENCE is the load-bearing property; a number,
+  an array, or an object with no string `name` is DROPPED. **Two premises in the
+  original entry were corrected in wave-33 (`ee7890a` / `f1e798a`, PR #131 — see the
+  Wave-33 section):** (1) "no conformant write path can store a non-string version"
+  was a reachability claim about our own client, not an enforced server rule —
+  PUT/PATCH accepted raw specs and 200'd a non-string `version`. Wave-33 makes it
+  TRUE BY CONSTRUCTION via `validate_writable_specs` (422 at the request boundary,
+  mirroring upstream `schemas.py:528/557/575`). (2) The "upstream RAISES (500)"
+  blanket was only half right: an object whose `name` is PRESENT but not a string is
+  KEPT upstream — `Spec` is a stdlib frozen dataclass, so `Spec(**{"name": 5})` →
+  `Spec(5, None)` WITHOUT raising (`structures/core.py:28-37`,
+  `catalog/adapter.py:307`) — and we drop it as a deliberate, now-API-unreachable
+  deviation; only a number, an array, or an object with NO `name` key genuinely
+  TypeErrors→500 (`Spec(**123)` / `List[Spec]` validation error), where the port
+  skips it and serves the readable siblings.
+
+## Wave-33: format priority-list, typed spec writes, sort precedence, WebSocket query/first-message auth
+
+Three sibling PRs (#129–#131), rebase-merged onto main — five behavioral landings
+plus one in-code note correction — followed by two ledger-worthy investigations
+that produced no code change. All hashes below are the merged commits.
+
+* **`?format=` is a comma-separated priority list, not one opaque token**
+  (`78562e3`, PR #129). Upstream `construct_data_response` splits `?format=` on
+  commas (`format.split(",")`, `core.py:381`) and negotiates the resulting media
+  types with the same first-serviceable-wins loop as `Accept` (`core.py:400-418`),
+  so `?format=` has identical priority-list semantics to `Accept` and keeps hard
+  priority over it. The port treated `?format=` as one opaque token in both
+  `negotiate_media_type` (registry.rs, the array/table/sparse/ragged/awkward
+  resolver) and `negotiate_container_full` (router.rs, the container/full resolver),
+  so any comma-bearing value (`?format=csv,application/json`, or a fallback list
+  `?format=badfmt,csv`) resolved to nothing and 406'd instead of serving the first
+  serviceable token. Both resolvers now split on ',', trim each token, and try them
+  in listed order through the extracted single-token owner `resolve_format_token`;
+  the first that resolves wins, `None`→406 only when every token fails, empty tokens
+  (leading/trailing/doubled comma) are skipped, and single-token behavior is
+  unchanged. `?format=` keeps hard priority over `Accept`. Tests (failing-first):
+  `csv,application/json` → csv on xarray / json on a plain container;
+  `application/json,csv` → json (order, not "csv wins"); `unknownfmt,csv` → csv;
+  `,csv` → csv (leading empty skipped); `badA,badB` → 406. **Known residual
+  (pre-existing, unchanged outcome):** a token that is an optimistic router alias
+  (e.g. `zip`) but unserviceable for the target structure does not fall through to a
+  later token — it resolves-then-fails to the same 406 as before this change. Only
+  genuinely comma-list callers gained the fall-through; the alias-token case was not
+  regressed and is not newly broken.
+* **Type-validate PUT/PATCH specs — wire-tightening 200→422** (`ee7890a`,
+  PR #131). tiled-rs PUT/PATCH took raw `Json<serde_json::Value>` specs while POST
+  is typed `Vec<Spec>`, so a non-string `version` (`{"name":"x","version":5}`)
+  stored as a 200 and was later silently dropped by `Spec::parse_stored_list`. A
+  single-owner `validate_writable_specs` — wired into both PUT and PATCH, gated on
+  `specs` present & non-null — now enforces the invariant *no API write path may
+  store a spec element `parse_stored_list` cannot round-trip losslessly*: accept a
+  bare string or `{name:string, version?:string|null}`, else 422 — mirroring
+  upstream's pydantic-typed `Specs` / `JSONPatchSpec` write bodies
+  (`schemas.py:528/557/575`). Previously-200 non-conformant PUT/PATCH writes are now
+  422 = upstream parity; bare strings stay accepted (they round-trip losslessly, so
+  the wave-30 back-compat suite holds). `validate_payload`'s existing checks are
+  kept. **In-code note correction** (`f1e798a`, PR #131, comment-only): the
+  `parse_stored_list` doc claimed upstream RAISES on any non-string-named stored
+  spec; corrected to state that upstream KEEPS a name-present-but-non-string spec
+  (`Spec` is a stdlib frozen dataclass → `Spec(5, None)`, `structures/core.py:28-37`,
+  `catalog/adapter.py:307`) and only 500s a number / array / no-`name`-key value.
+  The Wave-32 spec bullet above is cross-corrected to match.
+* **Sort: pattern-422 gates before dup/sentinel-400** (`5c6b43f`, PR #130;
+  refines wave-31 #122 / wave-32 #127). `parse_sort` validated each `?sort=` field
+  against the `SortField` pattern and checked the dup-key 400 in ONE interleaved
+  loop, so a valid duplicate positioned before a pattern-invalid field surfaced the
+  dup 400 before the later field was ever validated. Upstream types the query param
+  as `List[SortField]` (`dependencies.py:219`), so pydantic validates EVERY field
+  against the pattern (`dependencies.py:26`) at the FastAPI layer BEFORE
+  `sorting_param`'s body (`dependencies.py:222-252`) runs — a pattern-invalid field
+  anywhere is a 422 that pre-empts the body's dup/sentinel 400s. `parse_sort` is now
+  two phases: pass 1 validates all fields and returns the 422 on the first miss;
+  pass 2 runs the unchanged empty-filter + dup-key + sentinel-must-be-last 400
+  logic. `?sort=a&sort=a&sort=x,y` now returns 422 `String should match pattern
+  '...'` (was 400 `Duplicate sorting key: a`). This also resolves the wave-33 audit
+  caveat that the wave-32 sort entry overclaimed full pydantic gate-then-body
+  precedence — the pattern gate now genuinely precedes the dup/sentinel body.
+* **WebSocket `?access_token=` query JWT** (`57ed9c6`, PR #130). Browsers cannot
+  set an `Authorization` header on a WS upgrade, so upstream accepts a bearer JWT as
+  a `?access_token=` query param and decodes it at connect time
+  (`get_decoded_access_token_websocket`, `authentication.py:297-311`; resolved by
+  `get_current_scopes_websocket`, `:449-455`). Our `SubscribeQuery` carried only
+  `start` + `envelope_format` and `resolve_header_auth` passed an empty query
+  string, so a browser-presented `?access_token=` was ignored and fell through to
+  the first-message handshake → anonymous/timeout. `access_token: Option<String>` is
+  now threaded into `run_subscription` and auth resolves in upstream precedence: a
+  real Bearer/Apikey header credential wins, then the `?access_token=` query JWT
+  (decoded via the existing `validate_bearer` path), then the first-message
+  handshake. The query JWT is tried BEFORE anonymous admission so a valid token
+  overrides the anonymous `PUBLIC_SCOPES` fallback (upstream `:454-457`). **No
+  `?api_key=` query is accepted** — upstream WS api-key is header-only
+  (`authentication.py:283-294`); the port matches, and the `resolve_header_auth` doc
+  comment (which had claimed a `?api_key=` upgrade was honored) is corrected.
+* **WebSocket first-message keys renamed to `access_token` / `api_key`**
+  (`4c5f53a`, PR #130). The first-message handshake read the credential under
+  `bearer` / `apikey`, but upstream `authenticate_websocket_first_message` reads
+  `access_token` / `api_key` (`authentication.py:460`, docstring `:488-490`). An
+  upstream-shaped `{"type":"auth","access_token":"…"}` message was rejected as
+  "provide 'bearer' or 'apikey'". The two handshake keys (and their error-prefix
+  labels) are renamed to upstream's names exactly, with NO back-compat alias —
+  client and server ship in lockstep in this crate, and the Rust client
+  authenticates the WS via the `Authorization` header (no first-message emitter to
+  update). (The merged commit was amended post-review to fix a clippy
+  `useless_conversion` in its test; content otherwise as reviewed.)
+
+### Wave-33 investigations (classified, no code change)
+
+* **POST `/container/full` drops `max_depth` — upstream drops it too**
+  (port-local polish, NOT a parity gap). Upstream's container/full route honors no
+  `max_depth` on either GET or POST. The port's GET zip/hdf5 `max_depth` handling is
+  a port EXTENSION beyond upstream; it is simply asymmetric on POST, which drops the
+  parameter. Because upstream serves no `max_depth` on either verb, dropping it on
+  POST is not a divergence FROM upstream — closing the GET/POST asymmetry is optional
+  port-local polish, not required for parity.
+* **`/search` + `/metadata` `max_depth` + `structure.contents` inlining —
+  unimplemented PORT-GAP, largely dormant** (wave-34 candidate). Upstream
+  `construct_resource` inlines a container's children into `structure.contents` when
+  `max_depth` / `inlined_contents_enabled` permit (`core.py:511-556`, gate `:513`).
+  The port accepts `?max_depth=` but does not validate or honor it and never inlines
+  `structure.contents`. This is observable only for nodes that opt into inlined
+  contents (hdf5 / xarray / zarr group nodes); for ordinary catalog containers there
+  is nothing to inline, so the gap is largely dormant. `?max_depth=` is currently
+  accepted-unvalidated-ignored. Tracked as a wave-34 candidate.
 
 ## N/A (Python-specific or feature not in our port)
 
