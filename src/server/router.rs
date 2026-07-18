@@ -2531,7 +2531,16 @@ fn wants_xarray_wide_table(format_param: Option<&str>, accept: &str) -> Option<&
             Some(mime::ARROW_FILE)
         } else if base == mime::PARQUET {
             Some(mime::PARQUET)
-        } else if base == mime::CSV {
+        } else if base == mime::CSV || base == "text/comma-separated-values" || base == mime::PLAIN
+        {
+            // Upstream registers the dataset CSV serializer under three aliases —
+            // text/csv, text/comma-separated-values, text/plain
+            // (serialization/xarray.py:80-81) — all serving the same
+            // `to_dataframe()` CSV. Normalise to `text/csv` because the Table CSV
+            // serializer this path dispatches is keyed on that canonical type
+            // (the aliases are not separately registered there); the body is CSV
+            // either way. A non-`xarray_dataset` container still 406s downstream,
+            // exactly as it did before (Container family registers none of these).
             Some(mime::CSV)
         } else {
             None

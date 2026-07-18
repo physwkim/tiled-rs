@@ -646,3 +646,43 @@ async fn wide_table_empty_dataset_serves_200() {
         );
     }
 }
+
+/// Finding 11: upstream registers the dataset CSV serializer under `text/csv`,
+/// `text/comma-separated-values`, and `text/plain` (serialization/xarray.py:80-81).
+/// A request whose only `Accept` is one of the two aliases must reach the CSV
+/// wide-table export (200, `text/csv` body), not fall through to 406.
+#[tokio::test]
+async fn wide_table_accept_csv_aliases_serve_csv() {
+    let base = spawn(root_with(vec![("weather", weather())])).await;
+    let client = reqwest::Client::new();
+    for alias in ["text/comma-separated-values", "text/plain"] {
+        let resp = client
+            .get(format!("{base}/api/v1/container/full/weather"))
+            .header("accept", alias)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            200,
+            "Accept: {alias} must serve the CSV wide-table export"
+        );
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            ct.starts_with("text/csv"),
+            "Accept: {alias} must yield a text/csv response, got {ct:?}"
+        );
+        let text = String::from_utf8_lossy(&resp.bytes().await.unwrap()).into_owned();
+        for tok in ["time", "temp", "pressure"] {
+            assert!(
+                text.contains(tok),
+                "csv body for Accept: {alias} must name column {tok:?}: {text}"
+            );
+        }
+    }
+}
