@@ -25,6 +25,8 @@ use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use tower::ServiceExt;
 
+use tiled_rs::access::{ScopeSet, TagBasedPolicy};
+use tiled_rs::auth::{AuthDb, DummyAuthenticator, Issuer};
 use tiled_rs::catalog::adapter::UnresolvedLeaf;
 use tiled_rs::catalog::{Catalog, CatalogAdapter, RegisterRequest};
 use tiled_rs::core::adapters::ContainerAdapter;
@@ -285,4 +287,265 @@ async fn catalog_plain_container_fast_path_no_child_build() {
         "plain container stays non-inlined: {s}"
     );
     assert_eq!(s["count"], 1);
+}
+
+/// `?omit_links=true` shaping reaches the INLINED children, not just the
+/// addressed node: `build_container_structure` shapes each inlined child with the
+/// same `ShapeOptions` the metadata handler computed (Wave-35 Finding 2). A
+/// `Resource` drops its `links` key entirely when empty (`schemas.rs` —
+/// `skip_serializing_if = "NodeLinks::is_empty"`), so a shaped child has NO
+/// `links` key. Baseline (no `omit_links`) keeps the child's `self` link, which
+/// isolates the shaping to the flag.
+#[tokio::test]
+async fn catalog_topnode_inline_children_shaped_by_omit_links() {
+    let (app, _dir) = build_app().await;
+
+    // Baseline: without omit_links, the inlined child carries its own links.
+    let (status, body) = get_json(&app, "/api/v1/metadata/ds").await;
+    assert_eq!(status, StatusCode::OK, "metadata/ds must be 200: {body}");
+    let child = &body["data"]["attributes"]["structure"]["contents"]["x"];
+    assert!(
+        child["links"]["self"].is_string(),
+        "baseline inlined child keeps its self link: {child}"
+    );
+
+    // With omit_links=true, the handler shapes the addressed node AND the shape
+    // is threaded into the inline walk, so the inlined child is shaped too: both
+    // drop the `links` key.
+    let (status, body) = get_json(&app, "/api/v1/metadata/ds?omit_links=true").await;
+    assert_eq!(status, StatusCode::OK, "metadata/ds must be 200: {body}");
+    let data = &body["data"];
+    assert!(
+        data.get("links").is_none(),
+        "omit_links drops the addressed node's links: {data}"
+    );
+    let child = &data["attributes"]["structure"]["contents"]["x"];
+    assert!(
+        child.is_object() && child.get("links").is_none(),
+        "omit_links must reach the inlined child (shape threaded to \
+         build_container_structure): {child}"
+    );
+}
+
+/// Register one node under `parent_id` with an explicit `access_blob`, returning
+/// its DB id. Distinct from [`create`] (which hardcodes an empty access blob) so
+/// the access-filter fixture can tag a child.
+async fn create_with_access(
+    catalog: &Catalog,
+    parent_id: Option<i64>,
+    ancestors: Vec<String>,
+    key: &str,
+    specs: serde_json::Value,
+    access_blob: serde_json::Value,
+) -> i64 {
+    catalog
+        .create_node(
+            parent_id,
+            ancestors,
+            RegisterRequest {
+                key: key.into(),
+                structure_family: "container".into(),
+                metadata: serde_json::json!({}),
+                specs,
+                access_blob,
+            },
+        )
+        .await
+        .expect("create_node")
+        .id
+}
+
+/// Catalog-backed app under a `TagBasedPolicy`, with a dummy authenticator so a
+/// tagged principal can log in. Fixture tree (mirrors
+/// `tests/inline_access_filter.rs`, but exercised via the `/metadata/<node>`
+/// top-node path rather than `/search`):
+/// ```text
+/// ds        (container, spec "xarray_dataset", untagged)  → inline-enabled
+/// ├── visible   (container, untagged → public)
+/// └── secret    (container, tagged "team-b")              → hidden from team-a
+/// ```
+/// Alice is granted `team-a` only.
+async fn build_access_app() -> (axum::Router, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let cat_uri = format!("sqlite://{}", dir.path().join("catalog.db").display());
+    let auth_uri = format!("sqlite://{}", dir.path().join("auth.db").display());
+
+    // Size-1 warm pools sidestep the SQLite cold-start CANTOPEN flake on
+    // login+write integration tests.
+    let catalog = Catalog::connect_with_pool_size(&cat_uri, 1).await.unwrap();
+    catalog.migrate().await.unwrap();
+    let auth_db = AuthDb::connect_with_pool_size(&auth_uri, 1).await.unwrap();
+    auth_db.migrate().await.unwrap();
+
+    let (alice, _) = auth_db.ensure_principal("dummy", "alice").await.unwrap();
+    auth_db
+        .set_principal_tags(alice.id, &["team-a".to_string()])
+        .await
+        .unwrap();
+
+    // ds (xarray_dataset, untagged) → { visible (untagged), secret (team-b) }
+    let ds = create_with_access(
+        &catalog,
+        None,
+        vec![],
+        "ds",
+        serde_json::json!(["xarray_dataset"]),
+        serde_json::json!({}),
+    )
+    .await;
+    create_with_access(
+        &catalog,
+        Some(ds),
+        vec!["ds".into()],
+        "visible",
+        serde_json::json!([]),
+        serde_json::json!({}),
+    )
+    .await;
+    create_with_access(
+        &catalog,
+        Some(ds),
+        vec!["ds".into()],
+        "secret",
+        serde_json::json!([]),
+        serde_json::json!({"tags": ["team-b"]}),
+    )
+    .await;
+
+    let policy = TagBasedPolicy::new(Arc::new(auth_db.clone()), ScopeSet::full());
+    let access_policy: Arc<dyn tiled_rs::access::AccessPolicy> = Arc::new(policy);
+    let resolver: Arc<dyn tiled_rs::catalog::adapter::LeafResolver> = Arc::new(UnresolvedLeaf);
+    let root_tree: Arc<dyn ContainerAdapter> =
+        Arc::new(CatalogAdapter::root(catalog.clone(), resolver));
+    let issuer = Issuer::new(b"this-is-a-test-secret-32-bytes-long!!").unwrap();
+    let mut dummy = DummyAuthenticator::new("dummy");
+    dummy.add_user("alice", "wonderland").unwrap();
+
+    let state = tiled_rs::server::AppState {
+        root_tree,
+        serialization_registry: Arc::new(tiled_rs::serialization::default_registry()),
+        query_names: Query::all_query_names()
+            .into_iter()
+            .map(String::from)
+            .collect(),
+        base_url: Some("http://localhost:8000".into()),
+        root_path: String::new(),
+        cors_policy: tiled_rs::server::state::CorsOriginPolicy::Permissive,
+        trust_forwarded_headers: false,
+        api_key: None,
+        catalog: Some(catalog),
+        auth_db: Some(auth_db),
+        issuer: Some(issuer),
+        authenticators: vec![Arc::new(dummy)],
+        proxied_header_auth: None,
+        external_oidc: None,
+        #[cfg(feature = "saml")]
+        saml_providers: vec![],
+        forwarded_allow_ips: None,
+        max_request_body_bytes: 10 * 1024 * 1024,
+        response_bytesize_limit: 300_000_000,
+        streaming_cache: tiled_rs::server::streaming_cache::disabled(),
+        access_policy: Some(access_policy),
+        default_login_scopes: tiled_rs::auth::ScopeSet::full(),
+        enable_web: false,
+        web_assets_dir: None,
+        spec_views: Vec::new(),
+        webhook_config: None,
+        webhook_dispatcher: None,
+        request_timeout_secs: 30,
+        expose_raw_assets: true,
+        exact_count_limit: u64::MAX,
+        allow_anonymous_access: false,
+        background_tasks: tiled_rs::server::state::BackgroundTasks::new(),
+        validation: Default::default(),
+    };
+    (tiled_rs::server::build_app(state), dir)
+}
+
+async fn get_json_auth(
+    app: &axum::Router,
+    uri: &str,
+    bearer: &str,
+) -> (StatusCode, serde_json::Value) {
+    let req = Request::builder()
+        .method(Method::GET)
+        .uri(uri)
+        .header("authorization", bearer)
+        .header("accept", "application/json")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let v = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+    (status, v)
+}
+
+async fn login(app: &axum::Router, username: &str, password: &str) -> String {
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/api/v1/auth/dummy/login")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({"username": username, "password": password}))
+                .unwrap(),
+        ))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    body["access_token"].as_str().unwrap().to_string()
+}
+
+/// Access-filter closure for the top-node path (Wave-35 Finding 1): the inline
+/// walk on `GET /metadata/<node>` MUST route child enumeration through the
+/// caller's `list_filter`, never raw `keys()`. Alice (team-a) reads the
+/// `xarray_dataset` top node `ds`; its `visible` child inlines, its `secret`
+/// (team-b) child MUST be absent from `structure.contents`. `count` stays the
+/// full child count (2), unchanged by the filter — matching
+/// `tests/inline_access_filter.rs` on the `/search` path. A direct GET of the
+/// hidden child 404s, proving the inline path cannot surface what a direct read
+/// denies.
+#[tokio::test]
+async fn catalog_topnode_inline_walk_routes_through_access_filter() {
+    let (app, _dir) = build_access_app().await;
+    let token = login(&app, "alice", "wonderland").await;
+    let bearer = format!("Bearer {token}");
+
+    let (status, body) = get_json_auth(&app, "/api/v1/metadata/ds", &bearer).await;
+    assert_eq!(status, StatusCode::OK, "metadata/ds must be 200: {body}");
+    let s = &body["data"]["attributes"]["structure"];
+    let contents = &s["contents"];
+    assert!(
+        contents.is_object(),
+        "ds (xarray_dataset) top node must inline its children: {s}"
+    );
+    assert!(
+        contents.get("visible").is_some(),
+        "the visible child must be inlined: {contents}"
+    );
+    assert!(
+        contents.get("secret").is_none(),
+        "ACCESS LEAK: the access-filtered child `secret` must NOT be inlined \
+         into the top node's contents: {contents}"
+    );
+    // Count semantics unchanged: the full child count is still reported even
+    // though `secret` is absent from `contents`.
+    assert_eq!(
+        s["count"], 2,
+        "count is the full child count, unchanged by the access filter: {s}"
+    );
+
+    // Consistency: a direct GET of the hidden child 404s (read:metadata denied),
+    // so the inline path must not surface it either.
+    let (secret_status, _) = get_json_auth(&app, "/api/v1/metadata/ds/secret", &bearer).await;
+    assert_eq!(
+        secret_status,
+        StatusCode::NOT_FOUND,
+        "direct GET of the access-hidden child must 404"
+    );
 }

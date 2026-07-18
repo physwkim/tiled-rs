@@ -395,8 +395,9 @@ pub async fn metadata(
     // `keys()` (zarr-fix invariant). In-memory adapters carry no per-node
     // `access_blob`, so this is a no-op there today; passing it closes the
     // invariant by construction for any adapter that ever does. The catalog
-    // `/metadata` path builds via `catalog_metadata_resource`, which does not
-    // inline, so the filter is consulted only on the in-memory branch below.
+    // `/metadata` path builds via `catalog_metadata_resource`, which inlines an
+    // eligible top node's children through `build_container_structure` too, so
+    // it receives the same filter (and `shape`) below.
     let inline_access_filter: Option<crate::core::queries::AccessBlobFilter> =
         if let Some(ref policy) = state.access_policy {
             let requested = crate::auth::ScopeSet::from_iter([crate::auth::Scope::ReadMetadata]);
@@ -454,6 +455,9 @@ pub async fn metadata(
             &base_url,
             include_data_sources,
             i64::try_from(state.exact_count_limit).unwrap_or(i64::MAX),
+            max_depth,
+            inline_access_filter.as_ref(),
+            shape,
         )
         .await?
     } else if segments.is_empty() {
@@ -8145,6 +8149,15 @@ pub async fn close_stream(
 /// Build a `Resource` for the catalog by reading the DB directly. Skips
 /// the `CatalogAdapter`'s in-memory cache so a same-request read after a
 /// write sees the latest state.
+///
+/// `access_filter` and `shape` mirror the in-memory `/metadata` branch: they are
+/// threaded into `core::build_container_structure` when an inline-eligible top
+/// node inlines its children, so the top-node inline walk honors the caller's
+/// access filter (Wave-35 Finding 1) and shapes each inlined child (Finding 2).
+// A request-context resource builder threading the same args
+// `core::construct_resource` / `construct_entries_response` take; those siblings
+// carry the same allow.
+#[allow(clippy::too_many_arguments)]
 async fn catalog_metadata_resource(
     catalog: &crate::catalog::Catalog,
     root_tree: &dyn ContainerAdapter,
@@ -8152,6 +8165,9 @@ async fn catalog_metadata_resource(
     base_url: &str,
     include_data_sources: bool,
     exact_count_limit: i64,
+    max_depth: Option<usize>,
+    access_filter: Option<&crate::core::queries::AccessBlobFilter>,
+    shape: core::ShapeOptions<'_>,
 ) -> Result<crate::core::schemas::Resource, ServerError> {
     use crate::core::schemas::{
         NodeAttributes, NodeStructure, Resource, SortDirection, SortingItem,
@@ -8257,22 +8273,66 @@ async fn catalog_metadata_resource(
     // URIs, mimetypes, and management info without a separate request.
     let (structure_value, data_sources) =
         if matches!(family, crate::core::structures::StructureFamily::Container) {
-            // Container length: exact for small containers, statistics-based
-            // approximation for large ones on Postgres (SQLite stays exact).
-            let count = catalog
-                .count_children_or_approx(Some(node.id), exact_count_limit)
-                .await
-                .map_err(map_catalog_err)?;
-            (
-                Some(
-                    serde_json::to_value(&NodeStructure {
-                        contents: None,
-                        count: count as usize,
-                    })
-                    .unwrap_or_default(),
-                ),
-                None,
-            )
+            // Inline-eligibility pre-filter, read straight from the DB row so a
+            // plain container is never resolved: a container advertising the
+            // "xarray_dataset" spec — the same discriminator
+            // `ContainerAdapter::inlined_contents_enabled` keys on — is a
+            // candidate to inline its children into `structure.contents` at the
+            // addressed (top) node, depth 0, when `?max_depth=` is absent or
+            // `>= 1` (`Some(0)` means no inlining, mirroring `0 < max_depth` in
+            // the gate). This is the same cheap pre-filter the search path uses
+            // (`core::construct_entries_response`); every other container keeps
+            // the count-only fast path below, so plain-container reads pay
+            // nothing new and build no child adapters.
+            let inline_candidate = max_depth.is_none_or(|m| 0 < m)
+                && crate::core::structures::Spec::parse_stored_list(&node.specs)
+                    .iter()
+                    .any(|s| s.name == "xarray_dataset");
+            let structure = if inline_candidate {
+                // Resolve the container adapter and defer to the single inlining
+                // owner (`core::build_container_structure`), which re-applies the
+                // authoritative gate (`max_depth`, `inlined_contents_enabled`,
+                // `DEPTH_LIMIT`) and the 500-child cap — identical semantics to
+                // the in-memory `/metadata` and `/search` paths. The walk reads
+                // children fresh from the DB, so the read-after-write consistency
+                // the direct-DB top-node read preserves is unaffected.
+                //
+                // `access_filter` and `shape` are the SAME values the metadata
+                // route computes for this caller: the top-node child enumeration
+                // routes through the caller's `AccessBlobFilter` (Wave-35 Finding
+                // 1 — a child the caller may not see is never inlined) and each
+                // inlined child is shaped by the same rule as the in-memory path
+                // (Wave-35 Finding 2). The addressed (top) node is shaped by the
+                // metadata handler after this returns, not here.
+                let adapter = core::walk_tree(root_tree, segments).await?;
+                let container = adapter.as_container().ok_or_else(|| {
+                    ServerError::WrongType(format!("'{path}' is not a container"))
+                })?;
+                core::build_container_structure(
+                    container,
+                    &path,
+                    base_url,
+                    max_depth,
+                    0,
+                    access_filter,
+                    shape,
+                )
+                .await?
+            } else {
+                // Count-only fast path: exact for small containers, statistics-
+                // based approximation for large ones on Postgres (SQLite stays
+                // exact). No child adapter is built.
+                let count = catalog
+                    .count_children_or_approx(Some(node.id), exact_count_limit)
+                    .await
+                    .map_err(map_catalog_err)?;
+                serde_json::to_value(&NodeStructure {
+                    contents: None,
+                    count: count as usize,
+                })
+                .unwrap_or_default()
+            };
+            (Some(structure), None)
         } else {
             let ds_rows = catalog
                 .list_data_sources(node.id)
