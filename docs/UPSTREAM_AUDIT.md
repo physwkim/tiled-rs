@@ -68,7 +68,7 @@ fix problems in code we never wrote.
 | (core) | Sparse (COO) managed-write backend + `write_sparse` | 8cd661b + bf67a50 + 3534be1 + b081a90 + e1dfee7 + f42e6c3 | `structure_family=sparse` nodes are now creatable over managed storage and served back. Core (8cd661b): `SparseAdapterWrite` trait (`write`/`write_block`) behind an `as_writable` hook (`src/core/adapters.rs:290`/`:277`), mirroring upstream `SparseBlocksParquetAdapter.write`/`write_block` (`tiled/adapters/sparse_blocks_parquet.py:105`/`:91`). Adapter (bf67a50): each COO block is written to one parquet file, and `init_storage_sparse_parquet` lays out the block directory (`sparse_blocks_parquet_adapter.rs:252`/`:721`), matching upstream `init_storage` (`sparse_blocks_parquet.py:65`) and the `load_block` read helper (`:26`). Server wiring (3534be1): `default_creation_mimetype(Sparse)` → `application/x-parquet;structure=sparse` (upstream `DEFAULT_CREATION_MIMETYPE[sparse]`, `catalog/adapter.py:122`; `mimetypes.py:11`; mimetype→adapter dispatch `catalog/adapter.py:141`) at `router.rs:5498`, plus the `managed_init_storage` sparse arm (`:5665`) and the `file_resolver` sparse arm that reassembles the node from *all* block assets (`file_resolver.rs:206`→`build_sparse_blocks_adapter` `:537`). Server PUT (b081a90): `PUT /array/full` + `/block` accept COO Arrow-IPC bodies (`deserialize_sparse_coo`, `router.rs:1102`), mirroring upstream's sparse deserializer dispatch on `PUT /array/full` (`router.py:2018`/`:2051`). Client (e1dfee7): `ContainerClient::write_sparse` (`container.rs:649`) + `SparseClient::write`/`write_block` (`sparse.rs:138`/`:163`) mirror upstream `client/sparse.py:107`/`:125`. Windows test-root fix (f42e6c3): drop `canonicalize` from sparse test roots (verbatim-path family). Both wave-17 follow-ups have since landed. (a) The untagged-`AnyStructure` Array/Sparse family-ambiguity is fixed structurally (PR #42): `structure` is now parsed under `structure_family` authority everywhere instead of by untagged field-shape guessing — `AnyStructure::from_family_json` is the single family→variant owner (d9e6120, `core/structures.rs:547`), `DataSource`'s `Deserialize` narrows `structure` under that authority (c14eddd) and catalog DB reads narrow through the same owner (61dcb33), `managed_sparse_structure` collapses to a direct `AnyStructure::Sparse` match (873acf1, `router.rs:5729`), and the bare untagged `Deserialize` was removed from `AnyStructure` (eb7d86e — now **Serialize-only**, `core/structures.rs:505`/`:506`), so the mis-parse is unrepresentable by construction rather than worked around. Migration caveat: any sparse row persisted by the *old* untagged path with a non-default `coord_data_type` had that field silently dropped before storage and must be rewritten. A regression test pins this migration case (PR #44, c0dae72): an Array-shaped sparse row (data_type present, no `coord_data_type`/`layout`) still loads under `structure_family = sparse`, re-defaulting the absent coordinate dtype to uint64-LE rather than dropping the structure to `None` (`to_core_data_source_loads_array_shaped_sparse_row`, `catalog/data_source.rs:537`). (b) The sparse read stored-vs-declared dtype coupling is fixed (PR #41, 3dbc068): the read now labels values with the dtype **actually stored** in the parquet column and sizes `nnz` by the stored width (`SparseBlocksParquetAdapter::to_sparse_data`) rather than the node's declared `data_type` — upstream parity with `load_block`, which returns `df["data"].values` at the stored dtype (`sparse_blocks_parquet.py:29`/`:31`); the write-boundary 422 guard (`ensure_sparse_data_dtype`, `router.rs:1177`) remains as defense in depth. The sparse read was further hardened for externally-registered blocks (PR #45): (b0c3a40) `extract_data_bytes`/`read_sparse_parquet` now consult the Arrow null bitmap — a null in a float value column decodes to NaN (`is_null` → NaN, `sparse_blocks_parquet_adapter.rs:630`; upstream pandas parity `sparse_blocks_parquet.py:30-31`, blocks concatenated at `:124`), while a null in an integer value column or any coordinate column is a hard 422 (upstream promotes int+null to float64+NaN, which a typed int buffer and a COO index cannot represent — a deliberate parity ceiling; re-register with a float value dtype to read it); (7134aeb) `arrow_to_builtin_dtype`/`extract_data_bytes` (`:516`/`:565`) widen read coverage to every Int/UInt width (i8/i16, u8–u64) plus dictionary-encoded columns wrapping a supported primitive, all round-tripped through `dyn_ndarray_to_arrow`; Float16/Boolean/Timestamp/Date/Decimal/Utf8 stay 422-rejected (`:509-513`). The widening is read-only — managed writes still store only the four typed-client dtypes. |
 | (core) | CSV array-adapter null / empty-cell handling | c05e6a1 + b4d0d10 | `read_csv_array` (`csv_array_adapter.rs:113`) decoded every cell via `arr.value(r)` without the Arrow null bitmap, so an empty cell in a numeric CSV column emitted a garbage int (Arrow infers an int-looking column that contains an empty cell as Int64 + a null bitmap). Now it matches upstream's pandas/dask read (`dask.dataframe.read_csv`, `tiled/adapters/csv.py:290`): (c05e6a1) any null in any column forces float64 output (`use_float`, `:156`) — reproducing pandas' int+missing → float64 promotion plus numpy's whole-array upcast — and the float decode is null-aware (`is_null(r)` → NaN, `:191`); (b4d0d10) an all-empty column, which Arrow infers as `DataType::Null`, is treated by `decide_dtype` (`:235`/`:239`) as a float-promotion signal, so the array becomes float64 with that column all-NaN instead of the previous hard rejection. A file of only blank lines still errors — Arrow infers 0 fields, matching pandas `EmptyDataError`. That wave-19 follow-up — the *table* CSV adapter (`csv_adapter.rs`) reporting an all-empty column as Arrow `Null` in `TableStructure.arrow_schema` (`:61`) rather than upstream's float64 — has since landed (PR #49, 612a701): `promote_null_columns` (`csv_adapter.rs:335`) casts every all-empty `Null` column to nullable `Float64` in both the served schema and the record batches at load, so the schema now matches upstream, which reads the same file with pandas and reports an all-NaN float64 column (`CSVAdapter` → `TableStructure.from_dask_dataframe`, `tiled/adapters/csv.py:57` → `tiled/structures/table.py:44-54`). A *partially*-empty int column is deliberately left `Int64`-with-nulls (a client's `to_pandas()` reads int64+null back as float64/NaN observably, and promoting the stored column would risk >2^53 precision loss), pinned by a regression test. |
 | (core) | Float16 array serving (json / csv / zarr v3 scalar) | 2748706 + b9d55f3 | A float16 array (constructible from a `<f2` `.npy` or a 2-byte-float HDF5 dataset) fell through the element serializers' `(kind, itemsize)` match: CSV emitted `"unsupported dtype f2"` in every cell (silent content corruption), JSON hard-errored. Upstream serves it on both paths — `numpy.savetxt(fmt="%s")` prints each element and `safe_json_dump` falls back to `array.tolist()`, which widens each np.float16 to a Python float (`tiled/utils.py:575`). (2748706) Added a `(Float, 2)` arm to both formatters (`serialization/array.rs:178` CSV, `:427` JSON), decoding via `half::f16` and widening f16 → f32 (lossless, 11→24 significand bits); NaN/inf → JSON null like the f4/f8 arms. (b9d55f3) `decode_v3_scalar` (`server/zarr_router.rs:178`) gained the same `(Float, 2)` arm (`:208`), so a 0-d float16 array served over `/zarr/v3` reports its real scalar fill value instead of 0.0. The default `application/octet-stream` array route already served f16 transparently (raw C-buffer + metadata), and the PNG/JPEG/TIFF image serializer now serves it too (PR #51, 9f3030c — see the image-serializer row below). Documented parity ceilings: CSV prints the f32-widened decimal (`0.099975586`) rather than numpy's shortest float16 repr (`0.1`) — same stored value, more digits (no Rust primitive yields numpy's shortest-at-f16 repr); hdf5 f16 re-export stays rejected (needs f16 support in the downstream hdf5 crate); sparse COO f16 stays unreachable behind the sparse adapter's 422 (`sparse_blocks_parquet_adapter.rs:509-513`). Ragged Arrow f16 is **not** a parity gap: upstream ragged registers only the json and zip serializers (`tiled/serialization/ragged.py:70`/`:90`), so there is no upstream Arrow-ragged path to match — tiled-rs's Arrow ragged route is an extension that already errors loudly on f16. |
-| (core) | Image serializer numeric-dtype rendering (int / float / complex) | 9f3030c + 2efe74f | The PNG/JPEG/TIFF array serializer dispatched pixels on a `match (kind, itemsize)` with a `_ => data.to_vec()` catch-all, so any dtype without an explicit arm had its raw element bytes reinterpreted as u8 pixels and truncated to `h·w` — a silent 200-OK garbage image. (9f3030c) added the `("f", 2)` float16 arm; (2efe74f) then closed the family structurally: the width-keyed match is replaced by one uniform `decode_numeric_to_f32` → `normalize_floats` path (`serialization/image_array.rs:168`, dispatch at `:105`) that widens **every** numeric kind to f32 before scaling — unsigned/signed int at any width (i32/i64/u64 now render instead of falling through), float 2/4/8, and complex → real part only (matching numpy's imaginary-discarding `astype(numpy.float32)`, `tiled/serialization/array.py:76`). Booleans keep their direct 0/255 map. Non-renderable kinds (U/S/M/m/…) now raise a **loud error** (`image_array.rs:235`) instead of emitting garbage, so the Array HTML serializer falls back to CSV exactly like upstream `serialize_html` (`array.py:143-153`). Behavior change: the former per-width integer scaling (`u1`/`u2`/`u4` and `i1`/`i2` special cases) is folded into the uniform float32 path, toward upstream's uniform treatment. Deliberate (unscheduled) display divergence: `normalize_floats` (`:241`) scales by the array's own min/max, whereas upstream auto-contrasts by `numpy.percentile(1, 99)` then clips to [0, 1] (`array.py:76-80`) — a display-contrast-only difference; upstream's percentile path propagates NaN (any NaN ⇒ all-black), while ours maps non-finite → 0. That wave-20 follow-up has since landed (PR #53, 9cf84d5): npy `datetime64`/`timedelta64` (`M`/`m` descr) now load — see the npy header-parser row below. |
+| (core) | Image serializer numeric-dtype rendering (int / float / complex) | 9f3030c + 2efe74f | The PNG/JPEG/TIFF array serializer dispatched pixels on a `match (kind, itemsize)` with a `_ => data.to_vec()` catch-all, so any dtype without an explicit arm had its raw element bytes reinterpreted as u8 pixels and truncated to `h·w` — a silent 200-OK garbage image. (9f3030c) added the `("f", 2)` float16 arm; (2efe74f) then closed the family structurally: the width-keyed match is replaced by one uniform `decode_numeric_to_f32` → `normalize_floats` path (`serialization/image_array.rs:168`, dispatch at `:105`) that widens **every** numeric kind to f32 before scaling — unsigned/signed int at any width (i32/i64/u64 now render instead of falling through), float 2/4/8, and complex → real part only (matching numpy's imaginary-discarding `astype(numpy.float32)`, `tiled/serialization/array.py:76`). Booleans keep their direct 0/255 map. Non-renderable kinds (U/S/M/m/…) now raise a **loud error** (`image_array.rs:235`) instead of emitting garbage, so the Array HTML serializer falls back to CSV exactly like upstream `serialize_html` (`array.py:143-153`). Behavior change: the former per-width integer scaling (`u1`/`u2`/`u4` and `i1`/`i2` special cases) is folded into the uniform float32 path, toward upstream's uniform treatment. The former display divergence — `normalize_floats` scaling by the array's own min/max where upstream auto-contrasts by `numpy.percentile(1, 99)` then clips to [0, 1] (`array.py:76-80`) — **has since landed** (`04398b5`, PR #102, wave-28): `normalize_floats` (`image_array.rs:269`) now clips at percentile(1)/percentile(99) over the *finite* values. Residual parity note: upstream's percentile propagates NaN (any NaN ⇒ all-black), while ours takes percentiles over finite values only and maps non-finite → 0 — a NaN-handling difference, no longer min/max-vs-percentile. That wave-20 follow-up has since landed (PR #53, 9cf84d5): npy `datetime64`/`timedelta64` (`M`/`m` descr) now load — see the npy header-parser row below. |
 | (core) | npy header parser unified on `from_numpy_str` (datetime64 / timedelta64 + U / V / t) | 9cf84d5 | The npy header parser rejected `<M8[ns]` / `<m8[us]` descrs (`unsupported descr kind: M`) because `parse_descr` was a bespoke duplicate of the crate's canonical `BuiltinDType::from_numpy_str` lacking the `M`/`m` kinds and the `[unit]` bracket split. `parse_header` now parses the descr through `from_numpy_str` (`npy_adapter.rs:374` → `core/dtype.rs:162`) and `parse_descr` is deleted — a single dtype parser for the whole crate. datetime64/timedelta64 `.npy` files now load with their `dt_units` and serve payload bytes verbatim (upstream serves them via `numpy.load`). Collapsing onto the shared `Kind::from_numpy_char` (`dtype.rs:100`) also widens acceptance to `V` (void) and `t` (bit-field) descrs; this is intentional and safe — every serving route is byte-faithful (`/array/full` octet-stream and zarr v2 emit the raw void elements verbatim under a faithful void dtype string, i.e. numpy's own void round-trip) or loud (zarr v3 → 422 in `dtype_v3_name` `zarr_router.rs:145`; JSON → hard `Err` `array.rs:472`; the image serializer → loud error; CSV → a per-cell visible `unsupported dtype` placeholder `array.rs:302`), so no path reinterprets void bytes as numbers. The same collapse corrects Unicode itemsize to bytes (`<U3` → 12 via `dtype.rs:187` `size*4`), matching upstream `BuiltinDtype.from_numpy_dtype`, which stores numpy's `dtype.itemsize` (`structures/array.py:113`); the old char-count made the body-length check (`n × element_size`) reject every real `<U*` `.npy` file, so this **enables a previously-dead path** rather than changing a working one. Open (blocked): zarr v3 still 422s non-numeric dtypes (datetime64 / unicode / bytes) where upstream feeds them to `parse_data_type(zarr_format=3)` — reconciling against upstream's v3 *extension* data types needs a zarr-python wire-format reference before a decision. |
 | (core) | Table / Sparse CSV pandas `to_csv` byte parity | 3c16eb2 + abb729b | The table CSV serializer re-serves Arrow IPC through arrow-csv, whose writer diverges from upstream `serialize_csv` = `DataFrame.to_csv(index=False)` (`tiled/serialization/table.py:57-62`) on several column kinds — emitting 200-OK bytes pandas would never produce. (3c16eb2) adds one structural **normalization pass** (`normalize_batches_for_pandas_csv`, `serialization/csv_table.rs:347`) that rewrites each record batch to the pandas-equivalent arrays *before* the writer runs, so arrow's output equals pandas' by construction (no string post-patching). A per-column `ColPlan` (`csv_table.rs:148`) is decided by `plan_column` (`:297`) scanning **all** batches, so a column split across partitions formats uniformly: Boolean → `True`/`False`; integer-with-any-null → Float64 (pandas' int+missing promotion, `5`→`5.0`); float `NaN` → empty (pandas `na_rep=""`); naive Timestamp → space separator with `is_dates_only` date-only when the whole column is midnight and a per-column `{3,6,9}` fractional width (`frac_digits` `:234`, `fmt_datetime` `:270`); Time32/Time64 formatted per element as `datetime.time.isoformat` (`fmt_time` `:287`). Every rule was pinned against a pandas 3.0.3 + pyarrow 25.0.0 oracle running the exact upstream pipeline (reference only, not in the repo). The shared serializer also backs the Sparse family CSV (`sparse.rs:64`/`:70`), so both families are fixed at once. (abb729b) fixes the array-CSV boolean cell to `True`/`False` (`array.rs:237`), matching `numpy.savetxt(fmt="%s")` = `str(np.bool_)` (`array.py:45`); the JSON bool arm stays lowercase (correct JSON). Residual deliberate divergences: a tz-aware Timestamp column keeps arrow's RFC3339 form (reproducing pandas' wall-clock offset needs a tz database, and no tiled-rs adapter emits such a column — unreachable); `time64[ns]` with non-zero sub-microsecond nanoseconds truncates to microseconds (`fmt_time` has no `datetime.time` representation for it — upstream `to_pandas` raises, so no upstream output exists to match). |
 | (core) | Catalog write-path parity: recursive DELETE + PATCH `access_blob` | f86d28a + 6aa2fab + e9a3f95 | Three catalog write-path parity fixes. (f86d28a) `DELETE /metadata` gains a `?recursive=` query param (`delete_metadata`, `router.rs:6697`) defaulting to false, mirroring upstream `recursive: bool = Query(False)` (`server/router.py:1980`); the non-empty-container refusal (#503) is now gated `if !recursive` (`router.rs:6723`), matching upstream's `if not recursive` guard that raises `Conflicts` (`catalog/adapter.py:1069-1085`) — the catalog's own `delete_node` was already a cascading recursive delete, so `recursive=true` just skips the empty-check and lets it cascade. (6aa2fab) the client threads `recursive` through `BaseClient::delete(recursive, external_only)` (`client/base.rs:225`) and `Container::delete_contents(recursive, external_only)` (`client/container.rs:693`), forwarding it to each child delete — parameter order mirrors Python `BaseClient.delete(recursive=False, external_only=True)`. (e9a3f95) PATCH `access_blob` now runs through the **same** json-patch / merge-patch step as `metadata` and `specs` before `policy.modify_node` sees it (`patch_metadata`, `router.rs:5997`): the mode dispatch applies `apply_json_patch_field` / `merge_patch_apply` to the stored blob and hands the *result* — not the raw patch document — to the policy, mirroring upstream `apply_json_patch(entry.access_blob, …)` (`router.py:2351`) and the merge-patch path (`:2364-2367`). A null/absent `access_blob` means "no change": no patched blob is produced and the policy is not consulted, so the stored blob is preserved. |
@@ -455,14 +455,421 @@ Landed work:
   the feature-gated construction path is verified **by reading only** — a
   saml-enabled build remains owed.
 
-Open / in flight — wave-25 roadmap (not yet landed, tracked as `P`-items):
+Wave-25 roadmap (`P`-items) — status after waves 26–28 (landings recorded in
+the wave sections below):
 
-* **In progress:** `P10` (`root_path` config), `P12` (dictionary authenticator
-  from config), `P13` (`database:` / `webhooks:` YAML config blocks).
-* **In flight this round:** `P7` (`allow_anonymous_access`), `P15` (client
-  `update_metadata` diff-builder).
-* **Blocked on user sign-off:** `P6` (bytes structure family), `P8` (xarray
-  spec-dispatch), `P14` (`/metrics` endpoint).
+* **Landed in wave-26:** `P7` (`allow_anonymous_access`, `06a97dd`), `P10`
+  (`root_path` — link side `c6d2ffb`, `?root_path=true` endpoint side `2084f2b`),
+  `P12` (dictionary authenticator from config, `a4674a3`), `P13` (`database:` /
+  `webhooks:` YAML config blocks, `d14643f`), `P15` (client `update_metadata`
+  diff-builder, `5e2889b`).
+* **Partially landed (wave-28):** `P8` (xarray spec-dispatch) — the additive
+  `xarray_dataset` csv/parquet/arrow exports landed (`0ff278c`, PR #102); the
+  `application/json` / `text/html` spec-over-family override stays blocked (the
+  Container family already serves those).
+* **Still blocked on user sign-off:** `P6` (bytes structure family — no `Bytes`
+  variant on `StructureFamily`), `P14` (`/metrics` Prometheus scrape endpoint —
+  not wired as an HTTP route; the `Server-Timing` header from PR #107 is a
+  separate mechanism).
+
+## Wave-26: wave-25 P-item completions + small fixes
+
+Closes the wave-25 roadmap `P`-items that were "in flight" / "in progress" when
+the wave-25 doc landed (`abb7677`), plus a bundle of small correctness/citation
+fixes. The doc commit merged *before* these (PR numbers #87–#88 predate the
+doc's own #89), which is why wave-25 lists P7/P15 as still in flight.
+
+Landed work:
+
+* **`allow_anonymous_access` honored in multi-user mode** (`06a97dd`, PR #87,
+  wave-25 P7). The flag was parsed-but-dead: an unauthenticated request was
+  admitted only when `no_auth_configured()` (no api_key **and** no auth_db), and
+  then at full scope; once any auth backend was configured the flag had no effect
+  and anonymous requests always 401'd. Closed with one owner —
+  `AppState::anonymous_scopes() -> Option<ScopeSet>` (`server/state.rs:338`):
+  `no_auth_configured()` → `Some(full())` (the dev/demo hatch, checked first and
+  byte-identical), else `allow_anonymous_access` → `Some(ScopeSet::public())` (a
+  new named constructor = `read:metadata` + `read:data`, `auth/scopes.rs:154`),
+  else `None` (→401). All three admission sites consult it — the HTTP
+  `resolve_auth_inner` middleware, `about`'s `auth_required` (`router.rs:269`),
+  and both WebSocket paths (`streaming.rs`) — with the anonymous principal left
+  `None` so the access-policy public/private node filter still runs. Mirrors
+  upstream `PUBLIC_SCOPES if allow_anonymous_access else NO_SCOPES`
+  (`authentication.py:437`). Also fixes a pre-existing `about.auth_required`
+  mis-report for a single-user-api-key-only server (no authenticators). The
+  `no_auth_configured()` full-anonymous hatch has no upstream analogue and stays
+  loud-warned at startup.
+* **Client `update_metadata` diff-builder + `DELETE_KEY` sentinel** (`5e2889b`,
+  PR #88, wave-25 P15). The Rust client had only raw `patch_metadata`; no
+  `dict.update`-style convenience. `MetadataUpdate::{Set, Delete, Merge}`
+  (`client/base.rs:77`) maps 1:1 onto upstream `_update_obj`'s three branches —
+  `Set(Object)` merges leaf-by-leaf (upstream recurses, never wholesale-replaces),
+  `Delete` = the `DELETE_KEY` sentinel, `Merge` places a nested delete without
+  touching siblings. The pure `compute_metadata_patches` (`client/base.rs:189`)
+  merges the update tree into a clone then `json_patch::diff`s old-vs-new into
+  RFC 6902 ops; `BaseClient::update_metadata` (`:609`) always PATCHes as
+  `application/json-patch+json` (server records a revision unless `drop_revision`).
+  The client-held snapshot is not mutated; specs diffed as a name-list (versions
+  unset), `access_tags` merged into `access_blob`. Mirrors upstream
+  `BaseClient.update_metadata` / `build_metadata_patches` (`base.py:516`/`:585`).
+* **Reverse-proxy `root_path` prefixing** (`c6d2ffb`, PR #90 + `2084f2b` in
+  PR #92, wave-25 P10). No proxy-mount-prefix support existed; generated absolute
+  links never carried a sub-path and About `meta.root_path` was hardcoded `"/api"`.
+  `AppState::root_path` (`server/state.rs:37`) is held canonical via
+  `normalize_root_path` (`:287`), and the single link chokepoint
+  `resolve_base_url_with_peer` (`:426`) prepends it to every derived link (About,
+  search/pagination, item self/full, zarr, streaming, auth); an explicit
+  `base_url`/`public_url` override is the complete base and is not further
+  prefixed. Read from `--root-path` (wins) or config `uvicorn.root_path`
+  (`UvicornConfig`); other `uvicorn:` keys are captured + warn-logged (tiled-rs is
+  axum, not uvicorn). Endpoint side (`2084f2b`): `?root_path=true` on the metadata
+  endpoint fills `meta = {"root_path": state.root_path or "/"}` (`router.rs:522`),
+  matching upstream `router.py:463`/`:508` (the endpoint's `"/"` default is
+  deliberately distinct from About's `"/api"`). Mirrors upstream
+  `get_root_url_low_level` (`utils.py:82`).
+* **`DictionaryAuthenticator` from YAML config** (`a4674a3`, PR #91, wave-25 P12).
+  A `providers` entry naming `DictionaryAuthenticator` was skipped-with-warning;
+  no way to declare a username→password map in config.
+  `is_dictionary_authenticator` (`cli/config.rs:856`) matches the class name (any
+  import path) or the short `dictionary` selector — deliberately **not** upstream's
+  accept-anything `DummyAuthenticator` — and `build_dictionary_authenticator`
+  (`:925`) Argon2id-hashes each password at construction into a Rust
+  `DummyAuthenticator`, wired alongside LDAP/PAM but with **no build-feature gate**.
+  Mirrors upstream `DictionaryAuthenticator` (`authenticators.py:46`); upstream
+  `confirmation_message` is accepted-and-ignored.
+* **`database:` and `webhooks:` top-level config blocks** (`d14643f`, PR #91,
+  wave-25 P13). The auth-DB URI and webhook safety flags were CLI-only, so a valid
+  upstream `database: {uri: …}` never reached the auth DB (multi-user auth silently
+  stayed off). `DatabaseConfig` (`cli/config.rs:243`) → `auth_db_uri()` (`:1489`,
+  resolution `--auth-db-uri`/`TILED_AUTH_DB_URI` > `database.uri`); `WebhooksConfig`
+  (`:284`) OR-combines `allow_http`/`allow_private_addresses` with the `--webhooks-*`
+  flags (store_true cannot express an explicit false override). SQLAlchemy pool
+  fields and `secret_keys` (Fernet at-rest) have no SQLx analogue — parsed +
+  warn-logged, no effect. Mirrors upstream `Database`/`WebhooksConfig` config
+  models (`config.py:193`/`:242`).
+* **Small fixes bundle** (PR #92). (`912e90d`) The in-memory `CatalogAdapter::search`
+  NotEq screen used `is_none_or`, **including** rows missing the queried key, which
+  contradicted the authoritative SQL `push_neq` (no `IS NULL OR` arm), the
+  `MapAdapter` evaluator, and upstream `mapping.py::noteq`; now
+  `is_some_and(|v| v != …)` — no user-visible change today (the path is reached only
+  via server-built `AccessBlobFilter` queries), a latent-divergence trap removed.
+  (`1b4b531`) A `scopes:` list under an OIDC provider was silently dropped by serde;
+  `OidcProviderArgs::scopes` (`cli/config.rs:645`) now captures it and `assemble()`
+  warns it is ignored — tiled-rs does not implement upstream's external-PDP
+  scope-delegation mode (`authentication.py:542`), which remains blocked.
+  (`2084f2b`) `?root_path=true` endpoint side of P10 (above). (`7f0a574`, doc-only)
+  `ServerError::BadRequest`'s doc citation corrected: an out-of-range `read_block`
+  is upstream HTTP **500**, not 400; only the table-partition path returns 400.
+
+## Wave-27: client transport / CLI / navigation / profiles / HTTP-cache / retry
+
+A large client-and-CLI batch (PRs #93–#101, #103 on main). It hardens the Rust
+client's transport and caching to upstream fidelity, ports the `tiled` CLI's
+auth/profile/register/serve surface, and closes the client retry-wrap family.
+These are Rust-native equivalents, not verbatim ports of the Python client — the
+N/A "separate Rust client" framing still holds, but the specific capabilities
+(`max_connections` cap, retry coverage, non-interactive session resume, `tiled
+register`) now exist.
+
+Landed work:
+
+* **Default transport timeouts + profile timeout object + `ContextOptions`
+  overrides** (`a1d021a` + `34fb29f` + `f2fff6b`, PR #93). The default reqwest
+  client had **no timeouts** (a hung server left `send()` awaiting forever, past
+  the retry deadline); `DEFAULT_CONNECT_TIMEOUT = 5s` / `DEFAULT_READ_TIMEOUT = 30s`
+  now apply (`client/context.rs:39`/`:44`). `Profile::timeout` was `Option<f64>`,
+  so any upstream-shaped profile (`timeout` as an object) failed to deserialize;
+  retyped to `ProfileTimeout { connection, read, write, pool }`
+  (`client/profiles.rs:367`). `ContextOptions` gains `timeout`/`verify`/`headers`/
+  `max_connections`, with `max_connections` sizing both `pool_max_idle_per_host`
+  and the data-fetch semaphore (`context.rs:206`), matching upstream
+  `DEFAULT_TIMEOUT_PARAMS` (`utils.py:369`) and `max_connections` (`context.py:296`).
+  Parity ceiling: reqwest exposes only connect + per-read timeouts, so `write`/`pool`
+  are documented-but-not-applied, and no total-request deadline is set (upstream
+  sets none).
+* **`serve` host/port from config + `serve --public` + `tiled register`**
+  (`fecf342` + `c878003` + `873763b`, PR #94). `serve` hard-defaulted
+  `127.0.0.1:8000` and never read a `uvicorn: {host, port}` block;
+  `resolve_serve_host`/`resolve_serve_port` (`cli/mod.rs:833`/`:841`) now resolve
+  flag > config > default, matching upstream `_serve.py:711`. `--public`
+  OR-combines into the config-serve `allow_anonymous_access` (`cli/mod.rs:1880`).
+  The `tiled register` command (`Command::Register`, run arm `cli/mod.rs:1986`)
+  wires the already-ported `client::register` engine with an option subset
+  (`--prefix`/`--watch`/`--keep-ext`/`--include-ext`/`--ext`/`--api-key`);
+  `--verbose` is accepted for compatibility but is a no-op (the tracing subscriber
+  is installed before dispatch — use `RUST_LOG`). **This moves `tiled register` out
+  of the "features we never built" N/A list.**
+* **Nested `container.get()` path walk + lazy paginated listings** (`e2fe241` +
+  `58332b3`, PR #95). `container.get("a/b/c")` percent-encoded the slashes into one
+  `a%2Fb%2Fc` segment → 404; `split_key_segments` (`client/container.rs:75`) now
+  encodes each segment separately and issues one multi-step walk, resolving only
+  the first segment against the filtered set and walking the tail via a nested `get`
+  (matching upstream `container.py:279`/`:353`). Lazy `keys_view`/`values_view`/
+  `items_view` (`container.rs:331`+) over a shared `fetch_page` primitive back
+  `first`/`head`/`page_size` (upstream `iterviews.py`). Deliberate omission:
+  negative-index slicing (`last`/`[-n:]`) is **not** provided — upstream implements
+  it via reversed sorting, but the in-memory `ContainerAdapter::search_page` ignores
+  sort and returns insertion order, so a reversed walk would silently return wrong
+  rows.
+* **Register CSV/Parquet tables with a real `arrow_schema`** (`5875792`, PR #96).
+  The register engine built a table `TableStructure` from only `{columns,
+  npartitions:1}` with no `arrow_schema`, so the server's family-authoritative
+  `DataSource` parse **422'd** (`missing field arrow_schema`). One owner
+  `table_structure_from_file` (`client/register.rs:213`) now delegates to the same
+  server-side `CsvAdapter`/`ParquetAdapter::from_path(...).structure()` the node is
+  later served from, so the registered structure (incl. the base64 Arrow schema) is
+  byte-identical to what a read re-derives — mirroring upstream `register.py:334`
+  (`structure=dict_or_none(adapter.structure())`). A live-server E2E test
+  (`tests/register_table_integration.rs`) registers real CSV + Parquet and reads
+  the rows back. Feature-gated: with `csv-adapter`/`parquet-adapter` off the helper
+  hard-errors rather than shipping a placeholder schema.
+* **`from_profile` field wiring + cached-session resume** (`a6393be` + `54ddebf`,
+  PR #97). `from_profile` honored only `uri` + `api_key`, silently dropping every
+  other field; and `use_cached_tokens()`/`authenticate()` had **zero callers**, so
+  a saved login could never resume. `profile_to_options` (`client/profiles.rs:448`)
+  now maps headers/verify/timeout/max_connections; `maybe_resume_session`
+  (`client/constructors.rs:63`) performs non-interactive resume during construction,
+  with `remember_me` threaded through `from_context`/`from_uri_with_options`
+  (default true). Deliberate ceiling: interactive login is **not** performed inside
+  the library constructor (left to the CLI); `timeout.write`/`pool` and
+  `token_cache` are modeled-but-unwired.
+* **`login` / `whoami` / `logout` + `tiled profile` group** (`bc1817e` + `7e96e8c`,
+  PR #98). No client-facing CLI auth commands or profile group existed.
+  `resolve_client_target` resolves `--uri` (a tiled-rs escape hatch) > `--profile` >
+  default profile, rejecting `direct:` profiles; a `ProfileCommand`
+  (Paths/List/Show/Edit/Create/Delete/Get/Set/ClearDefault) with `open_in_editor`
+  (platform opener). Mirrors upstream `commandline/main.py` + `_profile.py`; the
+  default-on `--set-default` is modeled as a `--no-set-default` negation (clap has
+  no native toggle).
+* **HTTP-cache fidelity refinements** (`d2db4c5` + `84a1a21` + `93be738` +
+  `3a1f1e9` + `d23519b`, PR #99, all `client/cache.rs`). Five gaps vs upstream:
+  (1) eviction was FIFO-by-insertion — now LRU-by-access (`try_get` bumps
+  `stored_at` and persists via `touch_entry`, `:293`/`:855`); (2) no per-item
+  ceiling — `DEFAULT_MAX_ITEM_SIZE = 500_000` (`:100`), declines strictly-over
+  (matching upstream `incoming_size > max_item_size`); (3) freshness ignored
+  `Expires` — now derived alongside a parseable `Date` (`:752`/`:763`); (4) any
+  `<400` status was cached — now the `CACHEABLE_STATUSES = [200,203,300,301,308]`
+  whitelist (`:106`); (5) the module doc overclaimed request-side `Cache-Control`
+  honoring and cited nonexistent symbols — rewritten honestly (`min-fresh` /
+  `max-stale` / `only-if-cached` are parsed but not enforced; a `Vary` beyond
+  `Accept`/`Accept-Encoding` is a miss). Mirrors upstream `client/cache.py` +
+  `cache_control.py` (`cacheable_status_codes = (200,203,300,301,308)`).
+* **Retry-wrap metadata-writes + auth-management; `remember_me=false` token clear;
+  Python-interoperable token dir** (`2302e20` + `1ab35ac` + `4274b67`, PR #100).
+  The transient-failure `retry` helper (`client/utils.rs:209`) wrapped reads and
+  data-block writes but left metadata-writes (`delete`/`patch_metadata`/
+  `replace_metadata`) and auth-management (`whoami`/`logout`/`create_api_key`/
+  `revoke_*`) bare — a 5xx/429/connect blip that upstream recovers from failed fast;
+  now wrapped, matching upstream `retry_context` (write **primitives** stay
+  unwrapped to avoid double-retry). `configure_auth(remember_me=false)` now clears
+  any prior on-disk `access`/`refresh` tokens (not just skips persisting), so a
+  later `use_cached_tokens()` cannot resurrect them. The token-cache dir switched
+  from `NON_ALPHANUMERIC` to a `quote_plus`-compatible encoding (`TOKEN_DIR_ENCODE`,
+  `client/auth.rs:523`) so tiled-rs and python-tiled caches are mutually visible,
+  matching upstream `context.py:1042`/`:1047` (`quote_plus(str(api_uri))`).
+* **`serve --temp`/`--init`/cache flags + `serve directory` + api-key
+  `--access-tags` + `admin api-key` subgroup** (`a53d019` + `864a1b3` + `4b9cb78`,
+  PR #101). `--temp` synthesizes a fresh initialized SQLite catalog in a tempdir;
+  `--init` gates uninitialized catalogs (an uninitialized `--catalog-uri` is now a
+  **hard error** instead of a silent empty-DB create — behavior change); `--cache*`
+  builds a `StreamingConfig`. `serve directory <path>` orchestrates an ephemeral
+  catalog + single-user server + directory registration over HTTP. `tiled api-key
+  create --access-tags` (was hardcoded `None`) and an `admin api-key
+  {create,list,revoke}` subgroup (DB-direct, like other `tiled admin` subcommands).
+  Deliberate: the temp catalog dir is **not** removed at shutdown (upstream `# TODO`);
+  the duckdb tabular half is skipped.
+* **Retry-wrap family closure** (`59455ab`, PR #103). Closes the transient-failure
+  retry-wrap defect family across the three files PR #100 did not own —
+  `container.rs` `post_new_node` (the write behind `create_node` + every `write_*`),
+  all five `admin.rs` methods, and `register.rs` (`create_container`,
+  `try_register_single`, `register_image_sequence`) — the register `post_json`
+  writes were the last unwrapped sites. Non-idempotent creates are retried because
+  upstream retries them (`container.py:735`); a 409 collision stays non-transient and
+  surfaces immediately.
+
+## Wave-28: meta-sweep landings
+
+A module-centric coverage meta-sweep (PRs #102, #104–#112 on main). Unlike wave-24
+these do not form one feature; each closes an independent gap surfaced by the sweep.
+
+Landed work:
+
+* **Percentile-clip float image previews + `xarray_dataset` csv/parquet export**
+  (`04398b5` + `0ff278c`, PR #102). (`04398b5`) `normalize_floats`
+  (`serialization/image_array.rs:269`) now clips at percentile(1)/percentile(99)
+  over the **finite** values (`percentile_sorted`, numpy `method="linear"`, `:302`),
+  closing the display-contrast divergence the image-serializer row above flagged —
+  a single outlier pixel no longer crushes the preview. (`0ff278c`) `xarray_dataset`
+  containers 406'd/422'd on csv/parquet (only arrow was intercepted);
+  `wants_xarray_wide_table` (`server/router.rs:2514`) now serves arrow verbatim and
+  delegates csv/parquet to the **Table-family** serializer over the same wide-table
+  Arrow IPC, shared by GET and POST. Mirrors upstream `serialization/array.py:78`
+  (percentile) and `serialization/xarray.py`. Residual parity notes: upstream's
+  percentile poisons on any NaN (⇒ all-black) while ours takes percentiles over
+  finite values and maps non-finite → 0; the `application/json` / `text/html` xarray
+  formats stay **P8-blocked** (Container already serves those — dispatching the spec
+  serializer is the spec-over-family override); netcdf/excel/hdf5 not ported.
+* **Api-key revoke truncation + schema-version serve gate + config env-var
+  expansion** (`e910b41` + `3c002f4` + `9742e89`, PR #104). (`e910b41`) Top-level
+  `tiled api-key revoke` passed the raw argument to a match against the stored
+  8-char `first_eight`, so pasting a whole key silently never matched; a single
+  `api_key_search_prefix` owner (`cli/mod.rs:2742`) truncates both paths.
+  (`3c002f4`) Serve called `migrate()` unconditionally — a behind-schema catalog was
+  **silently auto-migrated** in place, an ahead/unknown one silently served;
+  `Catalog::ensure_serveable` (`catalog/migrate.rs:253`) over a `schema_state() ->
+  SchemaState { Uninitialized, Current, Behind, Ahead }` classifier now hard-errors:
+  `Behind` names `tiled catalog upgrade-database` (refused even with `--init`),
+  `Ahead` is a version-mismatch refusal, only `Uninitialized + may_initialize`
+  migrates. Mirrors upstream `check_catalog_database` (`catalog/core.py:53`).
+  (`9742e89`) Config and profile YAML now expand `$VAR`/`${VAR}` (POSIX
+  `expandvars`, ASCII names, **no** `${VAR:-default}` syntax; unset/non-string left
+  literal) via `expand_env_vars` (`env_expand.rs:21`) before typed deserialize —
+  matching upstream `expand_environment_variables` (`utils.py`).
+* **Client `sync.copy()` — cross-server node/tree replication** (`6eca60d`,
+  PR #105). Ports upstream `client/sync.py` `copy()` + `_copy_*` dispatch:
+  `copy(source, dest, on_conflict)` (`client/sync.rs:84`) recurses containers via a
+  boxed `copy_container` with per-family helpers. `is_conflict` (`:338`) recognizes
+  **both** 409 and the server's then-current 422-with-`already exists` (this landed
+  just before PR #106 flipped the server to 409, so it straddles both). `copy_table`
+  writes one full-table PUT rather than per-partition because a fresh managed-parquet
+  skeleton reports `npartitions == 0` and rejects `write_partition(0)` — a
+  multi-partition source lands as a single partition (row data preserved).
+  Deliberate: container→container only (Rust static types cannot express upstream's
+  duck-typed `copy(node, node)`); `OnConflict::Warn` = skip-with-log, not overwrite.
+* **Catalog conflict / would-delete-data → HTTP 409** (`cf4d585`, PR #106 +
+  `e4db02e`, PR #108). A duplicate `(parent_id, key)` create surfaced as HTTP
+  **422** instead of 409, and the `?`/`TiledError` bridge mapped `WouldDeleteData`
+  to 422. Both of the port's two mapping bridges were corrected to agree —
+  `map_catalog_err` (`router.rs:6334`) and `From<CatalogError> for TiledError`
+  (`catalog/error.rs`): `Conflict`/`WouldDeleteData` both resolve to
+  `ServerError::Conflict` → 409, matching upstream `Collision`/`WouldDeleteData`
+  handlers (`server/app.py:351`/`:368`). A genuine duplicate-specs validation error
+  intentionally stays 422. (The `map_catalog_err` two-bridge split is later
+  collapsed to a single owner in wave-29 — see PR #115.)
+* **`Server-Timing` header + lz4 content-encoding + compression-ratio gate**
+  (`fd5b19a` + `c66ffc2` + `0a54fbb` + `6594829`, PR #107). Adds a
+  `server_timing_middleware` (`server/server_timing.rs:109`) emitting the `app` and
+  `compress` phases (the other upstream phases `acl`/`read`/`pack`/`tok` are
+  deliberately **not** faked — no clean Rust seam); an lz4 content-encoding
+  (`server/lz4.rs`); and a single `worth_compressing` ratio gate
+  (`server/compression.rs`, `THRESHOLD = 1/0.9` — keep only if compressed < 90% of
+  original, else drop `Content-Encoding` and send identity). **lz4 uses the
+  python-lz4 BLOCK format, not the LZ4 frame format**: `compress_prepend_size`
+  (`lz4.rs:54`) writes the uncompressed length as a 4-byte little-endian prefix,
+  matching upstream `lz4.block.compress` with `store_size=True`
+  (`media_type_registration.py:297`). (This corrects an earlier brief that assumed
+  the frame format.) Negotiation priority blosc2 > lz4 > zstd > gzip reproduces
+  upstream's reversed registration order via middleware layering. Distinct from the
+  zarr-chunk `blosc(lz4)` divergence in the #774 row — that is chunk compression in
+  the zarr router, a separate mechanism.
+* **`AccessTagsCompiler` + offline `admin compile-access-tags`** (`a221526` +
+  `a0ef904`, PR #109). Ports upstream's offline tag-config compiler:
+  `AccessTagsCompiler` (`access/access_tags.rs:254`) compiles a tag config
+  (`roles`/`tags`/`auto_tags`/`tag_owners`, cycle-safe DFS, `MAX_TAG_NESTING = 5`)
+  into a self-contained SQLite ACL DB (per-`(user, tag, scope)` rows + `public_tags`/
+  `user_tag_scopes` views), driven by `tiled admin compile-access-tags <config>
+  <tags-db> [--groups <yaml>]` (`cli/mod.rs:2475`). Deliberate deviation: inherited
+  child ACLs are merged by **UNION**, not upstream's `dict.update` (which would drop
+  a shared user's scopes). **Runtime consumption is deferred** (does not touch
+  `TagBasedPolicy` / config `build()`): blocked on the identity fork — upstream ACLs
+  key on IdP **username**, the port's policy keys on principal **UUID**.
+* **TLRU resource cache of built leaf adapters** (`9063c7c`, PR #110). The file
+  resolver rebuilt a fresh adapter from disk on every request (npy reads the whole
+  file; hdf5/tiff/csv/parquet/zarr re-parse headers). `AdapterCache =
+  ResourceCache<CacheKey, AnyAdapter>` (`server/resource_cache.rs:154`) is a **TLRU**
+  (time-to-use: an entry lives ≤ `ttu` seconds from insertion, access does not extend
+  it), `DEFAULT_MAX_SIZE = 1024` / `DEFAULT_TTU_SECONDS = 60`
+  (`TILED_RESOURCE_CACHE_MAX_SIZE`/`_TTU`), keyed on `(mimetype, path, parameters,
+  structure, metadata)`. **Read-only paths only** — the resolver inserts only when
+  `!writable`, because a writable adapter mutates the file but leaves its in-memory
+  `&self` snapshot stale; writability is a pure function of the path, so a path is
+  always-cached or never-cached. Mirrors upstream `with_resource_cache`
+  (`adapters/resource_cache.py`). (Wave-29 PR #115 narrows the cached set further —
+  see below.)
+* **Client parallel/in-memory `raw_export` + recursive `smoke_read`** (`b1bf85c` +
+  `c21686e`, PR #111). `BaseClient::raw_export(destination, max_workers)`
+  (`client/base.rs:850`) adds bounded-parallel downloads (`buffered(workers)`) and an
+  in-memory sink (`ExportDestination::{Directory, Memory}` →
+  `ExportOutput::{Paths, Memory}`), mirroring upstream `raw_export` +
+  `ThreadPoolExecutor` (`client/download.py:154`). `smoke_read` (`client/smoke.rs:56`)
+  recursively reads every leaf of a tree and returns a structured
+  `Vec<FaultyLeaf { uri, error }>`. Deliberate: **no rich progress bar** is ported
+  (no new display dep, no invented callback); the structured fault list supersedes
+  upstream's `verbose`/`strict` flags.
+* **`TILED_EXPLAIN_SQL` query-plan aid + spec validation registry** (`c1efbb8` +
+  `31fbb94`, PR #112). (`c1efbb8`) `TILED_EXPLAIN_SQL` (parsed `bool(int(...))`,
+  `catalog/explain.rs:34`) emits `EXPLAIN QUERY PLAN` (SQLite) / `EXPLAIN` (Postgres)
+  for catalog search SELECTs via `tracing` (best-effort; an EXPLAIN failure is
+  warn-logged + swallowed). (`31fbb94`) A spec validation registry
+  (`server/validation.rs`) validates declared specs on node create/update at the
+  single `create_node_core` + `patch_metadata` + `put_metadata` owners (reject →
+  HTTP 400), with a `reject_undeclared_specs` YAML toggle (default false) that 400s
+  an unrecognized spec. Mirrors upstream `validate_specs` (`router.py`) +
+  `reject_undeclared_specs` (`settings.py:45`). Deliberate deviation: the registry is
+  **programmatic-only** — upstream populates it from import-path callables named in
+  YAML, for which Rust has no analogue, so only the mechanism + the
+  `reject_undeclared_specs` boolean are wired (the shipped `composite` validator is
+  out of scope).
+
+## Wave-29: adversarial-review fixes of the wave-28 landings
+
+An adversarial review of the wave-28 batch (#104–#112) surfaced seven defects
+across three PRs (#113–#115), each fixed at source. Two are structural
+single-owner collapses (one compression owner; one error→status bridge).
+
+Landed work:
+
+* **Compression: floor 500→1000, single `apply_encoding` owner, stale
+  Content-Length on stream error** (`c28ab43` + `157eaa7` + `5d847c4`, PR #113).
+  Three flaws in the wave-28 compression landing: (1) blosc2/lz4 hardcoded a
+  500-byte floor, but the running app overrides `minimum_size=1000` — raised to a
+  single `MINIMUM_SIZE = 1000` (`server/compression.rs:27`), matching upstream
+  `app.py:763`. (2) gzip/zstd went through tower-http's `CompressionLayer` (32-byte
+  floor, no ratio gate, no `compress` timing) so "the gate applies to every encoder"
+  was false — all four encoders now route through **one owner** `apply_encoding`
+  (`compression.rs:43`), sole owner of the floor, the `worth_compressing` ratio gate,
+  the `compress` Server-Timing phase, and the `Content-Encoding`/`Content-Length`/
+  `Vary` emission; tower-http compression is dropped from `Cargo.toml`. gzip uses a
+  per-media-type level (9 for json/msgpack, 1 for bulk); zstd level 3. (3) On a
+  mid-flight body-stream error the code returned an empty body while leaving the
+  handler's original `Content-Length`, framing the empty body as truncated — the
+  shared owner now removes `Content-Length` before returning `Body::empty()`
+  (`compression.rs:57`), fixing all four encoders at once.
+* **Access-tags: reject present-but-null role/scopes; DFS in config-insertion
+  order** (`0e54f02` + `49c2aa7`, PR #114). Fixes the wave-28 `AccessTagsCompiler`
+  (PR #109). (`0e54f02`) `Member.role`/`scopes` were plain `Option<T>`, so a
+  present-but-null key (`scopes:` blanked) collapsed to `None`, indistinguishable
+  from absent — a `role:` beside a blanked `scopes:` slipped the both/neither gate
+  and silently granted the role's full scope set. Retyped to `Option<Option<_>>` via
+  `double_option` (`access/access_tags.rs:141`) so the gate keys on YAML key
+  **presence** (`resolve_member_scopes`, `:585`), matching upstream `all(k in user
+  for k in ("scopes","role"))` (`access_tags.py:390`). (`49c2aa7`) `tags` was a
+  `BTreeMap` entered via sorted `adjacency.keys()`; for cyclic `auto_tags` the
+  first-visited tag wins a shared ACL, so entry order is a semantic tie-break —
+  changed to `IndexMap` entered in config-document order (`access_tags.rs:433`),
+  matching upstream's doc-order DFS. Acyclic configs are order-invariant; the child
+  DFS order is not a parity target (upstream is non-deterministic hash order).
+* **Revoke-key truncation completion; resource-cache npy/tiff/jpeg gate;
+  UnsupportedQuery→400 single owner** (`317dac2` + `aed117c` + `95acbd5`, PR #115).
+  (`317dac2`) Two of the three api-key revoke routes still matched the raw incoming
+  value against the stored 8-char `first_eight` (403 on the path route, 404 on the
+  admin route for a pasted full key); `auth_router.rs:507`/`:797` now truncate,
+  completing the family (`current_apikey_revoke` at `:559` already did). (`aed117c`)
+  The wave-28 TLRU cache (PR #110) inserted **every** read-only leaf adapter, but
+  upstream only caches npy/tiff/jpeg (the three that call `with_resource_cache`); a
+  read-only csv/parquet/zarr/hdf5 file changed on disk was served stale for up to
+  `ttu`. The insert guard adds `&& caches_resource(&mimetype)` (`file_resolver.rs:312`),
+  a `caches_resource` allow-list (`:546`) of npy/tiff/jpeg only — `image/png` is
+  deliberately excluded (upstream has no PNG read adapter, even though the Rust PNG
+  path reuses the jpeg `ImageAdapter`). (`95acbd5`) `map_catalog_err` kept its own
+  parallel `CatalogError` match whose `other => Internal` catch-all swallowed
+  `UnsupportedQuery` to HTTP **500**, while the sibling CatalogError→TiledError→
+  ServerError bridge (adapter `?` path) mapped it to 400 — a two-bridge divergence.
+  `map_catalog_err` (`router.rs:6334`) now **delegates to the bridge**
+  (`ServerError::from(TiledError::from(e))`), making it the single owner;
+  `UnsupportedQuery` → 400 (upstream `app.py:356`), 500-class variants still return a
+  generic body so DB internals do not leak, and the bridge's exhaustive `From` turns
+  a future variant into a compile error rather than a silent 500.
 
 ## N/A (Python-specific or feature not in our port)
 
@@ -476,8 +883,11 @@ behaviour lives outside this port:
 - **Features we never built**: Composite spec family (#1093, #1119,
   #949, #959); SQL-array adapter
   (#1010, #998); SimpleTiledServer (#1346); mount_node configuration
-  (#1348, #970, #971); `tiled register` CLI (#1254, #1260, #1370);
+  (#1348, #970, #971);
   `read_partition`-style SQL serializer; redis streaming cache (#1192).
+  (The `tiled register` CLI, #1254/#1260/#1370, is **no longer** in this list —
+  it was built in wave-27: PRs #94/#96 add the command and give registered
+  CSV/Parquet tables a real `arrow_schema`.)
 - **Python client behaviour**: chunked-response decoders, dask
   conversion, `Context` repr, write_dataframe overloads, profile
   cleanup, pickling, local cache layouts. Our Rust client is a
