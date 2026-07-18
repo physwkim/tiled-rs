@@ -848,6 +848,135 @@ async fn search_normalizes_persisted_bare_string_specs() {
     );
 }
 
+/// Task #121-followup (w32) — READ-BACK, router single-node path: an object
+/// spec whose `version` is present but NOT a string (e.g. `5`) must read back
+/// NAME-ONLY (`{name}`), not vanish. The full typed `Spec` parse fails because
+/// our `version` is `Option<String>`, but element PRESENCE is load-bearing: the
+/// deleted catalog `parse_specs` kept such an element (name-only), and upstream
+/// `Spec(**{"name":"x","version":5})` keeps it too (`catalog/adapter.py:307`,
+/// `structures/core.py:29`). Before the fix `serde_json::from_value::<Spec>`
+/// returned `Err` and the element was dropped entirely.
+#[tokio::test]
+async fn get_metadata_keeps_object_spec_name_only_when_version_non_string() {
+    let (app, _dir) = build_app(validation_config(false)).await;
+
+    let (status, _) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/metadata/",
+        serde_json::json!({
+            "key": "nv",
+            "structure_family": "container",
+            "metadata": {},
+            "specs": [],
+            "data_sources": [],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // Persist a single object spec with a NON-STRING version via merge-patch
+    // (raw storage keeps `version: 5` verbatim — a shape a valid typed write
+    // path can never produce, but a hand-crafted PATCH can).
+    let (status, body) = json_request(
+        &app,
+        Method::PATCH,
+        "/api/v1/metadata/nv",
+        serde_json::json!({
+            "content-type": "application/merge-patch+json",
+            "specs": [{"name": "x", "version": 5}],
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "persist non-string-version spec: {body}"
+    );
+
+    let (status, body) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/metadata/nv",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "read back: {body}");
+    assert_eq!(
+        body["data"]["attributes"]["specs"],
+        // Name-only: the non-portable `version: 5` is dropped, the element stays.
+        serde_json::json!([{"name": "x"}]),
+        "object spec with a non-string version must read back name-only, not vanish: {body}"
+    );
+}
+
+/// Task #121-followup (w32) — READ-BACK, catalog SEARCH path: a MIXED list of a
+/// bare string and an object spec with a NON-STRING version must read back
+/// keeping BOTH name-bearing elements (the string, and the object name-only) IN
+/// ORDER. This is the storable end-to-end shape of the name-only-keep fix on the
+/// search path.
+///
+/// The NAMELESS-garbage element (`123`) from the brief's fixture is intentionally
+/// NOT in this list: `validate_payload` (`catalog/node.rs:316`) rejects a spec
+/// with no string `name` at WRITE time (422 "spec missing name"), so garbage is
+/// unreachable through the API. The garbage-DROP read-back is therefore pinned at
+/// the `parse_stored_list` unit level (`src/core/structures.rs` tests), the only
+/// level a corrupt/out-of-band row can exercise it.
+#[tokio::test]
+async fn search_keeps_name_only_object_spec_in_order() {
+    let (app, _dir) = build_app(validation_config(false)).await;
+
+    let (status, _) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/metadata/",
+        serde_json::json!({
+            "key": "gv",
+            "structure_family": "container",
+            "metadata": {},
+            "specs": [],
+            "data_sources": [],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // string (kept), object w/ non-string version (kept name-only). Both carry a
+    // name, so both survive `validate_payload`; order must be preserved.
+    let (status, body) = json_request(
+        &app,
+        Method::PATCH,
+        "/api/v1/metadata/gv",
+        serde_json::json!({
+            "content-type": "application/merge-patch+json",
+            "specs": ["good", {"name": "y", "version": 5}],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "persist mixed specs: {body}");
+
+    let (status, body) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/search/",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "search: {body}");
+    let entry = body["data"]
+        .as_array()
+        .and_then(|rows| rows.iter().find(|r| r["id"] == "gv"))
+        .unwrap_or_else(|| panic!("search must return the seeded node: {body}"));
+    assert_eq!(
+        entry["attributes"]["specs"],
+        serde_json::json!([
+            {"name": "good"},
+            {"name": "y"},
+        ]),
+        "mixed list must keep name-bearing elements (object name-only) in order: {body}"
+    );
+}
+
 /// Task #119 follow-up (w31) — READ-BACK normalization, REVISIONS path
 /// (`GET /api/v1/revisions/{path}`). A revision whose stored specs snapshot
 /// holds a bare-string element must read back normalized to

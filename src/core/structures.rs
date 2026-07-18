@@ -113,13 +113,34 @@ impl Spec {
     /// which accepts a plain string) or an object `{name, version?}`.
     ///
     /// The single owner for lenient stored-spec parsing. Element-wise and
-    /// fault-isolating: an element that is neither a string nor a well-formed
-    /// spec object is skipped, never collapsing the whole list. A blanket
-    /// `serde_json::from_value::<Vec<Spec>>` is all-or-nothing — one persisted
-    /// bare-string element made the ENTIRE list decode fail and come back
-    /// empty/None on read-back. A non-array (or `null`) value yields an empty
-    /// vec; callers that must distinguish "absent" from "empty" check
+    /// fault-isolating: one malformed element never collapses the whole list. A
+    /// blanket `serde_json::from_value::<Vec<Spec>>` is all-or-nothing — one
+    /// persisted bare-string element made the ENTIRE list decode fail and come
+    /// back empty/None on read-back. A non-array (or `null`) value yields an
+    /// empty vec; callers that must distinguish "absent" from "empty" check
     /// `Value::as_array` themselves before calling.
+    ///
+    /// Per element, in order:
+    /// * bare string → `Spec { name, version: None }` (upstream back-compat).
+    /// * object → the full typed `Spec` (name + optional string `version`).
+    /// * object whose full typed parse FAILS but which carries a string `name`
+    ///   → kept NAME-ONLY (`Spec { name, version: None }`). Element PRESENCE is
+    ///   the load-bearing property: upstream `Spec(**{"name":"x","version":5})`
+    ///   keeps the element (`catalog/adapter.py:307`, `structures/core.py:29`),
+    ///   and the deleted catalog `parse_specs` kept it too. Exact passthrough of
+    ///   a non-string `version` is not portable to our `Option<String>`, and no
+    ///   valid write path can store one (upstream types `version: Optional[str]`,
+    ///   `server/schemas.py`; the catalog `validate_payload` accepts it only as a
+    ///   string), so dropping just the unrepresentable `version` while keeping
+    ///   the name loses nothing a conformant client could observe.
+    /// * anything else — a number, an array, or an object with no string `name`
+    ///   → DROPPED. This is a deliberate defensive deviation: upstream RAISES
+    ///   (500) on such a stored row (`Spec(**123)` TypeError / `List[Spec]`
+    ///   validation error), whereas we skip it and serve the rest. For all
+    ///   well-formed data the results are identical; the deviation only changes
+    ///   corrupt/out-of-band rows (a nameless spec is rejected at write time by
+    ///   `validate_payload` with 422, so it cannot arise through the API), where
+    ///   returning the readable siblings beats a 500 on read.
     pub fn parse_stored_list(value: &serde_json::Value) -> Vec<Spec> {
         let Some(arr) = value.as_array() else {
             return Vec::new();
@@ -127,13 +148,17 @@ impl Spec {
         arr.iter()
             .filter_map(|element| {
                 if let Some(name) = element.as_str() {
-                    Some(Spec::new(name))
-                } else {
-                    // Object form: keep the exact per-element semantics of a
-                    // `Vec<Spec>` deserialize (string `name` required, optional
-                    // string `version`), just without the all-or-nothing collapse.
-                    serde_json::from_value::<Spec>(element.clone()).ok()
+                    return Some(Spec::new(name));
                 }
+                // Object form: prefer the full typed parse (name + optional
+                // string version), just without the all-or-nothing collapse.
+                if let Ok(spec) = serde_json::from_value::<Spec>(element.clone()) {
+                    return Some(spec);
+                }
+                // Typed parse failed (e.g. a non-string `version`): keep the
+                // element name-only if it carries a string `name`, so presence
+                // survives; otherwise it is nameless garbage and is dropped.
+                element.get("name").and_then(|n| n.as_str()).map(Spec::new)
             })
             .collect()
     }
@@ -837,6 +862,47 @@ mod tests {
         let json = serde_json::to_value(&s).unwrap();
         assert_eq!(json["name"], "xdi");
         assert_eq!(json["version"], "1.0");
+    }
+
+    /// w32 — `parse_stored_list` element rules, pinned at the parse level (the
+    /// only level a nameless-garbage row can be exercised: `validate_payload`
+    /// rejects a spec with no string `name` at write time, so garbage cannot
+    /// reach storage through the API — see the integration suite for the
+    /// end-to-end name-only-keep coverage).
+    #[test]
+    fn parse_stored_list_keeps_name_only_and_drops_garbage() {
+        use serde_json::json;
+
+        // An object with a NON-STRING version keeps its name (version dropped),
+        // rather than vanishing as it did before the fix.
+        assert_eq!(
+            Spec::parse_stored_list(&json!([{"name": "x", "version": 5}])),
+            vec![Spec::new("x")],
+        );
+
+        // The brief's mixed fixture: bare string kept, nameless `123` dropped,
+        // non-string-version object kept name-only — survivors in input order.
+        assert_eq!(
+            Spec::parse_stored_list(&json!(["good", 123, {"name": "y", "version": 5}])),
+            vec![Spec::new("good"), Spec::new("y")],
+        );
+
+        // Well-formed elements are unaffected: bare string + full object spec.
+        assert_eq!(
+            Spec::parse_stored_list(&json!(["alpha", {"name": "beta", "version": "2"}])),
+            vec![Spec::new("alpha"), Spec::with_version("beta", "2")],
+        );
+
+        // Every nameless/garbage shape is dropped (upstream 500s on these):
+        // number, array, and an object carrying no string `name`.
+        assert!(
+            Spec::parse_stored_list(&json!([42, ["a"], {"version": "1"}, {"name": 7}])).is_empty(),
+        );
+
+        // Non-array / null inputs yield an empty vec (absent-vs-empty is the
+        // caller's job via `Value::as_array`).
+        assert!(Spec::parse_stored_list(&serde_json::Value::Null).is_empty());
+        assert!(Spec::parse_stored_list(&json!({"name": "x"})).is_empty());
     }
 
     #[test]
