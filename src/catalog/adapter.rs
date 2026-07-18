@@ -328,6 +328,18 @@ impl ContainerAdapter for CatalogAdapter {
                 })
                 .collect();
 
+            // When this listing carries an access filter (a restricted caller),
+            // every per-entry container count MUST be principal-scoped: a plain
+            // child's reported grandchild count is the caller-visible subset,
+            // not the full cardinality (the count-leak invariant, extended to
+            // listings). Apply the same `AccessBlobFilter` the page's own
+            // `meta.count` uses to each grandchild count query. No filter
+            // (admin / no policy) → the unfiltered fast paths, unchanged.
+            let access_filter = queries.iter().find_map(|q| match q {
+                Query::AccessBlobFilter(f) => Some(f),
+                _ => None,
+            });
+
             let is_sqlite = self.catalog.pool().is_sqlite();
             let batched_counts = if is_sqlite {
                 let container_ids: Vec<i64> = rows
@@ -336,7 +348,14 @@ impl ContainerAdapter for CatalogAdapter {
                     .filter(|(_, family)| matches!(family, StructureFamily::Container))
                     .map(|(n, _)| n.id)
                     .collect();
-                self.catalog.count_children_batch(&container_ids).await?
+                match access_filter {
+                    Some(f) => {
+                        self.catalog
+                            .count_children_batch_filtered(&container_ids, f)
+                            .await?
+                    }
+                    None => self.catalog.count_children_batch(&container_ids).await?,
+                }
             } else {
                 std::collections::HashMap::new()
             };
@@ -366,6 +385,20 @@ impl ContainerAdapter for CatalogAdapter {
                 let structure = if matches!(family, StructureFamily::Container) {
                     let count = if is_sqlite {
                         batched_counts.get(&node.id).copied().unwrap_or(0)
+                    } else if let Some(f) = access_filter {
+                        // Postgres per-parent, principal-scoped: the exact
+                        // `AccessBlobFilter`-scoped COUNT (`limit = 0` fetches no
+                        // rows, runs only the filtered count), matching this
+                        // child's own `/search` `meta.count`. The large-container
+                        // approximation cannot apply to a filtered caller — it
+                        // would count unfiltered rows — the same trade the
+                        // count-only fast path (`caller_facing_child_count`) makes.
+                        let scoped = [Query::AccessBlobFilter(f.clone())];
+                        let (_, total) = self
+                            .catalog
+                            .search_children(Some(node.id), &scoped, &[], 0, 0)
+                            .await?;
+                        total
                     } else {
                         self.catalog
                             .count_children_or_approx(Some(node.id), self.exact_count_limit)
