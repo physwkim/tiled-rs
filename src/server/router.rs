@@ -2567,9 +2567,7 @@ fn negotiate_container_full(
     // identical to the plain container path).
     for part in accept.split(',') {
         let base = part.split(';').next().unwrap_or("").trim();
-        if is_xarray_dataset
-            && let Some(target) = wide_table_media_type(base)
-        {
+        if is_xarray_dataset && let Some(target) = wide_table_media_type(base) {
             return Some(ContainerFullFormat::WideTable(target));
         }
         if let Some(mt) = crate::serialization::resolve_media_type(part.trim(), Container, registry)
@@ -2722,13 +2720,24 @@ fn repeated_query_values(uri: &axum::http::Uri, keys: &[&str]) -> Option<Vec<Str
 /// parity-fork more-precise-status rule does not apply (upstream already answers
 /// 400, not 500), so we return 400 verbatim with the same detail string.
 ///
-/// Access filtering composes on top exactly as upstream — `read(fields)` first,
-/// then per-node `filter_for_access` — so a field that exists but the caller
-/// cannot see is dropped silently, not rejected. `all_keys` is the container's
-/// full, unfiltered child set (the validation universe, matching `self._mapping`
-/// in `read`); `visible_keys` is the access-filtered set (equal to `all_keys`
-/// when no access policy is in force). Returns the projected keys in field
-/// order, or the first unknown field's 400.
+/// This is the SINGLE owner of explicit-projection semantics for every
+/// `/container/full` format — json/json-seq/html/zip/hdf5 AND the wide-table
+/// export all route their `?field=`/`?column=` resolution through here, so the
+/// access rule below is uniform across formats.
+///
+/// Hardening deviation (deliberate, uniform): upstream applies NO per-child
+/// access filter on this route — it would silently drop an access-hidden child.
+/// We instead REJECT an EXPLICIT field that names a child which EXISTS in the
+/// full mapping but is not visible to the caller, returning 404
+/// `no child named '{field}'` — the same existence-hiding a direct node fetch
+/// gives (`resolve_entry`), so a tagged variable's presence never leaks through
+/// `?field=`. This is applied ONLY to explicit field selection; a *listing*
+/// (no `?field=`) still filters silently (see `container_full`'s no-projection
+/// branch). `all_keys` is the container's full, unfiltered child set (the
+/// validation universe, matching `self._mapping` in `read`); `visible_keys` is
+/// the access-filtered set (equal to `all_keys` when no access policy is in
+/// force). Returns the projected keys in field order, the first unknown field's
+/// 400, or the first access-hidden field's 404.
 fn apply_child_projection(
     all_keys: &[String],
     visible_keys: &[String],
@@ -2736,14 +2745,51 @@ fn apply_child_projection(
 ) -> Result<Vec<String>, ServerError> {
     let mut projected = Vec::with_capacity(fields.len());
     for field in fields {
+        // Absent from the whole mapping → 400 "No such field {key}."
+        // (router.py:1444-1449).
         if !all_keys.iter().any(|k| k == field) {
             return Err(ServerError::BadRequest(format!("No such field {field}.")));
         }
-        if visible_keys.iter().any(|k| k == field) {
-            projected.push(field.clone());
+        // Exists but access-hidden → 404, treated as absent (see the doc note).
+        if !visible_keys.iter().any(|k| k == field) {
+            return Err(ServerError::NotFound(format!("no child named '{field}'")));
         }
+        projected.push(field.clone());
     }
     Ok(projected)
+}
+
+#[cfg(test)]
+mod apply_child_projection_tests {
+    use super::*;
+
+    fn v(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// F4: an EXPLICIT field naming a child that exists in the full mapping but
+    /// is access-hidden (not in the visible set) must be REJECTED with 404 —
+    /// uniform with the wide-table `?field=` path and a direct node fetch — not
+    /// silently dropped.
+    #[test]
+    fn explicit_hidden_field_is_404() {
+        let r = apply_child_projection(&v(&["a", "b"]), &v(&["a"]), &v(&["b"]));
+        assert!(matches!(r, Err(ServerError::NotFound(_))), "got {r:?}");
+    }
+
+    /// A visible field projects normally, in request order.
+    #[test]
+    fn visible_fields_project_in_request_order() {
+        let r = apply_child_projection(&v(&["a", "b", "c"]), &v(&["a", "b", "c"]), &v(&["c", "a"]));
+        assert_eq!(r.unwrap(), v(&["c", "a"]));
+    }
+
+    /// A field absent from the whole mapping → 400 (unchanged).
+    #[test]
+    fn unknown_field_is_400() {
+        let r = apply_child_projection(&v(&["a"]), &v(&["a"]), &v(&["nope"]));
+        assert!(matches!(r, Err(ServerError::BadRequest(_))), "got {r:?}");
+    }
 }
 
 /// Append a column projection to `uri` as repeated `field=` query keys,
@@ -2853,30 +2899,18 @@ async fn serve_xarray_wide_table(
 
     let keys: Vec<String> = match fields {
         Some(requested) => {
-            // Column projection. The FULL child set is the validation universe
-            // (upstream `read(fields)` checks the whole mapping before access
-            // filtering); the access-visible set decides which validated fields
-            // the caller may actually see.
+            // Column projection routed through the SINGLE owner
+            // `apply_child_projection` (unknown field → 400, access-hidden field
+            // → 404), so the wide-table path enforces the exact same rule as the
+            // json/html/zip/hdf5 paths. The FULL child set is the validation
+            // universe (upstream `read(fields)` checks the whole mapping before
+            // access filtering); the access-visible set decides which validated
+            // fields the caller may actually see.
             let all_keys = match &access_filter {
                 Some(_) => container.keys().await?,
                 None => visible_keys.clone(),
             };
-            for field in &requested {
-                // A field absent from the whole mapping → 400 "No such field
-                // {key}.", matching the sibling projection path
-                // (`apply_child_projection`) and upstream router.py:1444-1449.
-                if !all_keys.iter().any(|k| k == field) {
-                    return Err(ServerError::BadRequest(format!("No such field {field}.")));
-                }
-                // A field that exists but the caller cannot see is treated as
-                // absent (404) — matching `resolve_entry`'s existence-hiding for
-                // a direct node fetch — so a tagged variable's data never leaks
-                // through the `?field=` path.
-                if !visible_keys.iter().any(|k| k == field) {
-                    return Err(ServerError::NotFound(format!("no child named '{field}'")));
-                }
-            }
-            requested
+            apply_child_projection(&all_keys, &visible_keys, &requested)?
         }
         None => visible_keys,
     };
@@ -3116,7 +3150,10 @@ fn arrow_column_from_ndarray(
                 };
                 v.push(half::f16::from_bits(bits).to_f32());
             }
-            (DataType::Float32, Arc::new(Float32Array::from(v)) as ArrayRef)
+            (
+                DataType::Float32,
+                Arc::new(Float32Array::from(v)) as ArrayRef,
+            )
         }
         // Extended dtypes: csv/parquet only (server-side table serializer reads
         // any Arrow dtype; the arrow-wire client decoder cannot). numpy stores

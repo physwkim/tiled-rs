@@ -128,7 +128,10 @@ fn weather_f16() -> AnyAdapter {
                 f64_var(&[10.0, 20.0, 30.0], "xarray_coord", json!({})),
             ),
             // 0.5 = 0x3800, 1.5 = 0x3E00, 2.5 = 0x4100 in IEEE-754 half.
-            ("half", f16_var(&[0x3800, 0x3E00, 0x4100], "xarray_data_var")),
+            (
+                "half",
+                f16_var(&[0x3800, 0x3E00, 0x4100], "xarray_data_var"),
+            ),
         ],
         vec![Spec::new("xarray_dataset")],
     )
@@ -451,8 +454,12 @@ async fn accept_html_before_plain_alias_serves_html_on_plain_container() {
         vec![], // not an xarray_dataset
     );
     let app = app_for_root(root_with(vec![("plain", plain)]));
-    let (status, ct, _body) =
-        get_accept_ct(&app, "/api/v1/container/full/plain", "text/html, text/plain").await;
+    let (status, ct, _body) = get_accept_ct(
+        &app,
+        "/api/v1/container/full/plain",
+        "text/html, text/plain",
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert!(
         ct.starts_with("text/html"),
@@ -465,8 +472,12 @@ async fn accept_html_before_plain_alias_serves_html_on_plain_container() {
 #[tokio::test]
 async fn accept_html_before_plain_alias_serves_html_on_xarray_dataset() {
     let app = app_for_root(root_with(vec![("weather", weather())]));
-    let (status, ct, body) =
-        get_accept_ct(&app, "/api/v1/container/full/weather", "text/html, text/plain").await;
+    let (status, ct, body) = get_accept_ct(
+        &app,
+        "/api/v1/container/full/weather",
+        "text/html, text/plain",
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert!(
         ct.starts_with("text/html"),
@@ -485,8 +496,12 @@ async fn accept_html_before_plain_alias_serves_html_on_xarray_dataset() {
 #[tokio::test]
 async fn accept_csv_before_html_serves_csv_on_xarray_dataset() {
     let app = app_for_root(root_with(vec![("weather", weather())]));
-    let (status, ct, body) =
-        get_accept_ct(&app, "/api/v1/container/full/weather", "text/csv, text/html").await;
+    let (status, ct, body) = get_accept_ct(
+        &app,
+        "/api/v1/container/full/weather",
+        "text/csv, text/html",
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert!(
         ct.starts_with("text/csv"),
@@ -602,12 +617,8 @@ mod csv_export {
     #[tokio::test]
     async fn format_text_plain_serves_csv_on_xarray_dataset() {
         let app = app_for_root(root_with(vec![("weather", weather())]));
-        let (status, body) = get_accept(
-            &app,
-            "/api/v1/container/full/weather?format=text/plain",
-            "",
-        )
-        .await;
+        let (status, body) =
+            get_accept(&app, "/api/v1/container/full/weather?format=text/plain", "").await;
         assert_eq!(status, StatusCode::OK);
         assert!(
             String::from_utf8(body)
