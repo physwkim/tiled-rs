@@ -7,6 +7,11 @@ use crate::core::structures::StructureFamily;
 
 pub const DEFAULT_PAGE_SIZE: usize = 100;
 pub const MAX_PAGE_SIZE: usize = 300;
+/// Maximum walk depth shared by the `?max_depth=` inlining gate (metadata /
+/// search) and the container/full zip export — mirrors Python `DEPTH_LIMIT = 5`
+/// (`tiled/server/core.py:62`). It bounds both the accepted `max_depth` query
+/// value (`Query(None, ge=0, le=DEPTH_LIMIT)`, router.py:322/460) and the
+/// `depth <= DEPTH_LIMIT` clause of the inline gate (core.py:516).
 pub const DEPTH_LIMIT: usize = 5;
 
 /// Generate links for a node, returning a `NodeLinks` directly (no JSON round-trip).
