@@ -471,6 +471,153 @@ fn default_sorting() -> Vec<SortingItem> {
 /// stays `None` even when inlining is otherwise enabled — to bound response size.
 const INLINED_CONTENTS_LIMIT: usize = 500;
 
+/// Per-node response shaping applied to *every* node the response construction
+/// builds — the addressed node AND every inlined child (Wave-35 Finding 2).
+///
+/// Upstream passes `fields`, `select_metadata` and `omit_links` down the
+/// `construct_resource` recursion and applies them to each node it constructs
+/// (`tiled/server/core.py:485-583`). The port builds a full [`Resource`] and
+/// shapes it afterwards; [`shape_resource`] is the single implementation of that
+/// shaping, so the addressed node (shaped by the handler) and every inlined
+/// child (shaped by [`build_container_structure`]) go through the exact same
+/// rule.
+///
+/// `include_data_sources` is deliberately absent: the inline walk resolves
+/// children through `ContainerAdapter::get` → [`AnyAdapter`], which carries no
+/// `data_sources` accessor (the catalog populates that only in the top-level
+/// `search_page` batch, keyed by node id). For in-memory trees this matches
+/// upstream (in-memory adapters have no `data_sources`, so upstream's
+/// `hasattr(entry, "data_sources")` gate is false); the catalog inline path is
+/// the only residual divergence and closing it needs a trait-level child
+/// data-sources accessor — see the Wave-35 Finding 2 report.
+#[derive(Clone, Copy, Default)]
+pub struct ShapeOptions<'a> {
+    /// `?select_metadata=` JMESPath expression, applied within `metadata`.
+    pub select_metadata: Option<&'a str>,
+    /// `?fields=` section projection; `None` means "full entry" (no pruning).
+    pub fields: Option<&'a [String]>,
+    /// `?omit_links=true` drops the per-node `links`.
+    pub omit_links: bool,
+}
+
+/// Apply a JMESPath expression to node metadata, mirroring Python
+/// `core.py:486-489`.
+///
+/// When `select_metadata` is `Some(expr)`, compiles and evaluates the expression
+/// against the metadata JSON and returns `{"selected": <result>}`. On compile or
+/// evaluation error → `BadRequest` (HTTP 400), matching Python's `JMESPathError
+/// → HTTP_400_BAD_REQUEST` (`router.py:395-399 / 503-507`). When `select_metadata`
+/// is `None`, returns `metadata` unchanged.
+pub(crate) fn apply_select_metadata(
+    select_metadata: Option<&str>,
+    metadata: Option<serde_json::Value>,
+) -> Result<Option<serde_json::Value>, ServerError> {
+    let expr_str = match select_metadata {
+        None => return Ok(metadata),
+        Some(e) => e,
+    };
+    let expr = jmespath::compile(expr_str).map_err(|e| {
+        ServerError::BadRequest(format!(
+            "Malformed 'select_metadata' parameter raised JMESPathError: {e}"
+        ))
+    })?;
+    let meta = metadata.unwrap_or(serde_json::Value::Null);
+    // Round-trip through JSON string: serde_json::Value → &str → jmespath::Variable.
+    // serde_json::to_string on a Value never fails; from_json on its output
+    // also never fails, so both conversions are infallible here.
+    let json_str =
+        serde_json::to_string(&meta).expect("serde_json::Value always serializes to JSON");
+    let var = jmespath::Variable::from_json(&json_str)
+        .expect("JSON produced by serde_json::to_string always parses");
+    let result = expr.search(var).map_err(|e| {
+        ServerError::BadRequest(format!(
+            "Malformed 'select_metadata' parameter raised JMESPathError: {e}"
+        ))
+    })?;
+    // Variable: Display renders JSON; parse back to serde_json::Value.
+    let selected: serde_json::Value =
+        serde_json::from_str(&result.to_string()).unwrap_or(serde_json::Value::Null);
+    Ok(Some(serde_json::json!({"selected": selected})))
+}
+
+/// Apply the `?fields=` projection to one entry's attributes, mirroring Python
+/// `EntryFields` (`schemas.py`) as consumed by `construct_resource`
+/// (`core.py:485-577`) and the id-only `fields=""` shape (`core.py:248`).
+///
+/// `requested` is the set of `fields` query values the client sent. Each named
+/// attribute section is retained only when its `EntryFields` value is present;
+/// every other section is set to `None` and dropped by `skip_serializing_if`.
+/// `ancestors` is always kept (an id-only `fields=""` resource still carries it,
+/// `core.py:248`). Recognized names: `metadata`, `structure_family`, `structure`,
+/// `specs`, `sorting`, `access_blob`. `count` and the empty value (`none`)
+/// request no attribute section; unknown names are ignored.
+///
+/// `data_sources` is deliberately NOT pruned here: upstream sets it from the
+/// `include_data_sources` flag alone (`core.py:483`), independent of `fields`, so
+/// a `fields=metadata&include_data_sources=true` request keeps its data sources.
+/// It is `None` unless that flag was set, so leaving it untouched is a no-op for
+/// every request that did not ask for it.
+///
+/// The caller MUST invoke this only when the client actually sent `fields` — an
+/// absent `fields` means "full entry" (the FastAPI default selects every
+/// `EntryFields`), which is the unpruned state and must not be pruned to nothing.
+pub(crate) fn prune_entry_fields(attrs: &mut NodeAttributes, requested: &[String]) {
+    let want = |f: &str| requested.iter().any(|r| r == f);
+    if !want("metadata") {
+        attrs.metadata = None;
+    }
+    if !want("structure_family") {
+        attrs.structure_family = None;
+    }
+    if !want("structure") {
+        attrs.structure = None;
+    }
+    if !want("specs") {
+        attrs.specs = None;
+    }
+    if !want("sorting") {
+        attrs.sorting = None;
+    }
+    if !want("access_blob") {
+        attrs.access_blob = None;
+    }
+}
+
+/// Apply per-node response shaping to one built [`Resource`], in upstream order
+/// (`core.py:485-583`):
+///
+/// 1. `select_metadata` within `metadata` — but only when the `fields`
+///    projection keeps `metadata` (`core.py:485-489`): if the projection
+///    excludes `metadata`, upstream never compiles the expression, so a
+///    malformed one cannot 400 a request that was not asking for metadata.
+/// 2. the `fields` section projection ([`prune_entry_fields`]), applied last so
+///    it strips any section `select_metadata` populated but the client did not
+///    request.
+/// 3. `omit_links` — drop the per-node `links`.
+///
+/// This is the single owner of the shaping rule: the addressed node is shaped by
+/// each handler and every inlined child by [`build_container_structure`], so the
+/// whole recursion is shaped uniformly (Wave-35 Finding 2).
+pub(crate) fn shape_resource(
+    resource: &mut Resource,
+    opts: ShapeOptions<'_>,
+) -> Result<(), ServerError> {
+    let metadata_in_fields = opts
+        .fields
+        .is_none_or(|f| f.iter().any(|r| r == "metadata"));
+    if metadata_in_fields && opts.select_metadata.is_some() {
+        resource.attributes.metadata =
+            apply_select_metadata(opts.select_metadata, resource.attributes.metadata.take())?;
+    }
+    if let Some(requested) = opts.fields {
+        prune_entry_fields(&mut resource.attributes, requested);
+    }
+    if opts.omit_links {
+        resource.links = crate::core::schemas::NodeLinks::default();
+    }
+    Ok(())
+}
+
 /// Construct a Resource for a given adapter.
 ///
 /// Returns a boxed future because the container arm recurses (a container that
@@ -487,6 +634,14 @@ const INLINED_CONTENTS_LIMIT: usize = 500;
 /// see (Wave-35 Finding 1; see [`build_container_structure`]). `None` means "no
 /// access policy is in force" (inline every child); a leaf never enumerates
 /// children, so it ignores the argument.
+///
+/// `shape` carries the per-node response shaping (`select_metadata`, `fields`,
+/// `omit_links`). It is **not** applied to the node this call returns — the
+/// caller shapes the node it places into a response (a handler shapes the
+/// addressed node; [`build_container_structure`] shapes each inlined child) —
+/// but it is threaded into the inline walk so every inlined child is shaped
+/// (Wave-35 Finding 2).
+#[allow(clippy::too_many_arguments)]
 pub fn construct_resource<'a>(
     adapter: &'a AnyAdapter,
     id: &'a str,
@@ -495,6 +650,7 @@ pub fn construct_resource<'a>(
     max_depth: Option<usize>,
     depth: usize,
     access_filter: Option<&'a AccessBlobFilter>,
+    shape: ShapeOptions<'a>,
 ) -> BoxFuture<'a, Result<Resource, ServerError>> {
     Box::pin(async move {
         let family = adapter.structure_family();
@@ -517,6 +673,7 @@ pub fn construct_resource<'a>(
                     max_depth,
                     depth,
                     access_filter,
+                    shape,
                 )
                 .await?,
             ),
@@ -579,6 +736,14 @@ pub fn construct_resource<'a>(
 /// on a policy server with hidden children the port's `count` can exceed the
 /// number of `contents` entries — a preserved port count-semantic, not the
 /// upstream one).
+///
+/// # Per-node shaping (Wave-35 Finding 2)
+///
+/// This is the single owner of the inline walk, so it is also where each inlined
+/// child is shaped: after [`construct_resource`] builds a child, [`shape_resource`]
+/// applies `shape` (`select_metadata` / `fields` / `omit_links`) to it, matching
+/// upstream's per-node application down the recursion (`core.py:485-583`). The
+/// addressed top-level node is shaped by its handler, not here.
 async fn build_container_structure(
     container: &dyn ContainerAdapter,
     path: &str,
@@ -586,6 +751,7 @@ async fn build_container_structure(
     max_depth: Option<usize>,
     depth: usize,
     access_filter: Option<&AccessBlobFilter>,
+    shape: ShapeOptions<'_>,
 ) -> Result<serde_json::Value, ServerError> {
     let mut count = container.len().await?;
 
@@ -642,7 +808,7 @@ async fn build_container_structure(
                 };
                 match container.get(&key).await? {
                     Some(child) => {
-                        let child_resource = construct_resource(
+                        let mut child_resource = construct_resource(
                             &child,
                             &key,
                             &child_path,
@@ -650,8 +816,15 @@ async fn build_container_structure(
                             max_depth,
                             depth + 1,
                             access_filter,
+                            shape,
                         )
                         .await?;
+                        // Shape this inlined child exactly as a handler shapes
+                        // the addressed node — upstream applies `fields` /
+                        // `select_metadata` / `omit_links` per node down the
+                        // recursion (`core.py:485-583`). Its own children were
+                        // already shaped one level deeper by the recursive call.
+                        shape_resource(&mut child_resource, shape)?;
                         map.insert(
                             key,
                             serde_json::to_value(child_resource)
@@ -735,6 +908,10 @@ pub async fn construct_root_resource(
 /// caller injects into `queries` for the top-level `search_page`. It is threaded
 /// into [`build_container_structure`] so an inlined entry's children are
 /// enumerated through the filter too, never raw `keys()` (Wave-35 Finding 1).
+///
+/// `shape` carries the per-node response shaping. It is threaded into the inline
+/// walk so an inlined entry's children are shaped too; the top-level entries are
+/// shaped by the search handler after this returns (Wave-35 Finding 2).
 #[allow(clippy::too_many_arguments)]
 pub async fn construct_entries_response(
     container: &dyn ContainerAdapter,
@@ -749,6 +926,7 @@ pub async fn construct_entries_response(
     include_data_sources: bool,
     max_depth: Option<usize>,
     access_filter: Option<&AccessBlobFilter>,
+    shape: ShapeOptions<'_>,
 ) -> Result<Response<Vec<Resource>>, ServerError> {
     let page = container
         .search_page(
@@ -800,6 +978,7 @@ pub async fn construct_entries_response(
                         max_depth,
                         0,
                         access_filter,
+                        shape,
                     )
                     .await?,
                 );

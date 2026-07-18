@@ -359,88 +359,6 @@ pub async fn metadata_root(
     .await
 }
 
-/// Apply a JMESPath expression to node metadata, mirroring Python `core.py:480-485`.
-///
-/// When `select_metadata` is `Some(expr)`, compiles and evaluates the expression
-/// against the metadata JSON and returns `{"selected": <result>}`.
-/// On compile or evaluation error → `BadRequest` (HTTP 400), matching Python's
-/// `JMESPathError → HTTP_400_BAD_REQUEST` in `router.py:395-399 / 503-507`.
-/// When `select_metadata` is `None`, returns `metadata` unchanged.
-fn apply_select_metadata(
-    select_metadata: Option<&str>,
-    metadata: Option<serde_json::Value>,
-) -> Result<Option<serde_json::Value>, ServerError> {
-    let expr_str = match select_metadata {
-        None => return Ok(metadata),
-        Some(e) => e,
-    };
-    let expr = jmespath::compile(expr_str).map_err(|e| {
-        ServerError::BadRequest(format!(
-            "Malformed 'select_metadata' parameter raised JMESPathError: {e}"
-        ))
-    })?;
-    let meta = metadata.unwrap_or(serde_json::Value::Null);
-    // Round-trip through JSON string: serde_json::Value → &str → jmespath::Variable.
-    // serde_json::to_string on a Value never fails; from_json on its output
-    // also never fails, so both conversions are infallible here.
-    let json_str =
-        serde_json::to_string(&meta).expect("serde_json::Value always serializes to JSON");
-    let var = jmespath::Variable::from_json(&json_str)
-        .expect("JSON produced by serde_json::to_string always parses");
-    let result = expr.search(var).map_err(|e| {
-        ServerError::BadRequest(format!(
-            "Malformed 'select_metadata' parameter raised JMESPathError: {e}"
-        ))
-    })?;
-    // Variable: Display renders JSON; parse back to serde_json::Value.
-    let selected: serde_json::Value =
-        serde_json::from_str(&result.to_string()).unwrap_or(serde_json::Value::Null);
-    Ok(Some(serde_json::json!({"selected": selected})))
-}
-
-/// Apply the `?fields=` projection to one entry's attributes, mirroring Python
-/// `EntryFields` (`schemas.py`) as consumed by `construct_resource`
-/// (core.py:476-559) and the id-only `fields=""` shape (core.py:248).
-///
-/// `requested` is the set of `fields` query values the client sent. Each named
-/// attribute section is retained only when its `EntryFields` value is present;
-/// every other section is set to `None` and dropped by `skip_serializing_if`.
-/// `ancestors` is always kept (an id-only `fields=""` resource still carries it,
-/// core.py:248). Recognized names: `metadata`, `structure_family`, `structure`,
-/// `specs`, `sorting`, `access_blob`. `count` and the empty value (`none`)
-/// request no attribute section; unknown names are ignored.
-///
-/// `data_sources` is deliberately NOT pruned here: upstream sets it from the
-/// `include_data_sources` flag alone (core.py:483), independent of `fields`, so
-/// a `fields=metadata&include_data_sources=true` request keeps its data sources.
-/// It is `None` unless that flag was set, so leaving it untouched is a no-op for
-/// every request that did not ask for it.
-///
-/// The caller MUST invoke this only when the client actually sent `fields` —
-/// an absent `fields` means "full entry" (the FastAPI default selects every
-/// `EntryFields`), which is the unpruned state and must not be pruned to nothing.
-fn prune_entry_fields(attrs: &mut crate::core::schemas::NodeAttributes, requested: &[String]) {
-    let want = |f: &str| requested.iter().any(|r| r == f);
-    if !want("metadata") {
-        attrs.metadata = None;
-    }
-    if !want("structure_family") {
-        attrs.structure_family = None;
-    }
-    if !want("structure") {
-        attrs.structure = None;
-    }
-    if !want("specs") {
-        attrs.specs = None;
-    }
-    if !want("sorting") {
-        attrs.sorting = None;
-    }
-    if !want("access_blob") {
-        attrs.access_blob = None;
-    }
-}
-
 pub async fn metadata(
     State(state): State<AppState>,
     OriginalUri(uri): OriginalUri,
@@ -504,6 +422,14 @@ pub async fn metadata(
         .map(|v| matches!(v.as_str(), "true" | "True" | "1"))
         .unwrap_or(false);
     let select_metadata = params.get("select_metadata").map(String::as_str);
+    // Per-node response shaping, applied to the addressed node AND (threaded
+    // into `construct_resource`) every inlined child (Wave-35 Finding 2). The
+    // metadata endpoint has no `?fields=` projection, so `fields` is `None`.
+    let shape = core::ShapeOptions {
+        select_metadata,
+        fields: None,
+        omit_links,
+    };
     // ?root_path=true adds the reverse-proxy mount prefix to the response
     // `meta`, mirroring Python router.py:463,508
     // (`meta = {"root_path": request.scope.get("root_path") or "/"}`). Absent
@@ -547,16 +473,14 @@ pub async fn metadata(
             max_depth,
             0,
             inline_access_filter.as_ref(),
+            shape,
         )
         .await?
     };
 
-    resource.attributes.metadata =
-        apply_select_metadata(select_metadata, resource.attributes.metadata)?;
-
-    if omit_links {
-        resource.links = crate::core::schemas::NodeLinks::default();
-    }
+    // Shape the addressed node. Its inlined children (if any) were already
+    // shaped inside `construct_resource` via the same `shape` (Wave-35 Finding 2).
+    core::shape_resource(&mut resource, shape)?;
 
     let meta = want_root_path.then(|| {
         serde_json::json!({
@@ -856,6 +780,14 @@ pub async fn search(
             ServerError::WrongType(format!("'{}' is not a container", segments.join("/")))
         })?
     };
+    // Per-node response shaping (`select_metadata` / `fields` / `omit_links`),
+    // applied to the top-level entries below AND (threaded into
+    // `construct_entries_response`) every inlined child (Wave-35 Finding 2).
+    let shape = core::ShapeOptions {
+        select_metadata: select_metadata.as_deref(),
+        fields: fields.as_deref(),
+        omit_links,
+    };
     // An unsupported query variant propagates as HTTP 400.
     let mut resp = core::construct_entries_response(
         container,
@@ -870,38 +802,17 @@ pub async fn search(
         include_data_sources,
         max_depth,
         access_filter.as_ref(),
+        shape,
     )
     .await?;
-    // `select_metadata` only applies within `metadata in fields` (core.py:479-485):
-    // when the projection excludes `metadata`, the expression is never evaluated,
-    // so a malformed one cannot 400 a request that wasn't asking for metadata.
-    let metadata_in_fields = fields
-        .as_ref()
-        .is_none_or(|f| f.iter().any(|r| r == "metadata"));
-    if metadata_in_fields
-        && let Some(ref expr_str) = select_metadata
-        && let Some(ref mut items) = resp.data
-    {
+    // Shape each top-level entry through the single owner. `select_metadata`,
+    // the `?fields=` projection and `omit_links` apply in upstream order
+    // (core.py:485-583); a malformed `select_metadata` a request never asked
+    // for (projection excludes `metadata`) does not 400, all handled inside
+    // `shape_resource`. The envelope pagination links are unaffected.
+    if let Some(ref mut items) = resp.data {
         for item in items.iter_mut() {
-            item.attributes.metadata =
-                apply_select_metadata(Some(expr_str), item.attributes.metadata.take())?;
-        }
-    }
-    // Apply the `?fields=` projection last so it strips any section the
-    // select_metadata step populated but the client did not request. Links are
-    // untouched here — an id-only resource keeps its `self` link (core.py:248);
-    // `omit_links` below is the only switch that drops per-entry links.
-    if let Some(ref requested) = fields
-        && let Some(ref mut items) = resp.data
-    {
-        for item in items.iter_mut() {
-            prune_entry_fields(&mut item.attributes, requested);
-        }
-    }
-    // Drop per-entry links when requested; the envelope pagination links remain.
-    if omit_links && let Some(ref mut items) = resp.data {
-        for item in items.iter_mut() {
-            item.links = crate::core::schemas::NodeLinks::default();
+            core::shape_resource(item, shape)?;
         }
     }
     Ok(Json(resp))
@@ -3873,10 +3784,21 @@ pub async fn container_full(
             // export is a flat one-level listing of child Resources, not the
             // metadata inline tree. Because inlining never runs here the access
             // filter is unused (`None`); the visible child set is already
-            // access-filtered upstream (`visible_keys`).
+            // access-filtered upstream (`visible_keys`). The `?fields=` /
+            // `select_metadata` / `omit_links` shaping does not apply to this
+            // export, so the default (no shaping) is passed.
             children.push(
-                core::construct_resource(&child, k, &child_path, &base_url, Some(0), 0, None)
-                    .await?,
+                core::construct_resource(
+                    &child,
+                    k,
+                    &child_path,
+                    &base_url,
+                    Some(0),
+                    0,
+                    None,
+                    core::ShapeOptions::default(),
+                )
+                .await?,
             );
         }
         serde_json::to_vec(&children).map_err(|e| ServerError::Internal(format!("encode: {e}")))?
@@ -8298,7 +8220,9 @@ async fn catalog_metadata_resource(
                     let path = segments.join("/");
                     // A synthesized table-column array leaf: `Some(0)` — inlining
                     // never applies to a leaf, this is the no-inline default, so
-                    // the access filter is unused (`None`).
+                    // the access filter is unused (`None`). Shaping is the
+                    // default (no-op): this resource is the addressed node, so
+                    // the metadata handler shapes it after this returns.
                     return core::construct_resource(
                         &adapter,
                         &id,
@@ -8307,6 +8231,7 @@ async fn catalog_metadata_resource(
                         Some(0),
                         0,
                         None,
+                        core::ShapeOptions::default(),
                     )
                     .await;
                 }

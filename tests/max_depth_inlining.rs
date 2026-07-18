@@ -649,3 +649,111 @@ async fn post_longrequest_forwards_max_depth() {
     );
     assert_ne!(post0, post1, "LongRequest must actually honor max_depth");
 }
+
+// ---------------------------------------------------------------------------
+// Wave-35 Finding 2: per-node response shaping (`?select_metadata=`,
+// `?fields=`, `?omit_links=`) must be applied to EVERY inlined child, not just
+// the addressed top-level node. Upstream threads `fields`, `select_metadata`,
+// `omit_links` through the `construct_resource` recursion and applies them to
+// each node it builds (`tiled/server/core.py:485-583`); the port applied them
+// top-level only, leaving inlined children unshaped.
+//
+// `build_root`'s `ds` (xarray_dataset) inlines two array children: `x`
+// (metadata `{"units": "K"}`) and `y` (metadata `{}`).
+// ---------------------------------------------------------------------------
+
+// select_metadata must reach inlined children on the metadata route: each
+// child's `metadata` becomes `{"selected": <jmespath result>}`, exactly as the
+// addressed node's does.
+#[tokio::test]
+async fn metadata_inline_children_get_select_metadata() {
+    let base = spawn(build_root()).await;
+    let (status, body) =
+        get_json(&format!("{base}/api/v1/metadata/ds?select_metadata=units")).await;
+    assert_eq!(status, 200);
+    // The addressed node is shaped (ds metadata has no `units` → selected null).
+    assert_eq!(
+        body["data"]["attributes"]["metadata"],
+        json!({"selected": null}),
+        "addressed node must be shaped"
+    );
+    let s = &body["data"]["attributes"]["structure"];
+    // Each inlined child MUST be shaped too.
+    assert_eq!(
+        s["contents"]["x"]["attributes"]["metadata"],
+        json!({"selected": "K"}),
+        "inlined child `x` must have select_metadata applied: {s}"
+    );
+    assert_eq!(
+        s["contents"]["y"]["attributes"]["metadata"],
+        json!({"selected": null}),
+        "inlined child `y` must have select_metadata applied: {s}"
+    );
+}
+
+// omit_links must reach inlined children on the metadata route: each child's
+// `links` key is dropped, exactly as the addressed node's is.
+#[tokio::test]
+async fn metadata_inline_children_get_omit_links() {
+    let base = spawn(build_root()).await;
+    let (status, body) = get_json(&format!("{base}/api/v1/metadata/ds?omit_links=true")).await;
+    assert_eq!(status, 200);
+    assert!(
+        body["data"].get("links").is_none(),
+        "addressed node must drop links"
+    );
+    let s = &body["data"]["attributes"]["structure"];
+    assert!(
+        s["contents"]["x"].get("links").is_none(),
+        "inlined child `x` must drop links under omit_links: {s}"
+    );
+    assert!(
+        s["contents"]["y"].get("links").is_none(),
+        "inlined child `y` must drop links under omit_links: {s}"
+    );
+}
+
+// select_metadata must reach inlined children on the search route too.
+#[tokio::test]
+async fn search_inline_children_get_select_metadata() {
+    let base = spawn(build_root()).await;
+    let (status, body) = get_json(&format!("{base}/api/v1/search/?select_metadata=units")).await;
+    assert_eq!(status, 200);
+    let ds = find_entry(&body, "ds");
+    let s = &ds["attributes"]["structure"];
+    assert_eq!(
+        s["contents"]["x"]["attributes"]["metadata"],
+        json!({"selected": "K"}),
+        "search-inlined child `x` must have select_metadata applied: {s}"
+    );
+}
+
+// A `?fields=` projection must reach inlined children on the search route: with
+// `fields=structure`, every node — the entry AND its inlined children — keeps
+// only `structure`; `metadata` and `structure_family` are pruned to absent.
+#[tokio::test]
+async fn search_inline_children_get_fields_projection() {
+    let base = spawn(build_root()).await;
+    let (status, body) = get_json(&format!("{base}/api/v1/search/?fields=structure")).await;
+    assert_eq!(status, 200);
+    let ds = find_entry(&body, "ds");
+    // The entry keeps structure (so the inlined children are present to inspect).
+    let s = &ds["attributes"]["structure"];
+    assert!(
+        s["contents"]["x"].is_object(),
+        "the entry keeps structure so children remain inspectable: {ds}"
+    );
+    // The inlined child MUST be pruned to structure-only.
+    assert!(
+        s["contents"]["x"]["attributes"]["metadata"].is_null(),
+        "inlined child `x` metadata must be pruned by fields=structure: {s}"
+    );
+    assert!(
+        s["contents"]["x"]["attributes"]["structure_family"].is_null(),
+        "inlined child `x` structure_family must be pruned by fields=structure: {s}"
+    );
+    assert!(
+        s["contents"]["x"]["attributes"]["structure"].is_object(),
+        "inlined child `x` must retain the requested structure section: {s}"
+    );
+}
