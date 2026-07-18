@@ -7081,14 +7081,23 @@ pub async fn get_revisions(
     // Each item: `{revision_number, attributes: {metadata, specs, time_updated}}`
     // (Python construct_revisions_response, server/core.py:339-348). access_blob
     // is intentionally not surfaced.
+    //
+    // `specs` is normalized through the single lenient owner, matching upstream
+    // `Revision.specs: Specs` (a typed `List[Spec]`, schemas.py) — the stored
+    // JSON may hold bare-string elements, which read back as `{name, version:
+    // null}` objects, in order alongside object-form siblings, exactly like the
+    // metadata and search read-back paths.
     let data: Vec<serde_json::Value> = revisions
         .into_iter()
         .map(|r| {
+            let specs =
+                serde_json::to_value(crate::core::structures::Spec::parse_stored_list(&r.specs))
+                    .unwrap_or_else(|_| serde_json::Value::Array(Vec::new()));
             serde_json::json!({
                 "revision_number": r.revision_number,
                 "attributes": {
                     "metadata": r.metadata,
-                    "specs": r.specs,
+                    "specs": specs,
                     "time_updated": r.time_updated,
                 },
             })

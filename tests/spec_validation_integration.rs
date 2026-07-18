@@ -847,3 +847,82 @@ async fn search_normalizes_persisted_bare_string_specs() {
         "search row must carry the same normalized specs as its metadata row: {body}"
     );
 }
+
+/// Task #119 follow-up (w31) — READ-BACK normalization, REVISIONS path
+/// (`GET /api/v1/revisions/{path}`). A revision whose stored specs snapshot
+/// holds a bare-string element must read back normalized to
+/// `{name, version: null}`, in order alongside object-form siblings — matching
+/// upstream `Revision.specs: Specs` (a typed `List[Spec]`, schemas.py). The
+/// endpoint used to emit the raw stored JSON, so a bare string leaked through
+/// as `"mystery"` instead of the object form.
+#[tokio::test]
+async fn revisions_normalize_persisted_bare_string_specs() {
+    let (app, _dir) = build_app(validation_config(false)).await;
+
+    // Seed a no-spec node.
+    let (status, _) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/metadata/",
+        serde_json::json!({
+            "key": "rev",
+            "structure_family": "container",
+            "metadata": {},
+            "specs": [],
+            "data_sources": [],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // PATCH #1 sets a MIXED bare-string + object specs list. This pushes the
+    // pre-update state (empty specs) as revision 1 and makes the mixed list the
+    // node's current specs.
+    let (status, body) = json_request(
+        &app,
+        Method::PATCH,
+        "/api/v1/metadata/rev",
+        serde_json::json!({
+            "content-type": "application/merge-patch+json",
+            "specs": ["mystery", {"name": "beta", "version": "2"}],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "persist mixed specs: {body}");
+
+    // PATCH #2 is a metadata-only change. It pushes the PREVIOUS state — the
+    // mixed specs snapshot — as revision 2, which is the row under test.
+    let (status, body) = json_request(
+        &app,
+        Method::PATCH,
+        "/api/v1/metadata/rev",
+        serde_json::json!({
+            "content-type": "application/merge-patch+json",
+            "metadata": {"x": 1},
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "metadata-only patch: {body}");
+
+    // Read the revision history: revision 2's specs snapshot must be normalized.
+    let (status, body) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/revisions/rev",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "list revisions: {body}");
+    let rev2 = body["data"]
+        .as_array()
+        .and_then(|rows| rows.iter().find(|r| r["revision_number"] == 2))
+        .unwrap_or_else(|| panic!("revision 2 must be present: {body}"));
+    assert_eq!(
+        rev2["attributes"]["specs"],
+        serde_json::json!([
+            {"name": "mystery"},
+            {"name": "beta", "version": "2"},
+        ]),
+        "revision specs must read back normalized and in order: {body}"
+    );
+}
