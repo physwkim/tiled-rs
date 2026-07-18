@@ -2240,3 +2240,102 @@ async fn exact_count_limit_threads_into_search_page_entry_counts() {
         "empty container's per-entry count must be 0, not miscounted by the batched query"
     );
 }
+
+/// Wave-36 (convergence #139) — a container's wire `structure` must ALWAYS carry
+/// an explicit `contents` key, JSON `null` when the children are not inlined.
+/// Upstream dumps `NodeStructure(contents=None)` → `{"contents": null, "count":
+/// N}` (its pydantic model serializes `Optional` fields as explicit `null`). The
+/// port's `NodeStructure` struct carried `#[serde(skip_serializing_if =
+/// "Option::is_none")]` on `contents`, so a non-inlined container emitted
+/// `{"count": N}` with the `contents` key ABSENT — diverging from both upstream
+/// and the port's own inlining owner (`build_container_structure`, which already
+/// emits the explicit null via a `json!`). RED before this fix: the `contents`
+/// key is absent on a plain container's `/metadata` (count-only fast path,
+/// `router.rs`) and on its `/search` entry (catalog batch listing, `adapter.rs`).
+#[tokio::test]
+async fn container_structure_always_carries_explicit_contents_null() {
+    let (app, _dir) = build_test_app().await;
+
+    // A plain (non-xarray) container with one child: count = 1, never inlined.
+    let (status, _) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/register/",
+        serde_json::json!({
+            "key": "plain", "structure_family": "container",
+            "metadata": {}, "specs": [], "data_sources": [],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/register/plain",
+        serde_json::json!({
+            "key": "child", "structure_family": "container",
+            "metadata": {}, "specs": [], "data_sources": [],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // /metadata: structure must be {"contents": null, "count": 1}.
+    let (status, body) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/metadata/plain",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let structure = &body["data"]["attributes"]["structure"];
+    let obj = structure
+        .as_object()
+        .unwrap_or_else(|| panic!("structure must be an object: {structure}"));
+    assert!(
+        obj.contains_key("contents"),
+        "/metadata structure must carry an explicit `contents` key: {structure}"
+    );
+    assert!(
+        obj["contents"].is_null(),
+        "/metadata `contents` must be JSON null when not inlined: {structure}"
+    );
+    assert_eq!(
+        structure["count"].as_i64(),
+        Some(1),
+        "/metadata structure count: {structure}"
+    );
+
+    // /search entry: the same explicit `contents` key must be present and null.
+    let (status, body) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/search/",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let entries = body["data"].as_array().expect("data must be an array");
+    let entry = entries
+        .iter()
+        .find(|e| e["id"] == "plain")
+        .unwrap_or_else(|| panic!("entry 'plain' missing from search response"));
+    let structure = &entry["attributes"]["structure"];
+    let obj = structure
+        .as_object()
+        .unwrap_or_else(|| panic!("search entry structure must be an object: {structure}"));
+    assert!(
+        obj.contains_key("contents"),
+        "/search entry structure must carry an explicit `contents` key: {structure}"
+    );
+    assert!(
+        obj["contents"].is_null(),
+        "/search entry `contents` must be JSON null when not inlined: {structure}"
+    );
+    assert_eq!(
+        structure["count"].as_i64(),
+        Some(1),
+        "/search entry structure count: {structure}"
+    );
+}
