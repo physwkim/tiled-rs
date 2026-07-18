@@ -2096,6 +2096,36 @@ async fn subscribe_via_access_token_query_authenticates() {
     assert_eq!(schema["type"], "array-schema", "schema: {schema}");
 }
 
+/// The WS first-message auth handshake uses upstream's key names: a
+/// `{"type":"auth","access_token":"<jwt>"}` message authenticates the
+/// subscription. Upstream `authenticate_websocket_first_message` reads
+/// `access_token`/`api_key` (authentication.py:460, docstring :488-490); the port
+/// previously read `bearer`/`apikey`, so an upstream-shaped first message was
+/// rejected and no schema arrived. No header and no query are presented, forcing
+/// the first-message handshake path.
+#[tokio::test]
+async fn first_message_access_token_authenticates() {
+    use futures::SinkExt;
+
+    let (base, _dir) = spawn_auth_stream_server(ScopeSet::read_only(), None).await;
+    let client = reqwest::Client::new();
+    let token = login_token(&client, &base, "alice", "wonderland").await;
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(ws_url(&base, "arr"))
+        .await
+        .unwrap();
+    ws.send(Message::Text(
+        json!({"type": "auth", "access_token": token}).to_string(),
+    ))
+    .await
+    .unwrap();
+
+    let schema = next_text_json(&mut ws)
+        .await
+        .expect("array-schema first message after an access_token first message");
+    assert_eq!(schema["type"], "array-schema", "schema: {schema}");
+}
+
 /// (c) A subscriber whose TOKEN carries BOTH read scopes (so the global gate
 /// passes) but who is narrowed to read:metadata-only on the node by the access
 /// policy is REJECTED at the subscribe-time node gate (`subscribe_allowed`). The
