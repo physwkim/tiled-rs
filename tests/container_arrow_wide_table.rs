@@ -74,6 +74,23 @@ fn i64_var(data: &[i64], spec: &str) -> AnyAdapter {
     AnyAdapter::Array(Arc::new(arr))
 }
 
+/// A 1-D float16 array child carrying `spec`. Values are given as IEEE-754
+/// half-precision bit patterns (little-endian on the wire); the server widens
+/// them to f32 for the csv/parquet wide-table export.
+fn f16_var(bits: &[u16], spec: &str) -> AnyAdapter {
+    let bytes: Vec<u8> = bits.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let dtype = BuiltinDType::new(Endianness::Little, Kind::Float, 2);
+    let arr = ArrayAdapter::from_array(
+        Bytes::from(bytes),
+        dtype,
+        vec![bits.len()],
+        vec![vec![bits.len()]],
+        json!({}),
+        vec![Spec::new(spec)],
+    );
+    AnyAdapter::Array(Arc::new(arr))
+}
+
 fn container(children: Vec<(&str, AnyAdapter)>, specs: Vec<Spec>) -> AnyAdapter {
     let mut m = IndexMap::new();
     for (k, v) in children {
@@ -96,6 +113,22 @@ fn weather() -> AnyAdapter {
                 f64_var(&[1.5, 2.5, 3.5], "xarray_data_var", json!({})),
             ),
             ("pressure", i64_var(&[100, 200, 300], "xarray_data_var")),
+        ],
+        vec![Spec::new("xarray_dataset")],
+    )
+}
+
+/// `weather_f16`: an `xarray_dataset` with an f64 coord `time` and a **float16**
+/// data var `half` = [0.5, 1.5, 2.5] (exact half-precision bit patterns).
+fn weather_f16() -> AnyAdapter {
+    container(
+        vec![
+            (
+                "time",
+                f64_var(&[10.0, 20.0, 30.0], "xarray_coord", json!({})),
+            ),
+            // 0.5 = 0x3800, 1.5 = 0x3E00, 2.5 = 0x4100 in IEEE-754 half.
+            ("half", f16_var(&[0x3800, 0x3E00, 0x4100], "xarray_data_var")),
         ],
         vec![Spec::new("xarray_dataset")],
     )
@@ -340,6 +373,17 @@ async fn arrow_on_non_xarray_container_is_406() {
     );
     let app = app_for_root(root_with(vec![("plain", plain)]));
     let (status, _) = get(&app, "/api/v1/container/full/plain?format=arrow").await;
+    assert_eq!(status, StatusCode::NOT_ACCEPTABLE);
+}
+
+// F3: a float16 data var is served by csv/parquet (the server-side table
+// serializer path) but NOT by the arrow-wire export — the Rust client's
+// wide-table decoder handles only the six primitives, so float16 stays a 406 on
+// arrow, exactly as before.
+#[tokio::test]
+async fn arrow_wire_float16_data_var_is_406() {
+    let app = app_for_root(root_with(vec![("weather", weather_f16())]));
+    let (status, _) = get(&app, "/api/v1/container/full/weather?format=arrow").await;
     assert_eq!(status, StatusCode::NOT_ACCEPTABLE);
 }
 
@@ -593,6 +637,23 @@ mod csv_export {
         );
     }
 
+    /// F3: a float16 data var flows end-to-end through the csv ColPlan — the
+    /// server widens f16→f32 at column build (arrow's csv writer has no native
+    /// Float16 path), and the widened column prints its decimal value, matching
+    /// upstream `to_dataframe().to_csv()`.
+    #[tokio::test]
+    async fn get_csv_float16_data_var() {
+        let app = app_for_root(root_with(vec![("weather", weather_f16())]));
+        let (status, body) =
+            get_accept(&app, "/api/v1/container/full/weather?format=csv", "").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            String::from_utf8(body).unwrap(),
+            "time,half\n10.0,0.5\n20.0,1.5\n30.0,2.5\n",
+            "float16 data var widens to f32 and prints its decimal value"
+        );
+    }
+
     /// A plain container has no csv serializer (neither spec nor family) → 406,
     /// exactly as negotiation answers, and matching the arrow gate.
     #[tokio::test]
@@ -684,6 +745,24 @@ mod parquet_export {
             .downcast_ref::<Int64Array>()
             .unwrap();
         assert_eq!(pressure.values(), &[100, 200, 300]);
+    }
+
+    /// F3: a float16 data var round-trips through the parquet writer as a
+    /// widened Float32 column (parquet has no native Float16 either).
+    #[tokio::test]
+    async fn get_parquet_float16_data_var() {
+        let app = app_for_root(root_with(vec![("weather", weather_f16())]));
+        let (status, body) =
+            get_accept(&app, "/api/v1/container/full/weather?format=parquet", "").await;
+        assert_eq!(status, StatusCode::OK);
+        let batches = parquet_batches(&body);
+        assert_eq!(column_names(&batches[0]), vec!["time", "half"]);
+        let half = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::Float32Array>()
+            .expect("float16 data var widened to Float32");
+        assert_eq!(half.values(), &[0.5, 1.5, 2.5]);
     }
 
     /// `Accept: application/x-parquet` (no `?format=`) drives the interception.
