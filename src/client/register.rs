@@ -465,11 +465,11 @@ fn is_conflict(err: &ClientError) -> bool {
 
 /// Create a node, or drop the collision. Mirrors upstream
 /// `create_node_or_drop_collision` (register.py:623-648): POST the create; on a
-/// `409 Conflict` remove the pre-existing node occupying the key
-/// (`node.get(key)` → `delete(recursive = true)`) and log a `COLLISION`
-/// warning, then return `Ok` so the walk continues — neither the original nor
-/// the new node remains, avoiding the ambiguity of two source items mapping to
-/// one node. Any non-409 error propagates, matching upstream's `else: raise`.
+/// `409 Conflict` remove the pre-existing node occupying the key (a recursive
+/// `DELETE` on the child at `key`) and log a `COLLISION` warning, then return
+/// `Ok` so the walk continues — neither the original nor the new node remains,
+/// avoiding the ambiguity of two source items mapping to one node. Any non-409
+/// error propagates, matching upstream's `else: raise`.
 ///
 /// The create itself stays wrapped in `retry` (transient 5xx/429/connect), so a
 /// genuine transient blip is retried before a real collision is ever observed.
@@ -482,11 +482,34 @@ async fn create_node_or_drop_collision(
     match retry(|| async { node.base().context().post_json(url, body).await }).await {
         Ok(_) => Ok(()),
         Err(e) if is_conflict(&e) => {
-            // The offender exists (it just caused the 409); fetch and remove it.
-            let offender = node.get(key).await?;
-            if let Some(base) = offender.base() {
-                base.delete(true, true).await?;
-            }
+            // The offender exists (it just caused the 409). Delete it by
+            // addressing it directly as this container's child at `key`, rather
+            // than through the client `node.get(key)` returns: a
+            // `ClientResolver` can map the offender to a `Custom` client whose
+            // links are erased (`AnyClient::base()` is `None`), which would
+            // silently skip the delete and leave the offender behind while
+            // still logging the COLLISION warning. Rebuilding the child URL from
+            // the parent's `self` link deletes every variant uniformly, matching
+            // upstream `offender.delete(recursive=True)` (register.py:640-642),
+            // which always removes the node.
+            let self_link = node
+                .base()
+                .uri()
+                .ok_or_else(|| ClientError::MissingLink("self".into()))?;
+            let mut del_url = Url::parse(self_link)?;
+            del_url
+                .path_segments_mut()
+                .map_err(|()| {
+                    ClientError::Invalid(format!("self link cannot be a base: {self_link}"))
+                })?
+                .pop_if_empty()
+                .push(key);
+            // `recursive=true` only, matching `BaseClient::delete(recursive =
+            // true, external_only = true)` (base.py:918-936), which omits
+            // `external_only` when it is `true`. Wrapped in `retry` like every
+            // other client DELETE.
+            del_url.query_pairs_mut().append_pair("recursive", "true");
+            retry(|| async { node.base().context().delete(&del_url).await }).await?;
             tracing::warn!(
                 target: "tiled.register",
                 key,
@@ -1163,6 +1186,164 @@ mod tests {
             "the offending node must be deleted exactly once on collision"
         );
         // Neither the original nor the new node survives (deleted-on-collision).
+        assert!(
+            !st.created.lock().unwrap().contains("data"),
+            "no `data` node may remain after the collision is dropped"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Wave-31 (finding 2): a collision offender that a `ClientResolver` maps to
+    // a `Custom` client must STILL be deleted. `AnyClient::base()` returns
+    // `None` for the `Custom` variant, so the old `if let Some(base) =
+    // offender.base()` gate silently skipped the delete — the offender survived
+    // while the COLLISION warning still claimed it had been dropped. Upstream
+    // removes it unconditionally (`offender.delete(recursive=True)`,
+    // register.py:640-642).
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn walk_drops_collision_deletes_resolver_custom_offender() {
+        use std::any::Any;
+        use std::collections::HashSet;
+        use std::sync::Mutex;
+
+        use crate::client::any_client::ClientResolver;
+        use crate::client::context::ContextOptions;
+
+        // Map every node to a `Custom` client, so the offender the collision
+        // handler observes is `AnyClient::Custom` (whose `base()` is `None`).
+        #[derive(Debug)]
+        struct AlwaysCustom;
+        impl ClientResolver for AlwaysCustom {
+            fn resolve(
+                &self,
+                _ctx: &Context,
+                _item: &Item,
+                _include_data_sources: bool,
+            ) -> Option<Result<Arc<dyn Any + Send + Sync>>> {
+                Some(Ok(Arc::new(()) as Arc<dyn Any + Send + Sync>))
+            }
+        }
+
+        #[derive(Clone)]
+        struct St {
+            base: String,
+            created: Arc<Mutex<HashSet<String>>>,
+            deletes: Arc<Mutex<Vec<String>>>,
+        }
+
+        async fn post_register(
+            axum::extract::State(st): axum::extract::State<St>,
+            axum::extract::Path(_path): axum::extract::Path<String>,
+            axum::Json(body): axum::Json<serde_json::Value>,
+        ) -> axum::response::Response {
+            use axum::response::IntoResponse;
+            let id = body
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let mut created = st.created.lock().unwrap();
+            if created.contains(&id) {
+                return (axum::http::StatusCode::CONFLICT, "already exists").into_response();
+            }
+            created.insert(id.clone());
+            axum::Json(serde_json::json!({ "id": id })).into_response()
+        }
+
+        async fn get_meta(
+            axum::extract::State(st): axum::extract::State<St>,
+            axum::extract::Path(path): axum::extract::Path<String>,
+        ) -> axum::response::Response {
+            use axum::response::IntoResponse;
+            let key = path.rsplit('/').next().unwrap_or_default().to_string();
+            axum::Json(serde_json::json!({
+                "data": {
+                    "id": key,
+                    "attributes": { "ancestors": ["mydir"], "structure_family": "container" },
+                    "links": { "self": format!("{}/api/v1/metadata/{}", st.base, path) },
+                }
+            }))
+            .into_response()
+        }
+
+        async fn delete_meta(
+            axum::extract::State(st): axum::extract::State<St>,
+            axum::extract::Path(path): axum::extract::Path<String>,
+        ) -> axum::http::StatusCode {
+            let key = path.rsplit('/').next().unwrap_or_default().to_string();
+            st.deletes.lock().unwrap().push(key.clone());
+            st.created.lock().unwrap().remove(&key);
+            axum::http::StatusCode::OK
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base = format!("http://{addr}");
+        let st = St {
+            base: base.clone(),
+            created: Arc::new(Mutex::new(HashSet::new())),
+            deletes: Arc::new(Mutex::new(Vec::new())),
+        };
+        let app = axum::Router::new()
+            .route(
+                "/api/v1/register/{*path}",
+                axum::routing::post(post_register),
+            )
+            .route(
+                "/api/v1/metadata/{*path}",
+                axum::routing::get(get_meta).delete(delete_meta),
+            )
+            .with_state(st.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Root container over a context whose resolver forces `Custom` clients,
+        // so the collision offender resolves to `AnyClient::Custom`.
+        let opts = ContextOptions::default().resolver(Arc::new(AlwaysCustom));
+        let (ctx, _) = Context::from_uri_with_options(&base, opts).unwrap();
+        let item: Item = serde_json::from_value(serde_json::json!({
+            "id": "mydir",
+            "attributes": { "ancestors": [], "structure_family": "container" },
+            "links": { "self": format!("{base}/api/v1/metadata/mydir") },
+        }))
+        .unwrap();
+        let node = ContainerClient::from_item(ctx, item, false).unwrap();
+
+        // Two files, same stem → both strip to key `data`, colliding.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("data.aaa"), b"x").unwrap();
+        std::fs::write(dir.path().join("data.bbb"), b"y").unwrap();
+
+        let adapter: Arc<dyn RegistrationAdapter> = Arc::new(PassthroughAdapter {
+            mimetype: "application/x-stub".into(),
+            family: StructureFamily::Array,
+        });
+        let mut settings = Settings::default();
+        settings.adapters.clear();
+        settings
+            .adapters
+            .insert("application/x-stub".into(), adapter);
+        settings
+            .mimetypes_by_ext
+            .insert(".aaa".into(), "application/x-stub".into());
+        settings
+            .mimetypes_by_ext
+            .insert(".bbb".into(), "application/x-stub".into());
+
+        walk_and_register(&node, dir.path(), &settings)
+            .await
+            .expect("a same-key collision must be dropped, not abort the walk");
+
+        // The offender is `Custom` (base() == None); it must STILL be deleted.
+        assert_eq!(
+            *st.deletes.lock().unwrap(),
+            vec!["data".to_string()],
+            "a resolver-produced Custom offender must be deleted on collision, not silently skipped"
+        );
         assert!(
             !st.created.lock().unwrap().contains("data"),
             "no `data` node may remain after the collision is dropped"
