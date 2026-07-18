@@ -2795,33 +2795,35 @@ fn repeated_query_values(uri: &axum::http::Uri, keys: &[&str]) -> Option<Vec<Str
 /// access rule below is uniform across formats.
 ///
 /// Hardening deviation (deliberate, uniform): upstream applies NO per-child
-/// access filter on this route — it would silently drop an access-hidden child.
-/// We instead REJECT an EXPLICIT field that names a child which EXISTS in the
-/// full mapping but is not visible to the caller, returning 404
-/// `no child named '{field}'` — the same existence-hiding a direct node fetch
-/// gives (`resolve_entry`), so a tagged variable's presence never leaks through
-/// `?field=`. This is applied ONLY to explicit field selection; a *listing*
-/// (no `?field=`) still filters silently (see `container_full`'s no-projection
-/// branch). `all_keys` is the container's full, unfiltered child set (the
-/// validation universe, matching `self._mapping` in `read`); `visible_keys` is
-/// the access-filtered set (equal to `all_keys` when no access policy is in
-/// force). Returns the projected keys in field order, the first unknown field's
-/// 400, or the first access-hidden field's 404.
+/// access filter on this route — it would silently drop an access-hidden child,
+/// leaking its DATA through an explicit `?field=`. We instead REJECT an explicit
+/// field that is not visible to the caller.
+///
+/// Existence-hiding: hidden ≡ absent. A field that names an access-hidden child
+/// must be INDISTINGUISHABLE from one that names a truly-absent child — identical
+/// status AND body — otherwise the response is a presence oracle a caller can use
+/// to enumerate hidden children. The absent case keeps upstream parity (`KeyError`
+/// → 400 `No such field {key}.`, router.py:1442-1449), so a hidden field returns
+/// that SAME 400. (This supersedes the interim hidden→404 choice, which — because
+/// absent stays 400 — left hidden ≠ absent and so still leaked presence.) Both
+/// cases therefore collapse to one check: a field absent from `visible_keys` —
+/// whether truly absent or merely access-hidden — is the one 400. Only explicit
+/// field selection is hardened; a *listing* (no `?field=`) still filters silently
+/// (see `container_full`'s no-projection branch).
+///
+/// `visible_keys` is the access-filtered child set (equal to the full child set
+/// when no access policy is in force). Returns the projected keys in field order,
+/// or the first non-visible field's 400.
 fn apply_child_projection(
-    all_keys: &[String],
     visible_keys: &[String],
     fields: &[String],
 ) -> Result<Vec<String>, ServerError> {
     let mut projected = Vec::with_capacity(fields.len());
     for field in fields {
-        // Absent from the whole mapping → 400 "No such field {key}."
-        // (router.py:1444-1449).
-        if !all_keys.iter().any(|k| k == field) {
-            return Err(ServerError::BadRequest(format!("No such field {field}.")));
-        }
-        // Exists but access-hidden → 404, treated as absent (see the doc note).
+        // Not visible — truly absent OR access-hidden — → 400 "No such field
+        // {key}." Both collapse to one response so hidden ≡ absent (see doc).
         if !visible_keys.iter().any(|k| k == field) {
-            return Err(ServerError::NotFound(format!("no child named '{field}'")));
+            return Err(ServerError::BadRequest(format!("No such field {field}.")));
         }
         projected.push(field.clone());
     }
@@ -2836,27 +2838,34 @@ mod apply_child_projection_tests {
         items.iter().map(|s| s.to_string()).collect()
     }
 
-    /// F4: an EXPLICIT field naming a child that exists in the full mapping but
-    /// is access-hidden (not in the visible set) must be REJECTED with 404 —
-    /// uniform with the wide-table `?field=` path and a direct node fetch — not
-    /// silently dropped.
+    /// F4: an access-hidden field (present in the mapping but not in the visible
+    /// set) must be REJECTED — not silently dropped — with the EXACT same error a
+    /// truly-absent field yields, so the two are indistinguishable (hidden ≡
+    /// absent).
     #[test]
-    fn explicit_hidden_field_is_404() {
-        let r = apply_child_projection(&v(&["a", "b"]), &v(&["a"]), &v(&["b"]));
-        assert!(matches!(r, Err(ServerError::NotFound(_))), "got {r:?}");
+    fn hidden_field_is_indistinguishable_from_absent() {
+        let hidden = apply_child_projection(&v(&["a"]), &v(&["b"]));
+        let absent = apply_child_projection(&v(&["a"]), &v(&["nope"]));
+        match (&hidden, &absent) {
+            (Err(ServerError::BadRequest(h)), Err(ServerError::BadRequest(a))) => {
+                assert_eq!(h, "No such field b.");
+                assert_eq!(a, "No such field nope.");
+            }
+            other => panic!("expected both BadRequest, got {other:?}"),
+        }
     }
 
     /// A visible field projects normally, in request order.
     #[test]
     fn visible_fields_project_in_request_order() {
-        let r = apply_child_projection(&v(&["a", "b", "c"]), &v(&["a", "b", "c"]), &v(&["c", "a"]));
+        let r = apply_child_projection(&v(&["a", "b", "c"]), &v(&["c", "a"]));
         assert_eq!(r.unwrap(), v(&["c", "a"]));
     }
 
-    /// A field absent from the whole mapping → 400 (unchanged).
+    /// A field absent from the mapping → 400.
     #[test]
     fn unknown_field_is_400() {
-        let r = apply_child_projection(&v(&["a"]), &v(&["a"]), &v(&["nope"]));
+        let r = apply_child_projection(&v(&["a"]), &v(&["nope"]));
         assert!(matches!(r, Err(ServerError::BadRequest(_))), "got {r:?}");
     }
 }
@@ -2969,17 +2978,11 @@ async fn serve_xarray_wide_table(
     let keys: Vec<String> = match fields {
         Some(requested) => {
             // Column projection routed through the SINGLE owner
-            // `apply_child_projection` (unknown field → 400, access-hidden field
-            // → 404), so the wide-table path enforces the exact same rule as the
-            // json/html/zip/hdf5 paths. The FULL child set is the validation
-            // universe (upstream `read(fields)` checks the whole mapping before
-            // access filtering); the access-visible set decides which validated
-            // fields the caller may actually see.
-            let all_keys = match &access_filter {
-                Some(_) => container.keys().await?,
-                None => visible_keys.clone(),
-            };
-            apply_child_projection(&all_keys, &visible_keys, &requested)?
+            // `apply_child_projection` (a non-visible field — absent or
+            // access-hidden — → the same 400), so the wide-table path enforces the
+            // exact same rule as the json/html/zip/hdf5 paths against the
+            // access-visible child set.
+            apply_child_projection(&visible_keys, &requested)?
         }
         None => visible_keys,
     };
@@ -3585,7 +3588,6 @@ pub async fn container_full(
         let queries: Vec<crate::core::queries::Query> = access_filter
             .map(|f| vec![crate::core::queries::Query::AccessBlobFilter(f)])
             .unwrap_or_default();
-        let has_access_filter = !queries.is_empty();
         let visible_keys = if queries.is_empty() {
             container.keys().await?
         } else {
@@ -3593,20 +3595,11 @@ pub async fn container_full(
             container.search(&queries).await?
         };
         // Column projection: restrict the listing to the requested fields, in
-        // field order. Validation is against the FULL child set (upstream
-        // `read(fields)` checks the whole mapping before access filtering); the
-        // access-visible set only decides which projected fields survive.
+        // field order, against the access-visible child set (a non-visible field
+        // — absent or access-hidden — → the same 400 via `apply_child_projection`).
         let visible_keys = match projection.as_deref() {
             None => visible_keys,
-            Some(fields) => {
-                let all_keys = if has_access_filter {
-                    container.keys().await?
-                } else {
-                    // no access filter → visible_keys is already the full set
-                    visible_keys.clone()
-                };
-                apply_child_projection(&all_keys, &visible_keys, fields)?
-            }
+            Some(fields) => apply_child_projection(&visible_keys, fields)?,
         };
         let mut children: Vec<crate::core::schemas::Resource> = Vec::new();
         for k in &visible_keys {
@@ -3924,19 +3917,11 @@ fn collect_zip_entries<'a>(
             }
             None => container.keys().await?,
         };
-        // Restrict the root level to the requested fields, in field order.
-        // Validation is against the FULL child set (upstream `read(fields)`
-        // checks the whole mapping before access filtering).
+        // Restrict the root level to the requested fields, in field order,
+        // against the access-visible child set (a non-visible field — absent or
+        // access-hidden — → the same 400 via `apply_child_projection`).
         let visible_keys = match projection {
-            Some(fields) if current_depth == 0 => {
-                let all_keys = if access_filter.is_some() {
-                    container.keys().await?
-                } else {
-                    // no access filter → visible_keys is already the full set
-                    visible_keys.clone()
-                };
-                apply_child_projection(&all_keys, &visible_keys, fields)?
-            }
+            Some(fields) if current_depth == 0 => apply_child_projection(&visible_keys, fields)?,
             _ => visible_keys,
         };
         for key in visible_keys {
@@ -4059,20 +4044,12 @@ fn build_container_json_contents<'a>(
             }
             None => container.keys().await?,
         };
-        // Restrict the root level to the requested fields, in field order.
-        // Validation is against the FULL child set (upstream `read(fields)`
-        // checks the whole mapping before access filtering).
+        // Restrict the root level to the requested fields, in field order,
+        // against the access-visible child set (a non-visible field — absent or
+        // access-hidden — → the same 400 via `apply_child_projection`).
         let visible_keys = match projection {
             None => visible_keys,
-            Some(fields) => {
-                let all_keys = if access_filter.is_some() {
-                    container.keys().await?
-                } else {
-                    // no access filter → visible_keys is already the full set
-                    visible_keys.clone()
-                };
-                apply_child_projection(&all_keys, &visible_keys, fields)?
-            }
+            Some(fields) => apply_child_projection(&visible_keys, fields)?,
         };
         let mut contents = serde_json::Map::new();
         for key in visible_keys {

@@ -288,7 +288,9 @@ async fn wide_table_post_fallback_end_to_end() {
 // Access-filter enforcement (Finding 2): the wide-table export must enumerate
 // children through the access filter (`search([AccessBlobFilter])`), never raw
 // `keys()`. A variable the caller cannot see is absent from every full-export
-// format and 404s on a direct `?field=` fetch.
+// format, and a direct `?field=` fetch of it is rejected identically to a
+// genuinely-absent field (400 `No such field {key}.`), so its presence never
+// leaks.
 // ---------------------------------------------------------------------------
 
 /// A container wrapping a `MapAdapter` that HIDES one child from `search` (the
@@ -439,25 +441,49 @@ async fn wide_table_hides_access_filtered_variable_in_full_export() {
     }
 }
 
-/// A direct `?field=` fetch of the hidden variable is treated as absent (404) —
-/// its data never leaks through the projection path either.
+/// A direct `?field=` fetch of the hidden variable never leaks its data, and its
+/// rejection is INDISTINGUISHABLE from that of a genuinely-absent variable:
+/// `?field=secret_zzz` on `ds` (where `secret_zzz` is access-hidden) is
+/// byte-identical to the same request on `ds2` (where `secret_zzz` does not
+/// exist), so the response is not a presence oracle. Both are 400 `No such field
+/// secret_zzz.` (upstream parity for a missing field), NOT a distinguishable 404.
 #[tokio::test]
-async fn wide_table_field_fetch_of_hidden_variable_404s() {
+async fn wide_table_field_fetch_of_hidden_variable_matches_absent() {
     let policy: Arc<dyn AccessPolicy> = Arc::new(ListFilterPolicy);
-    let base = spawn_with_policy(root_with(vec![("ds", secret_weather())]), policy).await;
+    // `ds` hides `secret_zzz`; sibling `ds2` (plain weather) has no such variable.
+    let base = spawn_with_policy(
+        root_with(vec![("ds", secret_weather()), ("ds2", weather())]),
+        policy,
+    )
+    .await;
     let client = reqwest::Client::new();
 
-    let resp = client
+    let hidden = client
         .get(format!(
             "{base}/api/v1/container/full/ds?format=csv&field=secret_zzz"
         ))
         .send()
         .await
         .unwrap();
+    let absent = client
+        .get(format!(
+            "{base}/api/v1/container/full/ds2?format=csv&field=secret_zzz"
+        ))
+        .send()
+        .await
+        .unwrap();
+    let hidden_status = hidden.status();
+    let absent_status = absent.status();
+    let hidden_body = hidden.bytes().await.unwrap();
+    let absent_body = absent.bytes().await.unwrap();
     assert_eq!(
-        resp.status(),
-        404,
-        "a hidden variable requested by ?field= must 404 (existence-hiding), not leak its data"
+        hidden_status, 400,
+        "a hidden variable requested by ?field= must 400, matching an absent one"
+    );
+    assert_eq!(
+        (hidden_status, &hidden_body),
+        (absent_status, &absent_body),
+        "access-hidden secret_zzz must be byte-identical to absent secret_zzz"
     );
 
     // A visible field still projects normally.
