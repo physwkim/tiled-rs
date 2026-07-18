@@ -105,6 +105,13 @@ const DEFAULT_MAX_ITEM_SIZE: usize = 500_000;
 /// 301 Moved Permanently, 308 Permanent Redirect.
 const CACHEABLE_STATUSES: [u16; 5] = [200, 203, 300, 301, 308];
 
+/// Permanent-redirect statuses, matching upstream `_PERMANENT_REDIRECT_STATUSES`
+/// (`tiled/client/cache_control.py:15`): 301 Moved Permanently, 308 Permanent
+/// Redirect. Upstream `is_response_fresh` (`cache_control.py:180-185`) treats a
+/// cached response with one of these statuses as always fresh, ahead of any
+/// cache-control or `Expires` evaluation.
+const PERMANENT_REDIRECT_STATUSES: [u16; 2] = [301, 308];
+
 impl CacheEntry {
     pub fn is_fresh(&self) -> bool {
         !self.no_cache && Utc::now() < self.expires_at
@@ -426,26 +433,36 @@ impl HttpCache {
 
         let now = Utc::now();
         let max_freshness = now + chrono::Duration::seconds(MAX_FRESHNESS_SECS as i64);
-        let expires_at = match cc.max_age.or(cc.s_maxage) {
-            Some(secs) => now + chrono::Duration::seconds(secs.min(MAX_FRESHNESS_SECS) as i64),
-            None => match header_value(&headers, "expires") {
-                // No `max-age`/`s-maxage`: honor an `Expires` header, but only
-                // when a valid `Date` header is also present. Upstream
-                // `is_response_fresh` (`tiled/client/cache_control.py`) returns
-                // "not fresh" for an `Expires` without a parseable `Date`; with
-                // both present, freshness reduces to `now <= Expires` (the Date
-                // terms cancel). Clamp to the same one-year ceiling as max-age.
-                Some(exp_raw) => match (
-                    header_value(&headers, "date").and_then(parse_http_date),
-                    parse_http_date(exp_raw),
-                ) {
-                    (Some(_date), Some(exp)) => exp.min(max_freshness),
-                    _ => now,
+        let expires_at = if PERMANENT_REDIRECT_STATUSES.contains(&status) {
+            // Upstream `is_response_fresh` (`cache_control.py:180-185`) short-circuits
+            // 301/308 to always fresh, before consulting any cache-control or
+            // `Expires` header. Pin them to the one-year ceiling this design uses
+            // as its "forever".
+            max_freshness
+        } else {
+            match cc.max_age.or(cc.s_maxage) {
+                Some(secs) => now + chrono::Duration::seconds(secs.min(MAX_FRESHNESS_SECS) as i64),
+                None => match header_value(&headers, "expires") {
+                    // No `max-age`/`s-maxage`: honor an `Expires` header, but only
+                    // when a valid `Date` header is also present. Upstream
+                    // `is_response_fresh` (`cache_control.py:213-231`) returns "not
+                    // fresh" for an `Expires` without a parseable `Date`; with both
+                    // present, freshness reduces to `now <= Expires` (the Date terms
+                    // cancel). Clamp to the same one-year ceiling as max-age.
+                    Some(exp_raw) => match (
+                        header_value(&headers, "date").and_then(parse_http_date),
+                        parse_http_date(exp_raw),
+                    ) {
+                        (Some(_date), Some(exp)) => exp.min(max_freshness),
+                        _ => now,
+                    },
+                    // No freshness directive at all → upstream assumes the response
+                    // is fresh (`cache_control.py:233-238`). Pin to the one-year
+                    // ceiling; the entry can still be conditionally revalidated once
+                    // it expires.
+                    None => max_freshness,
                 },
-                // No freshness directive at all → immediately stale; the entry
-                // is still stored so it can drive conditional revalidation.
-                None => now,
-            },
+            }
         };
 
         let bytes = resp.bytes().await?;
@@ -1117,6 +1134,63 @@ mod tests {
         assert!(
             cache.try_get(&nodate, accept).await.unwrap().is_none(),
             "an Expires without a valid Date header must not be fresh"
+        );
+    }
+
+    // Finding 3 (wave-30): a cacheable response carrying no freshness directive
+    // at all (no max-age/s-maxage, no Expires) is served fresh, matching upstream
+    // `is_response_fresh` (`cache_control.py:233-238`), which assumes fresh when a
+    // request/response pair has no cache-control headers.
+    #[tokio::test]
+    async fn no_directive_response_is_fresh() {
+        let cache = HttpCache::in_memory(1024 * 1024);
+        let accept = "application/json";
+
+        // No cache-control, no Expires, no Date — nothing to key freshness on.
+        let url = Url::parse("http://test/bare").unwrap();
+        cache
+            .store_response(&url, accept, make_response(200, b"body", &[]))
+            .await
+            .unwrap();
+        assert!(
+            cache.try_get(&url, accept).await.unwrap().is_some(),
+            "a response with no freshness directive must be served fresh (upstream parity)"
+        );
+    }
+
+    // Finding 3 (wave-30): permanent redirects (301, 308) are always fresh, ahead
+    // of any cache-control evaluation, matching upstream `is_response_fresh`
+    // (`cache_control.py:180-185`). Even a `max-age=0` that would otherwise mark a
+    // 200 stale does not make a cached redirect stale.
+    #[tokio::test]
+    async fn permanent_redirect_is_always_fresh() {
+        let cache = HttpCache::in_memory(1024 * 1024);
+        let accept = "application/json";
+        let zero_max_age: &[(&str, &str)] = &[("cache-control", "max-age=0")];
+
+        for status in [301u16, 308] {
+            let url = Url::parse(&format!("http://test/redir/{status}")).unwrap();
+            cache
+                .store_response(&url, accept, make_response(status, b"body", zero_max_age))
+                .await
+                .unwrap();
+            assert!(
+                cache.try_get(&url, accept).await.unwrap().is_some(),
+                "status {status} is a permanent redirect and must be fresh even with max-age=0"
+            );
+        }
+
+        // The redirect short-circuit is status-scoped: a 200 with the same
+        // `max-age=0` is immediately stale, so existing max-age behavior is
+        // unchanged for non-redirect statuses.
+        let ok = Url::parse("http://test/ok-zero").unwrap();
+        cache
+            .store_response(&ok, accept, make_response(200, b"body", zero_max_age))
+            .await
+            .unwrap();
+        assert!(
+            cache.try_get(&ok, accept).await.unwrap().is_none(),
+            "a 200 with max-age=0 must remain stale — the redirect override is status-scoped"
         );
     }
 
