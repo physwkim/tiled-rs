@@ -1888,6 +1888,19 @@ async fn spawn_auth_stream_server(
     default_login_scopes: ScopeSet,
     access_policy: Option<Arc<dyn tiled_rs::access::AccessPolicy>>,
 ) -> (String, tempfile::TempDir) {
+    spawn_auth_stream_server_cfg(default_login_scopes, access_policy, false).await
+}
+
+/// Same as [`spawn_auth_stream_server`] but with `allow_anonymous_access`
+/// configurable. With the flag set, an unauthenticated (or invalid-token) WS
+/// connect is admitted with `PUBLIC_SCOPES` (both read scopes) via the
+/// anonymous fallback — the substrate for testing that a PRESENTED-but-invalid
+/// `?access_token=` denies rather than silently downgrading to anonymous.
+async fn spawn_auth_stream_server_cfg(
+    default_login_scopes: ScopeSet,
+    access_policy: Option<Arc<dyn tiled_rs::access::AccessPolicy>>,
+    allow_anonymous_access: bool,
+) -> (String, tempfile::TempDir) {
     use tiled_rs::auth::{AuthDb, DummyAuthenticator, Issuer};
 
     let dir = tempfile::tempdir().unwrap();
@@ -1948,7 +1961,7 @@ async fn spawn_auth_stream_server(
         request_timeout_secs: 30,
         expose_raw_assets: true,
         exact_count_limit: u64::MAX,
-        allow_anonymous_access: false,
+        allow_anonymous_access,
         background_tasks: tiled_rs::server::state::BackgroundTasks::new(),
         validation: Default::default(),
     };
@@ -2124,6 +2137,57 @@ async fn first_message_access_token_authenticates() {
         .await
         .expect("array-schema first message after an access_token first message");
     assert_eq!(schema["type"], "array-schema", "schema: {schema}");
+}
+
+/// A PRESENTED-but-invalid `?access_token=` query JWT must be DENIED, NOT
+/// silently downgraded to the anonymous `PUBLIC_SCOPES` fallback — even on an
+/// `allow_anonymous_access` server. Upstream treats a presented token as a
+/// committed credential: `decode_token` (authentication.py:153-177) raises
+/// `HTTPException(401, "Could not validate credentials")` on any JWT error (and
+/// `get_decoded_access_token_websocket`, :297-311, raises 401 "Access token has
+/// expired" on expiry) DURING WS dependency resolution — before
+/// `get_current_scopes_websocket`'s `allow_anonymous_access` fallback (:454-457)
+/// is ever reached. So an invalid token is a hard deny, never an anonymous
+/// admission.
+///
+/// With anonymous access ON, `PUBLIC_SCOPES` carries BOTH read scopes, so the
+/// pre-fix fall-through admitted the connection as anonymous and the
+/// array-schema first message arrived — the silent downgrade. The fix denies:
+/// a plain-text `access_token: …` reject frame arrives and NO schema is sent.
+#[tokio::test]
+async fn subscribe_invalid_access_token_query_denied_even_when_anonymous_allowed() {
+    let (base, _dir) = spawn_auth_stream_server_cfg(ScopeSet::read_only(), None, true).await;
+
+    let mut ws = connect_ws_access_token_query(&base, "arr", "not-a-valid-jwt").await;
+    let frame = next_frame_text(&mut ws)
+        .await
+        .expect("a deny text frame, not an anonymous-downgrade array-schema");
+    assert!(
+        frame.starts_with("access_token:"),
+        "expected an access_token reject frame (no anonymous downgrade), got: {frame:?}"
+    );
+}
+
+/// A PRESENTED-but-invalid `?access_token=` on an auth-REQUIRED server
+/// (anonymous OFF) must be denied IMMEDIATELY. The pre-fix code set the resolved
+/// context to `None` and fell through to `handshake_auth`, which blocks up to
+/// 10s waiting for a first message before timing out. Upstream denies at
+/// connect-time dependency resolution (401), with no first-message window. After
+/// the fix the deny frame arrives at once (well inside `next_frame_text`'s
+/// 500 ms budget); pre-fix, no frame arrives in that window because the
+/// handshake is still waiting.
+#[tokio::test]
+async fn subscribe_invalid_access_token_query_denied_immediately() {
+    let (base, _dir) = spawn_auth_stream_server(ScopeSet::read_only(), None).await;
+
+    let mut ws = connect_ws_access_token_query(&base, "arr", "not-a-valid-jwt").await;
+    let frame = next_frame_text(&mut ws)
+        .await
+        .expect("an immediate deny frame, not a 10s first-message wait");
+    assert!(
+        frame.starts_with("access_token:"),
+        "expected an access_token reject frame, got: {frame:?}"
+    );
 }
 
 /// (c) A subscriber whose TOKEN carries BOTH read scopes (so the global gate
