@@ -144,6 +144,53 @@ async fn from_uri_returns_root_container() {
     assert!(keys.contains(&"subgroup".to_string()));
 }
 
+/// Wave-32: a two-key sort must round-trip end-to-end. The client emits one
+/// `?sort=` param per key (never comma-joined), and the server parses the
+/// repeated params back into two ordered keys — exact upstream wire parity
+/// (`List[SortField]`, dependencies.py:219; container.py:121-128). Sorting by
+/// `group` ASC then `rank` DESC over four children yields [y, x, w, z].
+#[tokio::test]
+async fn two_key_sort_round_trips_client_to_server() {
+    use tiled_rs::client::SortDirection;
+
+    let mk = |group: &str, rank: i64| -> AnyAdapter {
+        let a =
+            ArrayAdapter::from_f64_1d(&[0.0], serde_json::json!({"group": group, "rank": rank}));
+        AnyAdapter::Array(Arc::new(a))
+    };
+    let mut mapping = IndexMap::new();
+    mapping.insert("w".to_string(), mk("b", 2));
+    mapping.insert("x".to_string(), mk("a", 1));
+    mapping.insert("y".to_string(), mk("a", 2));
+    mapping.insert("z".to_string(), mk("b", 1));
+    let root: Arc<dyn ContainerAdapter> =
+        Arc::new(MapAdapter::new(mapping, serde_json::json!({}), vec![]));
+    let base = spawn_server_with_root(root, None).await;
+
+    let root = from_uri(&base)
+        .await
+        .expect("from_uri")
+        .into_container()
+        .expect("root is container");
+    let ordered = root
+        .sort_by("group", SortDirection::Ascending)
+        .sort_by("rank", SortDirection::Descending)
+        .keys()
+        .await
+        .expect("list keys with a two-key sort");
+
+    assert_eq!(
+        ordered,
+        vec![
+            "y".to_string(),
+            "x".to_string(),
+            "w".to_string(),
+            "z".to_string()
+        ],
+        "two-key sort (group asc, rank desc) must round-trip through repeated ?sort= params"
+    );
+}
+
 #[tokio::test]
 async fn navigate_into_subgroup_and_read_metadata() {
     let base = spawn_server(None).await;
