@@ -2038,6 +2038,30 @@ async fn connect_ws_access_token_query(
     ws
 }
 
+/// Connect a WS subscription to `path` presenting `Bearer {header_token}` in the
+/// Authorization header AND `?access_token={query_token}` in the query — both
+/// credentials at once. Exercises the connect-time precedence when a real header
+/// credential and a query token coexist (F1): upstream validates the query token
+/// unconditionally even behind a valid header. The upgrade always succeeds
+/// (HTTP 101); any denial arrives as a text frame after it.
+async fn connect_ws_bearer_and_query(
+    base: &str,
+    path: &str,
+    header_token: &str,
+    query_token: &str,
+) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
+    let url = format!("{}?access_token={query_token}", ws_url(base, path));
+    let mut req = url.as_str().into_client_request().unwrap();
+    req.headers_mut().insert(
+        HeaderName::from_static("authorization"),
+        HeaderValue::from_str(&format!("Bearer {header_token}")).unwrap(),
+    );
+    let (ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+    ws
+}
+
 /// Read the next frame as raw text (no JSON parse), or `None` on close/timeout.
 /// Used for the plain-text `forbidden:` / `subscription denied:` rejection
 /// frames the handler sends before closing (which `next_text_json` would panic
@@ -2188,6 +2212,55 @@ async fn subscribe_invalid_access_token_query_denied_immediately() {
         frame.starts_with("access_token:"),
         "expected an access_token reject frame, got: {frame:?}"
     );
+}
+
+/// F1 (wave-35) — a PRESENTED-but-invalid `?access_token=` query JWT must be
+/// DENIED even when a VALID header credential is ALSO present. Upstream declares
+/// `get_decoded_access_token_websocket` as a direct WS dependency
+/// (`router.py:766-768`), resolved BEFORE the endpoint body, so a present-but-
+/// invalid/expired query token raises 401 (`authentication.py:303-311` expiry,
+/// `:153-177` other JWT errors) REGARDLESS of a valid Apikey/Bearer header — the
+/// header's `api_key` branch only shadows the decoded token for SCOPE SELECTION
+/// (`:449-455`); it does not skip the token's validation. The port previously let
+/// the valid header win and never validated the query token, silently admitting
+/// (RED before this fix: the array-schema arrives, no deny frame). A valid Bearer
+/// header exercises the same `real_header` path as an Apikey header.
+#[tokio::test]
+async fn subscribe_valid_header_with_invalid_access_token_query_is_denied() {
+    let (base, _dir) = spawn_auth_stream_server(ScopeSet::read_only(), None).await;
+    let client = reqwest::Client::new();
+    let token = login_token(&client, &base, "alice", "wonderland").await;
+
+    // Valid Bearer header + garbage query token: upstream denies at connect-time
+    // dependency resolution; the port must deny too, not admit on the header.
+    let mut ws = connect_ws_bearer_and_query(&base, "arr", &token, "not-a-valid-jwt").await;
+    let frame = next_frame_text(&mut ws)
+        .await
+        .expect("a deny text frame, not a header-wins array-schema admit");
+    assert!(
+        frame.starts_with("access_token:"),
+        "expected an access_token reject frame (present-but-invalid query token \
+         denies even behind a valid header), got: {frame:?}"
+    );
+}
+
+/// F1 guard (wave-35) — a valid header credential AND a valid `?access_token=`
+/// query token together still ADMIT: the query token validates cleanly, so there
+/// is nothing to deny, and the header supplies the scopes (upstream's `api_key`
+/// branch shadows the decoded token for scope selection, `:449-455`). Pins that
+/// the invalid-token deny does not over-fire on a valid coexisting token.
+#[tokio::test]
+async fn subscribe_valid_header_with_valid_access_token_query_admits() {
+    let (base, _dir) = spawn_auth_stream_server(ScopeSet::read_only(), None).await;
+    let client = reqwest::Client::new();
+    let token = login_token(&client, &base, "alice", "wonderland").await;
+
+    // Same valid token presented via BOTH transports — must authenticate.
+    let mut ws = connect_ws_bearer_and_query(&base, "arr", &token, &token).await;
+    let schema = next_text_json(&mut ws)
+        .await
+        .expect("array-schema first message with valid header + valid query token");
+    assert_eq!(schema["type"], "array-schema", "schema: {schema}");
 }
 
 /// (c) A subscriber whose TOKEN carries BOTH read scopes (so the global gate
