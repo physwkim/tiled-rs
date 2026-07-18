@@ -668,3 +668,70 @@ async fn raw_export_multiple_assets_namespaced_by_id() {
         "asset 1 namespaced key + bytes"
     );
 }
+
+// --- get_asset_filepaths ----------------------------------------------------
+
+#[tokio::test]
+async fn get_asset_filepaths_returns_backing_file_paths() {
+    // Smoke test parity with upstream tests/test_asset_access.py::
+    // test_get_asset_filepaths: the util maps every asset's `file://` data_uri
+    // back to a local path, in data-source/asset order.
+    let (base, cat, _db) = spawn_catalog_server().await;
+
+    // Single-asset node → one filepath.
+    let one = tempfile::tempdir().unwrap();
+    let one_file = one.path().join("scan.h5");
+    std::fs::write(&one_file, b"x").unwrap();
+    add_asset(&cat, "single", &file_uri(&one_file), false).await;
+
+    let single_base = node_base(&base, "single").await;
+    let paths = tiled_rs::client::utils::get_asset_filepaths(&single_base)
+        .await
+        .unwrap();
+    assert_eq!(paths, vec![one_file.clone()]);
+
+    // Two-asset node → both filepaths, ordered by `num`.
+    let two = tempfile::tempdir().unwrap();
+    let a = two.path().join("a.h5");
+    let b = two.path().join("b.h5");
+    std::fs::write(&a, b"a").unwrap();
+    std::fs::write(&b, b"b").unwrap();
+    add_two_asset_node(&cat, "double", &file_uri(&a), &file_uri(&b)).await;
+
+    let double_base = node_base(&base, "double").await;
+    let paths = tiled_rs::client::utils::get_asset_filepaths(&double_base)
+        .await
+        .unwrap();
+    assert_eq!(paths, vec![a, b]);
+}
+
+#[tokio::test]
+async fn get_asset_filepaths_errors_on_unresolvable_scheme() {
+    // An asset whose data_uri has no local-path scheme (e.g. `s3://`) is an
+    // error, matching upstream where `path_from_uri` raises for such schemes.
+    let (base, cat, _db) = spawn_catalog_server().await;
+    add_asset(&cat, "remote", "s3://bucket/object.h5", false).await;
+
+    let remote_base = node_base(&base, "remote").await;
+    let err = tiled_rs::client::utils::get_asset_filepaths(&remote_base)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ClientError::Invalid(_)), "got {err:?}");
+}
+
+#[tokio::test]
+async fn get_asset_filepaths_empty_for_node_without_sources() {
+    // A container node with no data sources yields an empty list, not an error
+    // (data_sources() returns None → treated as no assets).
+    let (base, _cat, _db) = spawn_catalog_server().await;
+    let root_base = from_uri_with_options(&base, ContextOptions::default(), true)
+        .await
+        .unwrap()
+        .base()
+        .unwrap()
+        .clone();
+    let paths = tiled_rs::client::utils::get_asset_filepaths(&root_base)
+        .await
+        .unwrap();
+    assert!(paths.is_empty());
+}

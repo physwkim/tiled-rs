@@ -62,6 +62,42 @@ pub fn file_uri_to_path(uri: &str) -> Option<PathBuf> {
     Some(path)
 }
 
+/// Map any asset `data_uri` to its backing local filesystem path.
+///
+/// Mirrors Python tiled's `path_from_uri` (`tiled/utils.py:745`), the resolver
+/// the client's `get_asset_filepaths` uses: the `file` scheme decodes
+/// cross-platform (via [`file_uri_to_path`]); the `sqlite` and `duckdb` schemes
+/// carry the database file path directly after the scheme. Any other scheme
+/// (`s3://`, `http://`, …) or a scheme-less bare path yields `None` — upstream
+/// raises there, and the caller turns `None` into an error.
+///
+/// Broader than [`file_uri_to_path`], which is file-only because its callers are
+/// the server's read/delete resolvers, where a `sqlite://` asset must not be
+/// treated as a plain file path. This helper is for the read-only client path,
+/// which only reports where the data lives.
+///
+/// Deviation from upstream on the SQL schemes: this keeps the full path the Rust
+/// server emits (`sqlite://{absolute}`, matching
+/// [`crate::server::file_resolver`]'s `sqlite_uri_to_path`), rather than
+/// upstream's `parsed.path[1:]`, which strips the leading slash. The Rust
+/// convention is what round-trips with the URIs this server actually stores.
+pub fn path_from_uri(uri: &str) -> Option<PathBuf> {
+    if let Some(path) = file_uri_to_path(uri) {
+        return Some(path);
+    }
+    for scheme in ["sqlite", "duckdb"] {
+        if let Some(rest) = uri.strip_prefix(scheme).and_then(|r| r.strip_prefix("://")) {
+            // Drop any `?query` suffix sqlx/duckdb would accept on the URI.
+            let path_part = rest.split('?').next().unwrap_or(rest);
+            if path_part.is_empty() {
+                return None;
+            }
+            return Some(PathBuf::from(path_part));
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -148,5 +184,56 @@ mod tests {
     fn rejects_malformed_file_uri() {
         assert_eq!(file_uri_to_path("file://"), None);
         assert_eq!(file_uri_to_path("file://relative-no-slash"), None);
+    }
+
+    // --- path_from_uri: the broader client-side resolver (file + sqlite +
+    //     duckdb), mirroring upstream tiled/utils.py:path_from_uri ---
+
+    #[cfg(unix)]
+    #[test]
+    fn path_from_uri_decodes_file_scheme() {
+        assert_eq!(
+            path_from_uri("file:///data/scan001.h5"),
+            Some(PathBuf::from("/data/scan001.h5"))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn path_from_uri_decodes_file_scheme() {
+        assert_eq!(
+            path_from_uri("file:///C:/data/scan001.h5"),
+            Some(PathBuf::from(r"C:\data\scan001.h5"))
+        );
+    }
+
+    #[test]
+    fn path_from_uri_decodes_sqlite_and_duckdb() {
+        // Matches the `sqlite://{absolute}` form the Rust server emits for
+        // managed ragged-SQL assets (file_resolver::sqlite_uri_to_path).
+        assert_eq!(
+            path_from_uri("sqlite:///srv/data/ragged.db"),
+            Some(PathBuf::from("/srv/data/ragged.db"))
+        );
+        assert_eq!(
+            path_from_uri("duckdb:///srv/data/tbl.duckdb"),
+            Some(PathBuf::from("/srv/data/tbl.duckdb"))
+        );
+    }
+
+    #[test]
+    fn path_from_uri_strips_query_suffix() {
+        assert_eq!(
+            path_from_uri("sqlite:///srv/data/ragged.db?mode=ro"),
+            Some(PathBuf::from("/srv/data/ragged.db"))
+        );
+    }
+
+    #[test]
+    fn path_from_uri_rejects_unsupported_and_empty() {
+        assert_eq!(path_from_uri("s3://bucket/key"), None);
+        assert_eq!(path_from_uri("http://host/p"), None);
+        assert_eq!(path_from_uri("/etc/passwd"), None);
+        assert_eq!(path_from_uri("sqlite://"), None);
     }
 }

@@ -10,6 +10,7 @@ use reqwest::Response;
 use reqwest::header::{ACCEPT, HeaderMap, HeaderValue, USER_AGENT};
 use serde::de::DeserializeOwned;
 
+use crate::client::base::BaseClient;
 use crate::client::error::{ClientError, Result};
 
 pub const MSGPACK_MIME_TYPE: &str = "application/x-msgpack";
@@ -307,6 +308,33 @@ fn format_from_suffixes(dest: &std::path::Path) -> Option<String> {
     } else {
         Some(suffixes.join("."))
     }
+}
+
+/// Return the local filesystem paths of the data files backing `node`.
+///
+/// Mirrors `get_asset_filepaths` (`tiled/client/utils.py:470`): walk the node's
+/// data sources — fetching them if the client was not built with
+/// `include_data_sources=true` (via [`BaseClient::data_sources`]) — and map each
+/// asset's `data_uri` to a path. A `data_uri` whose scheme has no local-path
+/// mapping (e.g. `s3://`) is an error, since no filepath can be produced for it,
+/// matching upstream where `path_from_uri` raises for such schemes.
+///
+/// Takes a [`BaseClient`] because `data_sources` is common to every node family;
+/// callers hand it `node.base()` (all built-in client variants expose one).
+pub async fn get_asset_filepaths(node: &BaseClient) -> Result<Vec<std::path::PathBuf>> {
+    let mut filepaths = Vec::new();
+    for data_source in node.data_sources().await?.unwrap_or_default() {
+        for asset in &data_source.assets {
+            let path = crate::core::file_uri::path_from_uri(&asset.data_uri).ok_or_else(|| {
+                ClientError::Invalid(format!(
+                    "cannot derive a filepath from asset data_uri '{}'",
+                    asset.data_uri
+                ))
+            })?;
+            filepaths.push(path);
+        }
+    }
+    Ok(filepaths)
 }
 
 #[cfg(test)]
