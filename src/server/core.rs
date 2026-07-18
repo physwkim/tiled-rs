@@ -699,7 +699,16 @@ pub fn construct_resource<'a>(
 
 /// Build a container's wire `structure` (`{"contents": …, "count": N}`),
 /// inlining its children's full Resources when the upstream gate passes
-/// (`tiled/server/core.py:513-556`). Mirrors upstream exactly:
+/// (`tiled/server/core.py:513-556`).
+///
+/// The single inlining owner. Three callers route through it so the gate is
+/// enforced in exactly one place: in-memory `/metadata` ([`construct_resource`]),
+/// `/search` entries ([`construct_entries_response`]), and the catalog top node
+/// (`catalog_metadata_resource`, `router.rs`). Each caller pre-filters cheaply on
+/// the `"xarray_dataset"` spec discriminator to avoid resolving a plain
+/// container's children, then defers to the authoritative gate here.
+///
+/// Mirrors upstream exactly:
 ///
 /// - Gate: `(max_depth is None || depth < max_depth) && inlined_contents_enabled(depth)
 ///   && depth <= DEPTH_LIMIT`. When it fails, `contents` is `null` (an explicit
@@ -744,7 +753,7 @@ pub fn construct_resource<'a>(
 /// applies `shape` (`select_metadata` / `fields` / `omit_links`) to it, matching
 /// upstream's per-node application down the recursion (`core.py:485-583`). The
 /// addressed top-level node is shaped by its handler, not here.
-async fn build_container_structure(
+pub(crate) async fn build_container_structure(
     container: &dyn ContainerAdapter,
     path: &str,
     base_url: &str,
