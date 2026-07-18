@@ -612,6 +612,34 @@ pub trait ContainerAdapter: BaseAdapter {
             })
         })
     }
+
+    /// Whether this container asks the server to inline its children's full
+    /// Resources into `structure.contents` when built at walk `depth`
+    /// (the `entry.inlined_contents_enabled(depth)` clause of the metadata /
+    /// search inline gate, `tiled/server/core.py:514`).
+    ///
+    /// Upstream defines this method ONLY on the hdf5/zarr group adapters
+    /// (`depth <= INLINED_DEPTH`, i.e. 7) and the xarray `DatasetAdapter`
+    /// (always `True`); every other tree adapter lacks it, so the `hasattr`
+    /// gate fails and its contents stay `None`. Our port has **no** dedicated
+    /// hdf5/zarr *group* adapter (those are array leaves — N/A) and **no**
+    /// dedicated `DatasetAdapter` type: an xarray dataset is represented as a
+    /// container carrying the `"xarray_dataset"` spec, produced by several
+    /// backends (netcdf → `MapAdapter`, mongo `EventStreamAdapter`, a
+    /// catalog-registered node). Because the discriminator is a *spec* (not a
+    /// Rust type), the faithful, backend-uniform mapping lives here in the
+    /// default: a container so tagged inlines (DatasetAdapter parity —
+    /// always-on, `depth`-independent), and every other container keeps the
+    /// `hasattr`-absent behaviour (contents `None`). This is the same
+    /// discriminator the wide-table export already gates on
+    /// (`router.rs`, `specs().any(|s| s.name == "xarray_dataset")`).
+    ///
+    /// The `depth` argument is part of the surface so a future real hdf5/zarr
+    /// group adapter can override with `depth <= INLINED_DEPTH`; the gate's own
+    /// `depth <= DEPTH_LIMIT` (5) clause bounds the walk regardless.
+    fn inlined_contents_enabled(&self, _depth: usize) -> bool {
+        self.specs().iter().any(|s| s.name == "xarray_dataset")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -703,6 +731,19 @@ impl AnyAdapter {
         match self {
             Self::Container(c) => Some(c.as_ref()),
             _ => None,
+        }
+    }
+
+    /// Whether this node asks the server to inline its children at walk `depth`
+    /// — the `entry.inlined_contents_enabled(depth)` clause of the inline gate
+    /// (`tiled/server/core.py:514`). Only a container can inline; every leaf
+    /// family answers `false`, matching upstream where the gate's preceding
+    /// `entry.structure_family == container` branch already excludes leaves.
+    #[inline]
+    pub fn inlined_contents_enabled(&self, depth: usize) -> bool {
+        match self {
+            Self::Container(c) => c.inlined_contents_enabled(depth),
+            _ => false,
         }
     }
 
@@ -847,5 +888,66 @@ mod sparse_densify_tests {
         };
         let dense = sd.densify(&[2], &[2]);
         assert_eq!(read_f64s(&dense), vec![9.0, 0.0]);
+    }
+}
+
+#[cfg(test)]
+mod inlined_contents_enabled_tests {
+    use super::{AnyAdapter, ContainerAdapter};
+    use crate::adapters::{ArrayAdapter, MapAdapter};
+    use crate::core::structures::Spec;
+    use indexmap::IndexMap;
+    use serde_json::json;
+    use std::sync::Arc;
+
+    fn container(specs: Vec<Spec>) -> MapAdapter {
+        MapAdapter::new(IndexMap::new(), json!({}), specs)
+    }
+
+    // A container carrying the "xarray_dataset" spec maps to upstream
+    // DatasetAdapter: inlining is enabled and DEPTH-INDEPENDENT (always-on),
+    // so it holds at every depth the gate can present (0..=DEPTH_LIMIT).
+    #[test]
+    fn xarray_dataset_spec_enables_at_every_depth() {
+        let ds = container(vec![Spec::new("xarray_dataset")]);
+        for depth in 0..=crate::core::links::DEPTH_LIMIT {
+            assert!(
+                ds.inlined_contents_enabled(depth),
+                "xarray_dataset container must inline at depth {depth}"
+            );
+        }
+    }
+
+    // A plain container (no spec) keeps the hasattr-absent behaviour: never
+    // inline. A non-xarray spec ("bluesky_run") does not opt in either.
+    #[test]
+    fn plain_and_other_spec_containers_do_not_enable() {
+        assert!(
+            !container(vec![]).inlined_contents_enabled(0),
+            "plain container must not inline"
+        );
+        assert!(
+            !container(vec![Spec::new("bluesky_run")]).inlined_contents_enabled(0),
+            "a non-xarray spec must not opt into inlining"
+        );
+    }
+
+    // AnyAdapter dispatch: the Container arm delegates to the container's
+    // method; every leaf family answers false (leaves cannot inline).
+    #[test]
+    fn any_adapter_dispatch_container_vs_leaf() {
+        let ds = AnyAdapter::Container(Arc::new(container(vec![Spec::new("xarray_dataset")])));
+        let plain = AnyAdapter::Container(Arc::new(container(vec![])));
+        let leaf = AnyAdapter::Array(Arc::new(ArrayAdapter::from_f64_1d(&[1.0], json!({}))));
+
+        assert!(ds.inlined_contents_enabled(0), "tagged container inlines");
+        assert!(
+            !plain.inlined_contents_enabled(0),
+            "plain container does not inline"
+        );
+        assert!(
+            !leaf.inlined_contents_enabled(0),
+            "an array leaf never inlines"
+        );
     }
 }
