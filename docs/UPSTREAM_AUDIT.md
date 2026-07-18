@@ -1317,12 +1317,19 @@ fix. All hashes below are the merged commits.
   WS credential as an `Authorization` header (`client/stream.rs`). This is an
   internally-consistent superset — the credential is legitimate, no privilege is
   gained, and a browser still uses `?access_token=` in both — not a break.
-  **Precedence edge:** with an *invalid* `Apikey` header AND a *valid*
-  `?access_token=` query, upstream lets the unvalidated header shadow the query
-  (its `api_key` branch runs first in `get_current_scopes_websocket`, `:449-455`)
-  and denies; the port drops the rejected header (`resolve_header_auth` returns
-  `None`) and falls through to the valid query token, authenticating. Documented
-  as a known, low-impact deviation.
+  **Precedence edge — one remaining direction (updated wave-35 `63768df`).** The
+  sibling direction — a *valid* header AND an *invalid/expired* `?access_token=`
+  query — was a bug (silent admit) that wave-35 `63768df` closed: the port now
+  validates a present query token unconditionally in stage 1, so it DENIES,
+  matching upstream (see the Wave-35 #138 entry). The residual documented
+  deviation is only the OTHER direction: an *invalid/garbage `Authorization`
+  header* AND a *valid* `?access_token=` query. Upstream rejects on the bad
+  header first — a non-`Apikey` scheme raises 400 in `get_api_key_websocket`
+  (`authentication.py:289-292`), and a malformed `Apikey` value denies via the
+  `api_key` branch that runs first in `get_current_scopes_websocket` (`:449-455`)
+  — never reaching the query token; the port drops the rejected header
+  (`resolve_header_auth` returns `None`) and falls through to the valid query
+  token, authenticating. Documented as a known, low-impact deviation.
 * **`assets.size` absent end-to-end — pre-existing, tracked** (surfaced by the
   #1429 / #1424 sweep re-verification). Upstream carries an asset byte-size:
   an `assets.size` `BigInteger` column (`orm.py`) and `Asset.size: Optional[int]
@@ -1344,7 +1351,178 @@ fix. All hashes below are the merged commits.
   `structure.contents` is not inlined even when `max_depth` and the capability
   would permit. The search path covers catalog children, so this is narrow;
   routing the top-node metadata response through the inlining builder is deferred
-  to wave-35.
+  to wave-35. **→ Closed in wave-35** (`120d3f6`, PR #139): the catalog top-node
+  metadata response now routes an inline-eligible container through
+  `build_container_structure`; see the Wave-35 #139 entry.
+
+## Wave-35: inline-walk access filter + per-node shaping, WS query-token validation, catalog top-node inlining
+
+Three sibling PRs (#137–#139), merged onto main (`120d3f6`). #137 hardens the
+wave-34 `structure.contents` inlining — access-filtering the child walk (a HIGH
+metadata-leak fix) and shaping each inlined child; #138 lands two auth-boundary
+fixes (WS query-token validation behind a header, spec name/version char bounds);
+#139 closes the wave-34 catalog top-node deferral by routing that node through the
+same inlining owner. All hashes below are the merged commits.
+
+### #137 — access-filter the inline walk + per-node child shaping
+
+* **Route the `structure.contents` inline walk through the caller's access filter**
+  (`7696646`, **HIGH**). The wave-34 recursive inline walk
+  (`build_container_structure`, `server/core.rs`) enumerated a container's children
+  with raw `keys()`/`get()`, outside any access filter. On a catalog server with an
+  access policy, a `/search` (and in-memory `/metadata`) response inlined an
+  inline-enabled container's children — including children the caller's
+  `list_filter` hides from `/search` and from a direct GET — leaking their
+  metadata, structure, and specs. Upstream never reaches this: its catalog nodes
+  carry no `inlined_contents_enabled` (only in-memory hdf5/zarr/xarray group
+  adapters, which have no per-node `access_blob`), and its tree is a
+  `filter_for_access`-wrapped view whose `keys()`/`getitem` apply the conditions.
+  The port's spec-based `inlined_contents_enabled` fires on catalog containers too,
+  so the walk must filter itself. **Invariant:** every caller-facing child
+  enumeration — the inline walk included — MUST route through the caller's access
+  filter (`list_filter(read:metadata)`, parity with upstream `get_entry`'s
+  `filter_for_access` scopes; `router.rs:401-411`); no inline path may enumerate a
+  child the caller's `list_filter` would hide (the zarr-fix invariant, `82a7041`).
+  **Owner:** `build_container_structure` is the single owner of the inline child
+  enumeration. **Structural closure:** `construct_resource` /
+  `build_container_structure` / `construct_entries_response` now REQUIRE an
+  `Option<&AccessBlobFilter>` argument (no unfiltered default), so the illegal path
+  is hard to write by signature. When the filter is `Some`, permitted keys come from
+  the same filtered listing `/search` uses (`container.search(&[AccessBlobFilter])`);
+  a hidden child is skipped (never resolved, absent from `contents`, as if
+  unlisted). `None` (no policy) inlines every child, so policy-free and in-memory
+  deployments are unaffected. `count` is deliberately preserved as the port's full
+  child count (see the deviations note below).
+* **Per-node shaping of inlined children via a single owner** (`23f06e2`). Upstream
+  threads `fields`, `select_metadata` and `omit_links` down the `construct_resource`
+  recursion and applies them to every node it builds (`core.py:485-583`); the port
+  applied them to the addressed top-level node only, so inlined `structure.contents`
+  children carried raw `metadata` and `links`. `apply_select_metadata` and
+  `prune_entry_fields` move into `server::core` as the single shaping
+  implementation, wrapped by `ShapeOptions` + `shape_resource` and threaded through
+  `construct_resource` / `construct_entries_response` / `build_container_structure`.
+  Order is select_metadata → `fields` projection → `omit_links` (`shape_resource`,
+  `core.rs:601-618`). Every node is shaped exactly once by whoever places it into a
+  response; `build_container_structure` shapes each inlined child, the handlers
+  shape the addressed node / top-level entries through the same `shape_resource`.
+  `include_data_sources` is deliberately NOT threaded (see the wave-36 residual
+  below).
+
+### #138 — WS query-token validation behind a header + spec char bounds
+
+* **Validate a present WS `?access_token=` even behind a valid header** (`63768df`).
+  `run_subscription` let a real Bearer/Apikey header credential win and NEVER
+  validated a coexisting `?access_token=` query JWT, so a valid header + a
+  present-but-invalid/expired query token was silently ADMITTED where upstream
+  401s. Upstream declares `get_decoded_access_token_websocket` a DIRECT dependency
+  of the WS endpoint (`router.py:766-768`), resolved before the endpoint body, so a
+  present-but-invalid/expired query token raises 401 there regardless of a valid
+  header — expiry → "Access token has expired. Refresh token."
+  (`authentication.py:303-311`), any other JWT error → `decode_token`'s
+  `credentials_exception`; the header's `api_key` branch only shadows the decoded
+  token for SCOPE selection (`get_current_scopes_websocket`, `:449-455`), never its
+  validation. The fix splits resolution into two stages: stage 1 validates a present
+  query token unconditionally (`Ok(Some)` / `Ok(None)` / `Err`), stage 2 selects the
+  auth context by the unchanged precedence (real header → valid query token →
+  first-message handshake). Both the invalid-token deny and the handshake-failure
+  deny funnel through one `Err` handler and the uniform text-frame + `Close` deny
+  path, removing the "header present ⇒ query token unvalidated" dual meaning. This
+  closes the *valid header + invalid query* direction of the WS precedence edge
+  documented under wave-34; see that note — only the *invalid header + valid query*
+  direction now remains a deviation.
+* **Bound spec `name`/`version` length by characters, not bytes** (`e38c156`).
+  `validate_payload` compared `str::len()` (UTF-8 BYTE count) against
+  `MAX_SPEC_CHARS = 255` for both the spec `name` (`catalog/node.rs:317`) and the
+  `version` (`:327`, added in wave-34 `7b1f49a`). Upstream
+  `StringConstraints(max_length=255)` bounds the Python `str` by `len(str)`, which
+  counts CODE POINTS (`structures/core.py:29-30`), so a 200-character multibyte
+  name/version (≤255 chars but ~600 bytes) was wrongly 422'd where upstream accepts
+  it. Both spec-field sites now use `chars().count()`; the ASCII 256-char boundary
+  still rejects. The list-length (`MAX_SPECS`, `MAX_REFERENCES`) and metadata-byte
+  (`MAX_METADATA_BYTES`) bounds are correctly left as byte/element counts; the
+  reference `label`/`url` char-bounds are a separate lane (see the wave-36
+  residual).
+
+### #139 — catalog top-node metadata inlining (closes the wave-34 deferral)
+
+* **Inline catalog top-node metadata under the shared gate** (`eb6da92` RED,
+  `120d3f6` fix). `GET /metadata/<node>` on a catalog-registered xarray_dataset
+  container returned `structure.contents = null`: `catalog_metadata_resource`
+  hand-built `NodeStructure{contents: None}` from a child count and never routed an
+  inline-enabled container through the wave-34 inlining owner
+  (`build_container_structure`) — the wave-34 deferral. Upstream inlines the
+  addressed (top) node under the same `core.py:513` gate the in-memory `/metadata`
+  and `/search` paths already honor. `eb6da92` pins the RED
+  (`catalog_xarray_dataset_topnode_inlines`) while locking the plain-container
+  fast-path, `max_depth=0`, and plain-`contents=null` guards. `120d3f6` pre-filters
+  the container branch on the `"xarray_dataset"` spec discriminator + the
+  `max_depth` gate (the same cheap pre-filter `construct_entries_response` uses): a
+  plain container keeps the count-only fast path unchanged and builds no child
+  adapter, while only an inline-eligible container is resolved via `walk_tree` and
+  handed to `build_container_structure` — now the single inlining owner for all
+  three callers (in-memory `/metadata`, `/search`, catalog top node), so the
+  max_depth semantics, the 500-child cap, and the child-`Resource` shape are
+  identical by construction. Because it inherits that owner, the catalog top node
+  gets the Finding-1 access filter and the Finding-2 `ShapeOptions` for free:
+  `catalog_metadata_resource` threads the SAME `inline_access_filter` and `shape`
+  the metadata route passes to `construct_resource` on the in-memory branch; the
+  addressed (top) node is still shaped by the handler after the resource is built.
+  The child walk reads fresh from the DB, so the direct-DB read-after-write
+  consistency `catalog_metadata_resource` preserves is unaffected. Tests:
+  `catalog_topnode_inline_walk_routes_through_access_filter` (a team-b child is
+  absent from a team-a caller's inlined contents, count unchanged) and
+  `catalog_topnode_inline_children_shaped_by_omit_links` (`?omit_links=true` drops
+  the inlined child's links, not just the addressed node's).
+
+### Wave-35 documented deviations + investigations
+
+* **`count` on inlined containers is the FULL walked count** (Finding 1). The
+  access filter deliberately does NOT change `count`: it stays the full child count
+  the walk produces, so on a policy server with hidden children the port's `count`
+  can exceed the number of visible `contents` entries. Upstream reports the
+  filtered-view count instead. This is a preserved port count-semantic, documented
+  in the `build_container_structure` doc comment (`server/core.rs:743-747`), not a
+  wave-35 regression.
+* **`contents` key omitted vs upstream explicit `"contents": null`** — pre-existing
+  minor wire divergence (wave-36 candidate). The catalog metadata route emits
+  `{"count": N}` with no `"contents"` key for a non-inlined container, where
+  upstream emits an explicit `"contents": null`. This is the pre-existing
+  `#[serde(skip_serializing_if = "Option::is_none")]` on `NodeStructure::contents`
+  (`core/schemas.rs:258-259`), not introduced by wave-35. Listed as a wave-36
+  candidate; **NOT changed in this wave.**
+* **Metadata-only PUT re-validates already-stored specs — no upstream-visible
+  divergence.** On a PUT with no `specs` field, `put_metadata` carries the stored
+  specs forward and still runs the FINAL count-≤20 + uniqueness check
+  (`router.rs:7328-7346`) and the validation-registry pass over them; only the
+  char-bound/normalizing `validate_writable_specs` is gated on a present `specs`
+  field (`:7324`), so the stored name/version is NOT re-normalized. This mirrors
+  upstream, whose `put_metadata` runs `validate_specs` on `entry.specs` for a
+  metadata-only PUT too (`router.py:2456-2467`). The re-validation is reachable only
+  out-of-band — stored specs were themselves validated on write — so it is an
+  observation, not a divergence.
+* **Name-only spec serializes as `{"name": N}` (omits the `version` key).** A
+  name-only `Spec` serializes without a `version` key (`version: Option<String>` +
+  `skip_serializing_if`, `core/structures.rs:91-92`), where upstream emits
+  `{"name": N, "version": null}`. Pre-existing and internally consistent — the Rust
+  client models the same `Spec`, so server↔client round-trips losslessly.
+* **Residuals carried to wave-36.**
+  - **`include_data_sources` not attached to catalog-inlined children.** The inline
+    walk resolves children through `ContainerAdapter::get` → `AnyAdapter`, which has
+    no `data_sources` accessor (the catalog populates that only in the top-level
+    `search_page` batch, keyed by node id). For in-memory trees this matches upstream
+    (`hasattr(entry, "data_sources")` false); the catalog inline path is the only
+    residual, and closing it needs a trait-level child data-sources accessor.
+  - **Inline walk uses exact `len()` where upstream uses `len_or_approx`.**
+    `build_container_structure` counts children with `container.len().await`
+    (`core.rs:765`/`:851`/`:876`); upstream uses `len_or_approx(entry, exact=...,
+    threshold=...)` (`core.py:509-511`), an approximate count above a threshold.
+    Closing this needs a `ContainerAdapter` trait extension for an approximate count.
+  - **Reference `label`/`url` bounds are byte-counted against `_CHARS`-named
+    limits.** `validate_payload` bounds `label`/`url` with `str::len()` (bytes)
+    against `MAX_REFERENCE_LABEL_CHARS = 255` / `MAX_REFERENCE_URL_CHARS = 2047`
+    (`catalog/node.rs:353`/`:360`) — the same byte-vs-char pattern `e38c156` fixed
+    for spec name/version, but on the reference fields, which are a port-side
+    extension with no upstream oracle. Flagged, unchanged.
 
 ## N/A (Python-specific or feature not in our port)
 
