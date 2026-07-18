@@ -34,6 +34,40 @@ pub struct SparseBlock {
     pub shape: Vec<usize>,
 }
 
+impl SparseBlock {
+    /// Densify this COO block into a row-major (C-order) `f64` buffer of length
+    /// `shape.iter().product()`: every non-zero is scattered to its coordinate
+    /// and all other entries stay `0.0`.
+    ///
+    /// Mirrors `SparseClient.todense` (`tiled/client/sparse.py:44`), which is
+    /// `self.read().todense()` — i.e. `sparse.COO(coords, data, shape).todense()`.
+    /// The caller owns any reshaping into an N-D array; the flat buffer here is
+    /// the C-order layout numpy produces. Coordinates are assumed in-range for
+    /// `shape` (the sparse-node contract the server upholds), matching
+    /// `sparse.COO`, which validates coords against shape on construction.
+    pub fn to_dense(&self) -> Vec<f64> {
+        let size: usize = self.shape.iter().product();
+        let mut out = vec![0.0f64; size];
+        if size == 0 {
+            return out;
+        }
+        // Row-major (C-order) strides for `shape`: the last axis is contiguous.
+        let ndim = self.shape.len();
+        let mut strides = vec![1usize; ndim];
+        for axis in (0..ndim.saturating_sub(1)).rev() {
+            strides[axis] = strides[axis + 1] * self.shape[axis + 1];
+        }
+        for (j, &value) in self.data.iter().enumerate() {
+            let mut flat = 0usize;
+            for (axis, stride) in strides.iter().enumerate() {
+                flat += (self.coords[axis][j] as usize) * stride;
+            }
+            out[flat] = value;
+        }
+        out
+    }
+}
+
 /// Client over a `sparse` node.
 #[derive(Debug, Clone)]
 pub struct SparseClient {
@@ -504,5 +538,57 @@ mod tests {
         // dim0 has 2 entries but data has 1.
         let err = encode_coo_arrow(&[vec![0i64, 1]], &[5.0]);
         assert!(matches!(err, Err(ClientError::Invalid(_))), "got {err:?}");
+    }
+
+    /// `to_dense` scatters each non-zero into a row-major buffer; a 2-D COO
+    /// densifies to the same C-order layout numpy's `sparse.COO.todense()`
+    /// yields. `(1,2)=5` sits at flat index `1*4 + 2 = 6`; `(0,3)=9` at `3`.
+    #[test]
+    fn to_dense_2d() {
+        let block = SparseBlock {
+            coords: vec![vec![1i64, 0], vec![2i64, 3]],
+            data: vec![5.0f64, 9.0],
+            shape: vec![3, 4],
+        };
+        let mut expected = vec![0.0f64; 12];
+        expected[6] = 5.0;
+        expected[3] = 9.0;
+        assert_eq!(block.to_dense(), expected);
+    }
+
+    /// A 1-D COO densifies by placing each value at its coordinate.
+    #[test]
+    fn to_dense_1d() {
+        let block = SparseBlock {
+            coords: vec![vec![0i64, 4, 7]],
+            data: vec![1.0f64, 2.0, 3.0],
+            shape: vec![10],
+        };
+        assert_eq!(
+            block.to_dense(),
+            vec![1.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 3.0, 0.0, 0.0]
+        );
+    }
+
+    /// No non-zeros → an all-zero dense buffer of the full size.
+    #[test]
+    fn to_dense_empty_is_all_zeros() {
+        let block = SparseBlock {
+            coords: vec![vec![], vec![]],
+            data: vec![],
+            shape: vec![2, 3],
+        };
+        assert_eq!(block.to_dense(), vec![0.0f64; 6]);
+    }
+
+    /// A zero-sized dimension yields an empty dense buffer without indexing.
+    #[test]
+    fn to_dense_zero_dim() {
+        let block = SparseBlock {
+            coords: vec![vec![], vec![]],
+            data: vec![],
+            shape: vec![0, 4],
+        };
+        assert!(block.to_dense().is_empty());
     }
 }
