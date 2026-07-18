@@ -1107,19 +1107,29 @@ that produced no code change. All hashes below are the merged commits.
   resolver) and `negotiate_container_full` (router.rs, the container/full resolver),
   so any comma-bearing value (`?format=csv,application/json`, or a fallback list
   `?format=badfmt,csv`) resolved to nothing and 406'd instead of serving the first
-  serviceable token. Both resolvers now split on ',', trim each token, and try them
-  in listed order through the extracted single-token owner `resolve_format_token`;
-  the first that resolves wins, `None`→406 only when every token fails, empty tokens
-  (leading/trailing/doubled comma) are skipped, and single-token behavior is
-  unchanged. `?format=` keeps hard priority over `Accept`. Tests (failing-first):
+  serviceable token. Both resolvers now split on ',' and try the tokens in listed
+  order through the extracted single-token owner `resolve_format_token`; the first
+  that resolves wins, `None`→406 only when every token fails, empty tokens
+  (leading/trailing/doubled comma) are skipped, and `?format=` keeps hard priority
+  over `Accept`. Tests (failing-first):
   `csv,application/json` → csv on xarray / json on a plain container;
   `application/json,csv` → json (order, not "csv wins"); `unknownfmt,csv` → csv;
-  `,csv` → csv (leading empty skipped); `badA,badB` → 406. **Known residual
-  (pre-existing, unchanged outcome):** a token that is an optimistic router alias
-  (e.g. `zip`) but unserviceable for the target structure does not fall through to a
-  later token — it resolves-then-fails to the same 406 as before this change. Only
-  genuinely comma-list callers gained the fall-through; the alias-token case was not
-  regressed and is not newly broken.
+  `,csv` → csv (leading empty skipped); `badA,badB` → 406.
+  **Correction (wave-34 `7dcb946`):** #129 additionally `.trim()`-ed each token,
+  documented here originally as upstream-faithful with "single-token behavior
+  unchanged" — both claims are wrong. Upstream `construct_data_response` splits on
+  comma with NO per-token strip (`core.py:381`), and the trim was itself a
+  divergence: a padded *single* token on the registry path (`?format=%20csv%20`)
+  went 406→200 under #129 where upstream still 406s the whitespace-padded value.
+  Wave-34 `7dcb946` removes the strip, restoring split-without-strip parity;
+  genuine comma-list negotiation is unaffected.
+  **Closed (wave-34 `b43743c`):** the former "known residual" — an optimistic
+  router alias (e.g. `zip`) unserviceable for the target structure resolved-then-
+  failed to a 406 instead of falling through to a later listed token — was a real
+  divergence, not an unchanged-outcome quirk: upstream's serviceability loop
+  (`core.py:400-418`) falls through to the next serviceable media type. `b43743c`
+  makes an unserviceable optimistic alias in a comma list fall through, matching
+  upstream.
 * **Type-validate PUT/PATCH specs — wire-tightening 200→422** (`ee7890a`,
   PR #131). tiled-rs PUT/PATCH took raw `Json<serde_json::Value>` specs while POST
   is typed `Vec<Spec>`, so a non-string `version` (`{"name":"x","version":5}`)
@@ -1138,6 +1148,17 @@ that produced no code change. All hashes below are the merged commits.
   (`Spec` is a stdlib frozen dataclass → `Spec(5, None)`, `structures/core.py:28-37`,
   `catalog/adapter.py:307`) and only 500s a number / array / no-`name`-key value.
   The Wave-32 spec bullet above is cross-corrected to match.
+  **Correction (wave-34 `5766859`):** the closure claim above — "no API write path
+  may store a spec element `parse_stored_list` cannot round-trip losslessly" — was
+  not fully true as of `ee7890a`. `validate_writable_specs` accepted a bare string
+  or `{name, version?}`, but an *extra-keyed* object
+  (`{"name":"x","version":"1","foo":1}`) still passed and persisted RAW, so
+  `parse_stored_list` round-tripped it lossily (the extra key silently dropped on
+  read). The invariant held for scalar shape but not for object shape. Wave-34
+  `5766859` normalizes PUT/PATCH specs by re-serializing each through the typed
+  `Spec` (name + optional version only) before storage, so what is stored is
+  exactly what `parse_stored_list` reads back — the invariant now holds by
+  construction, not just for the documented cases.
 * **Sort: pattern-422 gates before dup/sentinel-400** (`5c6b43f`, PR #130;
   refines wave-31 #122 / wave-32 #127). `parse_sort` validated each `?sort=` field
   against the `SortField` pattern and checked the dup-key 400 in ONE interleaved
@@ -1189,7 +1210,9 @@ that produced no code change. All hashes below are the merged commits.
   a port EXTENSION beyond upstream; it is simply asymmetric on POST, which drops the
   parameter. Because upstream serves no `max_depth` on either verb, dropping it on
   POST is not a divergence FROM upstream — closing the GET/POST asymmetry is optional
-  port-local polish, not required for parity.
+  port-local polish, not required for parity. **→ Landed in wave-34** (`5dcda5f`
+  forwards the validated `?max_depth=` on POST `/container/full`; see the Wave-34
+  section below).
 * **`/search` + `/metadata` `max_depth` + `structure.contents` inlining —
   unimplemented PORT-GAP, largely dormant** (wave-34 candidate). Upstream
   `construct_resource` inlines a container's children into `structure.contents` when
@@ -1198,7 +1221,130 @@ that produced no code change. All hashes below are the merged commits.
   `structure.contents`. This is observable only for nodes that opt into inlined
   contents (hdf5 / xarray / zarr group nodes); for ordinary catalog containers there
   is nothing to inline, so the gap is largely dormant. `?max_depth=` is currently
-  accepted-unvalidated-ignored. Tracked as a wave-34 candidate.
+  accepted-unvalidated-ignored. **→ Largely landed in wave-34** (#133: `4ff7bd0`
+  validates `?max_depth=`, `606fd7c` adds the `inlined_contents_enabled` capability,
+  `8bb2317` inlines `structure.contents`; see the Wave-34 section). The catalog
+  TOP-NODE metadata resource remains uninlined — a wave-35 deferral noted there.
+
+## Wave-34: container-contents inlining, `?format=` / spec-write corrections, WebSocket token deny
+
+Three sibling PRs (#133–#135), merged onto main (`5dcda5f`) — nine behavioral
+landings. #133 ports upstream's `structure.contents` inlining (closing the wave-33
+investigation gap); #134 corrects three wave-33 `?format=` / spec-write behaviors
+that the webhook-drain cross-review flagged; #135 lands the wave-34 A1 WebSocket
+fix. All hashes below are the merged commits.
+
+### #133 — `max_depth` validation + recursive `structure.contents` inlining
+
+* **Validate `?max_depth=` (`ge=0 le=DEPTH_LIMIT`)** (`4ff7bd0`). Upstream types
+  the param `Query(None, ge=0)` and caps it at `DEPTH_LIMIT` on `/metadata` and
+  `/search`; the port previously accepted it unvalidated-and-ignored (wave-33
+  investigation). Both routes now parse and bound `?max_depth=` — a negative or
+  over-limit value is a 422, matching upstream's FastAPI gate.
+* **`ContainerAdapter::inlined_contents_enabled` capability** (`606fd7c`).
+  Upstream inlines contents only for nodes whose adapter opts in (gate at
+  `core.py:513`). A spec-based capability on `ContainerAdapter`
+  (`core/adapters.rs:640`/`:743`) reproduces the opt-in, so ordinary catalog
+  containers (which must not inline) stay flat while hdf5 / xarray / zarr group
+  nodes can.
+* **Recursive `structure.contents` inlining** (`8bb2317`). Under the `max_depth`
+  + capability gate (`core.py:513-516`; port `construct_resource`,
+  `core.rs:482`/gate `:556`), a container's children are inlined into
+  `structure.contents` recursively, bounded by `INLINED_CONTENTS_LIMIT = 500`
+  nodes (upstream's cap). Metadata and search responses now carry inlined
+  contents where upstream does.
+* **Forward `?max_depth=` on POST `/container/full`** (`5dcda5f`). The wave-33
+  investigation noted POST dropped `max_depth` where the port's GET extension
+  honored it. POST now forwards the validated `max_depth`, closing the GET/POST
+  asymmetry. *Amend note:* the POST==GET equivalence tests compared whole zip
+  archives byte-for-byte and were flaky — the DOS mod-time bytes differ between
+  two separately-stamped archives. Amended to compare zip-entry structure
+  (member names + payloads) instead of raw archive bytes; test-only, no
+  behavioral change.
+
+### #134 — wave-33 `?format=` / spec-write corrections
+
+* **Stop stripping `?format=` tokens** (`7dcb946`). See the wave-33 #129
+  correction above: #129's per-token `.trim()` diverged from upstream's
+  strip-free `format.split(",")` (`core.py:381`) and flipped padded single-token
+  outcomes 406→200 on the registry path. `7dcb946` removes the strip; comma-list
+  negotiation is unaffected.
+* **Comma-list serviceability fall-through** (`b43743c`). See the wave-33 #129
+  residual, now closed: an optimistic router alias (e.g. `zip`) unserviceable for
+  the target structure no longer 406s the whole request — an unserviceable alias
+  in a comma list falls through to the next serviceable listed token, matching
+  upstream's serviceability loop (`core.py:400-418`).
+* **Normalize PUT/PATCH specs via typed re-serialization** (`5766859`). See the
+  wave-33 #131 correction above: `validate_writable_specs` accepted an
+  extra-keyed spec object and persisted it raw, so `parse_stored_list`
+  round-tripped it lossily. Specs are now re-serialized through the typed `Spec`
+  (name + optional version) before storage, so stored == read-back and the
+  wave-33 invariant holds by construction.
+* **Bound spec `version` length to 255 on write** (`7b1f49a`). Upstream
+  constrains a spec version to `max_length=255` (`structures/core.py:29-30`).
+  PUT/PATCH now reject a longer version at write, matching upstream's typed
+  bound.
+
+### #135 — WebSocket invalid-token deny
+
+* **Deny WS on an invalid `?access_token=` instead of downgrading** (`4f9daff`,
+  the wave-34 A1 fix). A presented-but-invalid `?access_token=` query JWT fell
+  through to the first-message handshake — on an `allow_anonymous_access` server
+  that silently admitted the connection as anonymous (`PUBLIC_SCOPES`, both read
+  scopes → array-schema served); auth-required, it blocked ~10s in the
+  first-message wait. Upstream decodes the query token during WS dependency
+  resolution and raises 401 there — expiry → "Access token has expired. Refresh
+  token." (`get_decoded_access_token_websocket`, `authentication.py:297-311`),
+  any other JWT error → `decode_token`'s `credentials_exception` (`:153-177`) —
+  before the anonymous / first-message path is reachable. The port now resolves
+  the query token and the handshake through one `Result`: a present-but-invalid
+  token funnels to the same `Err`→text-frame+close deny path a handshake failure
+  uses (removing the `query_ctx = None` dual meaning that conflated "no token"
+  with "invalid token"); an absent/empty token still falls through to the
+  handshake, a valid token still authenticates. Tests: anonymous-ON invalid token
+  denies (not the array-schema); anonymous-OFF invalid token denies immediately
+  (no 10s window); the valid `?access_token=` and first-message paths unchanged.
+
+### Wave-34 documented deviations + investigations
+
+* **WS accepts `Authorization: Bearer` — deliberate superset, NOT upstream
+  parity** (surfaced by the #135 review). Upstream's WS connect-time
+  `get_api_key_websocket` (`authentication.py:283-294`) 400s *any* non-`Apikey`
+  Authorization scheme, so upstream admits a JWT to a WebSocket only via the
+  `?access_token=` query, never a `Bearer` header. The port additionally accepts
+  a `Bearer` (and `Apikey`) header on the WS upgrade (`app.rs`
+  `resolve_header_auth` → `resolve_auth_inner`), because the Rust client sends its
+  WS credential as an `Authorization` header (`client/stream.rs`). This is an
+  internally-consistent superset — the credential is legitimate, no privilege is
+  gained, and a browser still uses `?access_token=` in both — not a break.
+  **Precedence edge:** with an *invalid* `Apikey` header AND a *valid*
+  `?access_token=` query, upstream lets the unvalidated header shadow the query
+  (its `api_key` branch runs first in `get_current_scopes_websocket`, `:449-455`)
+  and denies; the port drops the rejected header (`resolve_header_auth` returns
+  `None`) and falls through to the valid query token, authenticating. Documented
+  as a known, low-impact deviation.
+* **`assets.size` absent end-to-end — pre-existing, tracked** (surfaced by the
+  #1429 / #1424 sweep re-verification). Upstream carries an asset byte-size:
+  an `assets.size` `BigInteger` column (`orm.py`) and `Asset.size: Optional[int]
+  = None` on the wire (`schemas.py:122-125`). The port has NEITHER — no `size`
+  column in `src/catalog/migrations/{sqlite,postgres}/0001_initial.sql` and no
+  `size` field on `core::data_source::Asset` (`src/core/data_source.rs`). Impact
+  is low: the field is `Optional` upstream, so a Python ≥0.2.13 client reading a
+  port response deserializes `size` to its `None` default rather than erroring,
+  and the Rust client models no `size` either (internally consistent). This
+  predates the `da03df0f` upstream delta (the feature is older than #1424 /
+  #1429, which only fix / back-compat it), so it is a pre-existing structural
+  gap, not a delta PORT-GAP. Noted as tracked.
+* **Catalog top-node metadata inlining — deferred (wave-35 candidate).** #133
+  inlines `structure.contents` on the search path and for adapter children, but
+  the catalog TOP-NODE metadata resource (`catalog_metadata_resource`,
+  `router.rs:8185`) has a count-only fast path for the empty-segments root
+  (`router.rs:8196`) that builds the `Resource` directly with `contents: None`,
+  bypassing `construct_resource`. So a top-level container's own
+  `structure.contents` is not inlined even when `max_depth` and the capability
+  would permit. The search path covers catalog children, so this is narrow;
+  routing the top-node metadata response through the inlining builder is deferred
+  to wave-35.
 
 ## N/A (Python-specific or feature not in our port)
 
@@ -1263,9 +1409,17 @@ N/A batch (17), each with the structural reason it does not apply:
 * **Structurally absent in this port (6):**
   * **#1434** — guards the `array-ref` streaming-cache update in
     `put_data_source` against non-array nodes (upstream `KeyError: 'shape'`).
-    tiled-rs emits a shape-free bus `DataAppended { partition: None }`
-    uniformly across all structure families (`router.rs:6335`) and has no
-    redis `streaming_cache` (#1192, N/A) — the bug cannot be constructed.
+    **N/A verdict stands, but the prior reasoning here was wrong** (wave-34 B1
+    correction): the port is NOT shape-free and DOES have a streaming cache.
+    `router.rs:6335` is asset-mapping, not an emission site, and the port emits a
+    shape-CARRYING `array-ref` event via `StreamEvent::array_ref`
+    (`streaming_cache.rs:150`, `"shape": shape`) through `state.streaming_cache`
+    (an in-process cache; the redis backend is a separate off-by-default feature).
+    The real reason #1434 cannot occur here: the sole `array_ref` emission is
+    double-gated to arrays — `if updated.structure_family == "array" && let
+    Some(shape) = array_shape` (`router.rs:7999-8002`, via `stream_array_ref`
+    `:1889`) — so a non-array data source never builds the shape-carrying event
+    and the upstream `KeyError: 'shape'` is unconstructable.
   * **#1429** — widens `assets.size` int32→int64 (PostgreSQL overflow on
     files >2.1 GB). tiled-rs's `assets` table has no `size` column at all
     (`migrations/{sqlite,postgres}/0001_initial.sql`), so the overflow can't
