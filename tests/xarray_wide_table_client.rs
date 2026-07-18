@@ -588,3 +588,28 @@ async fn wide_table_arrow_rejects_extended_dtypes() {
         "arrow-wire export must reject int16/bool (client decoder cap)"
     );
 }
+
+/// Finding 6: an unknown `?field=` on the wide table returns 400 "No such field
+/// {key}.", matching the sibling projection path and upstream
+/// router.py:1444-1449 (not the previous NotFound).
+#[tokio::test]
+async fn wide_table_unknown_field_is_400() {
+    let base = spawn(root_with(vec![("weather", weather())])).await;
+    let resp = reqwest::Client::new()
+        .get(format!(
+            "{base}/api/v1/container/full/weather?format=csv&field=bogus"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        400,
+        "unknown field must be a 400 bad request"
+    );
+    let text = String::from_utf8_lossy(&resp.bytes().await.unwrap()).into_owned();
+    assert!(
+        text.contains("No such field bogus."),
+        "body must carry the upstream message: {text}"
+    );
+}
