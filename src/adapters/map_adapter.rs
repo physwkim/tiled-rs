@@ -337,10 +337,17 @@ fn compare_json(
 /// `None` (the key is absent from a child's metadata) is greatest, so missing
 /// keys sort last in ascending order — the Rust analog of Python's `_HIGH_SORTER`
 /// sentinel (adapters/mapping.py:851). Present values order by JSON type rank
-/// then by value; unorderable or heterogeneous types (null / array / object, or
-/// a number-vs-string pair) compare as their type rank and otherwise Equal, so a
-/// stable sort leaves them in input order rather than panicking (Python raises
-/// `TypeError` on such a mix — an error path no real sorted listing hits).
+/// then by value.
+///
+/// Bool and Number share one rank and compare numerically (`false` → 0.0,
+/// `true` → 1.0), matching Python where `bool` is a subclass of `int` — so a
+/// key mixing bools and numbers interleaves (`sorted([True, 0, 2])` → `[0,
+/// True, 2]`, mapping.py:365) rather than grouping all bools before all
+/// numbers. Genuinely-unorderable or heterogeneous types (null / array /
+/// object, or a number-vs-string pair) compare as their type rank and otherwise
+/// Equal, so a stable sort leaves them in input order rather than panicking
+/// (Python raises `TypeError` on such a mix — an error path no real sorted
+/// listing hits).
 fn json_sort_cmp(
     a: Option<&serde_json::Value>,
     b: Option<&serde_json::Value>,
@@ -350,12 +357,22 @@ fn json_sort_cmp(
     fn rank(v: Option<&Value>) -> u8 {
         match v {
             Some(Value::Null) => 0,
-            Some(Value::Bool(_)) => 1,
-            Some(Value::Number(_)) => 2,
-            Some(Value::String(_)) => 3,
-            Some(Value::Array(_)) => 4,
-            Some(Value::Object(_)) => 5,
-            None => 6, // _HIGH_SORTER: an absent key sorts last (ascending).
+            // Bool and Number share a rank so they interleave numerically,
+            // like Python's `bool`-as-`int`.
+            Some(Value::Bool(_) | Value::Number(_)) => 1,
+            Some(Value::String(_)) => 2,
+            Some(Value::Array(_)) => 3,
+            Some(Value::Object(_)) => 4,
+            None => 5, // _HIGH_SORTER: an absent key sorts last (ascending).
+        }
+    }
+    // Numeric key for the shared Bool/Number rank: `false`/`true` → 0.0/1.0,
+    // number → its f64 widening (same widening `compare_json` uses above).
+    fn numeric_key(v: &Value) -> Option<f64> {
+        match v {
+            Value::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
+            Value::Number(n) => n.as_f64(),
+            _ => None,
         }
     }
     let (ra, rb) = (rank(a), rank(b));
@@ -363,13 +380,13 @@ fn json_sort_cmp(
         return ra.cmp(&rb);
     }
     match (a, b) {
-        (Some(Value::Bool(x)), Some(Value::Bool(y))) => x.cmp(y),
-        // Compare numbers as f64 (same widening `compare_json` uses above).
-        (Some(Value::Number(x)), Some(Value::Number(y))) => x
-            .as_f64()
-            .partial_cmp(&y.as_f64())
-            .unwrap_or(Ordering::Equal),
-        (Some(Value::String(x)), Some(Value::String(y))) => x.cmp(y),
+        (Some(x), Some(y)) => match (numeric_key(x), numeric_key(y)) {
+            (Some(nx), Some(ny)) => nx.partial_cmp(&ny).unwrap_or(Ordering::Equal),
+            _ => match (x, y) {
+                (Value::String(sx), Value::String(sy)) => sx.cmp(sy),
+                _ => Ordering::Equal,
+            },
+        },
         _ => Ordering::Equal,
     }
 }
@@ -698,6 +715,25 @@ mod tests {
         let keys = vec!["a".into(), "b".into(), "c".into(), "d".into()];
         let out = map.sort_matched_keys(keys, &[term("n", SortDirection::Ascending)]);
         assert_eq!(out, vec!["c", "d", "a", "b"]);
+    }
+
+    #[test]
+    fn sort_bool_interleaves_with_numbers_like_python() {
+        // Python treats bool as a subclass of int (`False == 0`, `True == 1`),
+        // so `sorted` interleaves bools numerically with numbers instead of
+        // grouping every bool before every number (adapters/mapping.py:365 via
+        // the built-in `sorted`). Pre-fix, Rust ranked Bool (1) below Number
+        // (2), so this returned [f, t, half, two] — all bools first.
+        let map = map_of(&[
+            ("two", serde_json::json!({"n": 2})),
+            ("f", serde_json::json!({"n": false})), // → 0.0
+            ("t", serde_json::json!({"n": true})),  // → 1.0
+            ("half", serde_json::json!({"n": 0.5})),
+        ]);
+        let keys = vec!["two".into(), "f".into(), "t".into(), "half".into()];
+        let out = map.sort_matched_keys(keys, &[term("n", SortDirection::Ascending)]);
+        // Numeric order: false(0) < 0.5 < true(1) < 2.
+        assert_eq!(out, vec!["f", "half", "t", "two"]);
     }
 
     #[test]
