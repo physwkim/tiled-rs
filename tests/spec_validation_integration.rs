@@ -676,8 +676,11 @@ async fn get_metadata_normalizes_persisted_bare_string_spec() {
     let (app, _dir) = build_app(validation_config(false)).await;
 
     // Seed a no-spec node, then PATCH a BARE-STRING spec. With reject off the
-    // undeclared spec is accepted and the merge-patch stores the raw
-    // `["mystery"]` array verbatim (a bare string, the shape that broke read).
+    // undeclared spec is accepted; wave-34 (F2) NORMALIZES it to `{name}` at
+    // write, and the read path (`Spec::parse_stored_list`) likewise normalizes a
+    // genuine out-of-band bare-string row — either way a bare string reads back
+    // as an object and never collapses the list (the read-side guard for raw
+    // bare-string rows is pinned by the `parse_stored_list` unit tests).
     let (status, _) = json_request(
         &app,
         Method::POST,
@@ -1196,5 +1199,86 @@ async fn conformant_version_round_trips_and_distinct_agrees() {
     assert_eq!(
         distinct_value, metadata_specs,
         "distinct facet and parsed metadata read must agree for API-written data: {dist}"
+    );
+}
+
+/// Wave-34 (F2) — a PUT spec object carrying EXTRA keys beyond `{name, version}`
+/// must be NORMALIZED at write, not stored verbatim. Before the fix
+/// `validate_writable_specs` only type-checked `name`/`version` and the raw JSON
+/// (including `foo`) was persisted, so `GET /metadata` (parsed through
+/// `Spec::parse_stored_list`, which drops `foo`) and `GET /distinct?specs=true`
+/// (raw column) disagreed — the exact cross-endpoint inconsistency #131 set out
+/// to close, still reachable via extra keys. Upstream types the body as
+/// `List[Spec]` (name/version only), so extra keys are never persisted. The
+/// write still 200s; the stored value round-trips losslessly through
+/// `parse_stored_list` by construction.
+#[tokio::test]
+async fn put_extra_key_spec_is_normalized_and_distinct_agrees() {
+    let (app, _dir) = build_app(validation_config(false)).await;
+
+    let (status, _) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/metadata/",
+        serde_json::json!({
+            "key": "xk",
+            "structure_family": "container",
+            "metadata": {},
+            "specs": [],
+            "data_sources": [],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // PUT a spec object with an extra `foo` key alongside a conformant
+    // name/version. The write is accepted (200) — extra keys are dropped, not
+    // rejected — matching upstream's `List[Spec]` parse.
+    let (status, body) = json_request(
+        &app,
+        Method::PUT,
+        "/api/v1/metadata/xk",
+        serde_json::json!({
+            "metadata": {},
+            "specs": [{"name": "x", "version": "1", "foo": "bar"}],
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "extra-key spec must still 200: {body}"
+    );
+
+    // Parsed metadata read: normalized to {name, version}, no `foo`.
+    let (status, meta) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/metadata/xk",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "read back: {meta}");
+    let metadata_specs = meta["data"]["attributes"]["specs"].clone();
+    assert_eq!(
+        metadata_specs,
+        serde_json::json!([{"name": "x", "version": "1"}]),
+        "extra keys must be normalized away on the metadata read: {meta}"
+    );
+
+    // Raw `distinct` facet must carry the SAME normalized value (no `foo`).
+    let (status, dist) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/distinct/?specs=true",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "distinct: {dist}");
+    let distinct_value = dist["specs"][0]["value"].clone();
+    assert_eq!(
+        distinct_value, metadata_specs,
+        "distinct facet and parsed metadata read must agree — extra keys must not \
+         leak into the raw stored specs: {dist}"
     );
 }

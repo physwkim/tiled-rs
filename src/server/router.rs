@@ -7045,7 +7045,7 @@ pub async fn patch_metadata(
     } else {
         node.specs.clone()
     };
-    let (metadata, specs) = match mode {
+    let (metadata, mut specs) = match mode {
         PatchMode::JsonPatch => {
             // RFC 6902 ops applied DIRECTLY to each document — `metadata` ops
             // target the metadata doc, `specs` ops target the specs array.
@@ -7082,9 +7082,11 @@ pub async fn patch_metadata(
     // node's stored specs untouched and is never re-validated (upstream type-
     // checks `body.specs` and trusts `entry.specs`). Mirrors the typed
     // `PatchMetadataRequest.specs` request body (merge-patch `Specs`; json-patch
-    // op `value: Spec`, schemas.py:557/575).
+    // op `value: Spec`, schemas.py:557/575). The normalized (extra-keys-dropped)
+    // array REPLACES `specs` so the stored value round-trips losslessly and
+    // metadata/distinct reads agree.
     if req.get("specs").is_some_and(|v| !v.is_null()) {
-        validate_writable_specs(&specs)?;
+        specs = validate_writable_specs(&specs)?;
     }
 
     // Limits that bypass register-time schema validation when reached via
@@ -7269,7 +7271,7 @@ pub async fn put_metadata(
         Some(v) if !v.is_null() => v.clone(),
         _ => node.metadata.clone(),
     };
-    let specs = match req.get("specs") {
+    let mut specs = match req.get("specs") {
         Some(v) if !v.is_null() => v.clone(),
         _ if node.specs.is_null() => serde_json::Value::Array(Vec::new()),
         _ => node.specs.clone(),
@@ -7280,8 +7282,10 @@ pub async fn put_metadata(
     // present, non-null `specs` field so a metadata-only PUT never re-validates
     // the node's untouched stored specs. Mirrors the typed
     // `PutMetadataRequest.specs: Optional[Specs]` request body (schemas.py:528).
+    // The normalized (extra-keys-dropped) array REPLACES `specs` so the stored
+    // value round-trips losslessly and metadata/distinct reads agree.
     if req.get("specs").is_some_and(|v| !v.is_null()) {
-        validate_writable_specs(&specs)?;
+        specs = validate_writable_specs(&specs)?;
     }
 
     // Validate the FINAL specs (count ≤ 20, uniqueness) before writing — the
@@ -8617,51 +8621,69 @@ fn specs_for_validation(specs: &serde_json::Value) -> Vec<crate::core::structure
     crate::core::structures::Spec::parse_stored_list(specs)
 }
 
-/// Reject a metadata write that would persist a spec element
+/// Validate AND NORMALIZE the specs a metadata write would persist so that the
+/// stored array round-trips losslessly through
 /// [`Spec::parse_stored_list`](crate::core::structures::Spec::parse_stored_list)
-/// cannot round-trip losslessly — the structural guarantee behind that parser's
-/// "no API write path can store a non-string `version`" premise. Mirrors
-/// upstream's typed request bodies, where the PUT and merge-patch specs are
-/// `Specs` = `List[Spec]` (`server/schemas.py:119`/`:528`/`:575`) and every
-/// json-patch op `value` is a `Spec` (`JSONPatchSpec`, `schemas.py:557`): an
-/// element whose `name` is non-string, or whose `version` is present but neither
-/// `null` nor a string, is rejected with 422 — exactly as the POST path already
-/// rejects it through the typed `PostMetadataRequest.specs: Vec<Spec>`
-/// (`src/core/schemas.rs:300`).
+/// BY CONSTRUCTION — the structural guarantee behind that parser's "no API write
+/// path can store a non-string `version`" premise. Returns the re-serialized
+/// `[{name, version?}]` array to store in place of the raw request value.
 ///
-/// A bare string, and a `{name, version?}` object with a string name and a
-/// string/absent/`null` version, round-trip losslessly and are accepted (the
-/// bare-string form is tiled-rs read-back back-compat, `parse_stored_list`
-/// arm 1). The caller applies this only to the specs a write actually MODIFIES,
-/// so a metadata-only update never re-validates a node's untouched stored specs
-/// — matching upstream, which type-checks `body.specs` and trusts `entry.specs`.
-fn validate_writable_specs(specs: &serde_json::Value) -> Result<(), ServerError> {
+/// Each element is parsed into the typed `Spec` (name + optional string version)
+/// and the RESULT is re-serialized, exactly as the POST/register path does with
+/// its typed `PostMetadataRequest.specs: Vec<Spec>` (`src/core/schemas.rs:300`,
+/// re-serialized at the create site). This drops EXTRA object keys (e.g. a
+/// `{name, version, foo}` write) that `parse_stored_list` would silently discard
+/// on read — without normalization the raw JSON (with `foo`) was persisted, so
+/// `GET /metadata` (parsed) and `GET /distinct?specs=true` (raw column)
+/// disagreed. Mirrors upstream, whose typed `Specs` = `List[Spec]` request body
+/// (`server/schemas.py:119`/`:528`/`:575`, and each json-patch op `value: Spec`,
+/// `:557`) yields `Spec` instances carrying only name/version — extra keys are
+/// never persisted, and a non-string `name`/`version` is a 422.
+///
+/// A bare string is accepted and normalized to a name-only object (tiled-rs
+/// read-back back-compat, `parse_stored_list` arm 1). A non-string `name`, a
+/// present non-string/non-null `version`, or a non-string/non-object element is
+/// rejected with 422. The caller applies this only to the specs a write actually
+/// MODIFIES, so a metadata-only update never re-validates or re-normalizes a
+/// node's untouched stored specs — matching upstream, which type-checks
+/// `body.specs` and trusts `entry.specs`.
+fn validate_writable_specs(specs: &serde_json::Value) -> Result<serde_json::Value, ServerError> {
     let Some(arr) = specs.as_array() else {
         return Err(ServerError::Validation(
             "specs must be a JSON array of string names or {name, version?} objects".into(),
         ));
     };
+    let mut normalized: Vec<crate::core::structures::Spec> = Vec::with_capacity(arr.len());
     for el in arr {
-        let lossless = if el.is_string() {
-            true
-        } else if let Some(obj) = el.as_object() {
-            let name_ok = obj.get("name").is_some_and(serde_json::Value::is_string);
-            let version_ok = match obj.get("version") {
-                None => true,
-                Some(v) => v.is_null() || v.is_string(),
-            };
-            name_ok && version_ok
+        let spec = if let Some(name) = el.as_str() {
+            // Bare string → name-only Spec (back-compat, `parse_stored_list` arm 1).
+            crate::core::structures::Spec::new(name)
+        } else if el.is_object() {
+            // Strict typed parse: name:String + optional string/null version,
+            // EXTRA KEYS DROPPED. A non-string name or a non-string/non-null
+            // version fails here → 422.
+            serde_json::from_value::<crate::core::structures::Spec>(el.clone()).map_err(|_| {
+                ServerError::Validation(format!(
+                    "invalid spec {el}: each spec must be a string name or a {{name, version?}} \
+                     object with a string name and a string or null version"
+                ))
+            })?
         } else {
-            false
-        };
-        if !lossless {
             return Err(ServerError::Validation(format!(
-                "invalid spec {el}: each spec must be a string name or a {{name, version?}} \
-                 object with a string name and a string or null version"
+                "invalid spec {el}: each spec must be a string name or a {{name, version?}} object"
             )));
-        }
+        };
+        normalized.push(spec);
     }
-    Ok(())
+    // The stored form is now `[{name, version?}]` — lossless through
+    // `parse_stored_list`, and identical whether read via metadata (parsed) or
+    // distinct (raw).
+    Ok(serde_json::Value::Array(
+        normalized
+            .iter()
+            .map(|s| serde_json::to_value(s).unwrap_or_default())
+            .collect(),
+    ))
 }
 
 /// RFC 7396 merge-patch: recursively merge `patch` into `target`. A
