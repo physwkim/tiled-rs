@@ -569,7 +569,7 @@ pub enum ApiKeyCommand {
         /// Optional note describing the key (visible in `api-key list`).
         #[arg(long)]
         note: Option<String>,
-        /// Repeat to grant a scope. Default: full scope set.
+        /// Repeat to grant a scope. Default: inherit the principal's scopes.
         #[arg(long = "scope")]
         scopes: Vec<String>,
         /// Restrict the key to specific access tags (repeatable). Mirrors
@@ -703,7 +703,7 @@ pub enum AdminApiKeyCommand {
         /// Optional note describing the key.
         #[arg(long)]
         note: Option<String>,
-        /// Repeat to grant a scope. Default: full scope set.
+        /// Repeat to grant a scope. Default: inherit the principal's scopes.
         #[arg(long = "scope")]
         scopes: Vec<String>,
         /// Restrict the key to specific access tags (repeatable). Mirrors
@@ -2647,8 +2647,23 @@ async fn create_and_print_api_key(
     access_tags: &[String],
     expires_in: Option<i64>,
 ) -> Result<()> {
+    // The key's scope ceiling is the *target* principal's role scopes ∪
+    // {inherit}, mirroring upstream `generate_apikey`
+    // (authentication.py:1177-1187) and the server route
+    // (`auth_router.rs` `api_key_create`). Fetch the principal so an empty
+    // `--scope` can default to `inherit` (resolved to the principal's current
+    // role scopes at access time) and so an explicit set can be clamped — never
+    // full(), which silently over-granted every scope regardless of role.
+    let principal = db
+        .get_principal(principal_id)
+        .await
+        .map_err(|e| anyhow::anyhow!("lookup principal: {e}"))?
+        .ok_or_else(|| anyhow::anyhow!("principal id {principal_id} not found"))?;
+    let principal_scopes = crate::auth::ScopeSet::for_role(&principal.role);
     let scope_set = if scopes.is_empty() {
-        crate::auth::ScopeSet::full()
+        // Upstream parity: an unspecified `--scope` means `["inherit"]`, which
+        // resolves at access time to the principal's *current* role scopes.
+        crate::auth::ScopeSet::from_iter([crate::auth::Scope::Inherit])
     } else {
         let mut set = crate::auth::ScopeSet::default();
         for s in scopes {
@@ -2658,6 +2673,22 @@ async fn create_and_print_api_key(
         }
         set
     };
+    // Reject an explicit scope set that exceeds the principal's ceiling rather
+    // than silently minting a key more privileged than its owner (upstream
+    // raises HTTP 403 here, authentication.py:1180-1187). `inherit` is always
+    // permitted; the default-inherit path above trivially satisfies this.
+    let mut allowed = principal_scopes.clone();
+    allowed.insert(crate::auth::Scope::Inherit);
+    if !scope_set.is_subset(&allowed) {
+        return Err(anyhow::anyhow!(
+            "Requested scopes {:?} must be a subset of the principal's scopes {:?}.",
+            scopes,
+            principal_scopes
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+        ));
+    }
     // Repeatable `--access-tags`: none given ⟹ `None` (no restriction);
     // ≥1 given ⟹ `Some(tags)`. `Some(vec![])` (deny-all-tagged) is only
     // reachable via the REST API, never the CLI (you cannot pass zero values to
@@ -3586,9 +3617,11 @@ mod tests {
     }
 
     // Empty `--access-tags` and empty `--scope` ⟹ no tag restriction (None) and
-    // the full scope set. This is the boundary that maps CLI-absence to the
-    // `None` / `full()` defaults, distinct from `Some(vec![])` (deny-all-tagged,
-    // reachable only via REST).
+    // the `inherit` scope (resolved to the principal's role scopes at access
+    // time). This is the boundary that maps CLI-absence to the `None` /
+    // `["inherit"]` defaults, distinct from `Some(vec![])` (deny-all-tagged,
+    // reachable only via REST) and from the old `full()` default that silently
+    // over-granted every scope regardless of role.
     #[tokio::test]
     async fn create_and_print_api_key_no_tags_is_unrestricted() {
         let db = crate::auth::AuthDb::connect("sqlite::memory:")
@@ -3609,15 +3642,15 @@ mod tests {
         );
         assert_eq!(
             keys[0].scopes,
-            crate::auth::ScopeSet::full(),
-            "omitted --scope ⟹ full scope set"
+            crate::auth::ScopeSet::from_iter([crate::auth::Scope::Inherit]),
+            "omitted --scope ⟹ the `inherit` scope, not full()"
         );
     }
 
     // The tag-restriction guard lives at the DB INSERT owner; the helper must
-    // surface it as an error rather than swallow it. Empty scopes ⟹ full
-    // (includes `admin:apikeys`), which cannot combine with a tag restriction,
-    // so this create must fail and persist nothing.
+    // surface it as an error rather than swallow it. Empty scopes ⟹ `inherit`,
+    // which (like `admin:apikeys`) cannot combine with a tag restriction, so
+    // this create must fail and persist nothing.
     #[tokio::test]
     async fn create_and_print_api_key_rejects_tags_with_broad_scopes() {
         let db = crate::auth::AuthDb::connect("sqlite::memory:")
@@ -3628,12 +3661,102 @@ mod tests {
 
         create_and_print_api_key(&db, p.id, None, &[], &["team-a".to_string()], None)
             .await
-            .expect_err("access tags + full (broad) scopes must be rejected");
+            .expect_err("access tags + the `inherit` default scope must be rejected");
 
         let keys = db.list_api_keys(Some(p.id)).await.expect("list");
         assert!(
             keys.is_empty(),
             "the rejected create must not persist a key"
+        );
+    }
+
+    // Finding 1 (w30): an explicit `--scope` set is clamped to the principal's
+    // role ceiling ∪ {inherit}. A `user`-role principal cannot mint an `admin`
+    // key for itself; the helper rejects it (upstream 403,
+    // authentication.py:1180-1187) and persists nothing.
+    #[tokio::test]
+    async fn create_and_print_api_key_rejects_scope_above_principal_ceiling() {
+        let db = crate::auth::AuthDb::connect("sqlite::memory:")
+            .await
+            .expect("in-memory auth db");
+        db.migrate().await.expect("auth migrate");
+        // Default role is `user` (migration 0002 default), whose ceiling
+        // excludes `admin` / webhook / principal-management scopes.
+        let p = db.create_principal("user").await.expect("principal");
+
+        let err = create_and_print_api_key(&db, p.id, None, &["admin".to_string()], &[], None)
+            .await
+            .expect_err("--scope admin for a user-role principal must be rejected");
+        assert!(
+            err.to_string()
+                .contains("must be a subset of the principal's scopes"),
+            "unexpected error: {err}"
+        );
+
+        let keys = db.list_api_keys(Some(p.id)).await.expect("list");
+        assert!(
+            keys.is_empty(),
+            "the rejected create must not persist a key"
+        );
+    }
+
+    // Finding 1 (w30): an explicit `--scope` set that is within the principal's
+    // role ceiling is accepted and persisted verbatim (no inherit, no clamp
+    // that drops requested-and-allowed scopes).
+    #[tokio::test]
+    async fn create_and_print_api_key_accepts_scope_subset() {
+        let db = crate::auth::AuthDb::connect("sqlite::memory:")
+            .await
+            .expect("in-memory auth db");
+        db.migrate().await.expect("auth migrate");
+        let p = db.create_principal("user").await.expect("principal");
+
+        create_and_print_api_key(
+            &db,
+            p.id,
+            None,
+            &["read:data".to_string(), "read:metadata".to_string()],
+            &[],
+            None,
+        )
+        .await
+        .expect("a subset of the principal's scopes must be accepted");
+
+        let keys = db.list_api_keys(Some(p.id)).await.expect("list");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(
+            keys[0].scopes,
+            crate::auth::ScopeSet::from_iter([
+                crate::auth::Scope::ReadData,
+                crate::auth::Scope::ReadMetadata,
+            ]),
+            "an in-ceiling --scope set persists verbatim"
+        );
+    }
+
+    // Finding 1 (w30): an `admin`-role principal CAN be granted `admin` — the
+    // ceiling is derived from the principal's role, not hardcoded. Proves the
+    // subset gate does not over-reject.
+    #[tokio::test]
+    async fn create_and_print_api_key_admin_principal_may_get_admin_scope() {
+        let db = crate::auth::AuthDb::connect("sqlite::memory:")
+            .await
+            .expect("in-memory auth db");
+        db.migrate().await.expect("auth migrate");
+        let p = db.create_principal("user").await.expect("principal");
+        db.update_principal_role(p.id, "admin")
+            .await
+            .expect("promote to admin");
+
+        create_and_print_api_key(&db, p.id, None, &["admin".to_string()], &[], None)
+            .await
+            .expect("an admin-role principal may mint an admin-scoped key");
+
+        let keys = db.list_api_keys(Some(p.id)).await.expect("list");
+        assert_eq!(keys.len(), 1);
+        assert!(
+            keys[0].scopes.contains(crate::auth::Scope::Admin),
+            "the admin scope is present (canonicalized to full)"
         );
     }
 
