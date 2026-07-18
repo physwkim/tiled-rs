@@ -253,9 +253,20 @@ pub struct AboutAuthentication {
 // ---------------------------------------------------------------------------
 
 /// Wire-format structure for containers in API responses.
+///
+/// `contents` is serialized ALWAYS, as an explicit JSON `null` when the
+/// children are not inlined — never skipped. Upstream's pydantic `NodeStructure`
+/// dumps `Optional` fields as explicit `null` (`NodeStructure(contents=None)` →
+/// `{"contents": null, "count": N}`), and the port's own inlining owner
+/// ([`crate::server::core::build_container_structure`]) already emits that shape
+/// via a `json!`. Omitting the key on the count-only paths diverged from both;
+/// `skip_serializing_if` is deliberately absent so every container structure
+/// carries the key uniformly. This struct is container-only (leaves serialize
+/// their data-source structure instead), so the always-present key never leaks
+/// onto non-container families. It is never deserialized from a payload that
+/// could omit `contents`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeStructure {
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub contents: Option<serde_json::Value>,
     pub count: usize,
 }
