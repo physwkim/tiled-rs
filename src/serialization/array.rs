@@ -100,9 +100,14 @@ fn py_float_repr<T: std::fmt::Display + std::fmt::LowerExp>(v: T) -> String {
     let display = v.to_string();
     // Non-finite: Display yields "NaN"/"inf"/"-inf" (letters); a finite float's
     // Display is only `[-.0-9]`. LowerExp of a non-finite value has no 'e' to
-    // split on, so handle it here and pass the Display text through unchanged.
+    // split on, so handle it here. numpy `str` renders NaN lowercase (`nan`),
+    // collapsing the sign bit; inf/-inf already match Display verbatim.
     if display.bytes().any(|b| b.is_ascii_alphabetic()) {
-        return display;
+        return if display == "NaN" {
+            "nan".to_string()
+        } else {
+            display
+        };
     }
     // Finite: `{:e}` is "<mantissa>e<exponent>"; the mantissa is the shortest
     // round-trip digits, the exponent is the decimal exponent E.
@@ -870,6 +875,44 @@ mod tests {
         // still explicit and >= 2 digits.
         assert_eq!(cell_f64(-6.022e23), "-6.022e+23");
         assert_eq!(cell_f32(-6.022e23f32), "-6.022e+23");
+    }
+
+    /// Finding 2: `str(np.float64(np.nan))` is lowercase `nan` (numpy
+    /// `savetxt(fmt="%s")`, array.py:41-46), but Rust `Display` emits `NaN`.
+    /// inf/-inf already agree (`str(np.float64(np.inf))` == `inf`,
+    /// `str(np.float64(-np.inf))` == `-inf`), so only NaN must be lowercased.
+    /// Applies to both f64 and f32.
+    #[test]
+    fn csv_float_nan_inf_match_numpy_str() {
+        let ser = csv_serializer();
+        let cell_f64 = |v: f64| -> String {
+            let out = ser(
+                &v.to_le_bytes(),
+                &serde_json::json!({"itemsize": 8, "kind": "f", "shape": [1]}),
+            )
+            .unwrap();
+            String::from_utf8(out.to_vec()).unwrap()
+        };
+        let cell_f32 = |v: f32| -> String {
+            let out = ser(
+                &v.to_le_bytes(),
+                &serde_json::json!({"itemsize": 4, "kind": "f", "shape": [1]}),
+            )
+            .unwrap();
+            String::from_utf8(out.to_vec()).unwrap()
+        };
+
+        assert_eq!(cell_f64(f64::NAN), "nan");
+        assert_eq!(cell_f32(f32::NAN), "nan");
+        // A sign-bit-set NaN still renders `nan` (numpy collapses NaN sign in
+        // str, and Rust Display already ignores it).
+        assert_eq!(cell_f64(f64::from_bits(0xFFF8_0000_0000_0000)), "nan");
+
+        // inf / -inf were already correct — assert they are unchanged.
+        assert_eq!(cell_f64(f64::INFINITY), "inf");
+        assert_eq!(cell_f64(f64::NEG_INFINITY), "-inf");
+        assert_eq!(cell_f32(f32::INFINITY), "inf");
+        assert_eq!(cell_f32(f32::NEG_INFINITY), "-inf");
     }
 
     /// Finding 4: a >2-D array must error like Python `serialize_csv`
