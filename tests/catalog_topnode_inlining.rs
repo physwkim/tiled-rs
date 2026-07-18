@@ -146,6 +146,14 @@ async fn build_app() -> (axum::Router, tempfile::TempDir) {
     )
     .await;
 
+    (plain_app_from(catalog), dir)
+}
+
+/// Build a catalog-backed app with NO access policy from an already-populated
+/// `catalog`. Factored out of [`build_app`] so a fixture with a different tree
+/// (empty eligible container, nested recursion, the 500-child cap) reuses the
+/// identical policy-free state instead of duplicating the `AppState` literal.
+fn plain_app_from(catalog: Catalog) -> axum::Router {
     let resolver: Arc<dyn tiled_rs::catalog::adapter::LeafResolver> = Arc::new(UnresolvedLeaf);
     let root_tree: Arc<dyn ContainerAdapter> =
         Arc::new(CatalogAdapter::root(catalog.clone(), resolver));
@@ -187,7 +195,7 @@ async fn build_app() -> (axum::Router, tempfile::TempDir) {
         background_tasks: tiled_rs::server::state::BackgroundTasks::new(),
         validation: Default::default(),
     };
-    (tiled_rs::server::build_app(state), dir)
+    tiled_rs::server::build_app(state)
 }
 
 async fn get_json(app: &axum::Router, uri: &str) -> (StatusCode, serde_json::Value) {
@@ -748,5 +756,402 @@ async fn catalog_topnode_inline_gate_uses_visible_count() {
     assert_eq!(
         s["count"], 2,
         "count is the visible child count (2), not the full 502: {s}"
+    );
+}
+
+// ===========================================================================
+// Invariant-boundary regression tests (PR #139 review coverage gaps), written
+// against the post-#141 principal-scoped count semantics and the post-#142
+// always-serialized `contents` (explicit `null` when not inlined).
+// ===========================================================================
+
+/// Boundary 1 — an eligible-but-EMPTY container.
+///
+/// An `xarray_dataset` container with zero children still passes the inline gate
+/// (`inlined_contents_enabled` is spec-driven, count `0 <= 500`), so it inlines an
+/// EMPTY object: `contents == {}`, `count == 0`. This is structurally distinct
+/// from a plain (unspec'd) container, whose count-only fast path emits
+/// `contents == null`. The empty-object vs `null` distinction is the whole point:
+/// `{}` means "inlined, and there is nothing", `null` means "not inlined".
+#[tokio::test]
+async fn catalog_empty_eligible_container_inlines_empty_object() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("sqlite://{}", dir.path().join("catalog.db").display());
+    let catalog = Catalog::connect(&uri).await.unwrap();
+    catalog.migrate().await.unwrap();
+
+    // Eligible but childless.
+    create(
+        &catalog,
+        None,
+        vec![],
+        "empty_ds",
+        "container",
+        serde_json::json!([{"name": "xarray_dataset"}]),
+    )
+    .await;
+    // Plain and childless — the contrast partner.
+    create(
+        &catalog,
+        None,
+        vec![],
+        "empty_plain",
+        "container",
+        serde_json::json!([]),
+    )
+    .await;
+    let app = plain_app_from(catalog);
+
+    let (status, body) = get_json(&app, "/api/v1/metadata/empty_ds").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "metadata/empty_ds must be 200: {body}"
+    );
+    let s_ds = &body["data"]["attributes"]["structure"];
+    assert!(
+        s_ds["contents"].is_object(),
+        "an empty eligible container inlines an object, not null: {s_ds}"
+    );
+    assert_eq!(
+        s_ds["contents"].as_object().unwrap().len(),
+        0,
+        "the inlined object is empty (no children): {s_ds}"
+    );
+    assert_eq!(s_ds["count"], 0, "empty container count is 0: {s_ds}");
+
+    let (status, body) = get_json(&app, "/api/v1/metadata/empty_plain").await;
+    assert_eq!(status, StatusCode::OK);
+    let s_plain = &body["data"]["attributes"]["structure"];
+    assert!(
+        s_plain["contents"].is_null(),
+        "a plain empty container keeps contents:null (count-only fast path): {s_plain}"
+    );
+    assert_eq!(s_plain["count"], 0, "plain empty container count is 0");
+
+    // The boundary: {} (inlined-and-empty) and null (not inlined) must not be
+    // conflated even though both containers hold zero children.
+    assert_ne!(
+        s_ds["contents"], s_plain["contents"],
+        "empty-eligible {{}} and plain-empty null must stay distinct: \
+         ds={} plain={}",
+        s_ds["contents"], s_plain["contents"]
+    );
+}
+
+/// Boundary 2 — multi-level recursion and the `max_depth` gate.
+///
+/// Tree: `ds` (xarray_dataset) → `mid` (xarray_dataset) → `leaf` (plain, empty).
+///
+/// - `max_depth` absent (None) recurses to the `DEPTH_LIMIT` bound: `ds` inlines
+///   `mid`, and `mid`'s OWN `structure.contents` inlines the grandchild `leaf`.
+/// - `?max_depth=1` inlines only `ds`'s direct children: `mid` appears, but
+///   `mid`'s own `structure.contents` is an EXPLICIT `null` KEY (per #142 —
+///   present, value null), NOT recursed into. No grandchild leaks.
+#[tokio::test]
+async fn catalog_topnode_multilevel_recursion_respects_max_depth() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("sqlite://{}", dir.path().join("catalog.db").display());
+    let catalog = Catalog::connect(&uri).await.unwrap();
+    catalog.migrate().await.unwrap();
+
+    let ds = create(
+        &catalog,
+        None,
+        vec![],
+        "ds",
+        "container",
+        serde_json::json!([{"name": "xarray_dataset"}]),
+    )
+    .await;
+    let mid = create(
+        &catalog,
+        Some(ds),
+        vec!["ds".into()],
+        "mid",
+        "container",
+        serde_json::json!([{"name": "xarray_dataset"}]),
+    )
+    .await;
+    create(
+        &catalog,
+        Some(mid),
+        vec!["ds".into(), "mid".into()],
+        "leaf",
+        "container",
+        serde_json::json!([]),
+    )
+    .await;
+    let app = plain_app_from(catalog);
+
+    // max_depth=None → recurse into the nested eligible child; grandchild inlined.
+    let (status, body) = get_json(&app, "/api/v1/metadata/ds").await;
+    assert_eq!(status, StatusCode::OK, "metadata/ds must be 200: {body}");
+    let s = &body["data"]["attributes"]["structure"];
+    assert_eq!(s["count"], 1, "ds has one child (mid): {s}");
+    let mid_struct = &s["contents"]["mid"]["attributes"]["structure"];
+    assert_eq!(
+        mid_struct["count"], 1,
+        "mid has one child (leaf): {mid_struct}"
+    );
+    let grandchild = &mid_struct["contents"]["leaf"];
+    assert!(
+        grandchild.is_object(),
+        "max_depth=None must recurse into the nested eligible child: the \
+         grandchild `leaf` must be inlined under mid: {mid_struct}"
+    );
+    assert_eq!(
+        grandchild["attributes"]["structure_family"], "container",
+        "grandchild is a container: {grandchild}"
+    );
+    // The grandchild is itself a plain empty container: its own contents stay null.
+    assert!(
+        grandchild["attributes"]["structure"]["contents"].is_null(),
+        "the plain grandchild does not inline further: {grandchild}"
+    );
+
+    // max_depth=1 → inline ds's children only; mid's own contents is EXPLICIT null.
+    let (status, body) = get_json(&app, "/api/v1/metadata/ds?max_depth=1").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "metadata/ds?max_depth=1 must be 200: {body}"
+    );
+    let s1 = &body["data"]["attributes"]["structure"];
+    assert_eq!(
+        s1["count"], 1,
+        "ds still has one child at max_depth=1: {s1}"
+    );
+    let mid_obj = s1["contents"]["mid"]["attributes"]["structure"]
+        .as_object()
+        .unwrap_or_else(|| panic!("mid structure must be an object: {s1}"));
+    assert!(
+        mid_obj.contains_key("contents"),
+        "post-#142: the non-inlined nested child carries an EXPLICIT `contents` \
+         key: {mid_obj:?}"
+    );
+    assert!(
+        mid_obj["contents"].is_null(),
+        "max_depth=1 stops one level shallower: mid's own contents is null, not \
+         recursed: {mid_obj:?}"
+    );
+    assert_eq!(
+        mid_obj["count"], 1,
+        "the count is still reported on the non-inlined nested child: {mid_obj:?}"
+    );
+}
+
+/// Boundary 3 — the `INLINED_CONTENTS_LIMIT` (500) cap on the CATALOG path.
+///
+/// The shared owner (`build_container_structure`) inlines when the visible count
+/// is `<= 500` and suppresses (`contents: null`) when it is `> 500`; `count` is
+/// always reported. This exercises that boundary through the catalog top-node
+/// route (not the in-memory path `tests/max_depth_inlining.rs` already covers):
+/// `cap500` (500 children) inlines all 500; `cap501` (501 children) does not
+/// inline but still reports `count == 501`. No access policy here, so the visible
+/// count equals the full count.
+#[tokio::test]
+async fn catalog_topnode_inline_cap_500_boundary() {
+    let dir = tempfile::tempdir().unwrap();
+    let uri = format!("sqlite://{}", dir.path().join("catalog.db").display());
+    let catalog = Catalog::connect(&uri).await.unwrap();
+    catalog.migrate().await.unwrap();
+
+    let cap500 = create(
+        &catalog,
+        None,
+        vec![],
+        "cap500",
+        "container",
+        serde_json::json!([{"name": "xarray_dataset"}]),
+    )
+    .await;
+    for i in 0..500 {
+        create(
+            &catalog,
+            Some(cap500),
+            vec!["cap500".into()],
+            &format!("v{i:04}"),
+            "container",
+            serde_json::json!([]),
+        )
+        .await;
+    }
+
+    let cap501 = create(
+        &catalog,
+        None,
+        vec![],
+        "cap501",
+        "container",
+        serde_json::json!([{"name": "xarray_dataset"}]),
+    )
+    .await;
+    for i in 0..501 {
+        create(
+            &catalog,
+            Some(cap501),
+            vec!["cap501".into()],
+            &format!("v{i:04}"),
+            "container",
+            serde_json::json!([]),
+        )
+        .await;
+    }
+    let app = plain_app_from(catalog);
+
+    // Exactly at the cap → inline all 500.
+    let (status, body) = get_json(&app, "/api/v1/metadata/cap500").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "metadata/cap500 must be 200: {body}"
+    );
+    let s = &body["data"]["attributes"]["structure"];
+    assert_eq!(
+        s["contents"].as_object().map(|o| o.len()),
+        Some(500),
+        "exactly 500 children (== cap) must all inline: count={}",
+        s["count"]
+    );
+    assert_eq!(s["count"], 500, "count at the cap boundary");
+
+    // One over the cap → suppress inlining, but still report the count.
+    let (status, body) = get_json(&app, "/api/v1/metadata/cap501").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "metadata/cap501 must be 200: {body}"
+    );
+    let s = &body["data"]["attributes"]["structure"];
+    assert!(
+        s["contents"].is_null(),
+        "501 children (> cap) must NOT inline (contents:null): {}",
+        s["contents"]
+    );
+    assert_eq!(
+        s["count"], 501,
+        "count is still reported when over the cap: {s}"
+    );
+}
+
+/// Boundary 4 — a hidden child that is itself an ELIGIBLE container.
+///
+/// `ds` (xarray_dataset, untagged) holds `vis` (untagged, plain) and `hidden_ds`
+/// (team-b — hidden from alice — AND itself `xarray_dataset` with an array-leaf
+/// child). The danger the inline gate keys on the spec discriminator invites: an
+/// eligible hidden child could be resolved and recursed. The access filter runs
+/// FIRST, so `hidden_ds` must be: absent from `contents`, never resolved, never
+/// recursed, and excluded from the principal-scoped `count`.
+///
+/// "Never resolved/recursed" is observable: `hidden_ds` carries an
+/// `UnresolvedLeaf` array child that ERRORS on resolution. If the walk wrongly
+/// recursed into `hidden_ds`, resolving that child would surface a 500 instead of
+/// the 200 asserted here. A direct GET of the hidden child 404s, proving the
+/// inline path cannot surface what a direct read denies.
+#[tokio::test]
+async fn catalog_topnode_hidden_eligible_child_never_recursed() {
+    let dir = tempfile::tempdir().unwrap();
+    let cat_uri = format!("sqlite://{}", dir.path().join("catalog.db").display());
+    let auth_uri = format!("sqlite://{}", dir.path().join("auth.db").display());
+
+    let catalog = Catalog::connect_with_pool_size(&cat_uri, 1).await.unwrap();
+    catalog.migrate().await.unwrap();
+    let auth_db = AuthDb::connect_with_pool_size(&auth_uri, 1).await.unwrap();
+    auth_db.migrate().await.unwrap();
+
+    let (alice, _) = auth_db.ensure_principal("dummy", "alice").await.unwrap();
+    auth_db
+        .set_principal_tags(alice.id, &["team-a".to_string()])
+        .await
+        .unwrap();
+
+    let ds = create_with_access(
+        &catalog,
+        None,
+        vec![],
+        "ds",
+        serde_json::json!(["xarray_dataset"]),
+        serde_json::json!({}),
+    )
+    .await;
+    create_with_access(
+        &catalog,
+        Some(ds),
+        vec!["ds".into()],
+        "vis",
+        serde_json::json!([]),
+        serde_json::json!({}),
+    )
+    .await;
+    // Hidden AND eligible: team-b spec xarray_dataset, with an array-leaf child
+    // that the UnresolvedLeaf resolver refuses. Resolving/recursing it would 500.
+    let hidden_ds = create_with_access(
+        &catalog,
+        Some(ds),
+        vec!["ds".into()],
+        "hidden_ds",
+        serde_json::json!(["xarray_dataset"]),
+        serde_json::json!({"tags": ["team-b"]}),
+    )
+    .await;
+    // hidden_ds's array child (structure_family "array") → UnresolvedLeaf errors
+    // if ever resolved.
+    catalog
+        .create_node(
+            Some(hidden_ds),
+            vec!["ds".into(), "hidden_ds".into()],
+            RegisterRequest {
+                key: "arr".into(),
+                structure_family: "array".into(),
+                metadata: serde_json::json!({}),
+                specs: serde_json::json!([]),
+                access_blob: serde_json::json!({}),
+            },
+        )
+        .await
+        .expect("create_node");
+
+    let app = access_app_from(catalog, auth_db);
+    let token = login(&app, "alice", "wonderland").await;
+    let bearer = format!("Bearer {token}");
+
+    let (status, body) = get_json_auth(&app, "/api/v1/metadata/ds", &bearer).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "metadata/ds must be 200 — a 500 would mean the walk resolved the hidden \
+         eligible child's UnresolvedLeaf: {body}"
+    );
+    let s = &body["data"]["attributes"]["structure"];
+    let contents = &s["contents"];
+    assert!(contents.is_object(), "ds inlines its visible children: {s}");
+    assert!(
+        contents.get("vis").is_some(),
+        "the visible child must be inlined: {contents}"
+    );
+    assert!(
+        contents.get("hidden_ds").is_none(),
+        "ACCESS LEAK: the hidden eligible child must NOT be inlined (never \
+         resolved, never recursed): {contents}"
+    );
+    // No grandchild of the hidden subtree may appear anywhere in the object.
+    assert!(
+        contents.get("arr").is_none(),
+        "the hidden child's own child must never leak into the top node: {contents}"
+    );
+    assert_eq!(
+        s["count"], 1,
+        "count is principal-scoped: only `vis` is visible, `hidden_ds` is hidden \
+         AND uncounted: {s}"
+    );
+
+    // Consistency: a direct GET of the hidden child 404s (read denied), so the
+    // inline path must not surface it either.
+    let (hidden_status, _) = get_json_auth(&app, "/api/v1/metadata/ds/hidden_ds", &bearer).await;
+    assert_eq!(
+        hidden_status,
+        StatusCode::NOT_FOUND,
+        "direct GET of the access-hidden eligible child must 404"
     );
 }
