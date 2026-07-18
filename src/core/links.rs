@@ -85,16 +85,18 @@ pub fn links_for_node(family: StructureFamily, base_url: &str, path: &str) -> No
 
 /// Generate pagination links for a search/browse response.
 ///
-/// Supports both pagination modes:
+/// Emits EXACTLY the three keys upstream `pagination_links` builds —
+/// `{self, first, next}` — and nothing else (`rg '"(last|prev)"' tiled/server`
+/// → zero matches; upstream never emits `last`/`prev` on any page). Supports
+/// both pagination modes:
 /// - **Offset** (`cursor: None`): the in-memory/Mongo path and any non-default
-///   sort. `self`/`first`/`last`/`prev`/`next` are offset-relative, exactly as
-///   before.
+///   sort. `self`/`first` are offset-relative; `next` advances the offset when
+///   more rows remain.
 /// - **Keyset cursor**: when the backend supplied a `next_cursor` (the SQL
 ///   catalog under a default sort, Python's `keys_page` cursor), `next` becomes
 ///   a `page[cursor]` link instead of `page[offset]`. A request that itself
-///   arrived with a `cursor` echoes it in `self`; `last`/`prev` are omitted
-///   because a keyset page is forward-only. Mirrors Python `pagination_links`
-///   (tiled/server/core.py:122-147).
+///   arrived with a `cursor` echoes it in `self`. Mirrors Python
+///   `pagination_links` (tiled/server/core.py:122-147).
 #[allow(clippy::too_many_arguments)]
 pub fn pagination_links(
     base_url: &str,
@@ -133,20 +135,11 @@ pub fn pagination_links(
         }
     };
 
-    // The router accepts `page[limit]=0` (no CatchPanicLayer), and the bare
-    // `(count - 1) / limit` panics on divide-by-zero. Python `pagination_links`
-    // never divides (tiled/server/core.py:122-147). Guard the division so the
-    // illegal divisor cannot reach it: with `limit == 0` there is no meaningful
-    // last-page offset, so `last` collapses to the first page (offset 0).
-    let last_offset = if limit > 0 && count > 0 {
-        ((count - 1) / limit) * limit
-    } else {
-        0
-    };
-
     // `next`: prefer the keyset cursor the backend supplied; otherwise fall
     // back to an offset link when more rows remain — but only for an offset
-    // request, since a cursor request has no offset to advance.
+    // request, since a cursor request has no offset to advance. Upstream emits
+    // no `last`/`prev`, so there is no last-page offset to compute (and hence
+    // no `(count - 1) / limit` divide-by-zero to guard).
     let next = if let Some(nc) = next_cursor {
         Some(cursor_url(nc, limit))
     } else if cursor.is_none() && offset + limit < count {
@@ -161,10 +154,7 @@ pub fn pagination_links(
             None => offset_url(offset, limit),
         },
         first: Some(offset_url(0, limit)),
-        last: cursor.is_none().then(|| offset_url(last_offset, limit)),
         next,
-        prev: (cursor.is_none() && offset > 0)
-            .then(|| offset_url(offset.saturating_sub(limit), limit)),
     }
 }
 
@@ -272,12 +262,10 @@ mod tests {
             links.self_link,
             "http://localhost:8000/api/v1/search/?page[limit]=10"
         );
-        assert!(links.next.is_some());
-        assert!(links.prev.is_none());
-        // Last page has a non-zero offset, so it keeps page[offset].
+        // More rows remain, so `next` advances the offset.
         assert_eq!(
-            links.last.as_deref(),
-            Some("http://localhost:8000/api/v1/search/?page[offset]=90&page[limit]=10")
+            links.next.as_deref(),
+            Some("http://localhost:8000/api/v1/search/?page[offset]=10&page[limit]=10")
         );
     }
 
@@ -286,8 +274,8 @@ mod tests {
         // Upstream builds `self`/`first` with `offset_or_cursor = ""` when the
         // offset is 0 (core.py:126-129), so the first page's self/first read
         // `?page[limit]=N`, NOT `?page[offset]=0&page[limit]=N`. `first`
-        // (always offset 0) never carries an offset segment; on a single page
-        // `last` (offset 0) matches too. A non-zero offset still carries it.
+        // (always offset 0) never carries an offset segment. A non-zero offset
+        // still carries it.
         let links = pagination_links(
             "http://localhost:8000",
             "search",
@@ -339,6 +327,41 @@ mod tests {
     }
 
     #[test]
+    fn test_pagination_links_never_emits_last_or_prev() {
+        // Upstream `pagination_links` (core.py:122-147) builds EXACTLY
+        // {self, first, next}; `rg '"(last|prev)"' tiled/server` → zero
+        // matches. The port must never emit `last`/`prev` on ANY page. Check
+        // the two pages that historically populated them: a first/offset page
+        // (`last` was Some) and a middle page (`prev` was Some).
+        for (offset, count) in [(0usize, 100usize), (50, 100)] {
+            let links = pagination_links(
+                "http://localhost:8000",
+                "search",
+                "",
+                None,
+                offset,
+                10,
+                None,
+                count,
+            );
+            let obj = serde_json::to_value(&links).unwrap();
+            let obj = obj.as_object().unwrap();
+            let keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+            assert!(obj.contains_key("self"), "self present (offset {offset})");
+            assert!(obj.contains_key("first"), "first present (offset {offset})");
+            assert!(obj.contains_key("next"), "next present (offset {offset})");
+            assert!(
+                !obj.contains_key("last"),
+                "last must NOT be emitted (offset {offset}): keys={keys:?}"
+            );
+            assert!(
+                !obj.contains_key("prev"),
+                "prev must NOT be emitted (offset {offset}): keys={keys:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_pagination_links_middle_page() {
         let links = pagination_links(
             "http://localhost:8000",
@@ -350,8 +373,11 @@ mod tests {
             None,
             100,
         );
-        assert!(links.next.is_some());
-        assert!(links.prev.is_some());
+        // Middle page: more rows remain, so `next` advances the offset.
+        assert_eq!(
+            links.next.as_deref(),
+            Some("http://localhost:8000/api/v1/search/?page[offset]=60&page[limit]=10")
+        );
     }
 
     #[test]
@@ -366,19 +392,20 @@ mod tests {
             None,
             100,
         );
+        // Terminal page: no rows remain, so `next` is None (serialized null).
         assert!(links.next.is_none());
-        assert!(links.prev.is_some());
     }
 
     #[test]
     fn test_pagination_links_zero_limit_does_not_panic() {
-        // `page[limit]=0` is accepted by the router; the last-page division must
-        // not divide by zero. `last` collapses to the first page (offset 0).
+        // `page[limit]=0` is accepted by the router. There is no longer any
+        // `(count - 1) / limit` division (the `last` link that needed it was
+        // removed), so limit=0 simply yields well-formed self/first links.
         let links = pagination_links("http://localhost:8000", "search", "", None, 0, 0, None, 100);
         // offset 0 → no page[offset] segment (upstream parity).
         assert_eq!(
-            links.last.as_deref(),
-            Some("http://localhost:8000/api/v1/search/?page[limit]=0")
+            links.self_link,
+            "http://localhost:8000/api/v1/search/?page[limit]=0"
         );
         assert_eq!(
             links.first.as_deref(),
@@ -388,25 +415,24 @@ mod tests {
 
     #[test]
     fn test_pagination_links_zero_limit_zero_count_does_not_panic() {
-        // Both the `count == 0` and `limit == 0` guards exercised together.
+        // Both edge inputs together: limit=0 and count=0. No division, no
+        // panic; `next` is None because no rows remain.
         let links = pagination_links("http://localhost:8000", "search", "", None, 0, 0, None, 0);
         assert!(links.next.is_none());
-        assert!(links.prev.is_none());
         assert_eq!(
-            links.last.as_deref(),
+            links.first.as_deref(),
             Some("http://localhost:8000/api/v1/search/?page[limit]=0")
         );
     }
 
     #[test]
     fn test_pagination_links_limit_exceeds_count() {
-        // A single page larger than the result set: last == first, no next/prev.
+        // A single page larger than the result set: self == first, no next.
         let links = pagination_links("http://localhost:8000", "search", "", None, 0, 50, None, 10);
         assert!(links.next.is_none());
-        assert!(links.prev.is_none());
-        // last == first == offset 0 → no page[offset] segment.
+        // offset 0 → no page[offset] segment.
         assert_eq!(
-            links.last.as_deref(),
+            links.first.as_deref(),
             Some("http://localhost:8000/api/v1/search/?page[limit]=50")
         );
     }
@@ -414,8 +440,7 @@ mod tests {
     #[test]
     fn test_pagination_next_uses_cursor_when_supplied() {
         // Default-sort catalog search: the backend hands back a keyset cursor,
-        // so `next` is a page[cursor] link (N3 parity with Python). last/prev
-        // stay offset-relative for this offset request; first is unchanged.
+        // so `next` is a page[cursor] link (N3 parity with Python).
         let links = pagination_links(
             "http://localhost:8000",
             "search",
@@ -436,14 +461,13 @@ mod tests {
             links.self_link,
             "http://localhost:8000/api/v1/search/?page[limit]=2"
         );
-        assert!(links.last.is_some());
     }
 
     #[test]
-    fn test_pagination_cursor_request_is_forward_only() {
-        // A request that arrived with page[cursor]: self echoes the cursor,
-        // next carries the following cursor, and last/prev are omitted (a
-        // keyset page cannot cheaply seek backwards).
+    fn test_pagination_cursor_request_echoes_cursor_in_self() {
+        // A request that arrived with page[cursor]: self echoes the cursor and
+        // next carries the following cursor (a keyset page is forward-only;
+        // upstream emits no last/prev on any page).
         let links = pagination_links(
             "http://localhost:8000",
             "search",
@@ -462,8 +486,6 @@ mod tests {
             links.next.as_deref(),
             Some("http://localhost:8000/api/v1/search/?page[cursor]=42&page[limit]=2")
         );
-        assert!(links.last.is_none());
-        assert!(links.prev.is_none());
     }
 
     #[test]

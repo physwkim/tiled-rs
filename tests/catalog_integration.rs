@@ -1046,15 +1046,16 @@ async fn search_cursor_pagination_walks_keyset() {
             json_request(&app, Method::GET, &next_uri, serde_json::Value::Null).await;
         assert_eq!(status, StatusCode::OK, "cursor page: {body}");
         pages += 1;
-        // A cursor request must echo the cursor in `self` and omit last/prev
-        // (a keyset page is forward-only).
-        let self_link = body["links"]["self"].as_str().unwrap();
+        // A cursor request echoes the cursor in `self`; upstream emits no
+        // last/prev key on any page (the object holds only self/first/next).
+        let link_obj = body["links"].as_object().unwrap();
+        let self_link = link_obj["self"].as_str().unwrap();
         assert!(
             self_link.contains("page[cursor]="),
             "self is keyset: {self_link}"
         );
-        assert!(body["links"]["last"].is_null(), "cursor page has no last");
-        assert!(body["links"]["prev"].is_null(), "cursor page has no prev");
+        assert!(!link_obj.contains_key("last"), "no last key: {body}");
+        assert!(!link_obj.contains_key("prev"), "no prev key: {body}");
         // The total is the full match count on every page, not the page size.
         assert_eq!(body["meta"]["count"], 5);
         for r in body["data"].as_array().unwrap() {
@@ -1937,7 +1938,9 @@ async fn revisions_pagination_walks_all_pages() {
     }
 
     // First page (limit=1): total count is 3 (not the page length 1), one item,
-    // `next` + `last` present, `last` pointing at the final page (offset 2).
+    // `next` present. Upstream `pagination_links` emits only {self, first,
+    // next} — no `last`/`prev` key — so `/revisions` (same builder) must not
+    // carry them either; the final page is reached by walking `next`.
     let (status, body) = json_request(
         &app,
         Method::GET,
@@ -1955,12 +1958,14 @@ async fn revisions_pagination_walks_all_pages() {
         body["links"]["next"].is_string(),
         "next must be present when more revisions remain: {body}"
     );
+    let link_obj = body["links"].as_object().unwrap();
     assert!(
-        body["links"]["last"]
-            .as_str()
-            .unwrap()
-            .contains("page[offset]=2"),
-        "last points at the final page (offset 2): {body}"
+        !link_obj.contains_key("last"),
+        "last must not be emitted (upstream parity): {body}"
+    );
+    assert!(
+        !link_obj.contains_key("prev"),
+        "prev must not be emitted (upstream parity): {body}"
     );
 
     // Walk every page via the `next` links and confirm all three revisions come

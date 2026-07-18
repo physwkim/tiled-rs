@@ -200,27 +200,24 @@ pub struct Resource<A = NodeAttributes> {
 // Pagination
 // ---------------------------------------------------------------------------
 
-/// Pagination links (Python lines 53-58).
-///
-/// Key-presence contract mirrors upstream `pagination_links`
-/// (tiled/server/core.py:122-147), which seeds `{"self", "first", "next"}` as
-/// always-present keys (value `null` when there is no next/first page) and
-/// only conditionally adds `last`/`prev`. The Python client bracket-indexes
+/// Pagination links — matches upstream `pagination_links`
+/// (tiled/server/core.py:122-147), which builds EXACTLY three keys:
+/// `{"self", "first", "next"}` and only ever mutates `next`. `next` and
+/// `first` always serialize (an explicit `null` on the terminal page for
+/// `next`, never a dropped key) because the Python client bracket-indexes
 /// `content["links"]["next"]` (client/container.py:255/480/547, base.py:108,
-/// composite.py:42), so `next` and `first` MUST always serialize — an explicit
-/// `null` on the terminal page, never a dropped key, or the client raises
-/// `KeyError: 'next'`. `last`/`prev` keep `skip_serializing_if` because
-/// upstream never seeds those keys (they are absent, not null, when unset).
+/// composite.py:42) — a missing key raises `KeyError: 'next'`.
+///
+/// Upstream never emits `last` or `prev` on any page (offset or cursor):
+/// `rg '"(last|prev)"' tiled/server` → zero matches. This struct therefore
+/// carries no such fields; emitting them would be an extra-key wire
+/// divergence.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PaginationLinks {
     #[serde(rename = "self")]
     pub self_link: String,
     pub first: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub last: Option<String>,
     pub next: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub prev: Option<String>,
 }
 
 /// Container metadata (count of children).
@@ -494,46 +491,39 @@ mod tests {
     #[test]
     fn test_pagination_links() {
         let links = PaginationLinks {
-            self_link: "http://localhost:8000/api/v1/search/?page[offset]=0&page[limit]=10".into(),
-            first: Some(
-                "http://localhost:8000/api/v1/search/?page[offset]=0&page[limit]=10".into(),
-            ),
-            last: Some(
-                "http://localhost:8000/api/v1/search/?page[offset]=90&page[limit]=10".into(),
-            ),
+            self_link: "http://localhost:8000/api/v1/search/?page[limit]=10".into(),
+            first: Some("http://localhost:8000/api/v1/search/?page[limit]=10".into()),
             next: Some(
                 "http://localhost:8000/api/v1/search/?page[offset]=10&page[limit]=10".into(),
             ),
-            prev: None,
         };
         let json = serde_json::to_value(&links).unwrap();
         assert!(json["self"].is_string());
-        assert!(json["prev"].is_null());
+        assert!(json["first"].is_string());
+        assert!(json["next"].is_string());
     }
 
     /// Wire-contract boundary: which keys are *present* in the serialized
     /// `links` object. Upstream `pagination_links`
-    /// (tiled/server/core.py:122-147) seeds `{"self", "first", "next"}` as
-    /// always-present keys (value `null` when there is no next/first page) and
-    /// only conditionally adds `last`/`prev`. The Python client bracket-indexes
-    /// `content["links"]["next"]` (client/container.py:255/480/547,
-    /// base.py:108, composite.py:42), so a missing `next` key raises
-    /// `KeyError` on the terminal page. `next` and `first` must therefore
-    /// serialize an explicit `null`, never be dropped; `last`/`prev` stay
-    /// omitted-when-None (upstream never seeds those keys).
+    /// (tiled/server/core.py:122-147) builds EXACTLY `{"self", "first",
+    /// "next"}` and never emits `last`/`prev`. The Python client
+    /// bracket-indexes `content["links"]["next"]` (client/container.py:
+    /// 255/480/547, base.py:108, composite.py:42), so a missing `next` key
+    /// raises `KeyError` on the terminal page — `next` and `first` must
+    /// therefore serialize an explicit `null`, never be dropped. `last`/`prev`
+    /// must NOT appear at all (they are not fields on the struct).
     #[test]
     fn test_pagination_links_key_presence() {
-        // Offset single/last page: next=None, prev=None. `next` MUST be an
-        // explicit null key; `prev` MUST be absent.
-        let offset_page = PaginationLinks {
-            self_link: "http://x/api/v1/search/?page[offset]=0&page[limit]=10".into(),
-            first: Some("http://x/api/v1/search/?page[offset]=0&page[limit]=10".into()),
-            last: Some("http://x/api/v1/search/?page[offset]=0&page[limit]=10".into()),
+        // Terminal page: next=None. `next` MUST be an explicit null key; the
+        // object holds ONLY self/first/next — no last, no prev.
+        let terminal_page = PaginationLinks {
+            self_link: "http://x/api/v1/search/?page[limit]=10".into(),
+            first: Some("http://x/api/v1/search/?page[limit]=10".into()),
             next: None,
-            prev: None,
         };
-        let obj = serde_json::to_value(&offset_page).unwrap();
+        let obj = serde_json::to_value(&terminal_page).unwrap();
         let obj = obj.as_object().unwrap();
+        let keys: Vec<&str> = obj.keys().map(String::as_str).collect();
         assert!(obj.contains_key("next"), "next key must always be present");
         assert!(obj["next"].is_null(), "next is explicit null on last page");
         assert!(
@@ -541,27 +531,24 @@ mod tests {
             "first key must always be present"
         );
         assert!(obj["first"].is_string());
-        assert!(obj.contains_key("last"), "last present when Some");
-        assert!(!obj.contains_key("prev"), "prev omitted when None");
+        assert!(!obj.contains_key("last"), "last is never emitted: {keys:?}");
+        assert!(!obj.contains_key("prev"), "prev is never emitted: {keys:?}");
+        assert_eq!(keys.len(), 3, "exactly self/first/next: {keys:?}");
 
-        // Cursor (forward-only) page: last=None, prev=None. `next`/`first`
-        // still present; `last`/`prev` absent.
-        let cursor_page = PaginationLinks {
-            self_link: "http://x/api/v1/search/?page[cursor]=7&page[limit]=10".into(),
+        // A page with a live `next` link serializes it as a string; still only
+        // the three keys.
+        let more_pages = PaginationLinks {
+            self_link: "http://x/api/v1/search/?page[limit]=10".into(),
             first: Some("http://x/api/v1/search/?page[limit]=10".into()),
-            last: None,
-            next: None,
-            prev: None,
+            next: Some("http://x/api/v1/search/?page[offset]=10&page[limit]=10".into()),
         };
-        let obj = serde_json::to_value(&cursor_page).unwrap();
+        let obj = serde_json::to_value(&more_pages).unwrap();
         let obj = obj.as_object().unwrap();
-        assert!(obj.contains_key("next"), "next key present on cursor page");
-        assert!(obj["next"].is_null());
         assert!(
-            obj.contains_key("first"),
-            "first key present on cursor page"
+            obj["next"].is_string(),
+            "next is a URL when more pages exist"
         );
-        assert!(!obj.contains_key("last"), "last omitted on cursor page");
-        assert!(!obj.contains_key("prev"), "prev omitted on cursor page");
+        assert!(!obj.contains_key("last"));
+        assert!(!obj.contains_key("prev"));
     }
 }
