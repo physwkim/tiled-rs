@@ -6554,11 +6554,10 @@ pub async fn patch_metadata(
     // (upstream `patch_metadata` → `validate_specs`, router.py:2386; the entry
     // is the existing node). A registered validator may reject (→ 400) or
     // return a normalized metadata document; an undeclared spec is rejected only
-    // when `reject_undeclared_specs` is set. A `specs` array that does not parse
-    // as `Vec<Spec>` yields no specs to validate (it is stored as-is; validators
-    // apply only to well-formed specs).
-    let spec_list: Vec<crate::core::structures::Spec> =
-        serde_json::from_value(specs.clone()).unwrap_or_default();
+    // when `reject_undeclared_specs` is set. Parse leniently so a bare-string
+    // spec is validated too, not silently persisted unvalidated (see
+    // `specs_for_validation`).
+    let spec_list = specs_for_validation(&specs);
     let entry_family = parse_structure_family(&node.structure_family)?;
     let (_meta_modified, metadata) = crate::server::validation::validate_specs(
         &state.validation.registry,
@@ -6740,10 +6739,10 @@ pub async fn put_metadata(
     // (upstream `put_metadata` → `validate_specs`, router.py:2462; the entry is
     // the existing node). A registered validator may reject (→ 400) or return a
     // normalized metadata document; an undeclared spec is rejected only when
-    // `reject_undeclared_specs` is set. A `specs` array that does not parse as
-    // `Vec<Spec>` yields no specs to validate.
-    let spec_list: Vec<crate::core::structures::Spec> =
-        serde_json::from_value(specs.clone()).unwrap_or_default();
+    // `reject_undeclared_specs` is set. Parse leniently so a bare-string spec is
+    // validated too, not silently persisted unvalidated (see
+    // `specs_for_validation`).
+    let spec_list = specs_for_validation(&specs);
     let entry_family = parse_structure_family(&node.structure_family)?;
     let (_meta_modified, metadata) = crate::server::validation::validate_specs(
         &state.validation.registry,
@@ -7894,6 +7893,39 @@ fn spec_identity(spec: &serde_json::Value) -> serde_json::Value {
     } else {
         spec.clone()
     }
+}
+
+/// Parse a persisted/patched `specs` array into the `Vec<Spec>` that
+/// `validate_specs` consumes, accepting BOTH wire encodings of a spec: a bare
+/// string (`"foo"`) and an object (`{"name": "foo", "version": "1"}`). This
+/// matches `spec_identity` and `validate_payload`, which already treat the two
+/// forms identically, so EVERY persisted spec — not only the object form —
+/// reaches the validation registry.
+///
+/// The previous `serde_json::from_value::<Vec<Spec>>(..).unwrap_or_default()`
+/// was all-or-nothing: because `Spec` deserializes only from an object, a
+/// single bare-string element made the whole array fail to parse and collapse
+/// to empty, so `validate_specs` saw no specs and an undeclared bare-string
+/// spec was persisted WITHOUT being rejected under `reject_undeclared_specs`.
+/// Parsing element-by-element closes that bypass; an element that is neither a
+/// string nor an object carrying a string `name` contributes no `Spec` (there
+/// is no name to validate against), exactly as it contributed none before.
+fn specs_for_validation(specs: &serde_json::Value) -> Vec<crate::core::structures::Spec> {
+    let Some(arr) = specs.as_array() else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|element| {
+            if let Some(name) = element.as_str() {
+                Some(crate::core::structures::Spec::new(name))
+            } else {
+                // Object form: keep the exact per-element semantics of the old
+                // `Vec<Spec>` deserialize (requires a string `name`; `version`
+                // optional string), just without the all-or-nothing collapse.
+                serde_json::from_value::<crate::core::structures::Spec>(element.clone()).ok()
+            }
+        })
+        .collect()
 }
 
 /// RFC 7396 merge-patch: recursively merge `patch` into `target`. A

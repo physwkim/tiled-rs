@@ -321,6 +321,177 @@ async fn undeclared_spec_rejected_when_reject_on() {
     );
 }
 
+/// Finding 4 (w30): a bare-STRING spec on PATCH must reach `validate_specs`
+/// exactly like the object form. Before the fix the raw specs value was parsed
+/// with an all-or-nothing `serde_json::from_value::<Vec<Spec>>(..)`; a bare
+/// string (`"mystery"`) — a valid on-wire spec encoding — failed that parse,
+/// collapsed the list to empty, and was persisted WITHOUT rejection even under
+/// `reject_undeclared_specs`, while the object form `{"name":"mystery"}` was
+/// correctly rejected. The two encodings must now be treated identically.
+#[tokio::test]
+async fn patch_bare_string_undeclared_spec_rejected_like_object() {
+    let (app, _dir) = build_app(validation_config(true)).await;
+
+    // Seed a no-spec node.
+    let (status, _) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/metadata/",
+        serde_json::json!({
+            "key": "n",
+            "structure_family": "container",
+            "metadata": {},
+            "specs": [],
+            "data_sources": [],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // Bare-string undeclared spec via merge-patch → 400, upstream detail.
+    let (bare_status, bare_body) = json_request(
+        &app,
+        Method::PATCH,
+        "/api/v1/metadata/n",
+        serde_json::json!({
+            "content-type": "application/merge-patch+json",
+            "specs": ["mystery"],
+        }),
+    )
+    .await;
+    assert_eq!(
+        bare_status,
+        StatusCode::BAD_REQUEST,
+        "bare-string undeclared spec must be rejected: {bare_body}"
+    );
+    assert_eq!(
+        bare_body["error"]["message"].as_str().unwrap_or_default(),
+        "Unrecognized spec: mystery"
+    );
+
+    // Object form on the same (the rejected PATCH left it spec-less) node →
+    // identical status + message. This is the parity the fix restores.
+    let (obj_status, obj_body) = json_request(
+        &app,
+        Method::PATCH,
+        "/api/v1/metadata/n",
+        serde_json::json!({
+            "content-type": "application/merge-patch+json",
+            "specs": [{"name": "mystery"}],
+        }),
+    )
+    .await;
+    assert_eq!(
+        obj_status, bare_status,
+        "string and object forms must agree on status"
+    );
+    assert_eq!(
+        obj_body["error"]["message"].as_str().unwrap_or_default(),
+        bare_body["error"]["message"].as_str().unwrap_or_default(),
+        "string and object forms must agree on the rejection message"
+    );
+}
+
+/// Finding 4 (w30): the same bare-string parity on PUT (wholesale replacement).
+#[tokio::test]
+async fn put_bare_string_undeclared_spec_rejected_like_object() {
+    let (app, _dir) = build_app(validation_config(true)).await;
+
+    let (status, _) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/metadata/",
+        serde_json::json!({
+            "key": "m",
+            "structure_family": "container",
+            "metadata": {},
+            "specs": [],
+            "data_sources": [],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (bare_status, bare_body) = json_request(
+        &app,
+        Method::PUT,
+        "/api/v1/metadata/m",
+        serde_json::json!({
+            "metadata": {},
+            "specs": ["mystery"],
+        }),
+    )
+    .await;
+    assert_eq!(
+        bare_status,
+        StatusCode::BAD_REQUEST,
+        "bare-string undeclared spec must be rejected on PUT: {bare_body}"
+    );
+    assert_eq!(
+        bare_body["error"]["message"].as_str().unwrap_or_default(),
+        "Unrecognized spec: mystery"
+    );
+
+    let (obj_status, obj_body) = json_request(
+        &app,
+        Method::PUT,
+        "/api/v1/metadata/m",
+        serde_json::json!({
+            "metadata": {},
+            "specs": [{"name": "mystery"}],
+        }),
+    )
+    .await;
+    assert_eq!(
+        obj_status, bare_status,
+        "string and object forms must agree on status"
+    );
+    assert_eq!(
+        obj_body["error"]["message"].as_str().unwrap_or_default(),
+        bare_body["error"]["message"].as_str().unwrap_or_default(),
+        "string and object forms must agree on the rejection message"
+    );
+}
+
+/// Finding 4 (w30): with `reject_undeclared_specs` OFF, a bare-string undeclared
+/// spec is still accepted — the fix only routes every spec THROUGH validation;
+/// it does not itself reject undeclared specs when the toggle is off.
+#[tokio::test]
+async fn patch_bare_string_undeclared_spec_accepted_when_reject_off() {
+    let (app, _dir) = build_app(validation_config(false)).await;
+
+    let (status, _) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/metadata/",
+        serde_json::json!({
+            "key": "n",
+            "structure_family": "container",
+            "metadata": {},
+            "specs": [],
+            "data_sources": [],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, body) = json_request(
+        &app,
+        Method::PATCH,
+        "/api/v1/metadata/n",
+        serde_json::json!({
+            "content-type": "application/merge-patch+json",
+            "specs": ["mystery"],
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "bare-string undeclared spec, reject off → accepted: {body}"
+    );
+}
+
 /// A node carrying NO specs is unaffected whether `reject_undeclared_specs` is
 /// on or off — nothing to validate, nothing to reject.
 #[tokio::test]
