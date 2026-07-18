@@ -314,21 +314,26 @@ pub fn validate_payload(metadata: &Value, specs: &Value) -> Result<()> {
                 .as_str()
                 .or_else(|| s.get("name").and_then(|v| v.as_str()))
                 .ok_or_else(|| CatalogError::Validation("spec missing name".into()))?;
-            if name.len() > MAX_SPEC_CHARS {
+            // Count CHARACTERS (Unicode code points), not bytes — upstream
+            // `StringConstraints(max_length=255)` bounds the Python `str` by
+            // `len(str)`, which is code points (tiled/structures/core.py:29). A
+            // 200-char multibyte name is 600 UTF-8 bytes but ≤255 chars, so
+            // `str::len()` (bytes) would wrongly reject it.
+            if name.chars().count() > MAX_SPEC_CHARS {
                 return Err(CatalogError::Validation(format!(
                     "spec name length {} > {MAX_SPEC_CHARS}",
-                    name.len()
+                    name.chars().count()
                 )));
             }
             // Bound the version string the same way name is bounded — upstream
-            // Spec bounds both name and version to max_length=255
-            // (tiled/structures/core.py:29-30).
+            // Spec bounds both name and version to max_length=255, by code-point
+            // count (tiled/structures/core.py:29-30).
             if let Some(version) = s.get("version").and_then(|v| v.as_str())
-                && version.len() > MAX_SPEC_CHARS
+                && version.chars().count() > MAX_SPEC_CHARS
             {
                 return Err(CatalogError::Validation(format!(
                     "spec version length {} > {MAX_SPEC_CHARS}",
-                    version.len()
+                    version.chars().count()
                 )));
             }
         }
