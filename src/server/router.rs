@@ -556,28 +556,48 @@ static SORT_FIELD_PATTERN: std::sync::LazyLock<regex::Regex> =
 /// expressed as REPEATED `?sort=` params (`List[SortField]`, dependencies.py:219),
 /// each ONE field — the port never comma-splits a field, matching upstream and
 /// the client, which emits a repeated param per key (container.py:121-128).
-/// Each field is validated against upstream's `SortField` pattern first: a comma
-/// (or any other disallowed character) is a `Validation` error → HTTP 422, exactly
-/// as pydantic's `constr` rejects it. A leading `-` means descending, a leading
-/// `+` (or no prefix) ascending. Truly empty fields (old clients send a bare
-/// `sort=`) are dropped; a bare `-`/`+` yields an empty key — the default-direction
-/// sentinel honored by the `id` tiebreaker in `construct_order_by_clauses`.
 ///
-/// Two further validations match upstream `sorting_param` (dependencies.py:239-252),
-/// both `HTTP 400`: a duplicate sorting key (by key, after stripping the sign)
-/// is rejected, and the default-order sentinel (the empty key) must be the last
-/// item when present.
+/// Two phases, matching upstream's FastAPI-gate-then-body structure so the error
+/// precedence is identical:
+///
+/// - Pass 1 — the pydantic gate. Upstream types the query param as
+///   `List[SortField]` (dependencies.py:219), so pydantic validates EVERY field
+///   against the `SortField` pattern (dependencies.py:26) before `sorting_param`'s
+///   body runs. A comma (multi-key must use repeated params) or any other
+///   character outside `[a-zA-Z0-9_.]` past an optional sign is a `Validation`
+///   error → HTTP 422 quoting pydantic's message. Because the whole list is gated
+///   first, a pattern-invalid field pre-empts the pass-2 400s even when an earlier
+///   field would collide as a duplicate.
+/// - Pass 2 — upstream `sorting_param`'s body (dependencies.py:222-252). A leading
+///   `-` means descending, a leading `+` (or no prefix) ascending. Truly empty
+///   fields (old clients send a bare `sort=`) are dropped (dependencies.py:227); a
+///   bare `-`/`+` yields an empty key — the default-direction sentinel honored by
+///   the `id` tiebreaker in `construct_order_by_clauses`. Two `HTTP 400`
+///   validations remain (dependencies.py:239-252): a duplicate sorting key (by
+///   key, after stripping the sign) is rejected, and the default-order sentinel
+///   (the empty key) must be the last item when present.
 fn parse_sort(params: &[(String, String)]) -> Result<Vec<(String, SortDirection)>, ServerError> {
-    let mut sorting: Vec<(String, SortDirection)> = Vec::new();
-    for (_, item) in params.iter().filter(|(k, _)| k == "sort") {
-        // Validate the whole field against upstream's `SortField` pattern before
-        // parsing — a comma (multi-key must use repeated params) or any other
-        // disallowed character is a 422, quoting pydantic's exact message.
+    let fields: Vec<&str> = params
+        .iter()
+        .filter(|(k, _)| k == "sort")
+        .map(|(_, item)| item.as_str())
+        .collect();
+
+    // Pass 1: the pydantic whole-list gate (dependencies.py:219). Validate every
+    // field against upstream's `SortField` pattern before any dup/sentinel logic,
+    // so a pattern-invalid field anywhere is a 422 that pre-empts the pass-2 400s.
+    for item in &fields {
         if !SORT_FIELD_PATTERN.is_match(item) {
             return Err(ServerError::Validation(format!(
                 "String should match pattern '{SORT_FIELD_PATTERN_SRC}'"
             )));
         }
+    }
+
+    // Pass 2: upstream `sorting_param`'s body (dependencies.py:222-252). Every
+    // field is already pattern-valid.
+    let mut sorting: Vec<(String, SortDirection)> = Vec::new();
+    for item in fields {
         // Old clients send a bare `sort=`; upstream filters empty fields out
         // before the dup/sentinel checks (dependencies.py:227).
         if item.is_empty() {
@@ -588,7 +608,7 @@ fn parse_sort(params: &[(String, String)]) -> Result<Vec<(String, SortDirection)
         } else if let Some(rest) = item.strip_prefix('+') {
             (rest, SortDirection::Ascending)
         } else {
-            (item.as_str(), SortDirection::Ascending)
+            (item, SortDirection::Ascending)
         };
         // Duplicate key → 400, keyed on the sign-stripped name so `a` and
         // `-a` collide (upstream raises before inserting into its dict).
@@ -8208,6 +8228,23 @@ mod sort_param_tests {
                 "unexpected error for {spec}: {err:?}"
             );
         }
+    }
+
+    /// Precedence: upstream validates the WHOLE `List[SortField]` against the
+    /// `SortField` pattern at the FastAPI layer (dependencies.py:219) BEFORE
+    /// `sorting_param`'s body runs, so a pattern-invalid field anywhere in the
+    /// list is a 422 even when an earlier field would otherwise collide as a
+    /// duplicate — the dup check (dependencies.py:238-243) never runs. A field
+    /// order of `a, a, x,y` must therefore 422 on `x,y`, not 400 on the dup.
+    #[test]
+    fn pattern_422_precedes_duplicate_400() {
+        let err = p_raw(&[("sort", "a"), ("sort", "a"), ("sort", "x,y")])
+            .expect_err("a later pattern-invalid field must 422 before the earlier dup 400s");
+        assert!(
+            matches!(&err, ServerError::Validation(m)
+                if m == "String should match pattern '^(?:[+-][a-zA-Z0-9_.]*|[a-zA-Z0-9_.]+)?$'"),
+            "expected a pattern 422, got: {err:?}"
+        );
     }
 
     #[test]
