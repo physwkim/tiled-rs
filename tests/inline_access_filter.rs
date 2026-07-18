@@ -215,11 +215,14 @@ async fn search_inline_walk_routes_through_access_filter() {
         contents.get("secret").is_none(),
         "ACCESS LEAK: the access-filtered child `secret` must NOT be inlined: {contents}"
     );
-    // Count semantics are preserved: `ds` still reports its full child count,
-    // even though the access-filtered `secret` is absent from `contents`.
+    // Count is principal-scoped: `ds` reports only the children alice may see
+    // (`visible`), NOT the full cardinality. The access-filtered `secret` is
+    // absent from `contents` AND uncounted, matching upstream `len_or_approx`
+    // over the `filter_for_access` view (core.py:509) and this listing's own
+    // `meta.count` (already filtered).
     assert_eq!(
-        ds_entry["attributes"]["structure"]["count"], 2,
-        "count is the full child count, unchanged by the access filter"
+        ds_entry["attributes"]["structure"]["count"], 1,
+        "count is the caller-visible child count (secret is hidden AND uncounted)"
     );
 
     // Consistency: searching INTO ds hides `secret` the same way.

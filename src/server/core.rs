@@ -713,12 +713,12 @@ pub fn construct_resource<'a>(
 /// - Gate: `(max_depth is None || depth < max_depth) && inlined_contents_enabled(depth)
 ///   && depth <= DEPTH_LIMIT`. When it fails, `contents` is `null` (an explicit
 ///   JSON `null`, matching the prior non-inlined shape and upstream's
-///   `NodeStructure(contents=None)` dump) and `count` is the child count.
-/// - Size cap: a container whose count already exceeds
+///   `NodeStructure(contents=None)` dump) and `count` is the visible child count.
+/// - Size cap: a container whose *visible* count already exceeds
 ///   [`INLINED_CONTENTS_LIMIT`] is not inlined (`contents = null`). While
-///   walking, if the true count crosses the cap (the estimate was low or the
-///   container grew), inlining is abandoned (`contents = null`) and `count` is
-///   recomputed. Otherwise `count` becomes the exact walked count.
+///   walking, if the true visible count crosses the cap (the estimate was low or
+///   the container grew), inlining is abandoned (`contents = null`) and `count` is
+///   recomputed. Otherwise `count` becomes the exact walked (visible) count.
 /// - A key that `keys()` listed but `get()` cannot resolve — a broken link
 ///   (upstream `BrokenLink`) or a concurrent delete — is kept as an explicit
 ///   `null` value under its key (upstream `contents[key] = None`); a genuine
@@ -733,18 +733,26 @@ pub fn construct_resource<'a>(
 /// that gate for the whole inline family (`/search` entry inlining, in-memory
 /// `/metadata` inlining, and the held container/full top-node branch).
 ///
-/// When `access_filter` is `Some`, the permitted child set is taken from the
-/// same filtered listing `/search` uses — `container.search(&[AccessBlobFilter])`
-/// — and a child absent from it is skipped (never resolved, absent from
-/// `contents`), exactly as if it were not listed. When `access_filter` is `None`
-/// (no policy configured) every child is inlined, preserving the prior behaviour
-/// for policy-free deployments and in-memory trees.
+/// When `access_filter` is `Some`, the permitted child set is computed **first**
+/// from the same filtered listing `/search` uses —
+/// `container.search(&[AccessBlobFilter])` — and drives everything downstream: the
+/// inline gate, the [`INLINED_CONTENTS_LIMIT`] cap, the walk, AND `count`. A child
+/// absent from the permitted set is skipped (never resolved, absent from
+/// `contents`, uncounted), exactly as if it were not listed. When `access_filter`
+/// is `None` (no policy configured) every child is visible, preserving the prior
+/// behaviour for policy-free deployments and in-memory trees.
 ///
-/// `count` is deliberately **unchanged** by the filter: it stays the full child
-/// count the walk produces (upstream reports the filtered-view count instead, so
-/// on a policy server with hidden children the port's `count` can exceed the
-/// number of `contents` entries — a preserved port count-semantic, not the
-/// upstream one).
+/// `count` is **principal-scoped**: it is the number of children the caller may
+/// see, so it equals the number of `contents` entries when inlined and never
+/// exceeds it. This matches upstream, which computes `count` via `len_or_approx`
+/// over the `filter_for_access`-wrapped view (`core.py:509`) and recounts over the
+/// filtered keys during the walk (`core.py:527-529`); the `INLINED_CONTENTS_LIMIT`
+/// cap likewise applies to the filtered view (`core.py:520,530`). Because the
+/// visible count drives the cap, a mostly-hidden large container inlines its
+/// (few) visible children instead of being suppressed by its full cardinality.
+/// (With a filter the permitted-key count is exact rather than approximate — the
+/// `len_or_approx` approximation divergence for filtered callers is an accepted
+/// residual, since the filtered set is materialized to enumerate it anyway.)
 ///
 /// # Per-node shaping (Wave-35 Finding 2)
 ///
@@ -762,7 +770,29 @@ pub(crate) async fn build_container_structure(
     access_filter: Option<&AccessBlobFilter>,
     shape: ShapeOptions<'_>,
 ) -> Result<serde_json::Value, ServerError> {
-    let mut count = container.len().await?;
+    // The caller-visible child set, computed FIRST so it drives the count, the
+    // inline gate, the size cap, and the walk uniformly. With an access filter in
+    // force, only keys the filter admits are visible — resolved via the SAME
+    // filtered listing `/search` injects (`AccessBlobFilter`), never raw `keys()`
+    // (zarr-fix invariant). `None` (no policy) means every child is visible.
+    let permitted: Option<std::collections::HashSet<String>> = match access_filter {
+        Some(f) => Some(
+            container
+                .search(&[crate::core::queries::Query::AccessBlobFilter(f.clone())])
+                .await?
+                .into_iter()
+                .collect(),
+        ),
+        None => None,
+    };
+
+    // Principal-scoped `count` (upstream `len_or_approx` over the filtered view,
+    // core.py:509): the exact visible-key count with a filter, else the
+    // container's own (possibly approximate) count.
+    let mut count = match permitted {
+        Some(ref p) => p.len(),
+        None => container.len().await?,
+    };
 
     // Upstream inline gate (core.py:513-516). `max_depth is None` inlines down
     // to the `depth <= DEPTH_LIMIT` bound; a set `max_depth` stops one level
@@ -773,42 +803,30 @@ pub(crate) async fn build_container_structure(
 
     let contents: Option<serde_json::Map<String, serde_json::Value>> = if gate {
         if count > INLINED_CONTENTS_LIMIT {
-            // Estimated count already too large: do not inline.
+            // Visible count already too large: do not inline.
             None
         } else {
             let keys = container.keys().await?;
-            // The caller-visible child set. With an access filter in force, only
-            // keys the filter admits may be inlined — resolved via the SAME
-            // filtered listing `/search` injects (`AccessBlobFilter`), never raw
-            // `keys()` (zarr-fix invariant). `None` (no policy) inlines all.
-            let permitted: Option<std::collections::HashSet<String>> = match access_filter {
-                Some(f) => Some(
-                    container
-                        .search(&[crate::core::queries::Query::AccessBlobFilter(f.clone())])
-                        .await?
-                        .into_iter()
-                        .collect(),
-                ),
-                None => None,
-            };
             let mut map = serde_json::Map::new();
             let mut walked = 0usize;
             let mut too_large = false;
             for key in keys {
-                walked += 1;
-                if walked > INLINED_CONTENTS_LIMIT {
-                    // The estimate was low or the container grew while walking.
-                    too_large = true;
-                    break;
-                }
-                // Access gate: a child the caller's filter hides is absent from
-                // `contents` (as if unlisted) and is never resolved. It is still
-                // counted in `walked` above, so `count` stays the full child
-                // count.
+                // Access gate FIRST: a child the caller's filter hides is absent
+                // from `contents` (as if unlisted), never resolved, and — unlike
+                // the prior port behaviour — does NOT count toward the visible
+                // walk, the cap, or `count`.
                 if let Some(ref permitted) = permitted
                     && !permitted.contains(&key)
                 {
                     continue;
+                }
+                walked += 1;
+                if walked > INLINED_CONTENTS_LIMIT {
+                    // The estimate was low or the container grew while walking.
+                    // (Unreachable with a filter: `walked` is bounded by the exact
+                    // visible count, already confirmed `<= INLINED_CONTENTS_LIMIT`.)
+                    too_large = true;
+                    break;
                 }
                 let child_path = if path.is_empty() {
                     key.clone()
@@ -848,7 +866,14 @@ pub(crate) async fn build_container_structure(
                 }
             }
             if too_large {
-                count = container.len().await?;
+                // Re-query the visible count. Only reachable without a filter
+                // (with one, the visible count is exact and `<= the cap`), so this
+                // is the container's own count; the `permitted` arm is kept for
+                // correctness-by-construction.
+                count = match permitted {
+                    Some(ref p) => p.len(),
+                    None => container.len().await?,
+                };
                 None
             } else {
                 count = walked;
