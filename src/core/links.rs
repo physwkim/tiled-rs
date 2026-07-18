@@ -110,10 +110,19 @@ pub fn pagination_links(
     let p = path.trim_start_matches('/');
 
     let offset_url = |o: usize, l: usize| -> String {
-        if p.is_empty() {
-            format!("{base}/api/v1/{route}/?page[offset]={o}&page[limit]={l}")
+        // Upstream omits the `page[offset]` segment entirely when the offset is
+        // zero (core.py:126-129: `offset_or_cursor = ""` for offset 0/None), so
+        // the first page's self/first/last read `?page[limit]=N`, not
+        // `?page[offset]=0&page[limit]=N`. A non-zero offset keeps the segment.
+        let offset_seg = if o > 0 {
+            format!("page[offset]={o}&")
         } else {
-            format!("{base}/api/v1/{route}/{p}?page[offset]={o}&page[limit]={l}")
+            String::new()
+        };
+        if p.is_empty() {
+            format!("{base}/api/v1/{route}/?{offset_seg}page[limit]={l}")
+        } else {
+            format!("{base}/api/v1/{route}/{p}?{offset_seg}page[limit]={l}")
         }
     };
     let cursor_url = |c: i64, l: usize| -> String {
@@ -258,15 +267,74 @@ mod tests {
             None,
             100,
         );
+        // offset 0 → self omits the page[offset] segment (upstream parity).
         assert_eq!(
             links.self_link,
-            "http://localhost:8000/api/v1/search/?page[offset]=0&page[limit]=10"
+            "http://localhost:8000/api/v1/search/?page[limit]=10"
         );
         assert!(links.next.is_some());
         assert!(links.prev.is_none());
+        // Last page has a non-zero offset, so it keeps page[offset].
         assert_eq!(
             links.last.as_deref(),
             Some("http://localhost:8000/api/v1/search/?page[offset]=90&page[limit]=10")
+        );
+    }
+
+    #[test]
+    fn test_pagination_links_first_page_omits_zero_offset() {
+        // Upstream builds `self`/`first` with `offset_or_cursor = ""` when the
+        // offset is 0 (core.py:126-129), so the first page's self/first read
+        // `?page[limit]=N`, NOT `?page[offset]=0&page[limit]=N`. `first`
+        // (always offset 0) never carries an offset segment; on a single page
+        // `last` (offset 0) matches too. A non-zero offset still carries it.
+        let links = pagination_links(
+            "http://localhost:8000",
+            "search",
+            "",
+            None,
+            0,
+            10,
+            None,
+            100,
+        );
+        assert_eq!(
+            links.self_link, "http://localhost:8000/api/v1/search/?page[limit]=10",
+            "offset-0 self omits page[offset]"
+        );
+        assert_eq!(
+            links.first.as_deref(),
+            Some("http://localhost:8000/api/v1/search/?page[limit]=10"),
+            "first is always offset 0, so never carries page[offset]"
+        );
+        // A non-zero offset (the `next` link here, offset 10) keeps the segment.
+        assert_eq!(
+            links.next.as_deref(),
+            Some("http://localhost:8000/api/v1/search/?page[offset]=10&page[limit]=10"),
+            "non-zero offset still carries page[offset]"
+        );
+    }
+
+    #[test]
+    fn test_pagination_links_first_page_nested_path_omits_zero_offset() {
+        // Same zero-offset rule with a non-empty path segment.
+        let links = pagination_links(
+            "http://localhost:8000",
+            "search",
+            "expt",
+            None,
+            0,
+            10,
+            None,
+            2,
+        );
+        assert_eq!(
+            links.self_link,
+            "http://localhost:8000/api/v1/search/expt?page[limit]=10"
+        );
+        assert_eq!(
+            links.first.as_deref(),
+            Some("http://localhost:8000/api/v1/search/expt?page[limit]=10")
         );
     }
 
@@ -307,13 +375,14 @@ mod tests {
         // `page[limit]=0` is accepted by the router; the last-page division must
         // not divide by zero. `last` collapses to the first page (offset 0).
         let links = pagination_links("http://localhost:8000", "search", "", None, 0, 0, None, 100);
+        // offset 0 → no page[offset] segment (upstream parity).
         assert_eq!(
             links.last.as_deref(),
-            Some("http://localhost:8000/api/v1/search/?page[offset]=0&page[limit]=0")
+            Some("http://localhost:8000/api/v1/search/?page[limit]=0")
         );
         assert_eq!(
             links.first.as_deref(),
-            Some("http://localhost:8000/api/v1/search/?page[offset]=0&page[limit]=0")
+            Some("http://localhost:8000/api/v1/search/?page[limit]=0")
         );
     }
 
@@ -325,7 +394,7 @@ mod tests {
         assert!(links.prev.is_none());
         assert_eq!(
             links.last.as_deref(),
-            Some("http://localhost:8000/api/v1/search/?page[offset]=0&page[limit]=0")
+            Some("http://localhost:8000/api/v1/search/?page[limit]=0")
         );
     }
 
@@ -335,9 +404,10 @@ mod tests {
         let links = pagination_links("http://localhost:8000", "search", "", None, 0, 50, None, 10);
         assert!(links.next.is_none());
         assert!(links.prev.is_none());
+        // last == first == offset 0 → no page[offset] segment.
         assert_eq!(
             links.last.as_deref(),
-            Some("http://localhost:8000/api/v1/search/?page[offset]=0&page[limit]=50")
+            Some("http://localhost:8000/api/v1/search/?page[limit]=50")
         );
     }
 
@@ -360,9 +430,11 @@ mod tests {
             links.next.as_deref(),
             Some("http://localhost:8000/api/v1/search/?page[cursor]=42&page[limit]=2")
         );
+        // This is an offset request (cursor arg None) at offset 0 → self omits
+        // page[offset]; only `next` carries the keyset cursor.
         assert_eq!(
             links.self_link,
-            "http://localhost:8000/api/v1/search/?page[offset]=0&page[limit]=2"
+            "http://localhost:8000/api/v1/search/?page[limit]=2"
         );
         assert!(links.last.is_some());
     }
