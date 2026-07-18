@@ -541,40 +541,63 @@ pub async fn metadata(
 // GET /api/v1/search/{*path}
 // ---------------------------------------------------------------------------
 
+/// Upstream `SortField` `constr` pattern (dependencies.py:26): a valid `?sort=`
+/// field is an optional sign (`+`/`-`) followed by dotted-identifier characters,
+/// or the empty string (the old-client sentinel). A comma — or any other
+/// character outside `[a-zA-Z0-9_.]` — does not match, which pydantic answers
+/// with a 422 at the FastAPI layer. Kept as a literal so the 422 message can
+/// quote it verbatim.
+const SORT_FIELD_PATTERN_SRC: &str = r"^(?:[+-][a-zA-Z0-9_.]*|[a-zA-Z0-9_.]+)?$";
+static SORT_FIELD_PATTERN: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(SORT_FIELD_PATTERN_SRC).expect("static regex"));
+
 /// Parse the `sort` query parameter(s) into ordered `(key, direction)` pairs,
-/// mirroring Python `sorting_param` (dependencies.py:218-255): values are
-/// comma-separated; a leading `-` means descending, a leading `+` (or no
-/// prefix) ascending. Truly empty items (old clients send a bare `sort=`) are
-/// dropped; a bare `-`/`+` yields an empty key — the default-direction
+/// mirroring Python `sorting_param` (dependencies.py:218-255). Multi-key sort is
+/// expressed as REPEATED `?sort=` params (`List[SortField]`, dependencies.py:219),
+/// each ONE field — the port never comma-splits a field, matching upstream and
+/// the client, which emits a repeated param per key (container.py:121-128).
+/// Each field is validated against upstream's `SortField` pattern first: a comma
+/// (or any other disallowed character) is a `Validation` error → HTTP 422, exactly
+/// as pydantic's `constr` rejects it. A leading `-` means descending, a leading
+/// `+` (or no prefix) ascending. Truly empty fields (old clients send a bare
+/// `sort=`) are dropped; a bare `-`/`+` yields an empty key — the default-direction
 /// sentinel honored by the `id` tiebreaker in `construct_order_by_clauses`.
 ///
-/// Two validations match upstream `sorting_param` (dependencies.py:239-252),
+/// Two further validations match upstream `sorting_param` (dependencies.py:239-252),
 /// both `HTTP 400`: a duplicate sorting key (by key, after stripping the sign)
 /// is rejected, and the default-order sentinel (the empty key) must be the last
 /// item when present.
 fn parse_sort(params: &[(String, String)]) -> Result<Vec<(String, SortDirection)>, ServerError> {
     let mut sorting: Vec<(String, SortDirection)> = Vec::new();
-    for (_, raw) in params.iter().filter(|(k, _)| k == "sort") {
-        for item in raw.split(',') {
-            if item.is_empty() {
-                continue;
-            }
-            let (key, dir) = if let Some(rest) = item.strip_prefix('-') {
-                (rest, SortDirection::Descending)
-            } else if let Some(rest) = item.strip_prefix('+') {
-                (rest, SortDirection::Ascending)
-            } else {
-                (item, SortDirection::Ascending)
-            };
-            // Duplicate key → 400, keyed on the sign-stripped name so `a` and
-            // `-a` collide (upstream raises before inserting into its dict).
-            if sorting.iter().any(|(existing, _)| existing == key) {
-                return Err(ServerError::BadRequest(format!(
-                    "Duplicate sorting key: {key}"
-                )));
-            }
-            sorting.push((key.to_string(), dir));
+    for (_, item) in params.iter().filter(|(k, _)| k == "sort") {
+        // Validate the whole field against upstream's `SortField` pattern before
+        // parsing — a comma (multi-key must use repeated params) or any other
+        // disallowed character is a 422, quoting pydantic's exact message.
+        if !SORT_FIELD_PATTERN.is_match(item) {
+            return Err(ServerError::Validation(format!(
+                "String should match pattern '{SORT_FIELD_PATTERN_SRC}'"
+            )));
         }
+        // Old clients send a bare `sort=`; upstream filters empty fields out
+        // before the dup/sentinel checks (dependencies.py:227).
+        if item.is_empty() {
+            continue;
+        }
+        let (key, dir) = if let Some(rest) = item.strip_prefix('-') {
+            (rest, SortDirection::Descending)
+        } else if let Some(rest) = item.strip_prefix('+') {
+            (rest, SortDirection::Ascending)
+        } else {
+            (item.as_str(), SortDirection::Ascending)
+        };
+        // Duplicate key → 400, keyed on the sign-stripped name so `a` and
+        // `-a` collide (upstream raises before inserting into its dict).
+        if sorting.iter().any(|(existing, _)| existing == key) {
+            return Err(ServerError::BadRequest(format!(
+                "Duplicate sorting key: {key}"
+            )));
+        }
+        sorting.push((key.to_string(), dir));
     }
     // The default-order sentinel (the empty key) must be the last item when
     // present. Duplicate detection above guarantees at most one empty key, so a
@@ -8115,9 +8138,13 @@ mod sort_param_tests {
         assert!(p(&[]).is_empty());
     }
 
+    /// Multi-key sort is expressed as REPEATED `?sort=` params, each one field
+    /// with an optional sign prefix — matching upstream `List[SortField]`
+    /// (dependencies.py:219) and the client's list-valued `sort` param
+    /// (container.py:121-128). A single comma-joined param is NOT split.
     #[test]
-    fn comma_separated_keys_with_directions() {
-        let got = p(&[("sort", "color,-count,+name")]);
+    fn repeated_keys_with_directions() {
+        let got = p(&[("sort", "color"), ("sort", "-count"), ("sort", "+name")]);
         assert_eq!(
             got,
             vec![
@@ -8126,6 +8153,38 @@ mod sort_param_tests {
                 ("name".to_string(), SortDirection::Ascending),
             ]
         );
+    }
+
+    /// A comma inside one `?sort=` field violates upstream's `SortField`
+    /// `constr` pattern (dependencies.py:26), which pydantic answers with 422 at
+    /// the FastAPI layer. The port validates each field against the same regex
+    /// and returns `Validation` (422) — it never comma-splits a field.
+    #[test]
+    fn comma_in_field_is_422() {
+        for spec in ["a,b", "color,-count", "a,", ",a"] {
+            let err = p_raw(&[("sort", spec)])
+                .expect_err(&format!("a comma in a field must 422: {spec}"));
+            assert!(
+                matches!(&err, ServerError::Validation(m)
+                    if m == "String should match pattern '^(?:[+-][a-zA-Z0-9_.]*|[a-zA-Z0-9_.]+)?$'"),
+                "unexpected error for {spec}: {err:?}"
+            );
+        }
+    }
+
+    /// The `SortField` pattern rejects any character outside `[a-zA-Z0-9_.]`
+    /// (past an optional leading sign), so a space or slash is a 422 too — the
+    /// port validates the whole upstream pattern, not just the comma.
+    #[test]
+    fn other_invalid_chars_are_422() {
+        for spec in ["a b", "a/b", "a!", "++a"] {
+            let err =
+                p_raw(&[("sort", spec)]).expect_err(&format!("an invalid field must 422: {spec}"));
+            assert!(
+                matches!(&err, ServerError::Validation(_)),
+                "unexpected error for {spec}: {err:?}"
+            );
+        }
     }
 
     #[test]
@@ -8166,21 +8225,23 @@ mod sort_param_tests {
     /// sign, so `a` and `-a` collide. Previously `?sort=a,a` returned 200.
     #[test]
     fn duplicate_sort_key_is_rejected() {
-        for spec in ["a,a", "a,-a", "+a,a", "-a,+a"] {
-            let err = p_raw(&[("sort", spec)])
-                .expect_err(&format!("duplicate key must be rejected: {spec}"));
+        for spec in [["a", "a"], ["a", "-a"], ["+a", "a"], ["-a", "+a"]] {
+            let err = p_raw(&[("sort", spec[0]), ("sort", spec[1])])
+                .expect_err(&format!("duplicate key must be rejected: {spec:?}"));
             assert!(
                 matches!(&err, ServerError::BadRequest(m) if m == "Duplicate sorting key: a"),
-                "unexpected error for {spec}: {err:?}"
+                "unexpected error for {spec:?}: {err:?}"
             );
         }
     }
 
     /// Duplicate detection also applies to the empty default-order key (two
-    /// bare signs), and the message carries the empty key name verbatim.
+    /// bare signs as separate params), and the message carries the empty key
+    /// name verbatim.
     #[test]
     fn duplicate_empty_sentinel_is_rejected() {
-        let err = p_raw(&[("sort", "-,+")]).expect_err("two sentinels must be rejected");
+        let err =
+            p_raw(&[("sort", "-"), ("sort", "+")]).expect_err("two sentinels must be rejected");
         assert!(
             matches!(&err, ServerError::BadRequest(m) if m == "Duplicate sorting key: "),
             "unexpected error: {err:?}"
@@ -8192,7 +8253,8 @@ mod sort_param_tests {
     /// otherwise.
     #[test]
     fn empty_sentinel_must_be_last() {
-        let err = p_raw(&[("sort", "-,a")]).expect_err("sentinel-not-last must be rejected");
+        let err =
+            p_raw(&[("sort", "-"), ("sort", "a")]).expect_err("sentinel-not-last must be rejected");
         assert!(
             matches!(
                 &err,
@@ -8208,7 +8270,7 @@ mod sort_param_tests {
     #[test]
     fn empty_sentinel_last_is_accepted() {
         assert_eq!(
-            p(&[("sort", "a,-")]),
+            p(&[("sort", "a"), ("sort", "-")]),
             vec![
                 ("a".to_string(), SortDirection::Ascending),
                 (String::new(), SortDirection::Descending),
