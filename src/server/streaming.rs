@@ -272,13 +272,27 @@ async fn run_subscription(
     // non-browser clients usually arrive. Fall back to a first-message
     // handshake (tiled#1351) if the headers carried nothing usable.
     // Resolve the auth context in upstream's WS precedence: a real header
-    // credential wins, then the `?access_token=` query JWT, then the first-message
-    // handshake (which itself grants anonymous scopes when admission is allowed,
-    // else waits for an in-band credential). Upstream resolves connect-time scopes
-    // from the Apikey header OR the `access_token` query, preferring the header
-    // (`get_current_scopes_websocket`, authentication.py:449-455), and a valid
-    // token overrides the anonymous PUBLIC_SCOPES fallback (:454-457) — so the
-    // query JWT is tried BEFORE anonymous admission, not after.
+    // credential wins, then the `?access_token=` query JWT, then — only when no
+    // token was presented — the first-message handshake (which grants anonymous
+    // scopes when admission is allowed, else waits for an in-band credential).
+    // Upstream resolves connect-time scopes from the Apikey header OR the
+    // `access_token` query, preferring the header (`get_current_scopes_websocket`,
+    // authentication.py:449-455), and a valid token overrides the anonymous
+    // PUBLIC_SCOPES fallback (:454-457) — so the query JWT is tried BEFORE
+    // anonymous admission, not after.
+    //
+    // A PRESENTED-but-invalid `?access_token=` is a HARD DENY, never a
+    // fall-through. Upstream decodes the query token during WS dependency
+    // resolution and raises 401 there — expiry → "Access token has expired.
+    // Refresh token." (`get_decoded_access_token_websocket`,
+    // authentication.py:297-311); any other JWT error → `decode_token`'s
+    // `credentials_exception` (:153-177) — BEFORE the first-message/anonymous
+    // path is reachable. Mirror that: an ABSENT/empty token falls through to the
+    // handshake, a valid token authenticates, and an invalid token closes the
+    // connection. All three funnel through one `Result` so the invalid-token
+    // deny reuses the SAME close mechanics as a handshake failure, and the
+    // former `query_ctx = None` (which conflated "no token" with "invalid
+    // token", producing the silent anonymous downgrade) is gone.
     let real_header = header_auth.filter(|c| !matches!(c.kind, AuthKind::Anonymous));
     let auth_ctx = if let Some(ctx) = real_header {
         // A real Bearer/Apikey header credential (collected by
@@ -286,31 +300,25 @@ async fn run_subscription(
         ctx
     } else {
         // No real header credential (none presented, presented-but-rejected, or
-        // anonymous). Try the `?access_token=` query JWT — decoded through the same
-        // bearer path as a header token — before the handshake. `api_key` is
-        // header-only for WS (authentication.py:283-294), so there is deliberately
-        // no `?api_key=` query here.
-        let query_ctx = match access_token.as_deref().filter(|t| !t.is_empty()) {
-            Some(token) => match crate::server::app::validate_bearer(&state, token).await {
-                Ok(ctx) => Some(ctx),
-                Err(e) => {
-                    tracing::info!(target: "tiled.streaming", "ws ?access_token= rejected: {e}");
-                    None
-                }
-            },
-            None => None,
+        // anonymous). A PRESENTED query JWT is decoded through the same bearer
+        // path as a header token — `Ok` authenticates, `Err` denies. Only an
+        // ABSENT/empty token falls through to the first-message handshake.
+        // `api_key` is header-only for WS (authentication.py:283-294), so there
+        // is deliberately no `?api_key=` query here.
+        let resolved = match access_token.as_deref().filter(|t| !t.is_empty()) {
+            Some(token) => crate::server::app::validate_bearer(&state, token)
+                .await
+                .map_err(|e| format!("access_token: {e}")),
+            None => handshake_auth(&state, &mut tx, &mut rx).await,
         };
-        match query_ctx {
-            Some(ctx) => ctx,
-            None => match handshake_auth(&state, &mut tx, &mut rx).await {
-                Ok(ctx) => ctx,
-                Err(close_reason) => {
-                    tracing::info!(target: "tiled.streaming", "ws auth failed: {close_reason}");
-                    let _ = tx.send(Message::Text(close_reason.into())).await;
-                    let _ = tx.send(Message::Close(None)).await;
-                    return;
-                }
-            },
+        match resolved {
+            Ok(ctx) => ctx,
+            Err(close_reason) => {
+                tracing::info!(target: "tiled.streaming", "ws auth failed: {close_reason}");
+                let _ = tx.send(Message::Text(close_reason.into())).await;
+                let _ = tx.send(Message::Close(None)).await;
+                return;
+            }
         }
     };
     // Subscribing requires BOTH read:data AND read:metadata on the token,
