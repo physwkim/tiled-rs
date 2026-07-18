@@ -144,7 +144,41 @@ impl Default for SerializationRegistry {
 /// consulted, matching Python tiled (`tiled/server/core.py:374-419`, which
 /// raises `UnsupportedMediaTypes` rather than falling back to `Accept`).
 ///
-/// Resolution order for `format_param` (returns `None` if none apply):
+/// `?format=` is a comma-separated priority list (upstream `format.split(",")`,
+/// core.py:381), resolved in listed order with the same first-serviceable-wins
+/// loop as `Accept` (core.py:400-418): each token is resolved through
+/// [`resolve_format_token`] (whose doc gives the per-token resolution order); the
+/// first token that resolves to a serviceable media type wins, and `None`
+/// (→ HTTP 406) results only when EVERY token fails.
+///
+/// When `format_param` is `None`, fall back to the `Accept` header via
+/// [`resolve_media_type`].
+pub fn negotiate_media_type(
+    format_param: Option<&str>,
+    accept: &str,
+    family: StructureFamily,
+    registry: &SerializationRegistry,
+) -> Option<String> {
+    if let Some(fmt) = format_param {
+        // `?format=` is a COMMA-SEPARATED priority list, resolved in listed order
+        // (upstream `format.split(",")`, core.py:381, then first-serviceable-wins,
+        // core.py:400-418). Each token runs through the single-token resolution;
+        // the FIRST that resolves to a serviceable media type wins. `None` (→ 406)
+        // only when EVERY token fails — `?format=` keeps hard priority over Accept
+        // and never falls back to it (Python raises `UnsupportedMediaTypes`).
+        return fmt
+            .split(',')
+            .find_map(|token| resolve_format_token(token.trim(), family, registry));
+    }
+    resolve_media_type(accept, family, registry)
+}
+
+/// Resolve ONE `?format=` token (already split off the comma priority list and
+/// trimmed) to a serviceable media type for `family`, or `None` when it names
+/// nothing this family can produce (so the priority-list loop tries the next
+/// token).
+///
+/// Resolution order (returns the first that applies):
 ///  1. Verbatim full MIME type (e.g. `"text/csv"`) — accepted only when a
 ///     serializer is registered for this `family`.
 ///  2. Registry alias table — bare extensions and dotted forms
@@ -161,46 +195,39 @@ impl Default for SerializationRegistry {
 ///     (e.g. `"csv"` → `"text/csv"`). Accepted only when a serializer is registered
 ///     for this `family`.
 ///
-/// When `format_param` is `None`, fall back to the `Accept` header via
-/// [`resolve_media_type`].
-pub fn negotiate_media_type(
-    format_param: Option<&str>,
-    accept: &str,
+/// An empty token (leading/trailing/doubled comma) matches none of these and
+/// returns `None`, so the priority-list loop skips it — matching upstream, where
+/// an empty split entry resolves to nothing serviceable and the loop continues.
+fn resolve_format_token(
+    fmt: &str,
     family: StructureFamily,
     registry: &SerializationRegistry,
 ) -> Option<String> {
-    if let Some(fmt) = format_param {
-        // (1) Verbatim full MIME type — only accepted if a serializer for this family exists.
-        if fmt.contains('/') && registry.dispatch(family, fmt).is_some() {
-            return Some(fmt.to_string());
-        }
-
-        // (2) Registry alias table — bare or dotted extension.
-        if let Some(mt) = registry.resolve_alias(fmt) {
-            return Some(mt);
-        }
-        if !fmt.starts_with('.')
-            && let Some(mt) = registry.resolve_alias(&format!(".{fmt}"))
-        {
-            return Some(mt);
-        }
-
-        // (3) Core alias table — handles extensions not explicitly registered in the
-        // registry (e.g. "csv" → "text/csv"). Only accepted when a serializer is
-        // registered for this family.
-        if let Some(mt) = crate::core::media_type::resolve_alias(fmt)
-            && registry.dispatch(family, mt).is_some()
-        {
-            return Some(mt.to_string());
-        }
-
-        // An explicit `?format=` was given but resolved to nothing serviceable for
-        // this family. Give `format` hard priority (Python parity): return `None`
-        // so the caller raises an error, rather than silently falling back to the
-        // `Accept` default and serving the wrong representation.
-        return None;
+    // (1) Verbatim full MIME type — only accepted if a serializer for this family exists.
+    if fmt.contains('/') && registry.dispatch(family, fmt).is_some() {
+        return Some(fmt.to_string());
     }
-    resolve_media_type(accept, family, registry)
+
+    // (2) Registry alias table — bare or dotted extension.
+    if let Some(mt) = registry.resolve_alias(fmt) {
+        return Some(mt);
+    }
+    if !fmt.starts_with('.')
+        && let Some(mt) = registry.resolve_alias(&format!(".{fmt}"))
+    {
+        return Some(mt);
+    }
+
+    // (3) Core alias table — handles extensions not explicitly registered in the
+    // registry (e.g. "csv" → "text/csv"). Only accepted when a serializer is
+    // registered for this family.
+    if let Some(mt) = crate::core::media_type::resolve_alias(fmt)
+        && registry.dispatch(family, mt).is_some()
+    {
+        return Some(mt.to_string());
+    }
+
+    None
 }
 
 /// Resolve the appropriate media type from an Accept header.
@@ -364,6 +391,77 @@ mod tests {
             reg.dispatch(StructureFamily::Array, "application/zip")
                 .is_none(),
             "no array serializer for application/zip → router must reject"
+        );
+    }
+
+    /// `?format=` is a COMMA-SEPARATED priority list, resolved in listed order —
+    /// upstream `format.split(",")` (core.py:381) then first-serviceable-wins
+    /// negotiation (core.py:400-418), the same shape as the `Accept` path. The
+    /// FIRST token that resolves to a serviceable media type wins.
+    #[test]
+    fn format_comma_list_first_resolvable_token_wins() {
+        let reg = array_registry(); // octet-stream + json + csv + html
+        // `csv,application/json`: csv is first AND serviceable → csv wins.
+        assert_eq!(
+            negotiate_media_type(
+                Some("csv,application/json"),
+                "",
+                StructureFamily::Array,
+                &reg,
+            )
+            .as_deref(),
+            Some(crate::core::media_type::mime::CSV),
+        );
+        // Order matters, not "csv always wins": application/json listed first AND
+        // serviceable → it wins over the later csv.
+        assert_eq!(
+            negotiate_media_type(
+                Some("application/json,csv"),
+                "",
+                StructureFamily::Array,
+                &reg,
+            )
+            .as_deref(),
+            Some(crate::core::media_type::mime::JSON),
+        );
+    }
+
+    /// An unresolvable leading token is skipped; the next resolvable token wins.
+    #[test]
+    fn format_comma_list_skips_unresolvable_leading_token() {
+        let reg = array_registry();
+        assert_eq!(
+            negotiate_media_type(Some("unknownfmt,csv"), "", StructureFamily::Array, &reg)
+                .as_deref(),
+            Some(crate::core::media_type::mime::CSV),
+        );
+    }
+
+    /// A leading EMPTY token (`,csv` — leading/doubled comma) is skipped, never
+    /// treated as "no preference → default"; the next token wins.
+    #[test]
+    fn format_comma_list_skips_leading_empty_token() {
+        let reg = array_registry();
+        assert_eq!(
+            negotiate_media_type(Some(",csv"), "", StructureFamily::Array, &reg).as_deref(),
+            Some(crate::core::media_type::mime::CSV),
+        );
+    }
+
+    /// Every token unserviceable → `None` (HTTP 406), never an Accept fallback
+    /// (the Accept here asks for the serviceable octet-stream; `?format=` keeps
+    /// hard priority, upstream raises `UnsupportedMediaTypes`).
+    #[test]
+    fn format_comma_list_all_unresolvable_is_none() {
+        let reg = array_registry();
+        assert_eq!(
+            negotiate_media_type(
+                Some("badA,badB"),
+                "application/octet-stream",
+                StructureFamily::Array,
+                &reg,
+            ),
+            None,
         );
     }
 

@@ -2594,17 +2594,38 @@ fn negotiate_container_full(
 ) -> Option<ContainerFullFormat> {
     use crate::core::structures::StructureFamily::Container;
     if let Some(fmt) = format_param {
-        // `?format=` has hard priority over Accept and is single-valued in
-        // practice, so there is no ordering concern: a recognised wide-table
-        // format token is serviceable only on an `xarray_dataset` (on any other
-        // container it has no serializer → 406, exactly as before); every other
-        // token resolves through the container family.
-        let fmt = fmt.trim();
-        if let Some(target) = wide_table_format(fmt) {
-            return is_xarray_dataset.then_some(ContainerFullFormat::WideTable(target));
+        // `?format=` has hard priority over Accept and is a COMMA-SEPARATED
+        // priority list resolved in listed order (upstream `format.split(",")`,
+        // core.py:381, then first-serviceable-wins, core.py:400-418) — the same
+        // shape as the Accept loop below. Per token: a recognised wide-table
+        // format is serviceable ONLY on an `xarray_dataset`; on any other
+        // container it names nothing this container can produce and is disjoint
+        // from every container-family type, so it must FALL THROUGH to the next
+        // token (`?format=csv,application/json` on a plain container → json),
+        // never short-circuit to 406. A non-wide-table token resolves through the
+        // container family. The first token that resolves wins; `None` (→ 406)
+        // only when every token fails. Empty tokens (leading/trailing/doubled
+        // comma) match nothing and are skipped.
+        for token in fmt.split(',') {
+            let token = token.trim();
+            if token.is_empty() {
+                continue;
+            }
+            if let Some(target) = wide_table_format(token) {
+                if is_xarray_dataset {
+                    return Some(ContainerFullFormat::WideTable(target));
+                }
+                // Wide-table token on a non-xarray container: unserviceable here,
+                // and disjoint from the container family, so try the next token.
+                continue;
+            }
+            if let Some(mt) =
+                crate::serialization::negotiate_media_type(Some(token), "", Container, registry)
+            {
+                return Some(ContainerFullFormat::Family(mt));
+            }
         }
-        return crate::serialization::negotiate_media_type(Some(fmt), "", Container, registry)
-            .map(ContainerFullFormat::Family);
+        return None;
     }
     // A truly-absent / whole-blank Accept header expresses no preference → the
     // container family default, resolved ONCE here. This must NOT be delegated to
@@ -2788,6 +2809,74 @@ mod negotiate_container_full_tests {
     fn trailing_empty_accept_segment_does_not_default_to_html() {
         let reg = default_registry();
         assert!(negotiate_container_full(None, "application/xml,", false, &reg).is_none());
+    }
+
+    /// PART B: `?format=` is a COMMA-SEPARATED priority list resolved in listed
+    /// order (upstream `format.split(",")`, core.py:381, + first-serviceable-wins,
+    /// core.py:400-418), same as the Accept path. `csv,application/json`: on an
+    /// xarray_dataset csv is first AND serviceable (wide-table) → csv; on a plain
+    /// container csv is unserviceable and MUST fall through to the serviceable
+    /// application/json — never early-return None.
+    #[test]
+    fn format_comma_list_csv_then_json_depends_on_xarray_candidacy() {
+        let reg = default_registry();
+        assert_eq!(
+            wide(negotiate_container_full(
+                Some("csv,application/json"),
+                "",
+                true,
+                &reg
+            )),
+            "text/csv"
+        );
+        assert_eq!(
+            family(negotiate_container_full(
+                Some("csv,application/json"),
+                "",
+                false,
+                &reg
+            )),
+            "application/json"
+        );
+    }
+
+    /// PART B: a leading EMPTY `?format=` token (`,application/json`) is skipped;
+    /// the next serviceable token wins.
+    #[test]
+    fn format_comma_list_skips_leading_empty_token() {
+        let reg = default_registry();
+        assert_eq!(
+            family(negotiate_container_full(
+                Some(",application/json"),
+                "",
+                false,
+                &reg
+            )),
+            "application/json"
+        );
+    }
+
+    /// PART B: an unresolvable leading `?format=` token (`unknownfmt,application/json`)
+    /// is skipped; the next serviceable token wins.
+    #[test]
+    fn format_comma_list_skips_unresolvable_leading_token() {
+        let reg = default_registry();
+        assert_eq!(
+            family(negotiate_container_full(
+                Some("unknownfmt,application/json"),
+                "",
+                false,
+                &reg
+            )),
+            "application/json"
+        );
+    }
+
+    /// PART B: every `?format=` token unserviceable → None (HTTP 406).
+    #[test]
+    fn format_comma_list_all_unresolvable_is_none() {
+        let reg = default_registry();
+        assert!(negotiate_container_full(Some("badA,badB"), "", false, &reg).is_none());
     }
 }
 
