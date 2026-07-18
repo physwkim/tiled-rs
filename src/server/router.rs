@@ -8378,22 +8378,36 @@ async fn catalog_metadata_resource(
                 })
                 .unwrap_or_default()
             };
-            (Some(structure), None)
+            // A container can OWN data sources (`create_data_source` accepts a
+            // container node id), and `?include_data_sources=true` must surface
+            // them here — exactly as the /search page does. `search_page`
+            // (`catalog/adapter.rs`) computes each node's data sources
+            // regardless of family and sets `data_sources` unconditionally; only
+            // `structure` is family-branched. This branch previously hardcoded
+            // `None`, dropping a container's own data sources; route it through
+            // the same `attach_data_source_assets` owner the leaf branch uses.
+            let ds_list = if include_data_sources {
+                let ds_rows = catalog
+                    .list_data_sources(node.id)
+                    .await
+                    .map_err(map_catalog_err)?;
+                Some(attach_data_source_assets(catalog, ds_rows).await?)
+            } else {
+                None
+            };
+            (Some(structure), ds_list)
         } else {
             let ds_rows = catalog
                 .list_data_sources(node.id)
                 .await
                 .map_err(map_catalog_err)?;
+            // A leaf's structure is its first data source's raw stored structure
+            // (not the family-narrowed wire structure) — read it before moving
+            // `ds_rows` into the shared asset-attaching owner below, matching the
+            // /search leaf path.
             let sv = ds_rows.first().map(|ds| ds.structure.clone());
             let ds_list = if include_data_sources {
-                let mut result = Vec::with_capacity(ds_rows.len());
-                for ds in ds_rows {
-                    let asset_rows = catalog.list_assets(ds.id).await.map_err(map_catalog_err)?;
-                    result.push(crate::catalog::data_source::to_core_data_source(
-                        ds, asset_rows,
-                    ));
-                }
-                Some(result)
+                Some(attach_data_source_assets(catalog, ds_rows).await?)
             } else {
                 None
             };
@@ -8430,6 +8444,28 @@ async fn catalog_metadata_resource(
         },
         links,
     })
+}
+
+/// Load each catalog data-source row's assets and convert to the wire
+/// `DataSource`, for `?include_data_sources=true`. Single owner for the
+/// assets-plus-convert step shared by the container and leaf branches of
+/// [`catalog_metadata_resource`], so a node's data sources are shaped
+/// identically whatever its family — the same `to_core_data_source` mapping the
+/// /search page uses (`catalog/adapter.rs`). Given already-fetched `ds_rows`
+/// (never re-queried), the empty slice yields an empty list — parity with the
+/// /search page's `Some(vec![])` for a node with no sources.
+async fn attach_data_source_assets(
+    catalog: &crate::catalog::Catalog,
+    ds_rows: Vec<crate::catalog::DataSourceRecord>,
+) -> Result<Vec<crate::core::data_source::DataSource>, ServerError> {
+    let mut result = Vec::with_capacity(ds_rows.len());
+    for ds in ds_rows {
+        let asset_rows = catalog.list_assets(ds.id).await.map_err(map_catalog_err)?;
+        result.push(crate::catalog::data_source::to_core_data_source(
+            ds, asset_rows,
+        ));
+    }
+    Ok(result)
 }
 
 /// Map a DB `structure_family` string to the enum. Delegates to the canonical
