@@ -267,58 +267,65 @@ async fn run_subscription(
     let (mut tx, mut rx) = futures::StreamExt::split(socket);
     use futures::SinkExt;
 
-    // Resolve the authentication context. Prefer the header-based auth
-    // (Bearer JWT, Apikey) collected before the upgrade — that's how
-    // non-browser clients usually arrive. Fall back to a first-message
-    // handshake (tiled#1351) if the headers carried nothing usable.
-    // Resolve the auth context in upstream's WS precedence: a real header
-    // credential wins, then the `?access_token=` query JWT, then — only when no
-    // token was presented — the first-message handshake (which grants anonymous
-    // scopes when admission is allowed, else waits for an in-band credential).
-    // Upstream resolves connect-time scopes from the Apikey header OR the
-    // `access_token` query, preferring the header (`get_current_scopes_websocket`,
-    // authentication.py:449-455), and a valid token overrides the anonymous
-    // PUBLIC_SCOPES fallback (:454-457) — so the query JWT is tried BEFORE
-    // anonymous admission, not after.
+    // Resolve the authentication context. Two stages, mirroring how upstream's
+    // FastAPI WS endpoint resolves auth (`router.py:751-768`):
     //
-    // A PRESENTED-but-invalid `?access_token=` is a HARD DENY, never a
-    // fall-through. Upstream decodes the query token during WS dependency
-    // resolution and raises 401 there — expiry → "Access token has expired.
-    // Refresh token." (`get_decoded_access_token_websocket`,
-    // authentication.py:297-311); any other JWT error → `decode_token`'s
-    // `credentials_exception` (:153-177) — BEFORE the first-message/anonymous
-    // path is reachable. Mirror that: an ABSENT/empty token falls through to the
-    // handshake, a valid token authenticates, and an invalid token closes the
-    // connection. All three funnel through one `Result` so the invalid-token
-    // deny reuses the SAME close mechanics as a handshake failure, and the
-    // former `query_ctx = None` (which conflated "no token" with "invalid
-    // token", producing the silent anonymous downgrade) is gone.
+    // (1) VALIDATE a presented `?access_token=` query JWT UNCONDITIONALLY, before
+    //     any precedence choice. `get_decoded_access_token_websocket` is declared
+    //     as a DIRECT dependency of the WS endpoint (`router.py:766-768`) and is
+    //     resolved BEFORE the endpoint body, so a present-but-invalid/expired
+    //     token raises 401 there — expiry → "Access token has expired. Refresh
+    //     token." (`authentication.py:303-311`); any other JWT error →
+    //     `decode_token`'s `credentials_exception` (:153-177) — REGARDLESS of a
+    //     valid Apikey/Bearer header. The header's `api_key` branch only shadows
+    //     the decoded token for SCOPE SELECTION (`get_current_scopes_websocket`,
+    //     :449-455); it never skips the token's validation. So a present query
+    //     token that fails to decode is a HARD DENY even when a valid header is
+    //     also present (F1). An ABSENT/empty token decodes to `None`
+    //     (`authentication.py:303-304`) and defers to stage 2. `api_key` is
+    //     header-only for WS (`:283-294`), so there is deliberately no `?api_key=`
+    //     query here.
+    //
+    // (2) SELECT the auth context by precedence: a real header credential wins
+    //     (Bearer JWT or Apikey, collected by `resolve_header_auth` before the
+    //     upgrade — upstream's `api_key` branch runs first, :449-455), then the
+    //     valid query token (which overrides the anonymous `PUBLIC_SCOPES`
+    //     fallback, :454-457), then — only when NEITHER credential was presented —
+    //     the first-message handshake (tiled#1351; grants anonymous scopes when
+    //     admission is allowed, else waits for an in-band credential).
+    //
+    // The stage-1 invalid-token deny and the stage-2 handshake-failure deny funnel
+    // through the SINGLE `Err` handler below, reusing one close mechanism.
     let real_header = header_auth.filter(|c| !matches!(c.kind, AuthKind::Anonymous));
-    let auth_ctx = if let Some(ctx) = real_header {
-        // A real Bearer/Apikey header credential (collected by
-        // `resolve_header_auth` before the upgrade) always wins.
-        ctx
-    } else {
-        // No real header credential (none presented, presented-but-rejected, or
-        // anonymous). A PRESENTED query JWT is decoded through the same bearer
-        // path as a header token — `Ok` authenticates, `Err` denies. Only an
-        // ABSENT/empty token falls through to the first-message handshake.
-        // `api_key` is header-only for WS (authentication.py:283-294), so there
-        // is deliberately no `?api_key=` query here.
-        let resolved = match access_token.as_deref().filter(|t| !t.is_empty()) {
-            Some(token) => crate::server::app::validate_bearer(&state, token)
-                .await
-                .map_err(|e| format!("access_token: {e}")),
-            None => handshake_auth(&state, &mut tx, &mut rx).await,
-        };
-        match resolved {
-            Ok(ctx) => ctx,
-            Err(close_reason) => {
-                tracing::info!(target: "tiled.streaming", "ws auth failed: {close_reason}");
-                let _ = tx.send(Message::Text(close_reason.into())).await;
-                let _ = tx.send(Message::Close(None)).await;
-                return;
+    // Stage 1: a present query token is validated regardless of the header. `Err`
+    // propagates as a deny; `Ok(None)` means no token was presented.
+    let query_result = match access_token.as_deref().filter(|t| !t.is_empty()) {
+        Some(token) => crate::server::app::validate_bearer(&state, token)
+            .await
+            .map(Some)
+            .map_err(|e| format!("access_token: {e}")),
+        None => Ok(None),
+    };
+    // Stage 2: fold the query result and the precedence choice into one `Result`.
+    let resolved = match query_result {
+        Err(reason) => Err(reason),
+        Ok(query_ctx) => {
+            if let Some(ctx) = real_header {
+                Ok(ctx)
+            } else if let Some(ctx) = query_ctx {
+                Ok(ctx)
+            } else {
+                handshake_auth(&state, &mut tx, &mut rx).await
             }
+        }
+    };
+    let auth_ctx = match resolved {
+        Ok(ctx) => ctx,
+        Err(close_reason) => {
+            tracing::info!(target: "tiled.streaming", "ws auth failed: {close_reason}");
+            let _ = tx.send(Message::Text(close_reason.into())).await;
+            let _ = tx.send(Message::Close(None)).await;
+            return;
         }
     };
     // Subscribing requires BOTH read:data AND read:metadata on the token,
