@@ -8146,6 +8146,48 @@ pub async fn close_stream(
     Ok(axum::http::StatusCode::OK)
 }
 
+/// Caller-facing child count for a catalog container's count-only fast path
+/// (the root and every plain, non-inline container).
+///
+/// Invariant: every caller-facing container count is computed over the
+/// access-filtered child set when an access filter applies. With a filter, the
+/// count is the EXACT number of children the caller may list — the same
+/// `AccessBlobFilter`-scoped SQL `COUNT` `/search` reports as `meta.count` for
+/// this container (`search_children` `total`) — so a restricted caller is never
+/// told a cardinality larger than the children it can see. Without a filter
+/// (admin, or no policy: `list_filter` returns `None` = ALL_ACCESS) the count
+/// stays `count_children_or_approx`, preserving the Postgres statistics-based
+/// approximation for large containers. (The `len_or_approx` approximation
+/// divergence for filtered callers — an exact SQL `COUNT` instead of an estimate
+/// — is an accepted residual.)
+async fn caller_facing_child_count(
+    catalog: &crate::catalog::Catalog,
+    parent_id: Option<i64>,
+    access_filter: Option<&crate::core::queries::AccessBlobFilter>,
+    exact_count_limit: i64,
+) -> Result<i64, ServerError> {
+    match access_filter {
+        Some(f) => {
+            // `limit = 0` fetches no rows but still runs the filtered `COUNT`.
+            let (_, total) = catalog
+                .search_children(
+                    parent_id,
+                    &[crate::core::queries::Query::AccessBlobFilter(f.clone())],
+                    &[],
+                    0,
+                    0,
+                )
+                .await
+                .map_err(map_catalog_err)?;
+            Ok(total)
+        }
+        None => catalog
+            .count_children_or_approx(parent_id, exact_count_limit)
+            .await
+            .map_err(map_catalog_err),
+    }
+}
+
 /// Build a `Resource` for the catalog by reading the DB directly. Skips
 /// the `CatalogAdapter`'s in-memory cache so a same-request read after a
 /// write sees the latest state.
@@ -8173,12 +8215,11 @@ async fn catalog_metadata_resource(
         NodeAttributes, NodeStructure, Resource, SortDirection, SortingItem,
     };
     if segments.is_empty() {
-        // Root container length: exact for small containers, statistics-based
-        // approximation for large ones on Postgres (SQLite stays exact).
-        let count = catalog
-            .count_children_or_approx(None, exact_count_limit)
-            .await
-            .map_err(map_catalog_err)?;
+        // Root container length, principal-scoped: with an access filter the exact
+        // count of top-level nodes the caller may list, else the (SQLite-exact,
+        // Postgres-approximate) full count. See `caller_facing_child_count`.
+        let count =
+            caller_facing_child_count(catalog, None, access_filter, exact_count_limit).await?;
         let links = crate::core::links::links_for_node(
             crate::core::structures::StructureFamily::Container,
             base_url,
@@ -8319,13 +8360,18 @@ async fn catalog_metadata_resource(
                 )
                 .await?
             } else {
-                // Count-only fast path: exact for small containers, statistics-
-                // based approximation for large ones on Postgres (SQLite stays
-                // exact). No child adapter is built.
-                let count = catalog
-                    .count_children_or_approx(Some(node.id), exact_count_limit)
-                    .await
-                    .map_err(map_catalog_err)?;
+                // Count-only fast path (no child adapter built), principal-scoped:
+                // with an access filter the exact count of children the caller may
+                // list (matching this container's `/search` `meta.count`), else the
+                // (SQLite-exact, Postgres-approximate) full count. See
+                // `caller_facing_child_count`.
+                let count = caller_facing_child_count(
+                    catalog,
+                    Some(node.id),
+                    access_filter,
+                    exact_count_limit,
+                )
+                .await?;
                 serde_json::to_value(&NodeStructure {
                     contents: None,
                     count: count as usize,

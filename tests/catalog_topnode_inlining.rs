@@ -360,11 +360,17 @@ async fn create_with_access(
 /// `tests/inline_access_filter.rs`, but exercised via the `/metadata/<node>`
 /// top-node path rather than `/search`):
 /// ```text
-/// ds        (container, spec "xarray_dataset", untagged)  → inline-enabled
+/// ds         (container, spec "xarray_dataset", untagged) → inline-enabled
 /// ├── visible   (container, untagged → public)
 /// └── secret    (container, tagged "team-b")              → hidden from team-a
+/// pc         (plain container, untagged)                  → count-only fast path
+/// ├── pvis      (container, untagged → public)
+/// └── phid      (container, tagged "team-b")              → hidden from team-a
+/// roothidden (plain container, tagged "team-b")           → hidden root child
 /// ```
-/// Alice is granted `team-a` only.
+/// Alice is granted `team-a` only, so at the root she sees `ds` + `pc` (2 of 3),
+/// inside `pc` she sees `pvis` (1 of 2), and inside `ds` she sees `visible`
+/// (1 of 2).
 async fn build_access_app() -> (axum::Router, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let cat_uri = format!("sqlite://{}", dir.path().join("catalog.db").display());
@@ -412,6 +418,56 @@ async fn build_access_app() -> (axum::Router, tempfile::TempDir) {
     )
     .await;
 
+    // pc (plain container, untagged) → { pvis (untagged), phid (team-b) }. A
+    // plain container takes the count-only fast path (no inlining), so its count
+    // MUST also be principal-scoped.
+    let pc = create_with_access(
+        &catalog,
+        None,
+        vec![],
+        "pc",
+        serde_json::json!([]),
+        serde_json::json!({}),
+    )
+    .await;
+    create_with_access(
+        &catalog,
+        Some(pc),
+        vec!["pc".into()],
+        "pvis",
+        serde_json::json!([]),
+        serde_json::json!({}),
+    )
+    .await;
+    create_with_access(
+        &catalog,
+        Some(pc),
+        vec!["pc".into()],
+        "phid",
+        serde_json::json!([]),
+        serde_json::json!({"tags": ["team-b"]}),
+    )
+    .await;
+
+    // roothidden (plain container, team-b) → hidden from alice at the root, so
+    // the root count-only fast path must report 2 (ds + pc), not 3.
+    create_with_access(
+        &catalog,
+        None,
+        vec![],
+        "roothidden",
+        serde_json::json!([]),
+        serde_json::json!({"tags": ["team-b"]}),
+    )
+    .await;
+
+    (access_app_from(catalog, auth_db), dir)
+}
+
+/// Build a catalog-backed app under a `TagBasedPolicy` from an already-populated
+/// `catalog` + `auth_db`. Factored out of [`build_access_app`] so a fixture with a
+/// different tree (e.g. the >500-child boundary) reuses the identical state.
+fn access_app_from(catalog: Catalog, auth_db: AuthDb) -> axum::Router {
     let policy = TagBasedPolicy::new(Arc::new(auth_db.clone()), ScopeSet::full());
     let access_policy: Arc<dyn tiled_rs::access::AccessPolicy> = Arc::new(policy);
     let resolver: Arc<dyn tiled_rs::catalog::adapter::LeafResolver> = Arc::new(UnresolvedLeaf);
@@ -459,7 +515,7 @@ async fn build_access_app() -> (axum::Router, tempfile::TempDir) {
         background_tasks: tiled_rs::server::state::BackgroundTasks::new(),
         validation: Default::default(),
     };
-    (tiled_rs::server::build_app(state), dir)
+    tiled_rs::server::build_app(state)
 }
 
 async fn get_json_auth(
@@ -505,11 +561,12 @@ async fn login(app: &axum::Router, username: &str, password: &str) -> String {
 /// walk on `GET /metadata/<node>` MUST route child enumeration through the
 /// caller's `list_filter`, never raw `keys()`. Alice (team-a) reads the
 /// `xarray_dataset` top node `ds`; its `visible` child inlines, its `secret`
-/// (team-b) child MUST be absent from `structure.contents`. `count` stays the
-/// full child count (2), unchanged by the filter — matching
-/// `tests/inline_access_filter.rs` on the `/search` path. A direct GET of the
-/// hidden child 404s, proving the inline path cannot surface what a direct read
-/// denies.
+/// (team-b) child MUST be absent from `structure.contents`. `count` is
+/// principal-scoped: it reports only the visible child (1), NOT the full
+/// cardinality — matching `tests/inline_access_filter.rs` on the `/search` path
+/// and upstream `len_or_approx` over the `filter_for_access` view (core.py:509).
+/// A direct GET of the hidden child 404s, proving the inline path cannot surface
+/// what a direct read denies.
 #[tokio::test]
 async fn catalog_topnode_inline_walk_routes_through_access_filter() {
     let (app, _dir) = build_access_app().await;
@@ -533,11 +590,12 @@ async fn catalog_topnode_inline_walk_routes_through_access_filter() {
         "ACCESS LEAK: the access-filtered child `secret` must NOT be inlined \
          into the top node's contents: {contents}"
     );
-    // Count semantics unchanged: the full child count is still reported even
-    // though `secret` is absent from `contents`.
+    // Count is principal-scoped: only the visible child is counted, so `count`
+    // equals the number of `contents` entries (1). The access-filtered `secret`
+    // is absent from `contents` AND uncounted.
     assert_eq!(
-        s["count"], 2,
-        "count is the full child count, unchanged by the access filter: {s}"
+        s["count"], 1,
+        "count is the caller-visible child count (secret is hidden AND uncounted): {s}"
     );
 
     // Consistency: a direct GET of the hidden child 404s (read:metadata denied),
@@ -547,5 +605,148 @@ async fn catalog_topnode_inline_walk_routes_through_access_filter() {
         secret_status,
         StatusCode::NOT_FOUND,
         "direct GET of the access-hidden child must 404"
+    );
+}
+
+/// Count-only fast path (a plain, non-`xarray_dataset` container) must ALSO be
+/// principal-scoped. `pc` has `pvis` (visible) + `phid` (team-b, hidden); alice
+/// sees 1 of 2, so `GET /metadata/pc` must report `count == 1`, matching what a
+/// `/search/pc` listing (already filtered) reports as `meta.count`.
+#[tokio::test]
+async fn catalog_topnode_plain_container_count_is_principal_scoped() {
+    let (app, _dir) = build_access_app().await;
+    let token = login(&app, "alice", "wonderland").await;
+    let bearer = format!("Bearer {token}");
+
+    let (status, body) = get_json_auth(&app, "/api/v1/metadata/pc", &bearer).await;
+    assert_eq!(status, StatusCode::OK, "metadata/pc must be 200: {body}");
+    let s = &body["data"]["attributes"]["structure"];
+    // Plain container → count-only fast path, no inlining.
+    assert!(
+        s["contents"].is_null(),
+        "a plain container keeps contents:null: {s}"
+    );
+    assert_eq!(
+        s["count"], 1,
+        "plain-container count is the caller-visible child count (phid is hidden AND uncounted): {s}"
+    );
+
+    // Consistency: a `/search/pc` listing reports the same filtered count.
+    let (sstatus, sbody) = get_json_auth(
+        &app,
+        "/api/v1/search/pc?page[offset]=0&page[limit]=100",
+        &bearer,
+    )
+    .await;
+    assert_eq!(sstatus, StatusCode::OK, "search/pc must be 200: {sbody}");
+    assert_eq!(
+        sbody["meta"]["count"], 1,
+        "search meta.count and metadata count must agree for the same container: {sbody}"
+    );
+}
+
+/// The root container's count-only fast path must be principal-scoped too. The
+/// root holds `ds` + `pc` (visible) + `roothidden` (team-b, hidden); alice sees
+/// 2 of 3, so `GET /metadata/` must report `count == 2`.
+#[tokio::test]
+async fn catalog_root_count_is_principal_scoped() {
+    let (app, _dir) = build_access_app().await;
+    let token = login(&app, "alice", "wonderland").await;
+    let bearer = format!("Bearer {token}");
+
+    let (status, body) = get_json_auth(&app, "/api/v1/metadata/", &bearer).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "metadata/ (root) must be 200: {body}"
+    );
+    let s = &body["data"]["attributes"]["structure"];
+    assert_eq!(
+        s["count"], 2,
+        "root count is the caller-visible child count (roothidden is hidden AND uncounted): {s}"
+    );
+}
+
+/// Inline gate boundary: a container with MORE than `INLINED_CONTENTS_LIMIT`
+/// (500) total children but at most 500 *visible* to the caller must inline the
+/// visible set — the gate and cap operate on the permitted (filtered) count, not
+/// the full cardinality. Here `big` (xarray_dataset) has 500 hidden (team-b)
+/// children plus 2 visible, so total = 502 > 500 while alice sees only 2.
+/// Pre-fix, the full count (502) exceeded the cap and inlining was suppressed
+/// (`contents: null`, `count: 502`); post-fix the visible 2 inline (`count: 2`).
+#[tokio::test]
+async fn catalog_topnode_inline_gate_uses_visible_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let cat_uri = format!("sqlite://{}", dir.path().join("catalog.db").display());
+    let auth_uri = format!("sqlite://{}", dir.path().join("auth.db").display());
+
+    let catalog = Catalog::connect_with_pool_size(&cat_uri, 1).await.unwrap();
+    catalog.migrate().await.unwrap();
+    let auth_db = AuthDb::connect_with_pool_size(&auth_uri, 1).await.unwrap();
+    auth_db.migrate().await.unwrap();
+
+    let (alice, _) = auth_db.ensure_principal("dummy", "alice").await.unwrap();
+    auth_db
+        .set_principal_tags(alice.id, &["team-a".to_string()])
+        .await
+        .unwrap();
+
+    let big = create_with_access(
+        &catalog,
+        None,
+        vec![],
+        "big",
+        serde_json::json!(["xarray_dataset"]),
+        serde_json::json!({}),
+    )
+    .await;
+    // 500 hidden (team-b) children push the FULL count past the 500 cap.
+    for i in 0..500 {
+        create_with_access(
+            &catalog,
+            Some(big),
+            vec!["big".into()],
+            &format!("hidden{i:04}"),
+            serde_json::json!([]),
+            serde_json::json!({"tags": ["team-b"]}),
+        )
+        .await;
+    }
+    // 2 visible (untagged) children — the only ones alice may see.
+    for key in ["vis_a", "vis_b"] {
+        create_with_access(
+            &catalog,
+            Some(big),
+            vec!["big".into()],
+            key,
+            serde_json::json!([]),
+            serde_json::json!({}),
+        )
+        .await;
+    }
+
+    let app = access_app_from(catalog, auth_db);
+    let token = login(&app, "alice", "wonderland").await;
+    let bearer = format!("Bearer {token}");
+
+    let (status, body) = get_json_auth(&app, "/api/v1/metadata/big", &bearer).await;
+    assert_eq!(status, StatusCode::OK, "metadata/big must be 200: {body}");
+    let s = &body["data"]["attributes"]["structure"];
+    let contents = &s["contents"];
+    assert!(
+        contents.is_object(),
+        "502 total but 2 visible (<= 500 cap): the visible set MUST inline: {s}"
+    );
+    assert!(
+        contents.get("vis_a").is_some() && contents.get("vis_b").is_some(),
+        "both visible children must be inlined: {contents}"
+    );
+    assert!(
+        contents.get("hidden0000").is_none(),
+        "ACCESS LEAK: no hidden child may be inlined: {contents}"
+    );
+    assert_eq!(
+        s["count"], 2,
+        "count is the visible child count (2), not the full 502: {s}"
     );
 }
