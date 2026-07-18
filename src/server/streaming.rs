@@ -965,7 +965,9 @@ async fn handshake_auth(
         });
     }
     // Otherwise wait briefly for the client's first message — must be a
-    // JSON object: {"type": "auth", "apikey"|"bearer": "..."}.
+    // JSON object: {"type": "auth", "access_token"|"api_key": "..."}. The key
+    // names match upstream `authenticate_websocket_first_message`
+    // (authentication.py:460, docstring :488-490) exactly — no back-compat alias.
     let first =
         match tokio::time::timeout(Duration::from_secs(10), futures::StreamExt::next(rx)).await {
             Ok(Some(Ok(Message::Text(text)))) => text,
@@ -987,16 +989,16 @@ async fn handshake_auth(
     if parsed.get("type").and_then(|v| v.as_str()) != Some("auth") {
         return Err("auth handshake: first message must be {\"type\": \"auth\"}".into());
     }
-    if let Some(token) = parsed.get("bearer").and_then(|v| v.as_str()) {
+    if let Some(token) = parsed.get("access_token").and_then(|v| v.as_str()) {
         return crate::server::app::validate_bearer(state, token)
             .await
-            .map_err(|e| format!("bearer: {e}"));
+            .map_err(|e| format!("access_token: {e}"));
     }
-    if let Some(key) = parsed.get("apikey").and_then(|v| v.as_str()) {
+    if let Some(key) = parsed.get("api_key").and_then(|v| v.as_str()) {
         return crate::server::app::validate_apikey(state, key)
             .await
-            .map_err(|e| format!("apikey: {e}"));
+            .map_err(|e| format!("api_key: {e}"));
     }
     let _ = tx;
-    Err("auth handshake: provide 'bearer' or 'apikey'".into())
+    Err("auth handshake: provide 'access_token' or 'api_key'".into())
 }
