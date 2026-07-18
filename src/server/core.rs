@@ -4,7 +4,9 @@
 
 use std::sync::Arc;
 
-use crate::core::adapters::{AnyAdapter, ContainerAdapter, SearchEntry, TableAdapterRead};
+use crate::core::adapters::{
+    AnyAdapter, BoxFuture, ContainerAdapter, SearchEntry, TableAdapterRead,
+};
 use crate::core::dtype::{ArrowTable, BuiltinDType, Endianness, Kind};
 use crate::core::links;
 use crate::core::schemas::{
@@ -463,38 +465,158 @@ fn default_sorting() -> Vec<SortingItem> {
     }]
 }
 
+/// Upstream `INLINED_CONTENTS_LIMIT` (`tiled/server/core.py:56`): a container
+/// with more than this many children is never inlined — its `structure.contents`
+/// stays `None` even when inlining is otherwise enabled — to bound response size.
+const INLINED_CONTENTS_LIMIT: usize = 500;
+
 /// Construct a Resource for a given adapter.
 ///
-/// Async because a container node's `structure_json` now awaits a child count
-/// (a DB `count_children` for the SQL catalog).
-pub async fn construct_resource(
-    adapter: &AnyAdapter,
-    id: &str,
+/// Returns a boxed future because the container arm recurses (a container that
+/// [asks to inline](ContainerAdapter::inlined_contents_enabled) builds each
+/// child's full Resource one level deeper). `max_depth`/`depth` drive the
+/// upstream inline gate (`tiled/server/core.py:513-516`): `depth` is the walk
+/// level (0 at the addressed node) and `max_depth` the client's `?max_depth=`
+/// bound (`None` ⇒ inline down to `DEPTH_LIMIT`). A leaf ignores both and simply
+/// carries its own structure.
+pub fn construct_resource<'a>(
+    adapter: &'a AnyAdapter,
+    id: &'a str,
+    path: &'a str,
+    base_url: &'a str,
+    max_depth: Option<usize>,
+    depth: usize,
+) -> BoxFuture<'a, Result<Resource, ServerError>> {
+    Box::pin(async move {
+        let family = adapter.structure_family();
+        let node_links = links::links_for_node(family, base_url, path);
+
+        let sorting = match adapter {
+            AnyAdapter::Container(_) => Some(default_sorting()),
+            _ => None,
+        };
+
+        // A container's structure carries the child `count` and, when the inline
+        // gate passes, the children's full Resources under `contents`; a leaf
+        // carries its own array/table structure unchanged.
+        let structure = match adapter {
+            AnyAdapter::Container(c) => {
+                Some(build_container_structure(c.as_ref(), path, base_url, max_depth, depth).await?)
+            }
+            _ => adapter.structure_json().await?,
+        };
+
+        Ok(Resource {
+            id: id.to_string(),
+            attributes: NodeAttributes {
+                ancestors: ancestors_from_path(path),
+                structure_family: Some(family),
+                specs: Some(adapter.specs().to_vec()),
+                metadata: Some(adapter.metadata().clone()),
+                structure,
+                access_blob: None,
+                sorting,
+                data_sources: None,
+            },
+            links: node_links,
+        })
+    })
+}
+
+/// Build a container's wire `structure` (`{"contents": …, "count": N}`),
+/// inlining its children's full Resources when the upstream gate passes
+/// (`tiled/server/core.py:513-556`). Mirrors upstream exactly:
+///
+/// - Gate: `(max_depth is None || depth < max_depth) && inlined_contents_enabled(depth)
+///   && depth <= DEPTH_LIMIT`. When it fails, `contents` is `null` (an explicit
+///   JSON `null`, matching the prior non-inlined shape and upstream's
+///   `NodeStructure(contents=None)` dump) and `count` is the child count.
+/// - Size cap: a container whose count already exceeds
+///   [`INLINED_CONTENTS_LIMIT`] is not inlined (`contents = null`). While
+///   walking, if the true count crosses the cap (the estimate was low or the
+///   container grew), inlining is abandoned (`contents = null`) and `count` is
+///   recomputed. Otherwise `count` becomes the exact walked count.
+/// - A key that `keys()` listed but `get()` cannot resolve — a broken link
+///   (upstream `BrokenLink`) or a concurrent delete — is kept as an explicit
+///   `null` value under its key (upstream `contents[key] = None`); a genuine
+///   lookup error (DB/IO) propagates.
+async fn build_container_structure(
+    container: &dyn ContainerAdapter,
     path: &str,
     base_url: &str,
-) -> Result<Resource, ServerError> {
-    let family = adapter.structure_family();
-    let node_links = links::links_for_node(family, base_url, path);
+    max_depth: Option<usize>,
+    depth: usize,
+) -> Result<serde_json::Value, ServerError> {
+    let mut count = container.len().await?;
 
-    let sorting = match adapter {
-        AnyAdapter::Container(_) => Some(default_sorting()),
-        _ => None,
+    // Upstream inline gate (core.py:513-516). `max_depth is None` inlines down
+    // to the `depth <= DEPTH_LIMIT` bound; a set `max_depth` stops one level
+    // shallower via `depth < max_depth`.
+    let gate = max_depth.is_none_or(|m| depth < m)
+        && container.inlined_contents_enabled(depth)
+        && depth <= links::DEPTH_LIMIT;
+
+    let contents: Option<serde_json::Map<String, serde_json::Value>> = if gate {
+        if count > INLINED_CONTENTS_LIMIT {
+            // Estimated count already too large: do not inline.
+            None
+        } else {
+            let keys = container.keys().await?;
+            let mut map = serde_json::Map::new();
+            let mut walked = 0usize;
+            let mut too_large = false;
+            for key in keys {
+                walked += 1;
+                if walked > INLINED_CONTENTS_LIMIT {
+                    // The estimate was low or the container grew while walking.
+                    too_large = true;
+                    break;
+                }
+                let child_path = if path.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{path}/{key}")
+                };
+                match container.get(&key).await? {
+                    Some(child) => {
+                        let child_resource = construct_resource(
+                            &child,
+                            &key,
+                            &child_path,
+                            base_url,
+                            max_depth,
+                            depth + 1,
+                        )
+                        .await?;
+                        map.insert(
+                            key,
+                            serde_json::to_value(child_resource)
+                                .expect("Resource is always serializable"),
+                        );
+                    }
+                    // Broken link / concurrent delete: keep the key with a null
+                    // value (upstream `contents[key] = None`).
+                    None => {
+                        map.insert(key, serde_json::Value::Null);
+                    }
+                }
+            }
+            if too_large {
+                count = container.len().await?;
+                None
+            } else {
+                count = walked;
+                Some(map)
+            }
+        }
+    } else {
+        None
     };
 
-    Ok(Resource {
-        id: id.to_string(),
-        attributes: NodeAttributes {
-            ancestors: ancestors_from_path(path),
-            structure_family: Some(family),
-            specs: Some(adapter.specs().to_vec()),
-            metadata: Some(adapter.metadata().clone()),
-            structure: adapter.structure_json().await?,
-            access_blob: None,
-            sorting,
-            data_sources: None,
-        },
-        links: node_links,
-    })
+    Ok(serde_json::json!({
+        "contents": contents,
+        "count": count,
+    }))
 }
 
 /// Construct a Resource for the root container.
@@ -538,6 +660,12 @@ pub async fn construct_root_resource(
 /// absent — matching Python's cursor pagination. An unsupported query variant
 /// surfaces as `ServerError::UnsupportedQuery` (HTTP 400), matching Python
 /// tiled's `UnsupportedQueryType`.
+///
+/// `max_depth` mirrors the metadata route: each entry is built at walk depth 0,
+/// so an entry that is an inline-enabled container gets its children inlined
+/// into `structure.contents` when `(max_depth is None || 0 < max_depth)` — i.e.
+/// unless `?max_depth=0` (upstream builds each entry via `construct_resource`
+/// with `depth=0`, core.py:290).
 #[allow(clippy::too_many_arguments)]
 pub async fn construct_entries_response(
     container: &dyn ContainerAdapter,
@@ -550,6 +678,7 @@ pub async fn construct_entries_response(
     sorting: &[(String, SortDirection)],
     exact_count_limit: u64,
     include_data_sources: bool,
+    max_depth: Option<usize>,
 ) -> Result<Response<Vec<Resource>>, ServerError> {
     let page = container
         .search_page(
@@ -575,7 +704,31 @@ pub async fn construct_entries_response(
         } else {
             format!("{path_trimmed}/{}", entry.key)
         };
-        resources.push(resource_from_entry(entry, &child_path, base_url));
+        // Inline-eligibility pre-filter, read straight from the row so a listing
+        // full of plain containers is not resolved needlessly: a container entry
+        // advertising the "xarray_dataset" spec — the same discriminator
+        // `ContainerAdapter::inlined_contents_enabled` keys on — is a candidate to
+        // inline at depth 0 when `?max_depth=` is absent or `>= 1` (Some(0) means
+        // no inlining, mirroring `0 < max_depth` in the gate).
+        let inline_candidate = matches!(entry.structure_family, StructureFamily::Container)
+            && max_depth.is_none_or(|m| 0 < m)
+            && entry.specs.iter().any(|s| s.name == "xarray_dataset");
+        let key = entry.key.clone();
+        let mut resource = resource_from_entry(entry, &child_path, base_url);
+        if inline_candidate {
+            // Resolve the child and let `build_container_structure` apply the
+            // authoritative gate; it returns `{"contents": null, …}` if the
+            // resolved node opts out or exceeds the size cap.
+            if let Some(child) = container.get(&key).await?
+                && let Some(child_container) = child.as_container()
+            {
+                resource.attributes.structure = Some(
+                    build_container_structure(child_container, &child_path, base_url, max_depth, 0)
+                        .await?,
+                );
+            }
+        }
+        resources.push(resource);
     }
 
     let pagination = links::pagination_links(
