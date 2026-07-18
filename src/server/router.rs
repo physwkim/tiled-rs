@@ -2707,11 +2707,25 @@ async fn serve_xarray_wide_table(
 
     let keys: Vec<String> = match fields {
         Some(requested) => {
-            // Column projection. A requested field the caller cannot see is
-            // treated as absent (404) — matching `resolve_entry`'s existence-
-            // hiding for a direct node fetch — so a tagged variable's data never
-            // leaks through the `?field=` path.
+            // Column projection. The FULL child set is the validation universe
+            // (upstream `read(fields)` checks the whole mapping before access
+            // filtering); the access-visible set decides which validated fields
+            // the caller may actually see.
+            let all_keys = match &access_filter {
+                Some(_) => container.keys().await?,
+                None => visible_keys.clone(),
+            };
             for field in &requested {
+                // A field absent from the whole mapping → 400 "No such field
+                // {key}.", matching the sibling projection path
+                // (`apply_child_projection`) and upstream router.py:1444-1449.
+                if !all_keys.iter().any(|k| k == field) {
+                    return Err(ServerError::BadRequest(format!("No such field {field}.")));
+                }
+                // A field that exists but the caller cannot see is treated as
+                // absent (404) — matching `resolve_entry`'s existence-hiding for
+                // a direct node fetch — so a tagged variable's data never leaks
+                // through the `?field=` path.
                 if !visible_keys.iter().any(|k| k == field) {
                     return Err(ServerError::NotFound(format!("no child named '{field}'")));
                 }
