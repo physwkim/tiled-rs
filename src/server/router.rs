@@ -2455,7 +2455,6 @@ pub async fn post_container_full(
     fields: Option<Json<Vec<String>>>,
 ) -> Result<axum::response::Response, ServerError> {
     auth.require(crate::auth::Scope::ReadData)?;
-    let segments = segments_from_uri(&uri, "/api/v1/container/full/");
     let format_param = params
         .iter()
         .find(|(k, _)| k == "format")
@@ -2464,41 +2463,14 @@ pub async fn post_container_full(
         .iter()
         .find(|(k, _)| k == "filename")
         .map(|(_, v)| v.clone());
-    let accept = headers
-        .get("accept")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
 
-    if let Some(target) = wants_xarray_wide_table(format_param.as_deref(), accept) {
-        // H2: per-node policy check (parity with the GET path's resolve_entry).
-        if !segments.is_empty() {
-            let _ = resolve_entry(
-                &state,
-                auth.clone(),
-                &segments,
-                crate::auth::Scope::ReadData,
-            )
-            .await?;
-        }
-        let fields = fields.map(|Json(f)| f).filter(|f| !f.is_empty());
-        return serve_xarray_wide_table(
-            &state,
-            &auth,
-            &segments,
-            target,
-            fields,
-            filename_param,
-            &headers,
-        )
-        .await;
-    }
-
-    // Non-wide-table POST: delegate to the shared GET logic. The bare-list body is
-    // the column projection (upstream `container_full(field=field)` is shared by GET
-    // and POST, router.py:1428); forward it as repeated `field=` query keys so the
-    // GET path resolves the projection through the same `repeated_query_values`
-    // call — one projection resolution for both entry points, applied uniformly to
-    // every remaining format. format/filename ride the `Query` map as before.
+    // Every POST — wide-table export included — delegates to the shared GET logic.
+    // The bare-list body is the column projection (upstream
+    // `container_full(field=field)` is shared by GET and POST, router.py:1428);
+    // forward it as repeated `field=` query keys so the GET path resolves the
+    // projection through the same `repeated_query_values` call and runs the SINGLE
+    // `negotiate_container_full` — one projection resolution AND one negotiation
+    // owner for both entry points. format/filename ride the `Query` map as before.
     let mut query: HashMap<String, String> = HashMap::new();
     if let Some(f) = format_param {
         query.insert("format".to_string(), f);
@@ -2523,52 +2495,233 @@ pub async fn post_container_full(
     .map(IntoResponse::into_response)
 }
 
-/// Resolve a `/container/full` request to the wide-table export media type for an
-/// `xarray_dataset` container, or `None` when no such format is requested.
-///
-/// Only the ADDITIVE `xarray_dataset` spec formats are recognised — arrow (Arrow
-/// IPC), parquet, csv — which the Container family has no serializer for, so
-/// intercepting them here is not the spec-over-family override gated by P8 (that
-/// would be `application/json` / `text/html`, which the Container family already
-/// serves; see [`serve_xarray_wide_table`]). `?format=` wins over `Accept` (same
-/// hard priority as [`crate::serialization::negotiate_media_type`]); the format
-/// aliases mirror upstream (`arrow`/`feather` → Arrow, `parquet` →
-/// application/x-parquet, `csv` → text/csv). The returned media type is the
-/// TABLE-family key the wide table is encoded through.
-fn wants_xarray_wide_table(format_param: Option<&str>, accept: &str) -> Option<&'static str> {
+/// The format a `/container/full` request negotiated to. Upstream registers the
+/// additive `xarray_dataset` wide-table serializers (arrow/parquet/csv,
+/// serialization/xarray.py:68/73/80) under the `xarray_dataset` *spec*; the Rust
+/// serialization registry keys on `StructureFamily` only, so those spec
+/// serializers are served inline by [`serve_xarray_wide_table`]
+/// ([`WideTable`](ContainerFullFormat::WideTable)) while every container-family
+/// media type ([`Family`](ContainerFullFormat::Family)) flows through the normal
+/// container path. The `xarray_dataset` `application/json` / `text/html`
+/// serializers are deliberately NOT honoured — the Container family already
+/// serves those, so dispatching to the spec serializer would OVERRIDE the
+/// container default (the P8 spec-before-family override, blocked on sign-off).
+enum ContainerFullFormat {
+    /// A wide-table export; the str is the TABLE-family media type the flattened
+    /// table is encoded through (`text/csv`, `application/x-parquet`, or Arrow).
+    WideTable(&'static str),
+    /// A container-family media type (json / json-seq / html / zip / hdf5).
+    Family(String),
+}
+
+/// Map a base media type to its wide-table (`xarray_dataset` spec) encoding, or
+/// `None` when it is not one of the additive wide-table types. csv is registered
+/// upstream under three aliases — text/csv, text/comma-separated-values,
+/// text/plain (serialization/xarray.py:80-81) — all of which normalise to
+/// `text/csv`, the canonical key the TABLE csv serializer this path dispatches
+/// is keyed on (the aliases are not separately registered there).
+fn wide_table_media_type(base: &str) -> Option<&'static str> {
     use crate::core::media_type::mime;
-    if let Some(fmt) = format_param {
-        return match fmt {
-            "arrow" | "feather" | "ipc" => Some(mime::ARROW_FILE),
-            "parquet" | "pq" => Some(mime::PARQUET),
-            "csv" => Some(mime::CSV),
-            _ if fmt == mime::ARROW_FILE => Some(mime::ARROW_FILE),
-            _ if fmt == mime::PARQUET => Some(mime::PARQUET),
-            _ if fmt == mime::CSV => Some(mime::CSV),
-            _ => None,
-        };
+    match base {
+        mime::ARROW_FILE => Some(mime::ARROW_FILE),
+        mime::PARQUET => Some(mime::PARQUET),
+        mime::CSV | "text/comma-separated-values" | mime::PLAIN => Some(mime::CSV),
+        _ => None,
     }
-    accept.split(',').find_map(|part| {
-        let base = part.split(';').next().unwrap_or("").trim();
-        if base == mime::ARROW_FILE {
-            Some(mime::ARROW_FILE)
-        } else if base == mime::PARQUET {
-            Some(mime::PARQUET)
-        } else if base == mime::CSV || base == "text/comma-separated-values" || base == mime::PLAIN
-        {
-            // Upstream registers the dataset CSV serializer under three aliases —
-            // text/csv, text/comma-separated-values, text/plain
-            // (serialization/xarray.py:80-81) — all serving the same
-            // `to_dataframe()` CSV. Normalise to `text/csv` because the Table CSV
-            // serializer this path dispatches is keyed on that canonical type
-            // (the aliases are not separately registered there); the body is CSV
-            // either way. A non-`xarray_dataset` container still 406s downstream,
-            // exactly as it did before (Container family registers none of these).
-            Some(mime::CSV)
-        } else {
-            None
+}
+
+/// Resolve a `?format=` token to a wide-table media type, honouring the same
+/// extension aliases upstream `resolve_alias` does (arrow/feather/ipc, parquet/pq,
+/// csv) as well as the verbatim MIME forms — including the two csv aliases
+/// text/plain and text/comma-separated-values that upstream resolves through the
+/// same registry (core.py:381-388).
+fn wide_table_format(token: &str) -> Option<&'static str> {
+    use crate::core::media_type::mime;
+    match token {
+        "arrow" | "feather" | "ipc" => Some(mime::ARROW_FILE),
+        "parquet" | "pq" => Some(mime::PARQUET),
+        "csv" => Some(mime::CSV),
+        other => wide_table_media_type(other),
+    }
+}
+
+/// Negotiate the `/container/full` response format in listed order over the
+/// UNION of the container family's registered media types and — only when the
+/// node is an `xarray_dataset` candidate — the additive wide-table types
+/// (csv/parquet/arrow). Mirrors upstream core.py:396-425: the requested media
+/// types are tried in the order the client listed them (or the `?format=`
+/// order), and the FIRST type that ANY serializer can produce wins — the spec
+/// serializers (here, wide-table) and the structure-family serializers are
+/// considered together per media type, not in two separate passes. This closes
+/// the two-phase "scan the whole Accept for a wide-table type, then commit
+/// blindly" shape, which ignored listed order (a trailing csv alias could
+/// pre-empt an earlier-listed, container-servable `text/html`).
+///
+/// `?format=` keeps hard priority over `Accept` (upstream core.py:380, matching
+/// [`crate::serialization::negotiate_media_type`]). Container-family types
+/// (json/json-seq/html/zip/hdf5) and wide-table types (csv/parquet/arrow) are
+/// disjoint, so at most one branch matches per media type. Returns `None` —
+/// HTTP 406 — when nothing the client asked for is serviceable. Q-values are
+/// intentionally not parsed on either side (verified upstream parity).
+fn negotiate_container_full(
+    format_param: Option<&str>,
+    accept: &str,
+    is_xarray_dataset: bool,
+    registry: &crate::serialization::SerializationRegistry,
+) -> Option<ContainerFullFormat> {
+    use crate::core::structures::StructureFamily::Container;
+    if let Some(fmt) = format_param {
+        // `?format=` has hard priority over Accept and is single-valued in
+        // practice, so there is no ordering concern: a recognised wide-table
+        // format token is serviceable only on an `xarray_dataset` (on any other
+        // container it has no serializer → 406, exactly as before); every other
+        // token resolves through the container family.
+        let fmt = fmt.trim();
+        if let Some(target) = wide_table_format(fmt) {
+            return is_xarray_dataset.then_some(ContainerFullFormat::WideTable(target));
         }
-    })
+        return crate::serialization::negotiate_media_type(Some(fmt), "", Container, registry)
+            .map(ContainerFullFormat::Family);
+    }
+    // Accept header: iterate in listed order. Consider the spec (wide-table)
+    // serializers first for each entry — upstream checks the specs before the
+    // structure family (core.py:407) — then the container family via the shared
+    // `resolve_media_type` (so wildcard / blank-Accept / default handling stays
+    // identical to the plain container path).
+    for part in accept.split(',') {
+        let base = part.split(';').next().unwrap_or("").trim();
+        if is_xarray_dataset
+            && let Some(target) = wide_table_media_type(base)
+        {
+            return Some(ContainerFullFormat::WideTable(target));
+        }
+        if let Some(mt) = crate::serialization::resolve_media_type(part.trim(), Container, registry)
+        {
+            return Some(ContainerFullFormat::Family(mt));
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod negotiate_container_full_tests {
+    use super::{ContainerFullFormat, negotiate_container_full};
+    use crate::serialization::default_registry;
+
+    fn wide(f: Option<ContainerFullFormat>) -> &'static str {
+        match f {
+            Some(ContainerFullFormat::WideTable(t)) => t,
+            _ => panic!("expected WideTable"),
+        }
+    }
+    fn family(f: Option<ContainerFullFormat>) -> String {
+        match f {
+            Some(ContainerFullFormat::Family(t)) => t,
+            _ => panic!("expected Family"),
+        }
+    }
+
+    /// F1: a trailing csv alias must NOT pre-empt an earlier-listed,
+    /// container-servable `text/html` — the FIRST serviceable type wins, on both
+    /// a plain container and an xarray_dataset.
+    #[test]
+    fn accept_html_before_csv_alias_picks_html_in_listed_order() {
+        let reg = default_registry();
+        for is_xarray in [false, true] {
+            assert_eq!(
+                family(negotiate_container_full(
+                    None,
+                    "text/html, text/plain",
+                    is_xarray,
+                    &reg
+                )),
+                "text/html",
+                "is_xarray={is_xarray}"
+            );
+        }
+    }
+
+    /// F1: when the csv alias is listed FIRST it wins on an xarray_dataset (the
+    /// family cannot serve csv), but on a plain container it is skipped and the
+    /// later container-servable `text/html` wins.
+    #[test]
+    fn accept_csv_before_html_depends_on_xarray_candidacy() {
+        let reg = default_registry();
+        assert_eq!(
+            wide(negotiate_container_full(
+                None,
+                "text/csv, text/html",
+                true,
+                &reg
+            )),
+            "text/csv"
+        );
+        assert_eq!(
+            family(negotiate_container_full(
+                None,
+                "text/csv, text/html",
+                false,
+                &reg
+            )),
+            "text/html"
+        );
+    }
+
+    /// F2: every csv/parquet/arrow `?format=` alias — including the two csv
+    /// aliases text/plain and text/comma-separated-values — resolves to the
+    /// wide-table encoding on an xarray_dataset.
+    #[test]
+    fn format_wide_table_aliases_resolve_on_xarray() {
+        let reg = default_registry();
+        for (fmt, want) in [
+            ("csv", "text/csv"),
+            ("text/csv", "text/csv"),
+            ("text/plain", "text/csv"),
+            ("text/comma-separated-values", "text/csv"),
+            ("parquet", "application/x-parquet"),
+            ("pq", "application/x-parquet"),
+            ("arrow", "application/vnd.apache.arrow.file"),
+            ("feather", "application/vnd.apache.arrow.file"),
+            ("ipc", "application/vnd.apache.arrow.file"),
+        ] {
+            assert_eq!(
+                wide(negotiate_container_full(Some(fmt), "", true, &reg)),
+                want,
+                "?format={fmt}"
+            );
+        }
+    }
+
+    /// F2/F1: a wide-table `?format=` on a NON-xarray container has no serializer
+    /// → None (406); a container-family `?format=` (json) resolves regardless.
+    #[test]
+    fn format_wide_table_on_plain_is_none_family_still_resolves() {
+        let reg = default_registry();
+        assert!(negotiate_container_full(Some("text/plain"), "", false, &reg).is_none());
+        assert!(negotiate_container_full(Some("csv"), "", false, &reg).is_none());
+        assert_eq!(
+            family(negotiate_container_full(
+                Some("application/json"),
+                "",
+                false,
+                &reg
+            )),
+            "application/json"
+        );
+    }
+
+    /// A blank Accept expresses no preference → the container family default
+    /// (text/html), on either candidacy.
+    #[test]
+    fn blank_accept_resolves_to_container_default() {
+        let reg = default_registry();
+        for is_xarray in [false, true] {
+            assert_eq!(
+                family(negotiate_container_full(None, "", is_xarray, &reg)),
+                "text/html"
+            );
+        }
+    }
 }
 
 /// Collect the values of one or more repeated query keys off a raw URI, in order.
@@ -2665,7 +2818,7 @@ fn append_field_query(
 /// HTML index), so dispatching to the spec serializer would OVERRIDE the container
 /// default — the spec-before-family dispatch (upstream core.py:407) tracked as P8
 /// and blocked on sign-off (`docs/UPSTREAM_AUDIT.md`). See
-/// [`wants_xarray_wide_table`] for the request → media-type resolution.
+/// [`negotiate_container_full`] for the request → media-type resolution.
 ///
 /// `fields` is the column projection (a subset of child keys in request order,
 /// upstream `MapAdapter.read(fields=…)`, mapping.py:280); `None` reads every child.
@@ -2679,32 +2832,16 @@ fn append_field_query(
 async fn serve_xarray_wide_table(
     state: &AppState,
     auth: &crate::server::AuthContext,
-    segments: &[String],
+    container: &dyn ContainerAdapter,
     target_media_type: &str,
     fields: Option<Vec<String>>,
     filename: Option<String>,
     headers: &HeaderMap,
 ) -> Result<axum::response::Response, ServerError> {
-    let walked;
-    let container: &dyn ContainerAdapter = if segments.is_empty() {
-        state.root_tree.as_ref()
-    } else {
-        walked = core::walk_tree(state.root_tree.as_ref(), segments).await?;
-        walked.as_container().ok_or_else(|| {
-            ServerError::WrongType(format!("'{}' is not a container", segments.join("/")))
-        })?
-    };
-
-    // Parity gate: only an `xarray_dataset` container has these wide-table
-    // serializers upstream. A plain container → 406, exactly as the family-keyed
-    // `negotiate_media_type` answers for every other unsupported format.
-    if !container.specs().iter().any(|s| s.name == "xarray_dataset") {
-        return Err(unsupported_media_type(
-            crate::core::structures::StructureFamily::Container,
-            target_media_type,
-            &state.serialization_registry,
-        ));
-    }
+    // The `xarray_dataset` spec gate is enforced by construction: this function
+    // is reached only when `negotiate_container_full` returned `WideTable`, which
+    // requires `is_xarray_dataset` (checked on this same `container`). A plain
+    // container never negotiates to a wide-table format — it 406s at negotiation.
 
     // Access filter: caller-facing child listings MUST route through the policy's
     // list_filter, never raw keys() (invariant established in the zarr fix
@@ -3056,44 +3193,74 @@ pub async fn container_full(
         .await?;
     }
 
-    // No Accept header expresses no preference → resolve to the container
-    // family default (text/html) via `negotiate_media_type`. Do NOT substitute a
-    // concrete type here: that would make a no-Accept request indistinguishable
-    // from an explicit unsupported one and defeat the 406 below.
+    // No Accept header expresses no preference → resolve to the container family
+    // default (text/html). Do NOT substitute a concrete type here: that would
+    // make a no-Accept request indistinguishable from an explicit unsupported one
+    // and defeat the 406 below.
     let accept = headers
         .get("accept")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     let format_str = params.get("format").map(|s| s.to_string());
     let filename_str = params.get("filename").map(|s| s.to_string());
+    let family = crate::core::structures::StructureFamily::Container;
 
-    // Wide-table export (arrow / parquet / csv). Upstream registers these
-    // Container serializers under the `xarray_dataset` *spec*
-    // (serialization/xarray.py:68/73/80); the Rust serialization registry keys on
-    // `StructureFamily` only, so a spec-keyed serializer is unrepresentable and
-    // `negotiate_media_type` below (family-keyed) would answer 406. Intercept the
-    // request here and mirror the serializers' shared logic inline in
-    // `serve_xarray_wide_table`, which still 406s for a non-`xarray_dataset`
-    // container — exactly what negotiation would do. Only these additive formats
-    // are intercepted; the `xarray_dataset` json/html serializers would override a
-    // Container-family default (the P8 spec-before-family dispatch, blocked on
-    // sign-off), so they are left to the container path below. The repeated
-    // `field`/`column` query keys are the column projection (upstream `field` query
-    // param, router.py:1352); `Query<HashMap>` collapses repeated keys, so read
-    // them straight off the raw URI.
-    if let Some(target) = wants_xarray_wide_table(format_str.as_deref(), accept) {
-        let fields = repeated_query_values(&uri, &["field", "column"]);
-        return serve_xarray_wide_table(
-            &state,
-            &auth,
-            &segments,
-            target,
-            fields,
-            filename_str,
-            &headers,
-        )
-        .await;
-    }
+    // Resolve the container ONCE (walk), then negotiate over its specs. The
+    // node's `xarray_dataset` candidacy decides whether the additive wide-table
+    // formats (csv/parquet/arrow) are serviceable, so the walk must precede
+    // negotiation. A non-container path answers `WrongType` (404) up front here —
+    // the same "not a container" verdict each branch produced before, now uniform
+    // and hoisted. Every downstream branch (wide-table, zip, hdf5, json/html)
+    // reuses this single `container`, collapsing four redundant walks into one.
+    let walked;
+    let container: &dyn ContainerAdapter = if segments.is_empty() {
+        state.root_tree.as_ref()
+    } else {
+        walked = core::walk_tree(state.root_tree.as_ref(), &segments).await?;
+        walked.as_container().ok_or_else(|| {
+            ServerError::WrongType(format!("'{}' is not a container", segments.join("/")))
+        })?
+    };
+    let is_xarray_dataset = container.specs().iter().any(|s| s.name == "xarray_dataset");
+
+    // Single listed-order negotiation over the UNION of the container family's
+    // media types and (only when this node is an `xarray_dataset`) the additive
+    // wide-table types. The wide-table export is served inline — upstream
+    // registers it under the `xarray_dataset` *spec*, which the family-keyed Rust
+    // registry cannot represent; every container-family media type flows through
+    // the path below. The repeated `field`/`column` query keys are the column
+    // projection (upstream `field` query, router.py:1352); `Query<HashMap>`
+    // collapses repeated keys, so read them straight off the raw URI.
+    let media_type = match negotiate_container_full(
+        format_str.as_deref(),
+        accept,
+        is_xarray_dataset,
+        &state.serialization_registry,
+    ) {
+        Some(ContainerFullFormat::WideTable(target)) => {
+            let fields = repeated_query_values(&uri, &["field", "column"]);
+            return serve_xarray_wide_table(
+                &state,
+                &auth,
+                container,
+                target,
+                fields,
+                filename_str,
+                &headers,
+            )
+            .await;
+        }
+        Some(ContainerFullFormat::Family(mt)) => mt,
+        None => {
+            // An explicit but unserviceable format/Accept → HTTP 406, consistent
+            // with the array/table/sparse handlers (no silent HTML fallback).
+            return Err(unsupported_media_type(
+                family,
+                format_str.as_deref().unwrap_or(accept),
+                &state.serialization_registry,
+            ));
+        }
+    };
 
     // Column projection — resolved ONCE here, before the format dispatch below, so
     // every non-arrow format (zip, hdf5, json, json-seq/html) restricts its walk
@@ -3103,24 +3270,6 @@ pub async fn container_full(
     // list body as repeated `field=` query keys (see `post_container_full`), so GET
     // and POST converge on this single resolution.
     let projection = repeated_query_values(&uri, &["field", "column"]);
-
-    // Resolve effective media type once: format param beats Accept header. An
-    // explicit but unserviceable format/Accept resolves to `None` → HTTP 406,
-    // consistent with the array/table/sparse handlers (no silent HTML fallback).
-    let family = crate::core::structures::StructureFamily::Container;
-    let media_type = crate::serialization::negotiate_media_type(
-        format_str.as_deref(),
-        accept,
-        family,
-        &state.serialization_registry,
-    )
-    .ok_or_else(|| {
-        unsupported_media_type(
-            family,
-            format_str.as_deref().unwrap_or(accept),
-            &state.serialization_registry,
-        )
-    })?;
     let path = segments.join("/");
 
     // H3: compute access filter once (async) so it can be pushed into the
@@ -3147,19 +3296,10 @@ pub async fn container_full(
     // are async (a blocking backend offloads internally); the per-leaf zip
     // deflate is the CPU-bound part and stays on `spawn_blocking`.
     if media_type == "application/zip" {
-        // Phase 1: walk the container tree and collect a FLAT, ordered list of
-        // leaf entries. Each leaf captures an OWNED Arc handle (via
-        // as_array_arc/as_table_arc) — NOT decoded data — so the reads run in
-        // phase 2. No read() happens in this phase.
-        let walked_zip;
-        let container: &dyn ContainerAdapter = if segments.is_empty() {
-            state.root_tree.as_ref()
-        } else {
-            walked_zip = core::walk_tree(state.root_tree.as_ref(), &segments).await?;
-            walked_zip.as_container().ok_or_else(|| {
-                ServerError::WrongType(format!("'{}' is not a container", segments.join("/")))
-            })?
-        };
+        // Phase 1: walk the already-resolved container tree and collect a FLAT,
+        // ordered list of leaf entries. Each leaf captures an OWNED Arc handle
+        // (via as_array_arc/as_table_arc) — NOT decoded data — so the reads run
+        // in phase 2. No read() happens in this phase.
         let max_depth: Option<usize> = params
             .get("max_depth")
             .and_then(|s| s.parse::<usize>().ok())
@@ -3294,14 +3434,14 @@ pub async fn container_full(
 
     // Deep-export to a single HDF5 file — Python container.serialize_hdf5
     // (serialization/container.py:46). Like the zip branch this needs the
-    // adapter tree (not just bytes), so the walk + per-leaf read happen here:
-    // each numeric array → a dataset, each table column → its own 1-D dataset,
-    // intermediate containers → groups.
+    // adapter tree (not just bytes): each numeric array → a dataset, each table
+    // column → its own 1-D dataset, intermediate containers → groups. Reuses the
+    // container resolved above.
     #[cfg(feature = "hdf5-serializer")]
     if media_type == crate::core::media_type::mime::HDF5 {
         let h5 = container_full_hdf5(
             &state,
-            &segments,
+            container,
             &path,
             access_filter.as_ref(),
             &params,
@@ -3316,16 +3456,8 @@ pub async fn container_full(
         ));
     }
 
-    // Non-zip: resolve the container on the executor (async walk/keys/search/get).
-    let walked_nonzip;
-    let container: &dyn ContainerAdapter = if segments.is_empty() {
-        state.root_tree.as_ref()
-    } else {
-        walked_nonzip = core::walk_tree(state.root_tree.as_ref(), &segments).await?;
-        walked_nonzip.as_container().ok_or_else(|| {
-            ServerError::WrongType(format!("'{}' is not a container", segments.join("/")))
-        })?
-    };
+    // Non-zip: the container was resolved above; keys/search/get run on the
+    // executor (async).
 
     // Assemble the body for the registered Container serializer. application/json
     // is the recursive `{contents, metadata}` tree (Python `serialize_json`,
@@ -3478,7 +3610,7 @@ enum CollectedH5Leaf {
 #[cfg(feature = "hdf5-serializer")]
 async fn container_full_hdf5(
     state: &AppState,
-    segments: &[String],
+    container: &dyn ContainerAdapter,
     path: &str,
     access_filter: Option<&crate::core::queries::AccessBlobFilter>,
     params: &HashMap<String, String>,
@@ -3486,15 +3618,6 @@ async fn container_full_hdf5(
 ) -> Result<bytes::Bytes, ServerError> {
     use crate::serialization::hdf5_container::Hdf5TreeBuilder;
 
-    let walked;
-    let container: &dyn ContainerAdapter = if segments.is_empty() {
-        state.root_tree.as_ref()
-    } else {
-        walked = core::walk_tree(state.root_tree.as_ref(), segments).await?;
-        walked.as_container().ok_or_else(|| {
-            ServerError::WrongType(format!("'{}' is not a container", segments.join("/")))
-        })?
-    };
     let max_depth: Option<usize> = params
         .get("max_depth")
         .and_then(|s| s.parse::<usize>().ok())
