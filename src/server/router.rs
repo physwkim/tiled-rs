@@ -2460,6 +2460,7 @@ pub async fn post_container_full(
         let fields = fields.map(|Json(f)| f).filter(|f| !f.is_empty());
         return serve_xarray_wide_table(
             &state,
+            &auth,
             &segments,
             target,
             fields,
@@ -2645,6 +2646,7 @@ fn append_field_query(
 /// schema.
 async fn serve_xarray_wide_table(
     state: &AppState,
+    auth: &crate::server::AuthContext,
     segments: &[String],
     target_media_type: &str,
     fields: Option<Vec<String>>,
@@ -2672,9 +2674,51 @@ async fn serve_xarray_wide_table(
         ));
     }
 
-    let keys: Vec<String> = match fields {
-        Some(f) => f,
+    // Access filter: caller-facing child listings MUST route through the policy's
+    // list_filter, never raw keys() (invariant established in the zarr fix
+    // 82a7041; the sibling container_full path computes the same filter). A
+    // wide-table export reads child DATA, so it needs read:data — parity with the
+    // deep export's `list_filter` scopes (router.py:1456).
+    let access_filter = if let Some(ref policy) = state.access_policy {
+        let requested = crate::auth::ScopeSet::from_iter([crate::auth::Scope::ReadData]);
+        policy
+            .list_filter(
+                auth.principal.as_deref(),
+                &auth.scopes,
+                &requested,
+                auth.authn_access_tags.as_deref(),
+            )
+            .await
+    } else {
+        None
+    };
+
+    // The access-visible child set: the filter applied via `search` (which the
+    // in-memory tree, the SQL catalog, and every backend evaluate uniformly);
+    // raw `keys()` only when no policy is in force.
+    let visible_keys = match &access_filter {
+        Some(f) => {
+            container
+                .search(&[crate::core::queries::Query::AccessBlobFilter(f.clone())])
+                .await?
+        }
         None => container.keys().await?,
+    };
+
+    let keys: Vec<String> = match fields {
+        Some(requested) => {
+            // Column projection. A requested field the caller cannot see is
+            // treated as absent (404) — matching `resolve_entry`'s existence-
+            // hiding for a direct node fetch — so a tagged variable's data never
+            // leaks through the `?field=` path.
+            for field in &requested {
+                if !visible_keys.iter().any(|k| k == field) {
+                    return Err(ServerError::NotFound(format!("no child named '{field}'")));
+                }
+            }
+            requested
+        }
+        None => visible_keys,
     };
 
     let slice = crate::core::ndslice::NDSlice::empty();
@@ -2936,8 +2980,16 @@ pub async fn container_full(
     // them straight off the raw URI.
     if let Some(target) = wants_xarray_wide_table(format_str.as_deref(), accept) {
         let fields = repeated_query_values(&uri, &["field", "column"]);
-        return serve_xarray_wide_table(&state, &segments, target, fields, filename_str, &headers)
-            .await;
+        return serve_xarray_wide_table(
+            &state,
+            &auth,
+            &segments,
+            target,
+            fields,
+            filename_str,
+            &headers,
+        )
+        .await;
     }
 
     // Column projection — resolved ONCE here, before the format dispatch below, so

@@ -19,16 +19,21 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use indexmap::IndexMap;
 use serde_json::json;
 use tokio::net::TcpListener;
 
+use tiled_rs::access::{AccessPolicy, Decision, NodeContext};
 use tiled_rs::adapters::{ArrayAdapter, MapAdapter};
+use tiled_rs::auth::{Principal, ScopeSet};
 use tiled_rs::client::{DatasetClient, from_uri};
-use tiled_rs::core::adapters::{AnyAdapter, ContainerAdapter};
+use tiled_rs::core::adapters::{AnyAdapter, BaseAdapter, BoxFuture, ContainerAdapter};
 use tiled_rs::core::dtype::{BuiltinDType, Endianness, Kind};
-use tiled_rs::core::structures::Spec;
+use tiled_rs::core::error::Result as AdapterResult;
+use tiled_rs::core::queries::{AccessBlobFilter, Query};
+use tiled_rs::core::structures::{ContainerStructure, Spec, StructureFamily};
 
 // ---------------------------------------------------------------------------
 // fixtures
@@ -126,6 +131,17 @@ fn root_with(children: Vec<(&str, AnyAdapter)>) -> Arc<dyn ContainerAdapter> {
 /// `base_url: None` so node links derive from the request Host, letting the
 /// client follow them back to the ephemeral address.
 fn app_for_root(root: Arc<dyn ContainerAdapter>) -> axum::Router {
+    app_for_root_with_policy(root, None)
+}
+
+/// Like [`app_for_root`] but installs `access_policy`. `api_key`/`auth_db` stay
+/// unset so the server is in the `no_auth_configured` dev mode (anonymous full
+/// scope); the policy's `list_filter` still runs, so the wide-table export
+/// routes child enumeration through the access filter.
+fn app_for_root_with_policy(
+    root: Arc<dyn ContainerAdapter>,
+    access_policy: Option<Arc<dyn AccessPolicy>>,
+) -> axum::Router {
     let registry = Arc::new(tiled_rs::serialization::default_registry());
     let state = tiled_rs::server::AppState {
         root_tree: root,
@@ -151,7 +167,7 @@ fn app_for_root(root: Arc<dyn ContainerAdapter>) -> axum::Router {
         max_request_body_bytes: 10 * 1024 * 1024,
         response_bytesize_limit: 300_000_000,
         streaming_cache: tiled_rs::server::streaming_cache::disabled(),
-        access_policy: None,
+        access_policy,
         default_login_scopes: tiled_rs::auth::ScopeSet::full(),
         enable_web: false,
         web_assets_dir: None,
@@ -169,7 +185,17 @@ fn app_for_root(root: Arc<dyn ContainerAdapter>) -> axum::Router {
 }
 
 async fn spawn(root: Arc<dyn ContainerAdapter>) -> String {
-    let app = app_for_root(root);
+    spawn_app(app_for_root(root)).await
+}
+
+async fn spawn_with_policy(
+    root: Arc<dyn ContainerAdapter>,
+    policy: Arc<dyn AccessPolicy>,
+) -> String {
+    spawn_app(app_for_root_with_policy(root, Some(policy))).await
+}
+
+async fn spawn_app(app: axum::Router) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let base = format!("http://{addr}");
@@ -256,4 +282,193 @@ async fn wide_table_post_fallback_end_to_end() {
         Some(&serde_json::Value::Null),
         "wide-table POST path taken (narrow fallback would carry attrs)"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Access-filter enforcement (Finding 2): the wide-table export must enumerate
+// children through the access filter (`search([AccessBlobFilter])`), never raw
+// `keys()`. A variable the caller cannot see is absent from every full-export
+// format and 404s on a direct `?field=` fetch.
+// ---------------------------------------------------------------------------
+
+/// A container wrapping a `MapAdapter` that HIDES one child from `search` (the
+/// access-filtered listing path) while keeping it in `keys`/`get` (the raw
+/// path). The in-memory `MapAdapter` cannot tag individual nodes, so this
+/// focused stand-in models a backend whose access filter excludes one tagged
+/// child: if `serve_xarray_wide_table` enumerated via raw `keys()` the child
+/// would leak into the export; routing through `search` hides it.
+struct SecretHidingDataset {
+    inner: MapAdapter,
+    secret: String,
+}
+
+impl BaseAdapter for SecretHidingDataset {
+    fn structure_family(&self) -> StructureFamily {
+        self.inner.structure_family()
+    }
+    fn metadata(&self) -> &serde_json::Value {
+        self.inner.metadata()
+    }
+    fn specs(&self) -> &[Spec] {
+        self.inner.specs()
+    }
+}
+
+impl ContainerAdapter for SecretHidingDataset {
+    fn structure(&self) -> BoxFuture<'_, AdapterResult<ContainerStructure>> {
+        self.inner.structure()
+    }
+    fn get<'a>(&'a self, key: &'a str) -> BoxFuture<'a, AdapterResult<Option<AnyAdapter>>> {
+        self.inner.get(key)
+    }
+    fn keys(&self) -> BoxFuture<'_, AdapterResult<Vec<String>>> {
+        self.inner.keys()
+    }
+    fn len(&self) -> BoxFuture<'_, AdapterResult<usize>> {
+        self.inner.len()
+    }
+    fn search<'a>(&'a self, queries: &'a [Query]) -> BoxFuture<'a, AdapterResult<Vec<String>>> {
+        Box::pin(async move {
+            let mut keys = self.inner.keys().await?;
+            if queries
+                .iter()
+                .any(|q| matches!(q, Query::AccessBlobFilter(_)))
+            {
+                keys.retain(|k| k != &self.secret);
+            }
+            Ok(keys)
+        })
+    }
+}
+
+/// An `xarray_dataset` with visible coord `time` + data vars `temp`/`pressure`
+/// and a HIDDEN data var `secret_zzz`. The wrapper drops `secret_zzz` from the
+/// access-filtered listing.
+fn secret_weather() -> AnyAdapter {
+    let mut m = IndexMap::new();
+    m.insert(
+        "time".to_string(),
+        f64_var(&[10.0, 20.0, 30.0], "xarray_coord", json!({})),
+    );
+    m.insert(
+        "temp".to_string(),
+        f64_var(&[1.5, 2.5, 3.5], "xarray_data_var", json!({})),
+    );
+    m.insert(
+        "pressure".to_string(),
+        i64_var(&[100, 200, 300], "xarray_data_var"),
+    );
+    m.insert(
+        "secret_zzz".to_string(),
+        f64_var(&[9.0, 9.0, 9.0], "xarray_data_var", json!({})),
+    );
+    let inner = MapAdapter::new(m, json!({}), vec![Spec::new("xarray_dataset")]);
+    AnyAdapter::Container(Arc::new(SecretHidingDataset {
+        inner,
+        secret: "secret_zzz".to_string(),
+    }))
+}
+
+/// Access policy that grants full scope and returns a non-`None` list filter, so
+/// `serve_xarray_wide_table` routes child enumeration through `search`.
+struct ListFilterPolicy;
+
+#[async_trait]
+impl AccessPolicy for ListFilterPolicy {
+    async fn anonymous_decision(&self, _ctx: NodeContext<'_>) -> Decision {
+        Decision {
+            scopes: ScopeSet::full(),
+        }
+    }
+
+    async fn principal_decision(
+        &self,
+        _principal: &Principal,
+        session_scopes: &ScopeSet,
+        _authn_access_tags: Option<&[String]>,
+        _ctx: NodeContext<'_>,
+    ) -> Decision {
+        Decision {
+            scopes: session_scopes.clone(),
+        }
+    }
+
+    async fn list_filter(
+        &self,
+        _principal: Option<&Principal>,
+        _session_scopes: &ScopeSet,
+        _requested_scopes: &ScopeSet,
+        _authn_access_tags: Option<&[String]>,
+    ) -> Option<AccessBlobFilter> {
+        Some(AccessBlobFilter {
+            user_id: None,
+            tags: vec!["public".to_string()],
+            include_untagged: true,
+        })
+    }
+}
+
+/// The hidden variable is absent from the full export in EVERY wide-table
+/// format (csv/arrow/parquet, all derived from the same access-filtered column
+/// set), and a visible variable is present. Field names are stored as UTF-8 in
+/// all three formats (CSV header, Arrow IPC schema, Parquet footer), so a byte
+/// search over the response body is a faithful presence check.
+#[tokio::test]
+async fn wide_table_hides_access_filtered_variable_in_full_export() {
+    let policy: Arc<dyn AccessPolicy> = Arc::new(ListFilterPolicy);
+    let base = spawn_with_policy(root_with(vec![("ds", secret_weather())]), policy).await;
+    let client = reqwest::Client::new();
+
+    for format in ["csv", "arrow", "parquet"] {
+        let resp = client
+            .get(format!("{base}/api/v1/container/full/ds?format={format}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "format {format} exports with 200");
+        let bytes = resp.bytes().await.unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            !text.contains("secret_zzz"),
+            "hidden variable must be absent from the {format} export"
+        );
+        assert!(
+            text.contains("temp"),
+            "visible variable must be present in the {format} export"
+        );
+    }
+}
+
+/// A direct `?field=` fetch of the hidden variable is treated as absent (404) —
+/// its data never leaks through the projection path either.
+#[tokio::test]
+async fn wide_table_field_fetch_of_hidden_variable_404s() {
+    let policy: Arc<dyn AccessPolicy> = Arc::new(ListFilterPolicy);
+    let base = spawn_with_policy(root_with(vec![("ds", secret_weather())]), policy).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!(
+            "{base}/api/v1/container/full/ds?format=csv&field=secret_zzz"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        404,
+        "a hidden variable requested by ?field= must 404 (existence-hiding), not leak its data"
+    );
+
+    // A visible field still projects normally.
+    let resp = client
+        .get(format!(
+            "{base}/api/v1/container/full/ds?format=csv&field=temp"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "a visible ?field= projects normally");
+    let text = String::from_utf8_lossy(&resp.bytes().await.unwrap()).into_owned();
+    assert!(text.contains("temp") && !text.contains("secret_zzz"));
 }
