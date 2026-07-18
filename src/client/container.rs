@@ -184,11 +184,24 @@ impl ContainerClient {
                 .append_pair("include_data_sources", "true");
         }
 
-        let resp: ResourceEnvelope = retry(|| async {
+        let resp: ResourceEnvelope = match retry(|| async {
             let r = self.base.context.get(&url).await?;
             decode_response::<ResourceEnvelope>(r).await
         })
-        .await?;
+        .await
+        {
+            Ok(env) => env,
+            // A missing child is an HTTP 404. Surface it as `KeyNotFound` so a
+            // plain (non-search) lookup matches upstream `Container.__getitem__`,
+            // which raises a uniform `KeyError` on the 404 (container.py:370-377),
+            // and agrees with the search path (`get_within_search`), which
+            // already returns `KeyNotFound`. Without this a `match … { KeyNotFound
+            // => … }` caller catches an absent child only on filtered containers.
+            Err(ClientError::Server { status: 404, .. }) => {
+                return Err(ClientError::KeyNotFound(format!("no child '{key}'")));
+            }
+            Err(e) => return Err(e),
+        };
         let item = resp
             .data
             .ok_or_else(|| ClientError::KeyNotFound(format!("no child '{key}'")))?;
@@ -1110,3 +1123,58 @@ const _: fn() = || {
     let _ = std::mem::size_of::<NodeLinks>();
     let _ = std::mem::size_of::<ContainerLinks>();
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::base::Item;
+    use crate::client::context::Context;
+
+    /// Spawn an axum app on an ephemeral port and return its base URL.
+    async fn spawn(app: axum::Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        format!("http://{addr}")
+    }
+
+    /// A root container client (no active search filters) whose `self` link
+    /// points at `base`, so `get(key)` walks `/metadata/root/{key}`.
+    fn root_container(base: &str) -> ContainerClient {
+        let (ctx, _) = Context::from_uri(base).unwrap();
+        let item: Item = serde_json::from_value(serde_json::json!({
+            "id": "root",
+            "attributes": { "ancestors": [], "structure_family": "container" },
+            "links": { "self": format!("{base}/api/v1/metadata/root") },
+        }))
+        .unwrap();
+        ContainerClient::from_item(ctx, item, false).unwrap()
+    }
+
+    // Finding 2 (wave-30): a plain (non-search) `get` of an absent child must
+    // return `KeyNotFound`, not a raw `Server{404}` — matching upstream
+    // `Container.__getitem__`'s uniform `KeyError` (container.py:370-377) and the
+    // search path (`get_within_search`), which already returns `KeyNotFound`.
+    #[tokio::test]
+    async fn get_missing_child_is_key_not_found() {
+        async fn not_found() -> axum::http::StatusCode {
+            axum::http::StatusCode::NOT_FOUND
+        }
+        let app =
+            axum::Router::new().route("/api/v1/metadata/{*path}", axum::routing::get(not_found));
+        let base = spawn(app).await;
+        let node = root_container(&base);
+
+        let err = node
+            .get("missing")
+            .await
+            .expect_err("an absent child must be an error");
+        assert!(
+            matches!(err, ClientError::KeyNotFound(_)),
+            "a plain lookup of an absent child must be KeyNotFound, got {err:?}"
+        );
+    }
+}
