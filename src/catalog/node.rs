@@ -349,18 +349,24 @@ pub fn validate_payload(metadata: &Value, specs: &Value) -> Result<()> {
             )));
         }
         for r in refs {
+            // Count CHARACTERS (Unicode code points), not bytes — the
+            // `_CHARS`-named caps mirror the spec name/version bound fixed in
+            // e38c156 (this is its deferred reference sibling). A 200-char
+            // multibyte label is 600 UTF-8 bytes but ≤255 chars, so `str::len()`
+            // (bytes) would wrongly reject it. The 422 detail reports the char
+            // count for the same reason — a byte count misleads the client.
             let label = r.get("label").and_then(|v| v.as_str()).unwrap_or("");
-            if label.len() > MAX_REFERENCE_LABEL_CHARS {
+            if label.chars().count() > MAX_REFERENCE_LABEL_CHARS {
                 return Err(CatalogError::Validation(format!(
                     "reference label length {} > {MAX_REFERENCE_LABEL_CHARS}",
-                    label.len()
+                    label.chars().count()
                 )));
             }
             let url = r.get("url").and_then(|v| v.as_str()).unwrap_or("");
-            if url.len() > MAX_REFERENCE_URL_CHARS {
+            if url.chars().count() > MAX_REFERENCE_URL_CHARS {
                 return Err(CatalogError::Validation(format!(
                     "reference url length {} > {MAX_REFERENCE_URL_CHARS}",
-                    url.len()
+                    url.chars().count()
                 )));
             }
         }

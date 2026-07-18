@@ -1450,3 +1450,125 @@ async fn spec_name_and_version_bounded_by_chars_not_bytes() {
         "256-char version must still be rejected 422: {body}"
     );
 }
+
+/// Wave-36 — a reference `label`/`url` length bound must count CHARACTERS
+/// (Unicode code points), not BYTES — the deferred sibling of
+/// `spec_name_and_version_bounded_by_chars_not_bytes` (e38c156). The
+/// `MAX_REFERENCE_*_CHARS` caps (255 / 2047) are named for code points to match
+/// the spec-field fix and upstream `StringConstraints` semantics (Python
+/// `len(str)` counts code points), but the port compared `str::len()` (bytes)
+/// at `catalog/node.rs:353` (label) and `:360` (url), so a 200-char CJK label or
+/// a 2047-char multibyte url — each ≤ its char cap but > its byte cap — was
+/// wrongly 422'd (RED before this fix). References nest inside `metadata`, so the
+/// caps are wire-reachable through the metadata write path. The char boundary
+/// (256-char label, 2048-char url) still rejects.
+#[tokio::test]
+async fn reference_label_and_url_bounded_by_chars_not_bytes() {
+    let (app, _dir) = build_app(validation_config(false)).await;
+
+    let (status, _) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/metadata/",
+        serde_json::json!({
+            "key": "refmb",
+            "structure_family": "container",
+            "metadata": {},
+            "specs": [],
+            "data_sources": [],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // 200 CJK code points = 200 chars (≤255) but 600 UTF-8 bytes (>255). Upstream
+    // bounds by char count; the port must too. RED before: byte length 600 > 255.
+    let label_mb = "가".repeat(200);
+    assert_eq!(label_mb.chars().count(), 200);
+    assert!(
+        label_mb.len() > MAX_REFERENCE_LABEL_CHARS,
+        "precondition: 200 CJK chars must exceed the 255-byte encoding"
+    );
+
+    // Multibyte LABEL (≤255 chars) must be accepted.
+    let (status, body) = json_request(
+        &app,
+        Method::PUT,
+        "/api/v1/metadata/refmb",
+        serde_json::json!({
+            "metadata": {"references": [{"label": label_mb, "url": "https://x"}]},
+            "specs": [],
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "200-char multibyte label (≤255 chars, >255 bytes) must be accepted: {body}"
+    );
+
+    // 2047 CJK code points = 2047 chars (≤2047) but 6141 UTF-8 bytes (>2047).
+    // RED before: byte length 6141 > 2047.
+    let url_mb = "나".repeat(MAX_REFERENCE_URL_CHARS);
+    assert_eq!(url_mb.chars().count(), MAX_REFERENCE_URL_CHARS);
+    assert!(
+        url_mb.len() > MAX_REFERENCE_URL_CHARS,
+        "precondition: 2047 CJK chars must exceed the 2047-byte encoding"
+    );
+
+    // Multibyte URL at the 2047-char boundary must be accepted.
+    let (status, body) = json_request(
+        &app,
+        Method::PUT,
+        "/api/v1/metadata/refmb",
+        serde_json::json!({
+            "metadata": {"references": [{"label": "x", "url": url_mb}]},
+            "specs": [],
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "2047-char multibyte url (≤2047 chars, >2047 bytes) must be accepted: {body}"
+    );
+
+    // Boundary guard: a 256-CHAR ASCII label (256 chars = 256 bytes) still 422s.
+    let (status, body) = json_request(
+        &app,
+        Method::PUT,
+        "/api/v1/metadata/refmb",
+        serde_json::json!({
+            "metadata": {"references": [{"label": "a".repeat(256), "url": "https://x"}]},
+            "specs": [],
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "256-char label must still be rejected 422: {body}"
+    );
+
+    // Boundary guard: a 2048-CHAR ASCII url (2048 chars = 2048 bytes) still 422s.
+    let (status, body) = json_request(
+        &app,
+        Method::PUT,
+        "/api/v1/metadata/refmb",
+        serde_json::json!({
+            "metadata": {"references": [{"label": "x", "url": "a".repeat(2048)}]},
+            "specs": [],
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "2048-char url must still be rejected 422: {body}"
+    );
+}
+
+/// Local mirror of `catalog::node`'s private `MAX_REFERENCE_LABEL_CHARS` (255)
+/// and `MAX_REFERENCE_URL_CHARS` (2047) so the boundary test can name the caps.
+const MAX_REFERENCE_LABEL_CHARS: usize = 255;
+const MAX_REFERENCE_URL_CHARS: usize = 2047;
