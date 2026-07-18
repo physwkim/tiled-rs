@@ -472,3 +472,119 @@ async fn wide_table_field_fetch_of_hidden_variable_404s() {
     let text = String::from_utf8_lossy(&resp.bytes().await.unwrap()).into_owned();
     assert!(text.contains("temp") && !text.contains("secret_zzz"));
 }
+
+// ---------------------------------------------------------------------------
+// dtype cap (Finding 5): the arrow-wire export is capped to the six primitives
+// the Rust client's wide-table decoder handles, but csv/parquet run through a
+// server-side table serializer that reads any Arrow dtype — so they serve the
+// full set upstream `to_dataframe` serves (int8/16, uint8/16, bool).
+// ---------------------------------------------------------------------------
+
+/// A 1-D `int16` array child carrying `spec`.
+fn i16_var(data: &[i16], spec: &str) -> AnyAdapter {
+    let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let dtype = BuiltinDType::new(Endianness::Little, Kind::Integer, 2);
+    let arr = ArrayAdapter::from_array(
+        Bytes::from(bytes),
+        dtype,
+        vec![data.len()],
+        vec![vec![data.len()]],
+        json!({}),
+        vec![Spec::new(spec)],
+    );
+    AnyAdapter::Array(Arc::new(arr))
+}
+
+/// A 1-D `bool` array child (numpy stores one byte per element) carrying `spec`.
+fn bool_var(data: &[bool], spec: &str) -> AnyAdapter {
+    let bytes: Vec<u8> = data.iter().map(|&b| b as u8).collect();
+    let dtype = BuiltinDType::new(Endianness::NotApplicable, Kind::Boolean, 1);
+    let arr = ArrayAdapter::from_array(
+        Bytes::from(bytes),
+        dtype,
+        vec![data.len()],
+        vec![vec![data.len()]],
+        json!({}),
+        vec![Spec::new(spec)],
+    );
+    AnyAdapter::Array(Arc::new(arr))
+}
+
+/// An `xarray_dataset` mixing wire-decodable and extended dtypes: coord `idx`
+/// (f64), data var `small16` (int16, distinctive values), data var `flag`
+/// (bool). All length 3.
+fn mixed_dtype_dataset() -> AnyAdapter {
+    let mut m = IndexMap::new();
+    m.insert(
+        "idx".to_string(),
+        f64_var(&[0.0, 1.0, 2.0], "xarray_coord", json!({})),
+    );
+    m.insert(
+        "small16".to_string(),
+        i16_var(&[258, -259, 260], "xarray_data_var"),
+    );
+    m.insert(
+        "flag".to_string(),
+        bool_var(&[true, false, true], "xarray_data_var"),
+    );
+    AnyAdapter::Container(Arc::new(MapAdapter::new(
+        m,
+        json!({}),
+        vec![Spec::new("xarray_dataset")],
+    )))
+}
+
+/// int16 and bool variables export via csv and parquet (the server-side table
+/// serializer reads any Arrow dtype). The exact int16 values round-trip in the
+/// csv body.
+#[tokio::test]
+async fn wide_table_csv_parquet_serve_extended_dtypes() {
+    let base = spawn(root_with(vec![("ds", mixed_dtype_dataset())])).await;
+    let client = reqwest::Client::new();
+
+    // csv: exact values are readable text.
+    let resp = client
+        .get(format!("{base}/api/v1/container/full/ds?format=csv"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "int16/bool export via csv");
+    let text = String::from_utf8_lossy(&resp.bytes().await.unwrap()).into_owned();
+    for tok in ["small16", "flag", "258", "-259", "260"] {
+        assert!(text.contains(tok), "csv body must contain {tok:?}: {text}");
+    }
+
+    // parquet: binary, but the column names live as UTF-8 in the footer.
+    let resp = client
+        .get(format!("{base}/api/v1/container/full/ds?format=parquet"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "int16/bool export via parquet");
+    let text = String::from_utf8_lossy(&resp.bytes().await.unwrap()).into_owned();
+    assert!(
+        text.contains("small16") && text.contains("flag"),
+        "parquet footer must name the int16/bool columns"
+    );
+}
+
+/// Arrow-wire behavior pinned: the same int16/bool dataset is rejected with 406
+/// on the arrow export, because the Rust client's wide-table decoder handles
+/// only f64/f32/i64/i32/u64/u32. (Keeping the cap is deliberate — widening it
+/// would emit bytes the client cannot decode.)
+#[tokio::test]
+async fn wide_table_arrow_rejects_extended_dtypes() {
+    let base = spawn(root_with(vec![("ds", mixed_dtype_dataset())])).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!("{base}/api/v1/container/full/ds?format=arrow"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        406,
+        "arrow-wire export must reject int16/bool (client decoder cap)"
+    );
+}
