@@ -547,8 +547,13 @@ pub async fn metadata(
 /// prefix) ascending. Truly empty items (old clients send a bare `sort=`) are
 /// dropped; a bare `-`/`+` yields an empty key — the default-direction
 /// sentinel honored by the `id` tiebreaker in `construct_order_by_clauses`.
-fn parse_sort(params: &[(String, String)]) -> Vec<(String, SortDirection)> {
-    let mut sorting = Vec::new();
+///
+/// Two validations match upstream `sorting_param` (dependencies.py:239-252),
+/// both `HTTP 400`: a duplicate sorting key (by key, after stripping the sign)
+/// is rejected, and the default-order sentinel (the empty key) must be the last
+/// item when present.
+fn parse_sort(params: &[(String, String)]) -> Result<Vec<(String, SortDirection)>, ServerError> {
+    let mut sorting: Vec<(String, SortDirection)> = Vec::new();
     for (_, raw) in params.iter().filter(|(k, _)| k == "sort") {
         for item in raw.split(',') {
             if item.is_empty() {
@@ -561,10 +566,27 @@ fn parse_sort(params: &[(String, String)]) -> Vec<(String, SortDirection)> {
             } else {
                 (item, SortDirection::Ascending)
             };
+            // Duplicate key → 400, keyed on the sign-stripped name so `a` and
+            // `-a` collide (upstream raises before inserting into its dict).
+            if sorting.iter().any(|(existing, _)| existing == key) {
+                return Err(ServerError::BadRequest(format!(
+                    "Duplicate sorting key: {key}"
+                )));
+            }
             sorting.push((key.to_string(), dir));
         }
     }
-    sorting
+    // The default-order sentinel (the empty key) must be the last item when
+    // present. Duplicate detection above guarantees at most one empty key, so a
+    // single position check suffices.
+    if let Some(pos) = sorting.iter().position(|(key, _)| key.is_empty())
+        && pos != sorting.len() - 1
+    {
+        return Err(ServerError::BadRequest(
+            "Default sorting (empty string) must be the last item in the sort list".into(),
+        ));
+    }
+    Ok(sorting)
 }
 
 pub async fn search_root(
@@ -614,8 +636,9 @@ pub async fn search(
         .and_then(|(_, v)| v.parse().ok());
 
     // Parse `sort` before consuming `params`: comma-separated keys, leading
-    // `-` descending. Threaded into the catalog ORDER BY below.
-    let sorting = parse_sort(&params);
+    // `-` descending. Threaded into the catalog ORDER BY below. A duplicate key
+    // or a misplaced default-order sentinel is a 400 (upstream sorting_param).
+    let sorting = parse_sort(&params)?;
     // Extract select_metadata before params is moved by into_iter() below.
     let select_metadata: Option<String> = params
         .iter()
@@ -7873,12 +7896,16 @@ fn parse_structure_family(
 mod sort_param_tests {
     use super::*;
 
-    fn p(pairs: &[(&str, &str)]) -> Vec<(String, SortDirection)> {
+    fn p_raw(pairs: &[(&str, &str)]) -> Result<Vec<(String, SortDirection)>, ServerError> {
         let owned: Vec<(String, String)> = pairs
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         parse_sort(&owned)
+    }
+
+    fn p(pairs: &[(&str, &str)]) -> Vec<(String, SortDirection)> {
+        p_raw(pairs).expect("parse_sort should accept these params")
     }
 
     #[test]
@@ -7932,6 +7959,61 @@ mod sort_param_tests {
     #[test]
     fn non_sort_params_ignored() {
         assert!(p(&[("page[limit]", "10"), ("filter[eq]", "x")]).is_empty());
+    }
+
+    /// Upstream `sorting_param` (dependencies.py:239-244): a duplicate sorting
+    /// key is a 400 — the key identity is what remains after stripping the
+    /// sign, so `a` and `-a` collide. Previously `?sort=a,a` returned 200.
+    #[test]
+    fn duplicate_sort_key_is_rejected() {
+        for spec in ["a,a", "a,-a", "+a,a", "-a,+a"] {
+            let err = p_raw(&[("sort", spec)])
+                .expect_err(&format!("duplicate key must be rejected: {spec}"));
+            assert!(
+                matches!(&err, ServerError::BadRequest(m) if m == "Duplicate sorting key: a"),
+                "unexpected error for {spec}: {err:?}"
+            );
+        }
+    }
+
+    /// Duplicate detection also applies to the empty default-order key (two
+    /// bare signs), and the message carries the empty key name verbatim.
+    #[test]
+    fn duplicate_empty_sentinel_is_rejected() {
+        let err = p_raw(&[("sort", "-,+")]).expect_err("two sentinels must be rejected");
+        assert!(
+            matches!(&err, ServerError::BadRequest(m) if m == "Duplicate sorting key: "),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    /// Upstream `sorting_param` (dependencies.py:247-252): the default-order
+    /// sentinel (empty key, from a bare `-`/`+`) must be the LAST item → 400
+    /// otherwise.
+    #[test]
+    fn empty_sentinel_must_be_last() {
+        let err = p_raw(&[("sort", "-,a")]).expect_err("sentinel-not-last must be rejected");
+        assert!(
+            matches!(
+                &err,
+                ServerError::BadRequest(m)
+                    if m == "Default sorting (empty string) must be the last item in the sort list"
+            ),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    /// The sentinel as the last item is accepted (the common "sort by X then
+    /// fall back to natural order" shape).
+    #[test]
+    fn empty_sentinel_last_is_accepted() {
+        assert_eq!(
+            p(&[("sort", "a,-")]),
+            vec![
+                ("a".to_string(), SortDirection::Ascending),
+                (String::new(), SortDirection::Descending),
+            ]
+        );
     }
 }
 
