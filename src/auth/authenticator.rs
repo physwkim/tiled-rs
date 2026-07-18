@@ -99,6 +99,25 @@ impl DummyAuthenticator {
     }
 
     pub fn add_user(&mut self, username: &str, plaintext_password: &str) -> Result<()> {
+        // Upstream `DictionaryAuthenticator.authenticate` treats a falsy
+        // configured password as "username is not valid" and denies the login
+        // (`authenticators.py:77-78`, `if not true_password: return`). A common
+        // way to hit this is an env-var reference that expands to the empty
+        // string. Since Rust hashes the password eagerly here (there is no
+        // plaintext left to re-check at authenticate time), enforce the same
+        // rule at the single credential-registration site: an empty configured
+        // password registers no credential, so `authenticate` falls through to
+        // the unknown-username branch and returns `Unauthorized`. `is_empty`
+        // (not `trim`) mirrors Python truthiness — a whitespace-only password
+        // is truthy there and stays a valid credential here.
+        if plaintext_password.is_empty() {
+            tracing::warn!(
+                username,
+                "DummyAuthenticator: empty configured password; the user is not \
+                 registered and cannot log in (upstream falsy-password parity)"
+            );
+            return Ok(());
+        }
         let salt = SaltString::generate(&mut OsRng);
         let hash = Argon2::default()
             .hash_password(plaintext_password.as_bytes(), &salt)
@@ -160,6 +179,35 @@ mod tests {
         let a = DummyAuthenticator::new("dummy");
         let err = a.authenticate("nobody", "x").await.unwrap_err();
         assert!(matches!(err, AuthError::Unauthorized(_)));
+    }
+
+    // Finding 10 (w30): a user configured with an empty password (e.g. an
+    // unexpanded env var) registers no credential and can never log in —
+    // mirroring upstream's `if not true_password: return` falsy check. Logging
+    // in with the empty string it was "configured" with is Unauthorized, not a
+    // silent success as the eager Argon2 hash of "" would otherwise allow.
+    #[tokio::test]
+    async fn dummy_empty_configured_password_cannot_log_in() {
+        let mut a = DummyAuthenticator::new("dummy");
+        a.add_user("ghost", "").unwrap();
+        let err = a
+            .authenticate("ghost", "")
+            .await
+            .expect_err("empty configured password must not authenticate with \"\"");
+        assert!(matches!(err, AuthError::Unauthorized(_)));
+        // Nor with any other guess.
+        let err = a.authenticate("ghost", "anything").await.unwrap_err();
+        assert!(matches!(err, AuthError::Unauthorized(_)));
+    }
+
+    // A whitespace-only password is truthy in Python (`not "  "` is False), so
+    // it remains a valid credential here — the guard is `is_empty`, not `trim`.
+    #[tokio::test]
+    async fn dummy_whitespace_password_is_still_valid() {
+        let mut a = DummyAuthenticator::new("dummy");
+        a.add_user("spacey", "   ").unwrap();
+        let subject = a.authenticate("spacey", "   ").await.unwrap();
+        assert_eq!(subject.sub, "spacey");
     }
 
     #[test]
