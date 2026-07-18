@@ -812,6 +812,54 @@ impl ContainerClient {
         Ok(client)
     }
 
+    /// Delete this container's child at `key` via `DELETE /api/v1/metadata/…`,
+    /// addressing the child directly from this container's `self` link rather
+    /// than through a child client.
+    ///
+    /// This is the single owner of "delete a child by key": it removes the node
+    /// whatever client variant it would resolve to — in particular a
+    /// [`ClientResolver`](crate::client::any_client::ClientResolver)-substituted
+    /// `Custom` node, whose [`AnyClient::base`] is `None` and which a
+    /// `base()`-gated delete would silently skip. `recursive` and
+    /// `external_only` carry the same meaning and wire encoding as
+    /// [`BaseClient::delete`](crate::client::base::BaseClient::delete):
+    /// `recursive` appends `recursive=true`; a *false* `external_only` appends
+    /// `external_only=false`. The child URL is built exactly as [`get`](Self::get)
+    /// builds it — per-segment percent-encoding of `key` — so the two agree on
+    /// child addressing. Wrapped in `retry` like every other client `DELETE`.
+    ///
+    /// Mirrors upstream, where `node.get(key).delete(...)` deletes any node type
+    /// because every client subclasses `BaseClient` (register.py:640-642,
+    /// container.py:389-424).
+    pub async fn delete_child(
+        &self,
+        key: &str,
+        recursive: bool,
+        external_only: bool,
+    ) -> Result<()> {
+        let mut url = Url::parse(self.base.require_link("self")?)?;
+        let encoded = split_key_segments(key)
+            .into_iter()
+            .map(|seg| utf8_percent_encode(seg, PATH_SEGMENT).to_string())
+            .collect::<Vec<_>>()
+            .join("/");
+        let new_path = if url.path().ends_with('/') {
+            format!("{}{}", url.path(), encoded)
+        } else {
+            format!("{}/{}", url.path(), encoded)
+        };
+        url.set_path(&new_path);
+        if recursive {
+            url.query_pairs_mut().append_pair("recursive", "true");
+        }
+        if !external_only {
+            url.query_pairs_mut().append_pair("external_only", "false");
+        }
+        retry(|| async { self.base.context.delete(&url).await })
+            .await
+            .map(|_| ())
+    }
+
     /// Delete every immediate child of this container (to empty it before
     /// deleting the container itself). With `recursive=false` a child that is
     /// itself a non-empty container is refused by the server (409); pass
@@ -819,13 +867,14 @@ impl ContainerClient {
     /// `recursive` is forwarded to each child delete, mirroring Python
     /// `Container.delete_contents(recursive=False, external_only=True)`
     /// (container.py:389-424).
+    ///
+    /// Each child is removed through [`delete_child`](Self::delete_child), so a
+    /// `Custom` child (from a `ClientResolver`) is deleted too rather than
+    /// silently skipped by a `base()`-gated delete.
     pub async fn delete_contents(&self, recursive: bool, external_only: bool) -> Result<()> {
         let keys = self.keys().await?;
         for key in keys {
-            let child = self.get(&key).await?;
-            if let Some(b) = child.base() {
-                b.delete(recursive, external_only).await?;
-            }
+            self.delete_child(&key, recursive, external_only).await?;
         }
         Ok(())
     }
@@ -1175,6 +1224,135 @@ mod tests {
         assert!(
             matches!(err, ClientError::KeyNotFound(_)),
             "a plain lookup of an absent child must be KeyNotFound, got {err:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Wave-31 (finding 2, same-defect sibling): `delete_contents` must delete
+    // EVERY immediate child, including one a `ClientResolver` maps to a `Custom`
+    // client (whose `AnyClient::base()` is `None`). The old `if let Some(b) =
+    // child.base()` gate silently skipped such a child, leaving it behind while
+    // reporting the container emptied. Routing through the single-owner
+    // `delete_child` addresses each child directly and removes every variant,
+    // matching upstream, where all clients subclass `BaseClient`.
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn delete_contents_deletes_resolver_custom_children() {
+        use std::any::Any;
+        use std::sync::{Arc, Mutex};
+
+        use crate::client::any_client::ClientResolver;
+        use crate::client::context::ContextOptions;
+
+        // Map every node to a `Custom` client, so each child listed by `keys()`
+        // resolves to `AnyClient::Custom` (whose `base()` is `None`).
+        #[derive(Debug)]
+        struct AlwaysCustom;
+        impl ClientResolver for AlwaysCustom {
+            fn resolve(
+                &self,
+                _ctx: &Context,
+                _item: &Item,
+                _include_data_sources: bool,
+            ) -> Option<Result<Arc<dyn Any + Send + Sync>>> {
+                Some(Ok(Arc::new(()) as Arc<dyn Any + Send + Sync>))
+            }
+        }
+
+        #[derive(Clone)]
+        struct St {
+            base: String,
+            deletes: Arc<Mutex<Vec<String>>>,
+        }
+
+        // Search listing: two children `a` and `b`, no `next` page.
+        async fn search(
+            axum::extract::State(st): axum::extract::State<St>,
+        ) -> axum::response::Response {
+            use axum::response::IntoResponse;
+            let child = |key: &str| {
+                serde_json::json!({
+                    "id": key,
+                    "attributes": { "ancestors": ["root"], "structure_family": "container" },
+                    "links": { "self": format!("{}/api/v1/metadata/root/{}", st.base, key) },
+                })
+            };
+            // Omit `links` entirely (SearchResponse.links is optional) → no
+            // `next` page, so `keys()` stops after this single page.
+            axum::Json(serde_json::json!({
+                "data": [child("a"), child("b")],
+            }))
+            .into_response()
+        }
+
+        // Metadata GET for a child (reached only by the OLD, buggy path).
+        async fn get_meta(
+            axum::extract::State(st): axum::extract::State<St>,
+            axum::extract::Path(path): axum::extract::Path<String>,
+        ) -> axum::response::Response {
+            use axum::response::IntoResponse;
+            let key = path.rsplit('/').next().unwrap_or_default().to_string();
+            axum::Json(serde_json::json!({
+                "data": {
+                    "id": key,
+                    "attributes": { "ancestors": ["root"], "structure_family": "container" },
+                    "links": { "self": format!("{}/api/v1/metadata/{}", st.base, path) },
+                }
+            }))
+            .into_response()
+        }
+
+        async fn delete_meta(
+            axum::extract::State(st): axum::extract::State<St>,
+            axum::extract::Path(path): axum::extract::Path<String>,
+        ) -> axum::http::StatusCode {
+            let key = path.rsplit('/').next().unwrap_or_default().to_string();
+            st.deletes.lock().unwrap().push(key);
+            axum::http::StatusCode::OK
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base = format!("http://{addr}");
+        let st = St {
+            base: base.clone(),
+            deletes: Arc::new(Mutex::new(Vec::new())),
+        };
+        let app = axum::Router::new()
+            .route("/api/v1/search/{*path}", axum::routing::get(search))
+            .route(
+                "/api/v1/metadata/{*path}",
+                axum::routing::get(get_meta).delete(delete_meta),
+            )
+            .with_state(st.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let opts = ContextOptions::default().resolver(Arc::new(AlwaysCustom));
+        let (ctx, _) = Context::from_uri_with_options(&base, opts).unwrap();
+        let item: Item = serde_json::from_value(serde_json::json!({
+            "id": "root",
+            "attributes": { "ancestors": [], "structure_family": "container" },
+            "links": {
+                "self": format!("{base}/api/v1/metadata/root"),
+                "search": format!("{base}/api/v1/search/root"),
+            },
+        }))
+        .unwrap();
+        let node = ContainerClient::from_item(ctx, item, false).unwrap();
+
+        node.delete_contents(false, true)
+            .await
+            .expect("delete_contents must succeed");
+
+        let mut got = st.deletes.lock().unwrap().clone();
+        got.sort();
+        assert_eq!(
+            got,
+            vec!["a".to_string(), "b".to_string()],
+            "every child must be deleted, including resolver-produced Custom children"
         );
     }
 }

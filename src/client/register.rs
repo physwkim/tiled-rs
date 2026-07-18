@@ -482,34 +482,16 @@ async fn create_node_or_drop_collision(
     match retry(|| async { node.base().context().post_json(url, body).await }).await {
         Ok(_) => Ok(()),
         Err(e) if is_conflict(&e) => {
-            // The offender exists (it just caused the 409). Delete it by
-            // addressing it directly as this container's child at `key`, rather
-            // than through the client `node.get(key)` returns: a
-            // `ClientResolver` can map the offender to a `Custom` client whose
-            // links are erased (`AnyClient::base()` is `None`), which would
-            // silently skip the delete and leave the offender behind while
-            // still logging the COLLISION warning. Rebuilding the child URL from
-            // the parent's `self` link deletes every variant uniformly, matching
-            // upstream `offender.delete(recursive=True)` (register.py:640-642),
-            // which always removes the node.
-            let self_link = node
-                .base()
-                .uri()
-                .ok_or_else(|| ClientError::MissingLink("self".into()))?;
-            let mut del_url = Url::parse(self_link)?;
-            del_url
-                .path_segments_mut()
-                .map_err(|()| {
-                    ClientError::Invalid(format!("self link cannot be a base: {self_link}"))
-                })?
-                .pop_if_empty()
-                .push(key);
-            // `recursive=true` only, matching `BaseClient::delete(recursive =
-            // true, external_only = true)` (base.py:918-936), which omits
-            // `external_only` when it is `true`. Wrapped in `retry` like every
-            // other client DELETE.
-            del_url.query_pairs_mut().append_pair("recursive", "true");
-            retry(|| async { node.base().context().delete(&del_url).await }).await?;
+            // The offender exists (it just caused the 409). Delete it through the
+            // parent container's single-owner `delete_child`, which addresses the
+            // child directly and removes every variant — including a
+            // `ClientResolver`-substituted `Custom` node, whose
+            // `AnyClient::base()` is `None` and which a `base()`-gated delete
+            // would silently skip while still logging the COLLISION warning.
+            // `(recursive = true, external_only = true)` matches upstream
+            // `offender.delete(recursive=True)` (register.py:640-642), which
+            // always removes the node.
+            node.delete_child(key, true, true).await?;
             tracing::warn!(
                 target: "tiled.register",
                 key,
