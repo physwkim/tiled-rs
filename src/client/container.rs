@@ -914,16 +914,16 @@ impl ContainerClient {
             for (k, v) in &self.queries {
                 q.append_pair(k, v);
             }
-            if !self.sort.is_empty() {
-                let formatted: Vec<String> = self
-                    .sort
-                    .iter()
-                    .map(|(k, d)| match d {
-                        SortDirection::Ascending => k.clone(),
-                        SortDirection::Descending => format!("-{k}"),
-                    })
-                    .collect();
-                q.append_pair("sort", &formatted.join(","));
+            // Multi-key sort is REPEATED `?sort=` params, one field each — never
+            // comma-joined, matching upstream `List[SortField]` and the Python
+            // client's list-valued `sort` param (container.py:121-128). A comma
+            // in a single param would 422 against the server's `SortField` pattern.
+            for (k, d) in &self.sort {
+                let field = match d {
+                    SortDirection::Ascending => k.clone(),
+                    SortDirection::Descending => format!("-{k}"),
+                };
+                q.append_pair("sort", &field);
             }
             if include_data_sources {
                 q.append_pair("include_data_sources", "true");
@@ -1353,6 +1353,45 @@ mod tests {
             got,
             vec!["a".to_string(), "b".to_string()],
             "every child must be deleted, including resolver-produced Custom children"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Wave-32: multi-key sort must serialize as REPEATED `?sort=` params (one
+    // field each), matching upstream's `List[SortField]` server param and the
+    // Python client, whose `sort` param is list-valued (container.py:121-128).
+    // A single comma-joined param would 422 against the server's `SortField`
+    // pattern, which excludes the comma.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn multi_key_sort_emits_repeated_params() {
+        let (ctx, _) = Context::from_uri("http://127.0.0.1:9").unwrap();
+        let item: Item = serde_json::from_value(serde_json::json!({
+            "id": "root",
+            "attributes": { "ancestors": [], "structure_family": "container" },
+            "links": {
+                "self": "http://127.0.0.1:9/api/v1/metadata/root",
+                "search": "http://127.0.0.1:9/api/v1/search/root",
+            },
+        }))
+        .unwrap();
+        let node = ContainerClient::from_item(ctx, item, false)
+            .unwrap()
+            .sort_by("color", SortDirection::Ascending)
+            .sort_by("count", SortDirection::Descending);
+
+        let url = node
+            .search_url_with(0, 10, &[], false)
+            .expect("search URL must build");
+        let sorts: Vec<String> = url
+            .query_pairs()
+            .filter(|(k, _)| k == "sort")
+            .map(|(_, v)| v.into_owned())
+            .collect();
+        assert_eq!(
+            sorts,
+            vec!["color".to_string(), "-count".to_string()],
+            "each sort key must be its own `sort=` param, never comma-joined"
         );
     }
 }
