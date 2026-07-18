@@ -490,3 +490,162 @@ async fn search_max_depth_zero_no_inline() {
     );
     assert_eq!(outer["attributes"]["structure"]["count"], 2);
 }
+
+// ---------------------------------------------------------------------------
+// Commit 4: POST /container/full forwards ?max_depth= (closes the
+// GET-honors/POST-drops asymmetry of the zip/hdf5 export port extension). The
+// zip export caps recursion at `current_depth >= max_depth`, emitting a
+// truncation crumb instead of descending — so max_depth is byte-observable.
+//
+// Tree: root → outer_grp → inner_grp → leaf. Exporting `outer_grp` as zip:
+//   max_depth=0 → inner_grp is a truncation crumb (no leaf)
+//   max_depth=1 → recurse into inner_grp, leaf included
+// ---------------------------------------------------------------------------
+
+fn build_zip_tree() -> Arc<dyn ContainerAdapter> {
+    let inner = container(
+        vec![("leaf", arr(&[1.0, 2.0], json!({})))],
+        vec![],
+        json!({}),
+    );
+    let outer = container(vec![("inner_grp", inner)], vec![], json!({}));
+    root_with_child("outer_grp", outer)
+}
+
+async fn get_bytes(url: &str) -> (u16, Vec<u8>) {
+    let resp = reqwest::Client::new().get(url).send().await.unwrap();
+    let status = resp.status().as_u16();
+    (status, resp.bytes().await.unwrap().to_vec())
+}
+
+/// POST with no body (mirrors `post_container_full` with an empty field list).
+async fn post_bytes(url: &str) -> (u16, Vec<u8>) {
+    let resp = reqwest::Client::new().post(url).send().await.unwrap();
+    let status = resp.status().as_u16();
+    (status, resp.bytes().await.unwrap().to_vec())
+}
+
+/// POST a `LongRequest` JSON body (the `/container/full` no-path route).
+async fn post_json_bytes(url: &str, body: Value) -> (u16, Vec<u8>) {
+    let resp = reqwest::Client::new()
+        .post(url)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    (status, resp.bytes().await.unwrap().to_vec())
+}
+
+/// Parse an in-memory zip archive into `(entry name, decompressed bytes)`
+/// pairs, sorted by name. Two archives produced by separate requests get
+/// independent DOS mod-time stamps in their local-file and central-directory
+/// headers (2-second granularity), so a raw-byte compare of the two archives
+/// is a timing flake when the requests straddle a boundary. Comparing this
+/// structural view instead asserts the real claim: same entry set, same
+/// per-entry contents.
+fn zip_entries(bytes: &[u8]) -> Vec<(String, Vec<u8>)> {
+    use std::io::Read;
+    let mut archive =
+        zip::ZipArchive::new(std::io::Cursor::new(bytes.to_vec())).expect("valid zip archive");
+    let mut entries: Vec<(String, Vec<u8>)> = (0..archive.len())
+        .map(|i| {
+            let mut file = archive.by_index(i).unwrap();
+            let name = file.name().to_string();
+            let mut content = Vec::new();
+            file.read_to_end(&mut content).unwrap();
+            (name, content)
+        })
+        .collect();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    entries
+}
+
+// Sanity: max_depth is byte-observable on the GET zip export (crumb vs leaf), so
+// the POST-equals-GET assertions below actually test forwarding, not a no-op.
+#[tokio::test]
+async fn zip_export_max_depth_is_observable_on_get() {
+    let base = spawn(build_zip_tree()).await;
+    let (s0, g0) = get_bytes(&format!(
+        "{base}/api/v1/container/full/outer_grp?format=zip&max_depth=0"
+    ))
+    .await;
+    let (s1, g1) = get_bytes(&format!(
+        "{base}/api/v1/container/full/outer_grp?format=zip&max_depth=1"
+    ))
+    .await;
+    assert_eq!((s0, s1), (200, 200), "both zip exports serve 200");
+    assert_ne!(g0, g1, "max_depth must change the zip export");
+}
+
+// post_container_full (the `/container/full/{path}` POST) must forward max_depth
+// from the query it reconstructs, so POST(max_depth=N) == GET(?max_depth=N).
+#[tokio::test]
+async fn post_path_forwards_max_depth() {
+    let base = spawn(build_zip_tree()).await;
+    let (_, get0) = get_bytes(&format!(
+        "{base}/api/v1/container/full/outer_grp?format=zip&max_depth=0"
+    ))
+    .await;
+    let (_, get1) = get_bytes(&format!(
+        "{base}/api/v1/container/full/outer_grp?format=zip&max_depth=1"
+    ))
+    .await;
+    let (ps0, post0) = post_bytes(&format!(
+        "{base}/api/v1/container/full/outer_grp?format=zip&max_depth=0"
+    ))
+    .await;
+    let (ps1, post1) = post_bytes(&format!(
+        "{base}/api/v1/container/full/outer_grp?format=zip&max_depth=1"
+    ))
+    .await;
+    assert_eq!((ps0, ps1), (200, 200));
+    assert_eq!(
+        zip_entries(&post0),
+        zip_entries(&get0),
+        "POST max_depth=0 must equal GET max_depth=0"
+    );
+    assert_eq!(
+        zip_entries(&post1),
+        zip_entries(&get1),
+        "POST max_depth=1 must equal GET max_depth=1"
+    );
+    assert_ne!(post0, post1, "POST must actually honor max_depth");
+}
+
+// container_full_post (the `/container/full` no-path LongRequest route) must
+// forward max_depth from the JSON body via LongRequest::to_query_params.
+#[tokio::test]
+async fn post_longrequest_forwards_max_depth() {
+    let base = spawn(build_zip_tree()).await;
+    let (_, get0) = get_bytes(&format!(
+        "{base}/api/v1/container/full/outer_grp?format=zip&max_depth=0"
+    ))
+    .await;
+    let (_, get1) = get_bytes(&format!(
+        "{base}/api/v1/container/full/outer_grp?format=zip&max_depth=1"
+    ))
+    .await;
+    let (ps0, post0) = post_json_bytes(
+        &format!("{base}/api/v1/container/full"),
+        json!({"path": "outer_grp", "format": "zip", "max_depth": 0}),
+    )
+    .await;
+    let (ps1, post1) = post_json_bytes(
+        &format!("{base}/api/v1/container/full"),
+        json!({"path": "outer_grp", "format": "zip", "max_depth": 1}),
+    )
+    .await;
+    assert_eq!((ps0, ps1), (200, 200));
+    assert_eq!(
+        zip_entries(&post0),
+        zip_entries(&get0),
+        "LongRequest max_depth=0 must equal GET max_depth=0"
+    );
+    assert_eq!(
+        zip_entries(&post1),
+        zip_entries(&get1),
+        "LongRequest max_depth=1 must equal GET max_depth=1"
+    );
+    assert_ne!(post0, post1, "LongRequest must actually honor max_depth");
+}

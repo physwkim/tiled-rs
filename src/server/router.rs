@@ -2462,6 +2462,11 @@ pub struct LongRequest {
     pub format: Option<String>,
     #[serde(default)]
     pub filename: Option<String>,
+    /// `?max_depth=` bound for the container/full deep (zip/hdf5) export. Carried
+    /// in the body so a long-URI POST forwards it just like the GET query — else
+    /// the export silently ignores it (GET-honors/POST-drops asymmetry).
+    #[serde(default)]
+    pub max_depth: Option<i64>,
 }
 
 impl LongRequest {
@@ -2478,6 +2483,9 @@ impl LongRequest {
         }
         if let Some(name) = &self.filename {
             p.insert("filename".to_string(), name.clone());
+        }
+        if let Some(d) = self.max_depth {
+            p.insert("max_depth".to_string(), d.to_string());
         }
         p
     }
@@ -2557,6 +2565,13 @@ pub async fn post_container_full(
         .iter()
         .find(|(k, _)| k == "filename")
         .map(|(_, v)| v.clone());
+    // The deep (zip/hdf5) export's depth bound. Forward it verbatim so a POST
+    // honors `?max_depth=` exactly as the GET does; dropping it here left the
+    // export unbounded on POST (GET-honors/POST-drops asymmetry).
+    let max_depth_param = params
+        .iter()
+        .find(|(k, _)| k == "max_depth")
+        .map(|(_, v)| v.clone());
 
     // Every POST — wide-table export included — delegates to the shared GET logic.
     // The bare-list body is the column projection (upstream
@@ -2564,13 +2579,16 @@ pub async fn post_container_full(
     // forward it as repeated `field=` query keys so the GET path resolves the
     // projection through the same `repeated_query_values` call and runs the SINGLE
     // `negotiate_container_full` — one projection resolution AND one negotiation
-    // owner for both entry points. format/filename ride the `Query` map as before.
+    // owner for both entry points. format/filename/max_depth ride the `Query` map.
     let mut query: HashMap<String, String> = HashMap::new();
     if let Some(f) = format_param {
         query.insert("format".to_string(), f);
     }
     if let Some(name) = filename_param {
         query.insert("filename".to_string(), name);
+    }
+    if let Some(d) = max_depth_param {
+        query.insert("max_depth".to_string(), d);
     }
     let body_fields = fields.map(|Json(f)| f).filter(|f| !f.is_empty());
     let uri = match body_fields {
