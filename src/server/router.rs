@@ -452,8 +452,7 @@ pub async fn metadata(
     // Validate `?max_depth=` up front (Query(None, ge=0, le=DEPTH_LIMIT),
     // router.py:460) so an out-of-range/non-integer value is a 422 that
     // pre-empts the node walk's 404, matching FastAPI's query-gate precedence.
-    // The parsed value is not yet threaded into inlining (commit 3).
-    parse_max_depth(params.get("max_depth").map(String::as_str))?;
+    let max_depth = parse_max_depth(params.get("max_depth").map(String::as_str))?;
     // Use the raw URI path so a key containing `%2F` survives as one
     // segment rather than being split apart by axum's `Path<String>` (which
     // percent-decodes before splitting).
@@ -514,7 +513,7 @@ pub async fn metadata(
         let adapter = core::walk_tree(state.root_tree.as_ref(), &segments).await?;
         let id = segments.last().cloned().unwrap_or_default();
         let path = segments.join("/");
-        core::construct_resource(&adapter, &id, &path, &base_url).await?
+        core::construct_resource(&adapter, &id, &path, &base_url, max_depth, 0).await?
     };
 
     resource.attributes.metadata =
@@ -702,9 +701,8 @@ pub async fn search(
 ) -> Result<impl IntoResponse, ServerError> {
     auth.require(crate::auth::Scope::ReadMetadata)?;
     // Validate `?max_depth=` up front (Query(None, ge=0, le=DEPTH_LIMIT),
-    // router.py:322), same precedence as the metadata route. The parsed value
-    // is not yet threaded into inlining (commit 3).
-    parse_max_depth(
+    // router.py:322), same precedence as the metadata route.
+    let max_depth = parse_max_depth(
         params
             .iter()
             .find(|(k, _)| k == "max_depth")
@@ -833,6 +831,7 @@ pub async fn search(
         &sorting,
         state.exact_count_limit,
         include_data_sources,
+        max_depth,
     )
     .await?;
     // `select_metadata` only applies within `metadata in fields` (core.py:479-485):
@@ -3795,7 +3794,12 @@ pub async fn container_full(
             } else {
                 format!("{path}/{k}")
             };
-            children.push(core::construct_resource(&child, k, &child_path, &base_url).await?);
+            // `Some(0)` disables recursive inlining: the container/full JSON
+            // export is a flat one-level listing of child Resources, not the
+            // metadata inline tree.
+            children.push(
+                core::construct_resource(&child, k, &child_path, &base_url, Some(0), 0).await?,
+            );
         }
         serde_json::to_vec(&children).map_err(|e| ServerError::Internal(format!("encode: {e}")))?
     };
@@ -8210,7 +8214,10 @@ async fn catalog_metadata_resource(
                     let adapter = core::walk_tree(root_tree, segments).await?;
                     let id = segments.last().cloned().unwrap_or_default();
                     let path = segments.join("/");
-                    return core::construct_resource(&adapter, &id, &path, base_url).await;
+                    // A synthesized table-column array leaf: `Some(0)` — inlining
+                    // never applies to a leaf, this is the no-inline default.
+                    return core::construct_resource(&adapter, &id, &path, base_url, Some(0), 0)
+                        .await;
                 }
             }
             return Err(ServerError::NotFound(format!(

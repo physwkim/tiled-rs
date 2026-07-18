@@ -273,3 +273,220 @@ async fn search_max_depth_non_integer_is_422() {
         "Input should be a valid integer, unable to parse string as an integer"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Commit 3: recursive structure.contents inlining under the upstream gate
+//   ((max_depth is None) or (depth < max_depth))
+//   && inlined_contents_enabled(depth) && depth <= DEPTH_LIMIT
+// (tiled/server/core.py:513-556). The addressed node is depth 0.
+//
+// Nested inline-enabled tree:
+//   root
+//   ├── outer  (xarray_dataset)                depth 0
+//   │   ├── leaf0 (array)                        depth 1
+//   │   └── inner (xarray_dataset)               depth 1
+//   │       └── leaf1 (array)                     depth 2
+//   └── plain  (no spec)  → contents null
+//       └── a  (array)
+// ---------------------------------------------------------------------------
+
+fn build_nested() -> Arc<dyn ContainerAdapter> {
+    let inner = container(
+        vec![("leaf1", arr(&[1.0], json!({})))],
+        vec![Spec::new("xarray_dataset")],
+        json!({}),
+    );
+    let outer = container(
+        vec![("leaf0", arr(&[2.0], json!({}))), ("inner", inner)],
+        vec![Spec::new("xarray_dataset")],
+        json!({}),
+    );
+    let plain = container(vec![("a", arr(&[3.0], json!({})))], vec![], json!({}));
+    let mut m = IndexMap::new();
+    m.insert("outer".to_string(), outer);
+    m.insert("plain".to_string(), plain);
+    Arc::new(MapAdapter::new(m, json!({}), vec![]))
+}
+
+/// `structure` object of the metadata response for `path`.
+async fn meta_structure(base: &str, path: &str) -> Value {
+    let (status, body) = get_json(&format!("{base}/api/v1/metadata/{path}")).await;
+    assert_eq!(status, 200, "metadata/{path} must be 200");
+    body["data"]["attributes"]["structure"].clone()
+}
+
+// A plain (unspec'd) container never inlines — hasattr-absent parity — at any
+// max_depth, including the inline-active default (absent). count is still set.
+#[tokio::test]
+async fn metadata_plain_container_contents_null() {
+    let base = spawn(build_nested()).await;
+    for q in ["", "?max_depth=5", "?max_depth=1"] {
+        let s = meta_structure(&base, &format!("plain{q}")).await;
+        assert!(
+            s["contents"].is_null(),
+            "plain container must keep contents=null (q={q}): {s}"
+        );
+        assert_eq!(s["count"], 1, "plain container count");
+    }
+}
+
+// max_depth=0 disables inlining even on an enabled node (0 < 0 is false).
+#[tokio::test]
+async fn metadata_max_depth_zero_no_inline() {
+    let base = spawn(build_nested()).await;
+    let s = meta_structure(&base, "outer?max_depth=0").await;
+    assert!(s["contents"].is_null(), "max_depth=0 must not inline: {s}");
+    assert_eq!(s["count"], 2, "count still reported");
+}
+
+// max_depth=1: the depth-0 node inlines its children, but each child container
+// (depth 1) does NOT recurse (1 < 1 is false) — its own contents stay null.
+#[tokio::test]
+async fn metadata_max_depth_one_inlines_one_level_only() {
+    let base = spawn(build_nested()).await;
+    let s = meta_structure(&base, "outer?max_depth=1").await;
+    // outer inlined: both children present.
+    assert_eq!(s["count"], 2);
+    assert_eq!(s["contents"]["leaf0"]["id"], "leaf0");
+    assert_eq!(
+        s["contents"]["leaf0"]["attributes"]["structure_family"],
+        "array"
+    );
+    // inner is inlined as a Resource, but its OWN contents do not recurse.
+    assert_eq!(s["contents"]["inner"]["id"], "inner");
+    assert_eq!(
+        s["contents"]["inner"]["attributes"]["structure_family"],
+        "container"
+    );
+    assert!(
+        s["contents"]["inner"]["attributes"]["structure"]["contents"].is_null(),
+        "depth-1 child must not recurse at max_depth=1: {s}"
+    );
+    assert_eq!(
+        s["contents"]["inner"]["attributes"]["structure"]["count"], 1,
+        "inner still reports its child count"
+    );
+}
+
+// max_depth absent (None) inlines recursively down to the DEPTH_LIMIT bound:
+// outer (depth 0) → inner (depth 1) → leaf1 (depth 2).
+#[tokio::test]
+async fn metadata_max_depth_none_inlines_recursively() {
+    let base = spawn(build_nested()).await;
+    let s = meta_structure(&base, "outer").await;
+    assert_eq!(s["count"], 2);
+    // Recurse two levels: inner is inlined AND its child leaf1 is inlined.
+    let inner_structure = &s["contents"]["inner"]["attributes"]["structure"];
+    assert_eq!(inner_structure["count"], 1);
+    assert_eq!(inner_structure["contents"]["leaf1"]["id"], "leaf1");
+    assert_eq!(
+        inner_structure["contents"]["leaf1"]["attributes"]["structure_family"],
+        "array"
+    );
+}
+
+// max_depth=2 reaches the same full depth as None for this 2-level tree.
+#[tokio::test]
+async fn metadata_max_depth_two_reaches_leaf1() {
+    let base = spawn(build_nested()).await;
+    let s = meta_structure(&base, "outer?max_depth=2").await;
+    let inner_structure = &s["contents"]["inner"]["attributes"]["structure"];
+    assert_eq!(inner_structure["contents"]["leaf1"]["id"], "leaf1");
+}
+
+// A large xarray_dataset: exactly INLINED_CONTENTS_LIMIT (500) children inline;
+// 501 exceeds the cap so contents stays null (count still reported).
+fn big_dataset(n: usize) -> AnyAdapter {
+    let mut children = IndexMap::new();
+    for i in 0..n {
+        children.insert(format!("v{i:04}"), arr(&[i as f64], json!({})));
+    }
+    AnyAdapter::Container(Arc::new(MapAdapter::new(
+        children,
+        json!({}),
+        vec![Spec::new("xarray_dataset")],
+    )))
+}
+
+fn root_with_child(key: &str, child: AnyAdapter) -> Arc<dyn ContainerAdapter> {
+    let mut m = IndexMap::new();
+    m.insert(key.to_string(), child);
+    Arc::new(MapAdapter::new(m, json!({}), vec![]))
+}
+
+#[tokio::test]
+async fn metadata_inline_count_cap_500_inlines() {
+    let base = spawn(root_with_child("ds", big_dataset(500))).await;
+    let s = meta_structure(&base, "ds").await;
+    assert_eq!(s["count"], 500, "exactly-at-cap count");
+    assert_eq!(
+        s["contents"].as_object().map(|o| o.len()),
+        Some(500),
+        "500 children (== cap) are inlined"
+    );
+}
+
+#[tokio::test]
+async fn metadata_inline_count_cap_501_truncates() {
+    let base = spawn(root_with_child("ds", big_dataset(501))).await;
+    let s = meta_structure(&base, "ds").await;
+    assert!(
+        s["contents"].is_null(),
+        "501 children (> cap) must not inline"
+    );
+    assert_eq!(
+        s["count"], 501,
+        "count still reported when too large to inline"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Search-path inlining: each entry is built at depth 0, so an inline-enabled
+// container entry inlines its children into structure.contents (unless
+// ?max_depth=0). A plain container entry stays contents=null.
+// ---------------------------------------------------------------------------
+
+/// The entry with `id == key` from a search response's `data` list.
+fn find_entry<'a>(body: &'a Value, key: &str) -> &'a Value {
+    body["data"]
+        .as_array()
+        .expect("search data is a list")
+        .iter()
+        .find(|e| e["id"] == key)
+        .unwrap_or_else(|| panic!("no search entry {key}"))
+}
+
+#[tokio::test]
+async fn search_inlines_enabled_container_entry() {
+    let base = spawn(build_nested()).await;
+    // Search the root: entries are `outer` and `plain`.
+    let (status, body) = get_json(&format!("{base}/api/v1/search/")).await;
+    assert_eq!(status, 200);
+    let outer = find_entry(&body, "outer");
+    let s = &outer["attributes"]["structure"];
+    // outer inlines its children (depth 0, absent max_depth), and inner recurses.
+    assert_eq!(s["contents"]["leaf0"]["id"], "leaf0");
+    assert_eq!(
+        s["contents"]["inner"]["attributes"]["structure"]["contents"]["leaf1"]["id"],
+        "leaf1"
+    );
+    // The plain sibling entry stays non-inlined.
+    let plain = find_entry(&body, "plain");
+    assert!(
+        plain["attributes"]["structure"]["contents"].is_null(),
+        "plain container entry must not inline"
+    );
+}
+
+#[tokio::test]
+async fn search_max_depth_zero_no_inline() {
+    let base = spawn(build_nested()).await;
+    let (status, body) = get_json(&format!("{base}/api/v1/search/?max_depth=0")).await;
+    assert_eq!(status, 200);
+    let outer = find_entry(&body, "outer");
+    assert!(
+        outer["attributes"]["structure"]["contents"].is_null(),
+        "search max_depth=0 must not inline"
+    );
+    assert_eq!(outer["attributes"]["structure"]["count"], 2);
+}
