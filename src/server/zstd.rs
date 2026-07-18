@@ -15,17 +15,13 @@
 //!
 //! zstd is registered after gzip but before lz4 and blosc2 upstream, so the
 //! priority is `blosc2 > lz4 > zstd > gzip` (`CompressionRegistry.encodings`
-//! reverses registration order). This middleware runs on the response *after*
-//! blosc2 and lz4 — yielding to a `Content-Encoding` they set — and *before*
-//! gzip, which it preempts.
-
-use axum::extract::Request;
-use axum::http::header;
-use axum::middleware::Next;
-use axum::response::Response;
+//! reverses registration order). That ordering is enforced by the single
+//! [`compress_middleware`](crate::server::compression::compress_middleware)
+//! owner, which reaches zstd only after blosc2 and lz4 have been declined for
+//! the media type; it preempts gzip. This module supplies zstd's eligibility set
+//! and (de)compression.
 
 use crate::core::media_type::mime;
-use crate::server::server_timing::timing_from_request;
 
 /// zstd compression level. Upstream uses 3 (`media_type_registration.py:244`).
 const ZSTD_LEVEL: i32 = 3;
@@ -43,6 +39,12 @@ const ZSTD_ELIGIBLE: &[&str] = &[
     mime::PLAIN,
 ];
 
+/// Whether zstd is offered for `media_type`. Consulted by the single
+/// negotiation owner (`compression::negotiate`).
+pub(crate) fn eligible(media_type: &str) -> bool {
+    ZSTD_ELIGIBLE.contains(&media_type)
+}
+
 /// Compress `src` into a single standard zstd frame at [`ZSTD_LEVEL`], matching
 /// Python's `zstandard.ZstdCompressor(level=3).stream_writer(...)` output.
 pub fn compress(src: &[u8]) -> Vec<u8> {
@@ -54,51 +56,6 @@ pub fn compress(src: &[u8]) -> Vec<u8> {
 /// Returns an error string on malformed input.
 pub fn decompress(src: &[u8]) -> Result<Vec<u8>, String> {
     zstd::decode_all(src).map_err(|e| format!("zstd decompress: {e}"))
-}
-
-/// Axum middleware that applies zstd content-encoding to eligible responses.
-pub async fn zstd_compress_middleware(request: Request, next: Next) -> Response {
-    let wants_zstd = request
-        .headers()
-        .get(header::ACCEPT_ENCODING)
-        .and_then(|v| v.to_str().ok())
-        .map(|v| {
-            v.split(',')
-                .any(|enc| enc.trim().eq_ignore_ascii_case("zstd"))
-        })
-        .unwrap_or(false);
-
-    // Grab the request-scoped Server-Timing accumulator before the request is
-    // consumed, so the compress phase can be recorded on the way back out.
-    let timing = timing_from_request(&request);
-
-    let response = next.run(request).await;
-
-    if !wants_zstd {
-        return response;
-    }
-
-    // Skip if a higher-priority encoding (blosc2/lz4) already set one.
-    if response.headers().contains_key(header::CONTENT_ENCODING) {
-        return response;
-    }
-
-    let eligible = response
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .map(|v| {
-            let media_type = v.split(';').next().unwrap_or("").trim();
-            ZSTD_ELIGIBLE.contains(&media_type)
-        })
-        .unwrap_or(false);
-
-    if !eligible {
-        return response;
-    }
-
-    crate::server::compression::apply_encoding(response, timing, "zstd", |b| Some(compress(b)))
-        .await
 }
 
 #[cfg(test)]

@@ -386,27 +386,19 @@ pub fn build_app(mut state: AppState) -> Router {
             state.clone(),
             timeout_middleware,
         ))
-        // The four content-encoding middlewares are layered so the response
-        // passes through them in priority order blosc2 > lz4 > zstd > gzip
-        // (upstream's reversed registration order,
-        // tiled/media_type_registration.py). Each yields to a Content-Encoding
-        // an earlier one already set, so the highest-priority accepted encoding
-        // wins. All four share one MINIMUM_SIZE floor, worth_compressing ratio
-        // gate, and `compress` Server-Timing phase via
-        // compression::apply_encoding — replacing tower-http's CompressionLayer,
-        // which floored at 32 bytes, had no ratio gate, recorded no compress
-        // metric, and compressed a broader content-type set than upstream.
+        // Single content-encoding negotiation middleware. It picks ONE encoding
+        // up front — the highest-priority accepted candidate in priority order
+        // blosc2 > lz4 > zstd > gzip (upstream's reversed registration order,
+        // tiled/media_type_registration.py) — and compresses at most once,
+        // matching upstream's CompressionResponder (compression.py:60-107). It
+        // owns the MINIMUM_SIZE floor, worth_compressing ratio gate, and
+        // `compress` Server-Timing phase via compression::apply_encoding. This
+        // replaces both tower-http's CompressionLayer (32-byte floor, no ratio
+        // gate, no compress metric, broader content-type set) and the earlier
+        // four-layer cascade, which compressed an incompressible body up to four
+        // times and let a blosc2 ratio-decline fall through to zstd.
         .layer(axum::middleware::from_fn(
-            crate::server::blosc2::blosc2_compress_middleware,
-        ))
-        .layer(axum::middleware::from_fn(
-            crate::server::lz4::lz4_compress_middleware,
-        ))
-        .layer(axum::middleware::from_fn(
-            crate::server::zstd::zstd_compress_middleware,
-        ))
-        .layer(axum::middleware::from_fn(
-            crate::server::gzip::gzip_compress_middleware,
+            crate::server::compression::compress_middleware,
         ))
         // L2: the default request span records the full URI, including the
         // query string — so a credential passed as `?api_key=...` (a supported
