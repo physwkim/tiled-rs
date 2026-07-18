@@ -114,6 +114,15 @@ const PERMANENT_REDIRECT_STATUSES: [u16; 2] = [301, 308];
 
 impl CacheEntry {
     pub fn is_fresh(&self) -> bool {
+        // Upstream `is_response_fresh` (`cache_control.py:180-185`) short-circuits
+        // permanent redirects (301/308) to always-fresh BEFORE any header logic,
+        // including `no-cache`. Mirror that ordering here: the status override sits
+        // ahead of the `no_cache`/`expires_at` gate, so a cached permanent redirect
+        // that also carries `Cache-Control: no-cache` is still served fresh. Every
+        // other status keeps full `no_cache`/expiry semantics.
+        if PERMANENT_REDIRECT_STATUSES.contains(&self.status) {
+            return true;
+        }
         !self.no_cache && Utc::now() < self.expires_at
     }
 }
@@ -1191,6 +1200,44 @@ mod tests {
         assert!(
             cache.try_get(&ok, accept).await.unwrap().is_none(),
             "a 200 with max-age=0 must remain stale — the redirect override is status-scoped"
+        );
+    }
+
+    // wave-31 finding 1: a permanent redirect (301/308) that ALSO carries
+    // `Cache-Control: no-cache` must still be served fresh. Upstream
+    // `is_response_fresh` (`cache_control.py:180-185`) short-circuits permanent
+    // redirects to always-fresh BEFORE any header logic, including no-cache — so
+    // the redirect override must sit ahead of the `no_cache` gate, not behind it.
+    #[tokio::test]
+    async fn permanent_redirect_with_no_cache_is_still_fresh() {
+        let cache = HttpCache::in_memory(1024 * 1024);
+        let accept = "application/json";
+        let no_cache: &[(&str, &str)] = &[("cache-control", "no-cache")];
+
+        for status in [301u16, 308] {
+            let url = Url::parse(&format!("http://test/redir-nocache/{status}")).unwrap();
+            cache
+                .store_response(&url, accept, make_response(status, b"body", no_cache))
+                .await
+                .unwrap();
+            assert!(
+                cache.try_get(&url, accept).await.unwrap().is_some(),
+                "status {status} with Cache-Control: no-cache must still be fresh \
+                 (upstream short-circuits permanent redirects before no-cache)"
+            );
+        }
+
+        // The override stays status-scoped: a 200 carrying `no-cache` still forces
+        // revalidation (served as a miss), so no-cache semantics are unchanged for
+        // every non-redirect status.
+        let ok = Url::parse("http://test/ok-nocache").unwrap();
+        cache
+            .store_response(&ok, accept, make_response(200, b"body", no_cache))
+            .await
+            .unwrap();
+        assert!(
+            cache.try_get(&ok, accept).await.unwrap().is_none(),
+            "a 200 with no-cache must remain a miss — the redirect override is status-scoped"
         );
     }
 
