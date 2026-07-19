@@ -6136,6 +6136,29 @@ pub async fn post_metadata(
         ));
     }
     let segments = create_segments_from_uri(&uri);
+    // Upstream (router.py:1800-1804) rejects a create carrying data sources when
+    // the target is not writable — `entry.writable == bool(context.writable_storage)`,
+    // so an empty `writable_storage` means the server cannot generate managed
+    // storage. Without this guard the create still persists a node + data-source
+    // row backed by no storage (empty assets), leaving a permanently unreadable
+    // node (later GET /array/full → 422). Reject here — after the external-asset
+    // 400 loop, before any node/data-source row is written — so no half-baked
+    // node is ever created (strong-state-transition: fail before the transition).
+    // The check keys on `data_sources` presence only, so it fires for every
+    // structure family that carries data sources, not just array. `/register` is
+    // exempt, matching upstream `post_register`, which has no such guard: it
+    // trusts client-supplied assets for already-existing data.
+    if !req.data_sources.is_empty()
+        && state
+            .catalog
+            .as_ref()
+            .is_some_and(|catalog| catalog.writable_storage().is_empty())
+    {
+        let path = segments.join("/");
+        return Err(ServerError::MethodNotAllowed(format!(
+            "Data cannot be written at the path {path}"
+        )));
+    }
     // Create generates managed storage server-side (init_storage) when
     // writable storage is configured.
     create_node_core(state, segments, base_url, auth, req, true).await
