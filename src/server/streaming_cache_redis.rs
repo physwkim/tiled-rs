@@ -10,7 +10,8 @@
 //! upstream-Python process can interoperate against the same Redis:
 //!
 //! - `sequence:{node_id}` — the monotonic per-node counter (`INCR` / `GET`),
-//!   with an idle `seq_ttl` expiry.
+//!   with an idle `seq_ttl` expiry, extended to `1 + data_ttl` by `close` so the
+//!   counter outlives the cached data (upstream streaming.py:488).
 //! - `data:{node_id}:{seq}` — a hash holding `sequence`, `metadata` (a JSON
 //!   string), and, when the event carries bytes, `payload` (raw). Expires after
 //!   `data_ttl`.
@@ -247,11 +248,29 @@ impl StreamingCache for RedisStreamingCache {
     async fn close(&self, node_id: i64) {
         // Append an end-of-stream marker at a fresh sequence and publish it, so
         // every live subscriber sees the producer has ended (upstream
-        // `RedisStreamingDatastore.close`). `set` already refreshes nothing on
-        // the sequence key beyond what `incr_seq` did; the counter simply lives
-        // out its `seq_ttl` and any later write restarts the sequence.
+        // `RedisStreamingDatastore.close`, streaming.py:466-490).
         let seq = self.incr_seq(node_id).await;
         self.set(node_id, seq, StreamEvent::end_of_stream()).await;
+        // Extend the sequence counter to outlive the cached data (upstream
+        // streaming.py:488, `expire(sequence:{node_id}, 1 + data_ttl)`).
+        // `incr_seq` above stamped only the idle `seq_ttl` (~1 h), and `set`
+        // never touches the sequence key; left at `seq_ttl` the counter would
+        // expire long before the `data_ttl`-lived (~30 d) EOS + backlog, so a
+        // later `?start=` resumer would read `current_seq → 0`, replay nothing,
+        // and never receive the cached EOS — hanging instead of closing 1000.
+        // The extension is owned here in `close`, not in `incr_seq`/`set`, so no
+        // non-owner pokes the sequence TTL. `+ 1` matches upstream (outlive the
+        // last data by 1 s); `saturating_add` guards the `i64::MAX` clamp that
+        // `ttl_secs` may have produced from a very large `data_ttl`.
+        let Some(mut conn) = self.conn().await else {
+            return;
+        };
+        let key = format!("sequence:{node_id}");
+        let ttl = self.data_ttl.saturating_add(1);
+        let result: redis::RedisResult<()> = conn.expire(&key, ttl).await;
+        if let Err(e) = result {
+            tracing::warn!("streaming redis: close(node {node_id}) seq expire failed: {e}");
+        }
     }
 }
 
@@ -420,6 +439,25 @@ mod tests {
         let eos = cache.get(node, eos_seq).await.expect("eos event present");
         assert_eq!(eos.metadata["end_of_stream"], true);
         assert!(eos.payload.is_none());
+
+        // Regression (Redis close() seq-TTL extension, upstream streaming.py:488):
+        // after close(), the sequence counter must be extended to `1 + data_ttl`
+        // so it outlives the `data_ttl`-lived cached EOS/backlog. Left at the
+        // idle `seq_ttl` (3600) that `incr_seq` stamped, a later `?start=`
+        // resumer would read `current_seq → 0`, replay nothing, and hang. The
+        // TTL counts down from `1 + data_ttl` (2_592_001), so it must be far
+        // above `seq_ttl`; assert a generous lower bound tolerant of elapsed time.
+        let seq_ttl_after_close: i64 = redis::cmd("TTL")
+            .arg(&seq_key)
+            .query_async(&mut probe)
+            .await
+            .expect("TTL sequence key");
+        assert!(
+            seq_ttl_after_close > 3600,
+            "close() must extend the sequence TTL beyond seq_ttl (3600) to ~1+data_ttl; \
+             got {seq_ttl_after_close} — the counter would expire before the cached data \
+             and break post-close ?start= replay"
+        );
 
         // Cleanup every key this test created.
         let _: () = redis::cmd("DEL")
