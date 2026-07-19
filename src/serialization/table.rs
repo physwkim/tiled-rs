@@ -199,19 +199,56 @@ pub(crate) fn table_ipc_to_safe_columns(
     let cursor = Cursor::new(data.to_vec());
     let reader = FileReader::try_new(cursor, None).map_err(|e| format!("ipc reader: {e}"))?;
     let schema = reader.schema();
+    // Materialize every batch up front so the int+null→float64 promotion below is
+    // a table-wide decision: a nullable integer column split across batches must
+    // format uniformly (a null in ANY batch promotes the whole column), matching
+    // pandas, where `to_pandas()` promotes the column once at read.
+    let batches = reader
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("ipc batch: {e}"))?;
+    // Upstream serializes tables from `adapter.read()` = pyarrow `to_pandas()`
+    // (adapters/arrow.py:292), which promotes a nullable integer column with ANY
+    // null to float64/NaN before `_series_to_json_safe` runs (serialization/
+    // table.py:113-136). The CSV path mirrors this via `ColPlan::IntToFloat`
+    // (csv_table.rs); do the same here so json / json-seq / html emit floats, not
+    // ints, for such a column. A fully-populated integer column stays integer.
+    let promote_int_to_float: Vec<bool> = (0..schema.fields().len())
+        .map(|c| {
+            is_integer_type(schema.field(c).data_type())
+                && batches.iter().any(|b| b.column(c).null_count() > 0)
+        })
+        .collect();
     let mut columns: Vec<(String, Vec<Value>)> = schema
         .fields()
         .iter()
         .map(|f| (f.name().clone(), Vec::new()))
         .collect();
-    for batch in reader {
-        let batch = batch.map_err(|e| format!("ipc batch: {e}"))?;
+    for batch in &batches {
         for (col_idx, column) in columns.iter_mut().enumerate() {
-            let vals = arrow_column_to_json_values(batch.column(col_idx).as_ref())?;
+            let vals = arrow_column_to_json_values(
+                batch.column(col_idx).as_ref(),
+                promote_int_to_float[col_idx],
+            )?;
             column.1.extend(vals);
         }
     }
     Ok(columns)
+}
+
+/// The Arrow integer types pandas promotes to float64 when the column contains a
+/// null (int-with-missing → float64 at read; mirrors `csv_table.rs`).
+fn is_integer_type(dt: &DataType) -> bool {
+    matches!(
+        dt,
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+    )
 }
 
 /// Convert one Arrow array into a list of JSON-safe values (one per row).
@@ -226,8 +263,21 @@ pub(crate) fn table_ipc_to_safe_columns(
 /// A genuinely non-JSON-native column (binary, nested) remains a hard error,
 /// matching Python's orjson failure on such a column rather than emitting
 /// garbage.
-fn arrow_column_to_json_values(array: &dyn Array) -> Result<Vec<Value>, SerializeError> {
+fn arrow_column_to_json_values(
+    array: &dyn Array,
+    promote_int_to_float: bool,
+) -> Result<Vec<Value>, SerializeError> {
     let n = array.len();
+
+    // pandas int-with-missing → float64 (decided table-wide in
+    // `table_ipc_to_safe_columns`): cast the nullable integer column to Float64
+    // and fall through the Float64 arm so values become floats (`1`→`1.0`) and
+    // nulls stay null — matching upstream `to_pandas()` + `_series_to_json_safe`.
+    if promote_int_to_float {
+        let casted = arrow::compute::cast(array, &DataType::Float64)
+            .map_err(|e| -> SerializeError { format!("int->float64 cast: {e}").into() })?;
+        return arrow_column_to_json_values(casted.as_ref(), false);
+    }
 
     // Downcast to a concrete primitive array and map each slot, honoring the
     // null mask. `Value::from` covers every integer width, f32/f64, bool, &str.
@@ -401,6 +451,64 @@ mod tests {
         let out = json_serializer()(&ipc_bytes(&batch), &serde_json::Value::Null).unwrap();
         let parsed: Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(parsed["x"], serde_json::json!([1.0, null, null]));
+    }
+
+    /// Finding 1: a nullable integer column with ≥1 null promotes to float64/NaN
+    /// in JSON, mirroring upstream `to_pandas()` (adapters/arrow.py:292) +
+    /// `_series_to_json_safe` (table.py:113-136). Before this fix the JSON path
+    /// emitted the raw ints `[1,null,2]`; upstream emits `[1.0,null,2.0]`. A
+    /// serde_json `Number` int and float are NOT equal, so this pins the float-ness.
+    #[test]
+    fn json_table_int_column_with_null_promotes_to_float() {
+        let schema = Arc::new(Schema::new(vec![Field::new("b", DataType::Int64, true)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(vec![Some(1), None, Some(2)]))],
+        )
+        .unwrap();
+        let out = json_serializer()(&ipc_bytes(&batch), &serde_json::Value::Null).unwrap();
+        let parsed: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(parsed["b"], serde_json::json!([1.0, null, 2.0]));
+        let text = String::from_utf8(out.to_vec()).unwrap();
+        assert!(
+            text.contains("1.0") && text.contains("2.0"),
+            "promoted column must render floats, got {text}"
+        );
+    }
+
+    /// Finding 1 (json-seq): the same int+null→float promotion drives the
+    /// row-oriented NDJSON path (shared `table_ipc_to_safe_columns`).
+    #[test]
+    fn json_seq_table_int_column_with_null_promotes_to_float() {
+        let schema = Arc::new(Schema::new(vec![Field::new("b", DataType::Int64, true)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(vec![Some(1), None, Some(2)]))],
+        )
+        .unwrap();
+        let out = json_seq_serializer()(&ipc_bytes(&batch), &serde_json::Value::Null).unwrap();
+        let text = String::from_utf8(out.to_vec()).unwrap();
+        assert_eq!(
+            text, "{\"b\":1.0}\n{\"b\":null}\n{\"b\":2.0}",
+            "int+null column must promote to float in json-seq rows"
+        );
+    }
+
+    /// Finding 1 (html): the int+null→float promotion also drives HTML cell text
+    /// (shared `table_ipc_to_safe_columns`), so a promoted cell renders `1.0`.
+    #[test]
+    fn html_table_int_column_with_null_promotes_to_float() {
+        let schema = Arc::new(Schema::new(vec![Field::new("b", DataType::Int64, true)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(vec![Some(1), None, Some(2)]))],
+        )
+        .unwrap();
+        let out = html_serializer()(&ipc_bytes(&batch), &serde_json::Value::Null).unwrap();
+        let html = String::from_utf8(out.to_vec()).unwrap();
+        assert!(html.contains("<td>1.0</td>"), "promoted cell 1.0: {html}");
+        assert!(html.contains("<td>2.0</td>"), "promoted cell 2.0: {html}");
+        assert!(html.contains("<td></td>"), "null cell empty: {html}");
     }
 
     /// H1: string and boolean columns map to their JSON-native forms.
