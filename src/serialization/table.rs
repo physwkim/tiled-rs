@@ -5,12 +5,16 @@
 use std::io::Cursor;
 
 use arrow::array::{
-    Array, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array,
-    LargeStringArray, StringArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+    Array, BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array, Int8Array,
+    Int16Array, Int32Array, Int64Array, LargeStringArray, StringArray, Time32MillisecondArray,
+    Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
+    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
+    UInt16Array, UInt32Array, UInt64Array,
 };
-use arrow::datatypes::DataType;
+use arrow::datatypes::{DataType, TimeUnit};
 use arrow::ipc::reader::FileReader;
 use bytes::Bytes;
+use chrono::{NaiveDateTime, NaiveTime, Timelike};
 use serde_json::Value;
 
 use crate::core::media_type::mime;
@@ -316,36 +320,23 @@ fn arrow_column_to_json_values(
         DataType::Float64 => map_native!(Float64Array),
         DataType::Utf8 => map_native!(StringArray),
         DataType::LargeUtf8 => map_native!(LargeStringArray),
-        // Temporal columns → ISO-8601 strings. Python's `_series_to_json_safe`
-        // converts `pandas.Timestamp` with `.isoformat()` (table.py:135-139) and
-        // orjson renders date/time natively; Arrow's cast-to-Utf8 yields the
-        // equivalent ISO-8601 text and handles every unit/timezone uniformly.
-        // Null slots stay JSON null, matching the null mask of every other arm.
-        DataType::Timestamp(_, _)
-        | DataType::Date32
-        | DataType::Date64
-        | DataType::Time32(_)
-        | DataType::Time64(_) => {
-            let cast =
-                arrow::compute::cast(array, &DataType::Utf8).map_err(|e| -> SerializeError {
-                    format!("arrow temporal column cast to string failed: {e}").into()
-                })?;
-            let s =
-                cast.as_any()
-                    .downcast_ref::<StringArray>()
-                    .ok_or_else(|| -> SerializeError {
-                        "arrow temporal cast did not yield a Utf8 array".into()
-                    })?;
-            (0..n)
-                .map(|i| {
-                    if s.is_null(i) {
-                        Value::Null
-                    } else {
-                        Value::from(s.value(i))
-                    }
-                })
-                .collect()
-        }
+        // Temporal columns → ISO-8601 strings, matching upstream `_series_to_json_safe`,
+        // which serializes a `pandas.Timestamp` via `.isoformat()` (table.py:135-136)
+        // over the `to_pandas()` frame. isoformat's fractional width is 0/6/9 digits —
+        // NEVER 3 — whereas arrow's cast-to-Utf8 uses chrono's {0,3,6,9} debug width
+        // and would emit `.500` where upstream emits `.500000`. Render each type
+        // directly to hit the isoformat width. Null slots stay JSON null.
+        DataType::Timestamp(unit, None) => timestamp_isoformat_values(array, *unit)?,
+        // tz-aware Timestamp: documented residual divergence (csv_table module docs) —
+        // reproducing pandas' wall-clock offset needs a tz database, and no tiled-rs
+        // adapter emits such a column. Keep arrow's RFC3339 cast for it.
+        DataType::Timestamp(_, Some(_)) => temporal_cast_to_strings(array)?,
+        // pyarrow `to_pandas()` yields `datetime.date` objects for date columns
+        // (date_as_object default), which orjson renders as `YYYY-MM-DD`.
+        DataType::Date32 | DataType::Date64 => date_iso_values(array)?,
+        // pyarrow `to_pandas()` yields `datetime.time` objects, whose `isoformat`
+        // is `HH:MM:SS[.ffffff]` (0 or 6 fractional digits, never 3 or 9).
+        DataType::Time32(unit) | DataType::Time64(unit) => time_isoformat_values(array, *unit)?,
         other => {
             return Err(format!(
                 "application/json table serializer does not support arrow column type {other:?}"
@@ -354,6 +345,143 @@ fn arrow_column_to_json_values(
         }
     };
     Ok(values)
+}
+
+/// Render a naive Arrow Timestamp column as `pandas.Timestamp.isoformat()`
+/// strings (table.py:135-136): `YYYY-MM-DDTHH:MM:SS` with a fractional part of 0,
+/// 6, or 9 digits (never 3). Null slots → JSON null.
+fn timestamp_isoformat_values(
+    array: &dyn Array,
+    unit: TimeUnit,
+) -> Result<Vec<Value>, SerializeError> {
+    macro_rules! collect {
+        ($arr:ty) => {{
+            let a = array
+                .as_any()
+                .downcast_ref::<$arr>()
+                .ok_or_else(|| -> SerializeError { "expected timestamp array".into() })?;
+            (0..a.len())
+                .map(|i| match (a.is_null(i), a.value_as_datetime(i)) {
+                    (false, Some(dt)) => Value::from(fmt_timestamp_isoformat(&dt)),
+                    _ => Value::Null,
+                })
+                .collect()
+        }};
+    }
+    Ok(match unit {
+        TimeUnit::Second => collect!(TimestampSecondArray),
+        TimeUnit::Millisecond => collect!(TimestampMillisecondArray),
+        TimeUnit::Microsecond => collect!(TimestampMicrosecondArray),
+        TimeUnit::Nanosecond => collect!(TimestampNanosecondArray),
+    })
+}
+
+/// `pandas.Timestamp.isoformat()` fractional-second width: none when the
+/// sub-second part is zero, 6 digits (microseconds) when it is a whole number of
+/// microseconds, else 9 digits (nanoseconds). `datetime.isoformat` emits 0 or 6
+/// digits; pandas appends 3 more for a non-zero nanosecond remainder — so the
+/// width is {0,6,9}, never chrono's {0,3,6,9}. (Arrow encodes no leap seconds,
+/// so `nanosecond()` < 1e9.)
+fn fmt_timestamp_isoformat(dt: &NaiveDateTime) -> String {
+    let base = dt.format("%Y-%m-%dT%H:%M:%S").to_string();
+    let ns = dt.time().nanosecond();
+    if ns == 0 {
+        base
+    } else if ns.is_multiple_of(1_000) {
+        format!("{base}.{:06}", ns / 1_000)
+    } else {
+        format!("{base}.{ns:09}")
+    }
+}
+
+/// Render a Date32/Date64 column as `YYYY-MM-DD` — pyarrow `to_pandas()` yields
+/// `datetime.date` objects (date_as_object default), which orjson renders as the
+/// bare ISO date. Null slots → JSON null.
+fn date_iso_values(array: &dyn Array) -> Result<Vec<Value>, SerializeError> {
+    macro_rules! collect {
+        ($arr:ty) => {{
+            let a = array
+                .as_any()
+                .downcast_ref::<$arr>()
+                .ok_or_else(|| -> SerializeError { "expected date array".into() })?;
+            (0..a.len())
+                .map(|i| match (a.is_null(i), a.value_as_date(i)) {
+                    (false, Some(d)) => Value::from(d.format("%Y-%m-%d").to_string()),
+                    _ => Value::Null,
+                })
+                .collect()
+        }};
+    }
+    Ok(match array.data_type() {
+        DataType::Date32 => collect!(Date32Array),
+        DataType::Date64 => collect!(Date64Array),
+        _ => return Err("expected a date column".into()),
+    })
+}
+
+/// Render a Time32/Time64 column as `datetime.time.isoformat()`: `HH:MM:SS` with
+/// `.ffffff` (6 digits) only when microseconds are present — never 3 or 9.
+/// `datetime.time` has no nanosecond field, so a `time64[ns]` sub-microsecond
+/// remainder (which upstream `to_pandas` cannot represent) truncates to
+/// microseconds, matching the CSV serializer's `fmt_time`. Null slots → JSON null.
+fn time_isoformat_values(array: &dyn Array, unit: TimeUnit) -> Result<Vec<Value>, SerializeError> {
+    macro_rules! collect {
+        ($arr:ty) => {{
+            let a = array
+                .as_any()
+                .downcast_ref::<$arr>()
+                .ok_or_else(|| -> SerializeError { "expected time array".into() })?;
+            (0..a.len())
+                .map(|i| match (a.is_null(i), a.value_as_time(i)) {
+                    (false, Some(t)) => Value::from(fmt_time_isoformat(&t)),
+                    _ => Value::Null,
+                })
+                .collect()
+        }};
+    }
+    Ok(match unit {
+        TimeUnit::Second => collect!(Time32SecondArray),
+        TimeUnit::Millisecond => collect!(Time32MillisecondArray),
+        TimeUnit::Microsecond => collect!(Time64MicrosecondArray),
+        TimeUnit::Nanosecond => collect!(Time64NanosecondArray),
+    })
+}
+
+/// `datetime.time.isoformat()`: `HH:MM:SS` plus `.ffffff` (6 digits) iff there
+/// are microseconds; sub-microsecond nanoseconds are truncated (no `datetime.time`
+/// representation).
+fn fmt_time_isoformat(t: &NaiveTime) -> String {
+    let us = t.nanosecond() / 1_000;
+    if us == 0 {
+        t.format("%H:%M:%S").to_string()
+    } else {
+        format!("{}.{us:06}", t.format("%H:%M:%S"))
+    }
+}
+
+/// Fallback for a tz-aware Timestamp column: arrow's cast-to-Utf8 (RFC3339). A
+/// documented residual divergence — no tiled-rs adapter emits a tz-aware column.
+/// Null slots → JSON null.
+fn temporal_cast_to_strings(array: &dyn Array) -> Result<Vec<Value>, SerializeError> {
+    let n = array.len();
+    let cast = arrow::compute::cast(array, &DataType::Utf8).map_err(|e| -> SerializeError {
+        format!("arrow temporal column cast to string failed: {e}").into()
+    })?;
+    let s = cast
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| -> SerializeError {
+            "arrow temporal cast did not yield a Utf8 array".into()
+        })?;
+    Ok((0..n)
+        .map(|i| {
+            if s.is_null(i) {
+                Value::Null
+            } else {
+                Value::from(s.value(i))
+            }
+        })
+        .collect())
 }
 
 #[cfg(test)]
@@ -705,6 +833,101 @@ mod tests {
             "date must render as ISO-8601: {d0}"
         );
         assert_eq!(parsed["d"][1], Value::Null, "null date stays null");
+    }
+
+    /// Finding 2: a naive Timestamp with a millisecond-granular fractional second
+    /// renders 6 fractional digits (`pandas.Timestamp.isoformat`, table.py:135-136),
+    /// NOT chrono's 3. Before this fix `arrow::compute::cast(_, Utf8)` emitted
+    /// `.500`; upstream emits `.500000`. Also pins whole-second (no fraction) and
+    /// nanosecond (9 digits), and that json-seq shares the width.
+    #[test]
+    fn json_table_timestamp_isoformat_fractional_width() {
+        use arrow::array::{TimestampMillisecondArray, TimestampNanosecondArray};
+        use arrow::datatypes::TimeUnit;
+        // Millisecond unit: 1609459200500 ms = 2021-01-01T00:00:00.500 -> .500000
+        let schema_ms = Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            true,
+        )]));
+        let batch_ms = RecordBatch::try_new(
+            schema_ms,
+            vec![Arc::new(TimestampMillisecondArray::from(vec![Some(
+                1_609_459_200_500_i64,
+            )]))],
+        )
+        .unwrap();
+        let parsed: Value = serde_json::from_slice(
+            &json_serializer()(&ipc_bytes(&batch_ms), &serde_json::Value::Null).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            parsed["ts"][0],
+            serde_json::json!("2021-01-01T00:00:00.500000"),
+            "millisecond timestamp must render 6 fractional digits (isoformat), not 3"
+        );
+        // json-seq shares `table_ipc_to_safe_columns`, so it gets 6 digits too.
+        let seq = json_seq_serializer()(&ipc_bytes(&batch_ms), &serde_json::Value::Null).unwrap();
+        assert_eq!(
+            String::from_utf8(seq.to_vec()).unwrap(),
+            "{\"ts\":\"2021-01-01T00:00:00.500000\"}"
+        );
+
+        // Nanosecond unit: whole second (no fraction) then a sub-microsecond value
+        // (9 digits).
+        let schema_ns = Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            false,
+        )]));
+        let batch_ns = RecordBatch::try_new(
+            schema_ns,
+            vec![Arc::new(TimestampNanosecondArray::from(vec![
+                1_609_459_200_000_000_000_i64, // 2021-01-01T00:00:00 (no fraction)
+                1_609_459_200_123_456_789_i64, // .123456789 (9 digits)
+            ]))],
+        )
+        .unwrap();
+        let parsed: Value = serde_json::from_slice(
+            &json_serializer()(&ipc_bytes(&batch_ns), &serde_json::Value::Null).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(parsed["ts"][0], serde_json::json!("2021-01-01T00:00:00"));
+        assert_eq!(
+            parsed["ts"][1],
+            serde_json::json!("2021-01-01T00:00:00.123456789")
+        );
+    }
+
+    /// Finding 2 (time): a Time column renders `datetime.time.isoformat` width
+    /// (0 or 6 digits), not chrono's {0,3,6,9}. A millisecond time value emits 6
+    /// digits (`.500` before the fix → `.500000`).
+    #[test]
+    fn json_table_time_isoformat_fractional_width() {
+        use arrow::array::Time32MillisecondArray;
+        use arrow::datatypes::TimeUnit;
+        // 3600500 ms since midnight = 01:00:00.500
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "t",
+            DataType::Time32(TimeUnit::Millisecond),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Time32MillisecondArray::from(vec![Some(
+                3_600_500_i32,
+            )]))],
+        )
+        .unwrap();
+        let parsed: Value = serde_json::from_slice(
+            &json_serializer()(&ipc_bytes(&batch), &serde_json::Value::Null).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            parsed["t"][0],
+            serde_json::json!("01:00:00.500000"),
+            "millisecond time must render 6 fractional digits, not 3"
+        );
     }
 
     fn html_serializer() -> Arc<SerializerFn> {
