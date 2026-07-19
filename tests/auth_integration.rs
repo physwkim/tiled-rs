@@ -1397,6 +1397,106 @@ async fn session_revoke_by_token_missing_session_is_409() {
     );
 }
 
+/// F4: a present `Authorization` header whose scheme is neither `Bearer` nor
+/// `Apikey` is a 400 — upstream `StrictAPIKeyHeader` (authentication.py:118-126)
+/// raises `HTTP_400_BAD_REQUEST` when the scheme is non-empty and not
+/// `bearer`/`apikey`, as a Security dependency that runs before the handler and
+/// before any anonymous admission. An ABSENT header stays on the anonymous path
+/// (401 here, since anonymous is not admitted), and a recognized scheme with a
+/// bad credential stays 401 — never 400. The scheme match is case-insensitive
+/// (upstream compares `scheme.lower()`), so lowercase `bearer` is not a 400.
+#[tokio::test]
+async fn unrecognized_auth_scheme_is_400() {
+    let (app, _dir, _cat, _auth_db) = build_test_app().await;
+
+    // Unrecognized scheme (with a space + param) → 400.
+    let (status, _) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/metadata/",
+        &[("authorization", "Basic dXNlcjpwYXNz")],
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a non-Bearer/non-Apikey Authorization scheme must be 400 (upstream authentication.py:120)"
+    );
+
+    // A value with no space at all is still an unrecognized scheme → 400
+    // (upstream `get_authorization_scheme_param` yields the whole value as the
+    // scheme when there is no space).
+    let (status, _) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/metadata/",
+        &[("authorization", "garbage")],
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a scheme-only Authorization value is still an unrecognized scheme → 400"
+    );
+
+    // ABSENT header → anonymous path (here denied → 401), NEVER 400. This is the
+    // path F4 must not regress.
+    let (status, _) = json_request(&app, Method::GET, "/api/v1/metadata/", &[], None).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "absent Authorization header must stay on the anonymous path, never 400"
+    );
+
+    // Recognized scheme + bad credential → 401, NEVER 400.
+    let (status, _) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/metadata/",
+        &[("authorization", "Bearer not-a-real-jwt")],
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "a Bearer with a bad token stays 401, never 400"
+    );
+    let (status, _) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/metadata/",
+        &[("authorization", "Apikey badkey")],
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "an Apikey with a bad key stays 401, never 400"
+    );
+
+    // Lowercase `bearer` is a recognized scheme (upstream compares case-
+    // insensitively), so it must NOT 400. Here it falls to the anonymous denial
+    // → 401 (the port's Bearer match is case-sensitive, a distinct pre-existing
+    // divergence outside F4's scope); the F4-relevant claim is simply "not 400".
+    let (status, _) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/metadata/",
+        &[("authorization", "bearer whatever")],
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "lowercase 'bearer' is a recognized scheme (case-insensitive) → not 400"
+    );
+}
+
 /// `DELETE /api/v1/auth/session/revoke/{session_id}` allows an authenticated
 /// principal to revoke their own session by UUID (Python authentication.py:1432).
 /// Attempting to revoke another principal's session returns 404 (not 403 —

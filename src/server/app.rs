@@ -692,6 +692,31 @@ async fn resolve_auth_inner(
     headers: &axum::http::HeaderMap,
     query: &str,
 ) -> Result<AuthContext, axum::response::Response> {
+    // ---- 0. Strict Authorization scheme ----
+    // Upstream `StrictAPIKeyHeader` (authentication.py:118-126) rejects an
+    // Authorization header whose scheme is present but is neither `bearer` nor
+    // `apikey` with a 400 — as a Security dependency that runs before the
+    // handler and before any anonymous admission, and unconditionally on the
+    // header value (even when a valid `?api_key=` query is also present). The
+    // scheme is the text before the first space (empty when absent), compared
+    // case-insensitively (`scheme.lower()`), so lowercase `bearer`/`apikey` and
+    // an absent/empty header are NOT 400. Placing this first mirrors upstream's
+    // dependency ordering and keeps the rule uniform rather than special-cased
+    // at the anonymous boundary.
+    if let Some(auth) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
+        let scheme = auth.split(' ').next().unwrap_or("");
+        if !scheme.is_empty()
+            && !scheme.eq_ignore_ascii_case("bearer")
+            && !scheme.eq_ignore_ascii_case("apikey")
+        {
+            return Err(bad_request(
+                "Authorization header must include the authorization type \
+                 followed by a space and then the secret, as in \
+                 'Bearer SECRET' or 'Apikey SECRET'. ",
+            ));
+        }
+    }
+
     // ---- 1. Bearer JWT ----
     // Local Issuer first; falls through to ExternalOidcValidator
     // (tiled#1364, #1343) for tokens issued by upstream IdPs (Entra,
@@ -833,6 +858,10 @@ fn extract_api_key(headers: &axum::http::HeaderMap, query: &str) -> Option<Strin
 
 fn unauthorized(msg: &str) -> axum::response::Response {
     (StatusCode::UNAUTHORIZED, msg.to_string()).into_response()
+}
+
+fn bad_request(msg: &str) -> axum::response::Response {
+    (StatusCode::BAD_REQUEST, msg.to_string()).into_response()
 }
 
 /// Request timeout middleware.
