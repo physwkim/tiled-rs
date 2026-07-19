@@ -368,11 +368,11 @@ async fn create_with_access(
 /// `tests/inline_access_filter.rs`, but exercised via the `/metadata/<node>`
 /// top-node path rather than `/search`):
 /// ```text
-/// ds         (container, spec "xarray_dataset", untagged) → inline-enabled
-/// ├── visible   (container, untagged → public)
+/// ds         (container, spec "xarray_dataset", "public") → inline-enabled
+/// ├── visible   (container, tagged "public")             → readable by all
 /// └── secret    (container, tagged "team-b")              → hidden from team-a
-/// pc         (plain container, untagged)                  → count-only fast path
-/// ├── pvis      (container, untagged → public)
+/// pc         (plain container, "public")                  → count-only fast path
+/// ├── pvis      (container, tagged "public")             → readable by all
 /// └── phid      (container, tagged "team-b")              → hidden from team-a
 /// roothidden (plain container, tagged "team-b")           → hidden root child
 /// ```
@@ -397,14 +397,14 @@ async fn build_access_app() -> (axum::Router, tempfile::TempDir) {
         .await
         .unwrap();
 
-    // ds (xarray_dataset, untagged) → { visible (untagged), secret (team-b) }
+    // ds (xarray_dataset, "public") → { visible ("public"), secret (team-b) }
     let ds = create_with_access(
         &catalog,
         None,
         vec![],
         "ds",
         serde_json::json!(["xarray_dataset"]),
-        serde_json::json!({}),
+        serde_json::json!({"tags": ["public"]}),
     )
     .await;
     create_with_access(
@@ -413,7 +413,7 @@ async fn build_access_app() -> (axum::Router, tempfile::TempDir) {
         vec!["ds".into()],
         "visible",
         serde_json::json!([]),
-        serde_json::json!({}),
+        serde_json::json!({"tags": ["public"]}),
     )
     .await;
     create_with_access(
@@ -426,7 +426,7 @@ async fn build_access_app() -> (axum::Router, tempfile::TempDir) {
     )
     .await;
 
-    // pc (plain container, untagged) → { pvis (untagged), phid (team-b) }. A
+    // pc (plain container, "public") → { pvis ("public"), phid (team-b) }. A
     // plain container takes the count-only fast path (no inlining), so its count
     // MUST also be principal-scoped.
     let pc = create_with_access(
@@ -435,7 +435,7 @@ async fn build_access_app() -> (axum::Router, tempfile::TempDir) {
         vec![],
         "pc",
         serde_json::json!([]),
-        serde_json::json!({}),
+        serde_json::json!({"tags": ["public"]}),
     )
     .await;
     create_with_access(
@@ -444,7 +444,7 @@ async fn build_access_app() -> (axum::Router, tempfile::TempDir) {
         vec!["pc".into()],
         "pvis",
         serde_json::json!([]),
-        serde_json::json!({}),
+        serde_json::json!({"tags": ["public"]}),
     )
     .await;
     create_with_access(
@@ -705,7 +705,7 @@ async fn catalog_topnode_inline_gate_uses_visible_count() {
         vec![],
         "big",
         serde_json::json!(["xarray_dataset"]),
-        serde_json::json!({}),
+        serde_json::json!({"tags": ["public"]}),
     )
     .await;
     // 500 hidden (team-b) children push the FULL count past the 500 cap.
@@ -720,7 +720,7 @@ async fn catalog_topnode_inline_gate_uses_visible_count() {
         )
         .await;
     }
-    // 2 visible (untagged) children — the only ones alice may see.
+    // 2 visible (public-tagged) children — the only ones alice may see.
     for key in ["vis_a", "vis_b"] {
         create_with_access(
             &catalog,
@@ -728,7 +728,7 @@ async fn catalog_topnode_inline_gate_uses_visible_count() {
             vec!["big".into()],
             key,
             serde_json::json!([]),
-            serde_json::json!({}),
+            serde_json::json!({"tags": ["public"]}),
         )
         .await;
     }
@@ -1037,7 +1037,7 @@ async fn catalog_topnode_inline_cap_500_boundary() {
 
 /// Boundary 4 — a hidden child that is itself an ELIGIBLE container.
 ///
-/// `ds` (xarray_dataset, untagged) holds `vis` (untagged, plain) and `hidden_ds`
+/// `ds` (xarray_dataset, "public") holds `vis` ("public", plain) and `hidden_ds`
 /// (team-b — hidden from alice — AND itself `xarray_dataset` with an array-leaf
 /// child). The danger the inline gate keys on the spec discriminator invites: an
 /// eligible hidden child could be resolved and recursed. The access filter runs
@@ -1072,7 +1072,7 @@ async fn catalog_topnode_hidden_eligible_child_never_recursed() {
         vec![],
         "ds",
         serde_json::json!(["xarray_dataset"]),
-        serde_json::json!({}),
+        serde_json::json!({"tags": ["public"]}),
     )
     .await;
     create_with_access(
@@ -1081,7 +1081,7 @@ async fn catalog_topnode_hidden_eligible_child_never_recursed() {
         vec!["ds".into()],
         "vis",
         serde_json::json!([]),
-        serde_json::json!({}),
+        serde_json::json!({"tags": ["public"]}),
     )
     .await;
     // Hidden AND eligible: team-b spec xarray_dataset, with an array-leaf child

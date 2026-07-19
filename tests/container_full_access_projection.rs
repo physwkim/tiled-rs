@@ -99,14 +99,19 @@ async fn explicit_hidden_field_matches_absent_but_listing_filters_silently() {
         specs: json!([]),
         access_blob,
     };
-    // A public container `ds` with a visible child `vis` (untagged) and an
-    // access-hidden child `hid` (tagged team-b, which alice cannot see).
+    // A public container `ds` (tagged "public") with a visible child `vis`
+    // (tagged "public") and an access-hidden child `hid` (tagged team-b, which
+    // alice cannot see).
     let ds = catalog
-        .create_node(None, vec![], node("ds", json!({})))
+        .create_node(None, vec![], node("ds", json!({"tags": ["public"]})))
         .await
         .unwrap();
     catalog
-        .create_node(Some(ds.id), vec!["ds".into()], node("vis", json!({})))
+        .create_node(
+            Some(ds.id),
+            vec!["ds".into()],
+            node("vis", json!({"tags": ["public"]})),
+        )
         .await
         .unwrap();
     catalog
@@ -122,11 +127,15 @@ async fn explicit_hidden_field_matches_absent_but_listing_filters_silently() {
     // response must be byte-identical to `?field=hid` on `ds` (where `hid` is
     // merely access-hidden), so the two cases are indistinguishable.
     let ds2 = catalog
-        .create_node(None, vec![], node("ds2", json!({})))
+        .create_node(None, vec![], node("ds2", json!({"tags": ["public"]})))
         .await
         .unwrap();
     catalog
-        .create_node(Some(ds2.id), vec!["ds2".into()], node("vis2", json!({})))
+        .create_node(
+            Some(ds2.id),
+            vec!["ds2".into()],
+            node("vis2", json!({"tags": ["public"]})),
+        )
         .await
         .unwrap();
 

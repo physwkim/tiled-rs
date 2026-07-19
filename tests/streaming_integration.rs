@@ -394,10 +394,11 @@ async fn patch_child_metadata_emits_metadata_updated() {
 // ---------------------------------------------------------------------------
 
 /// Spawn a server with a `TagBasedPolicy` and no auth backend (anonymous
-/// principal → full scopes, narrowed per node by the policy: untagged nodes
-/// are public, tagged nodes are denied to the anonymous principal). Returns the
-/// catalog (to seed nodes) and the streaming cache (to inject parent-stream
-/// events directly, bypassing the write path).
+/// principal → full scopes, narrowed per node by the policy: `"public"`-tagged
+/// nodes are world-readable, every other node — untagged or otherwise tagged —
+/// is denied to the anonymous principal). Returns the catalog (to seed nodes)
+/// and the streaming cache (to inject parent-stream events directly, bypassing
+/// the write path).
 async fn spawn_server_with_tag_policy()
 -> (String, Catalog, Arc<dyn StreamingCache>, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
@@ -443,14 +444,18 @@ async fn ws_subscriber_does_not_receive_denied_descendant_events() {
     let (base, catalog, cache, _dir) = spawn_server_with_tag_policy().await;
 
     let pub_node = catalog
-        .create_node(None, vec![], container_node("pub", json!({})))
+        .create_node(
+            None,
+            vec![],
+            container_node("pub", json!({"tags": ["public"]})),
+        )
         .await
         .unwrap();
     catalog
         .create_node(
             Some(pub_node.id),
             vec!["pub".into()],
-            container_node("open", json!({})),
+            container_node("open", json!({"tags": ["public"]})),
         )
         .await
         .unwrap();
@@ -514,7 +519,11 @@ async fn ws_subscriber_does_not_receive_child_created_for_denied_child() {
     let (base, catalog, cache, _dir) = spawn_server_with_tag_policy().await;
 
     let pub_node = catalog
-        .create_node(None, vec![], container_node("pub", json!({})))
+        .create_node(
+            None,
+            vec![],
+            container_node("pub", json!({"tags": ["public"]})),
+        )
         .await
         .unwrap();
     catalog
@@ -529,7 +538,7 @@ async fn ws_subscriber_does_not_receive_child_created_for_denied_child() {
         .create_node(
             Some(pub_node.id),
             vec!["pub".into()],
-            container_node("open_child", json!({})),
+            container_node("open_child", json!({"tags": ["public"]})),
         )
         .await
         .unwrap();
@@ -570,7 +579,7 @@ async fn ws_subscriber_does_not_receive_child_created_for_denied_child() {
                 json!([]),
                 json!({}),
                 json!([]),
-                json!({}),
+                json!({"tags": ["public"]}),
             ),
         )
         .await;
@@ -1840,6 +1849,14 @@ async fn put_data_source_non_array_streams_nothing() {
 
 /// Seed an external array node `key` with a single f64 data source — enough for
 /// the WS handler to build an `array-schema` first message. Returns the node id.
+///
+/// The node carries the `"team-a"` tag: under `TagBasedPolicy` (F3, untagged →
+/// empty scope set) a principal-tagged node the principal holds resolves to
+/// `session_scopes ∩ default_scopes`, which is exactly the per-node grant the
+/// tag-policy subscribe/delete tests below exercise. `spawn_auth_stream_server`
+/// grants `alice` the `"team-a"` tag in the SAME auth backend the policy reads,
+/// so her grant on `arr` is controlled purely by the policy's `default_scopes`.
+/// For the no-policy harnesses (webhook / global-gate tests) the tag is inert.
 async fn seed_array_node(catalog: &Catalog, key: &str) -> i64 {
     let node = catalog
         .create_node(
@@ -1850,7 +1867,7 @@ async fn seed_array_node(catalog: &Catalog, key: &str) -> i64 {
                 structure_family: "array".to_string(),
                 metadata: json!({}),
                 specs: json!([]),
-                access_blob: json!({}),
+                access_blob: json!({"tags": ["team-a"]}),
             },
         )
         .await
@@ -1878,17 +1895,19 @@ async fn seed_array_node(catalog: &Catalog, key: &str) -> i64 {
 
 /// Spawn a live server with a real dummy authenticator (user `alice`, default
 /// `user` role) whose per-login session scopes are capped by
-/// `default_login_scopes`, an optional `access_policy`, and a pre-seeded
-/// external array node `arr`. With `access_policy = None` the global token-scope
-/// gate is the only subscribe check; with a policy the subscribe-time node gate
-/// (`subscribe_allowed`) also runs against the authenticated principal. Returns
-/// the http base and the TempDir holding the SQLite files (keep it alive for the
-/// test's duration).
+/// `default_login_scopes`, an optional `TagBasedPolicy` whose `default_scopes`
+/// is `policy_scopes`, and a pre-seeded external array node `arr`. With
+/// `policy_scopes = None` no access policy is installed, so the global
+/// token-scope gate is the only subscribe check; with `Some(scopes)` a
+/// `TagBasedPolicy` is built over the SAME auth backend that authenticates
+/// `alice` (so her `"team-a"` tag resolves) and the subscribe-time node gate
+/// (`subscribe_allowed`) also runs against her. Returns the http base and the
+/// TempDir holding the SQLite files (keep it alive for the test's duration).
 async fn spawn_auth_stream_server(
     default_login_scopes: ScopeSet,
-    access_policy: Option<Arc<dyn tiled_rs::access::AccessPolicy>>,
+    policy_scopes: Option<ScopeSet>,
 ) -> (String, tempfile::TempDir) {
-    spawn_auth_stream_server_cfg(default_login_scopes, access_policy, false).await
+    spawn_auth_stream_server_cfg(default_login_scopes, policy_scopes, false).await
 }
 
 /// Same as [`spawn_auth_stream_server`] but with `allow_anonymous_access`
@@ -1898,7 +1917,7 @@ async fn spawn_auth_stream_server(
 /// `?access_token=` denies rather than silently downgrading to anonymous.
 async fn spawn_auth_stream_server_cfg(
     default_login_scopes: ScopeSet,
-    access_policy: Option<Arc<dyn tiled_rs::access::AccessPolicy>>,
+    policy_scopes: Option<ScopeSet>,
     allow_anonymous_access: bool,
 ) -> (String, tempfile::TempDir) {
     use tiled_rs::auth::{AuthDb, DummyAuthenticator, Issuer};
@@ -1916,7 +1935,22 @@ async fn spawn_auth_stream_server_cfg(
     let auth_db = AuthDb::connect_with_pool_size(&auth_uri, 1).await.unwrap();
     auth_db.migrate().await.unwrap();
     // `alice` keeps the default `user` role (read:metadata + read:data + write).
-    auth_db.ensure_principal("dummy", "alice").await.unwrap();
+    let (alice, _) = auth_db.ensure_principal("dummy", "alice").await.unwrap();
+    // Grant `alice` the `"team-a"` tag `arr` carries, so a `TagBasedPolicy`
+    // built over THIS same auth backend resolves her per-node grant on `arr` to
+    // `session_scopes ∩ default_scopes`. (`ensure_principal` mints a random
+    // UUID per DB, so the policy MUST share this backend, not a throwaway one.)
+    auth_db
+        .set_principal_tags(alice.id, &["team-a".to_string()])
+        .await
+        .unwrap();
+
+    // Build the optional access policy over the SHARED auth backend so it sees
+    // `alice`'s tag. `default_scopes = policy_scopes` caps her grant on `arr`.
+    let access_policy: Option<Arc<dyn tiled_rs::access::AccessPolicy>> = policy_scopes.map(|s| {
+        Arc::new(TagBasedPolicy::new(Arc::new(auth_db.clone()), s))
+            as Arc<dyn tiled_rs::access::AccessPolicy>
+    });
 
     let resolver: Arc<dyn tiled_rs::catalog::adapter::LeafResolver> = Arc::new(UnresolvedLeaf);
     let root_tree: Arc<dyn ContainerAdapter> = Arc::new(tiled_rs::catalog::CatalogAdapter::root(
@@ -1966,23 +2000,6 @@ async fn spawn_auth_stream_server_cfg(
         validation: Default::default(),
     };
     (serve(state).await, dir)
-}
-
-/// A `TagBasedPolicy` whose untagged-node grant to an authenticated principal is
-/// `default_scopes` (intersected with the principal's session scopes). The node
-/// `arr` seeded by [`spawn_auth_stream_server`] is untagged, so this is exactly
-/// what the subscribe-time node gate resolves the node's scopes to. The policy's
-/// own auth backend is a throwaway in-memory DB — untagged nodes never consult
-/// per-principal tags, so its contents are irrelevant.
-async fn tag_policy(default_scopes: ScopeSet) -> Arc<dyn tiled_rs::access::AccessPolicy> {
-    let policy_auth_db = tiled_rs::auth::AuthDb::connect("sqlite::memory:")
-        .await
-        .unwrap();
-    policy_auth_db.migrate().await.unwrap();
-    Arc::new(TagBasedPolicy::new(
-        Arc::new(policy_auth_db),
-        default_scopes,
-    ))
 }
 
 /// Log in over HTTP and return the raw access token (no `Bearer ` prefix).
@@ -2266,14 +2283,15 @@ async fn subscribe_valid_header_with_valid_access_token_query_admits() {
 /// (c) A subscriber whose TOKEN carries BOTH read scopes (so the global gate
 /// passes) but who is narrowed to read:metadata-only on the node by the access
 /// policy is REJECTED at the subscribe-time node gate (`subscribe_allowed`). The
-/// authenticated `user` principal resolves the untagged node through
-/// `principal_decision`, whose grant is `session_scopes ∩ default_scopes` =
-/// `{read:metadata}` — so the node's read:data requirement fails.
+/// authenticated `user` principal (holding the `"team-a"` tag `arr` carries)
+/// resolves the node through `principal_decision`, whose grant is
+/// `session_scopes ∩ default_scopes` = `{read:metadata}` — so the node's
+/// read:data requirement fails.
 #[tokio::test]
 async fn subscribe_node_denied_read_data_is_rejected() {
     let (base, _dir) = spawn_auth_stream_server(
         ScopeSet::read_only(),
-        Some(tag_policy(ScopeSet::from_iter([Scope::ReadMetadata])).await),
+        Some(ScopeSet::from_iter([Scope::ReadMetadata])),
     )
     .await;
     let client = reqwest::Client::new();
@@ -2289,18 +2307,15 @@ async fn subscribe_node_denied_read_data_is_rejected() {
     );
 }
 
-/// (c, positive control) The SAME seeded node and token, but the policy grants
-/// read:data on untagged nodes → subscribe proceeds and the schema arrives. This
-/// proves the rejection above is specifically the node's read:data denial (the
-/// node exists and resolves for the same principal), not a missing/invisible
-/// node or the global token gate.
+/// (c, positive control) The SAME seeded node and token, but the policy's
+/// `default_scopes` grants read:data on the `"team-a"` node → subscribe proceeds
+/// and the schema arrives. This proves the rejection above is specifically the
+/// node's read:data denial (the node exists and resolves for the same
+/// principal), not a missing/invisible node or the global token gate.
 #[tokio::test]
 async fn subscribe_node_grants_read_data_proceeds() {
-    let (base, _dir) = spawn_auth_stream_server(
-        ScopeSet::read_only(),
-        Some(tag_policy(ScopeSet::read_only()).await),
-    )
-    .await;
+    let (base, _dir) =
+        spawn_auth_stream_server(ScopeSet::read_only(), Some(ScopeSet::read_only())).await;
     let client = reqwest::Client::new();
     let token = login_token(&client, &base, "alice", "wonderland").await;
 
@@ -2678,13 +2693,13 @@ async fn delete_node_delivers_node_deleted_then_closes() {
 /// and the stream then closes.
 ///
 /// Uses an authenticated `alice` (default `user` role carries
-/// delete:node/delete:revision) against a tag policy that grants untagged nodes
-/// in full: the seeded untagged `arr` is thus both subscribable and deletable,
-/// while the policy is live so `delivery_allowed` does NOT short-circuit.
+/// delete:node/delete:revision) against a tag policy whose `default_scopes` is
+/// full: her `"team-a"` grant on the seeded `arr` is thus full, making `arr`
+/// both subscribable and deletable, while the policy is live so
+/// `delivery_allowed` does NOT short-circuit.
 #[tokio::test]
 async fn delete_node_delivers_node_deleted_under_access_policy() {
-    let (base, _dir) =
-        spawn_auth_stream_server(ScopeSet::full(), Some(tag_policy(ScopeSet::full()).await)).await;
+    let (base, _dir) = spawn_auth_stream_server(ScopeSet::full(), Some(ScopeSet::full())).await;
     let client = reqwest::Client::new();
     let token = login_token(&client, &base, "alice", "wonderland").await;
 

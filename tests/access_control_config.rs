@@ -94,8 +94,15 @@ async fn tag_based_config_narrows_forbidden_node() {
         specs: json!([]),
         access_blob,
     };
+    // A public node is one carrying the literal "public" tag. Under tag_based an
+    // untagged / empty `{}` blob is NOT public (F3) — it would be narrowed out of
+    // every non-admin's results — so the public fixture uses the "public" tag.
     catalog
-        .create_node(None, vec![], make_node("public_node", json!({})))
+        .create_node(
+            None,
+            vec![],
+            make_node("public_node", json!({"tags": ["public"]})),
+        )
         .await
         .unwrap();
     catalog
