@@ -2019,26 +2019,6 @@ async fn login_token(client: &reqwest::Client, base: &str, user: &str, pw: &str)
         .to_string()
 }
 
-/// Connect a WS subscription to `path` presenting `Bearer {token}` in the
-/// Authorization header (the non-browser auth path `resolve_header_auth` reads
-/// before the upgrade). The upgrade itself always succeeds (HTTP 101); any
-/// authorization denial arrives as a text frame after the upgrade.
-async fn connect_ws_bearer(
-    base: &str,
-    path: &str,
-    token: &str,
-) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
-    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-    use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
-    let mut req = ws_url(base, path).as_str().into_client_request().unwrap();
-    req.headers_mut().insert(
-        HeaderName::from_static("authorization"),
-        HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
-    );
-    let (ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
-    ws
-}
-
 /// Connect a WS subscription to `path` presenting the bearer JWT as an
 /// `?access_token=` query param and NO Authorization header — the browser
 /// transport upstream decodes at connect time (`get_decoded_access_token_websocket`,
@@ -2055,16 +2035,63 @@ async fn connect_ws_access_token_query(
     ws
 }
 
-/// Connect a WS subscription to `path` presenting `Bearer {header_token}` in the
-/// Authorization header AND `?access_token={query_token}` in the query — both
-/// credentials at once. Exercises the connect-time precedence when a real header
-/// credential and a query token coexist (F1): upstream validates the query token
-/// unconditionally even behind a valid header. The upgrade always succeeds
-/// (HTTP 101); any denial arrives as a text frame after it.
-async fn connect_ws_bearer_and_query(
+/// Create an API key for the logged-in principal (bearer `token`) with the given
+/// scopes via `POST /api/v1/auth/apikeys`, returning the raw secret. Presented on
+/// WS as `Apikey {secret}` — the only credential upstream's `get_api_key_websocket`
+/// (authentication.py:283-294) accepts in the WS Authorization header.
+async fn create_apikey(
+    client: &reqwest::Client,
+    base: &str,
+    token: &str,
+    scopes: &[&str],
+) -> String {
+    let body: Value = client
+        .post(format!("{base}/api/v1/auth/apikeys"))
+        .header("authorization", format!("Bearer {token}"))
+        .json(&json!({"note": "ws-test", "scopes": scopes}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    body["secret"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no secret in apikey create response: {body}"))
+        .to_string()
+}
+
+/// Connect a WS subscription to `path` presenting `Apikey {api_key}` in the
+/// Authorization header — the ONLY scheme upstream's `get_api_key_websocket`
+/// (authentication.py:283-294) accepts on the WS Authorization header. The
+/// upgrade succeeds (HTTP 101); any authorization denial arrives as a text frame.
+async fn connect_ws_apikey(
     base: &str,
     path: &str,
-    header_token: &str,
+    api_key: &str,
+) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
+    let mut req = ws_url(base, path).as_str().into_client_request().unwrap();
+    req.headers_mut().insert(
+        HeaderName::from_static("authorization"),
+        HeaderValue::from_str(&format!("Apikey {api_key}")).unwrap(),
+    );
+    let (ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+    ws
+}
+
+/// Connect a WS subscription presenting `Apikey {api_key}` in the Authorization
+/// header AND `?access_token={query_token}` in the query — the upstream-faithful
+/// coexistence of a valid WS header credential and a query token. The WS header
+/// is apikey-only (`get_api_key_websocket`), so this replaces the former
+/// bearer-header variant. Exercises the connect-time precedence: upstream
+/// validates the query token unconditionally even behind the valid header (F1).
+/// The upgrade succeeds (HTTP 101); any denial arrives as a text frame after it.
+async fn connect_ws_apikey_and_query(
+    base: &str,
+    path: &str,
+    api_key: &str,
     query_token: &str,
 ) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -2073,10 +2100,30 @@ async fn connect_ws_bearer_and_query(
     let mut req = url.as_str().into_client_request().unwrap();
     req.headers_mut().insert(
         HeaderName::from_static("authorization"),
-        HeaderValue::from_str(&format!("Bearer {header_token}")).unwrap(),
+        HeaderValue::from_str(&format!("Apikey {api_key}")).unwrap(),
     );
     let (ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
     ws
+}
+
+/// Attempt a WS upgrade to `path` with a raw Authorization header value and
+/// return the HTTP status of a REJECTED upgrade (the WS was never accepted).
+/// Panics if the upgrade unexpectedly succeeds. Used to assert upstream's
+/// `get_api_key_websocket` 400 for a non-`apikey` scheme, raised during WS
+/// dependency resolution before the accept.
+async fn ws_upgrade_status_with_auth(base: &str, path: &str, auth_value: &str) -> u16 {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
+    let mut req = ws_url(base, path).as_str().into_client_request().unwrap();
+    req.headers_mut().insert(
+        HeaderName::from_static("authorization"),
+        HeaderValue::from_str(auth_value).unwrap(),
+    );
+    match tokio_tungstenite::connect_async(req).await {
+        Ok(_) => panic!("WS upgrade unexpectedly succeeded for Authorization: {auth_value:?}"),
+        Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => resp.status().as_u16(),
+        Err(other) => panic!("expected an HTTP error response, got: {other:?}"),
+    }
 }
 
 /// Read the next frame as raw text (no JSON parse), or `None` on close/timeout.
@@ -2103,7 +2150,7 @@ async fn subscribe_without_read_data_scope_is_rejected() {
     let client = reqwest::Client::new();
     let token = login_token(&client, &base, "alice", "wonderland").await;
 
-    let mut ws = connect_ws_bearer(&base, "arr", &token).await;
+    let mut ws = connect_ws_access_token_query(&base, "arr", &token).await;
     let frame = next_frame_text(&mut ws)
         .await
         .expect("a forbidden text frame before close");
@@ -2122,7 +2169,7 @@ async fn subscribe_with_both_read_scopes_proceeds() {
     let client = reqwest::Client::new();
     let token = login_token(&client, &base, "alice", "wonderland").await;
 
-    let mut ws = connect_ws_bearer(&base, "arr", &token).await;
+    let mut ws = connect_ws_access_token_query(&base, "arr", &token).await;
     let schema = next_text_json(&mut ws)
         .await
         .expect("array-schema first message");
@@ -2240,17 +2287,25 @@ async fn subscribe_invalid_access_token_query_denied_immediately() {
 /// header's `api_key` branch only shadows the decoded token for SCOPE SELECTION
 /// (`:449-455`); it does not skip the token's validation. The port previously let
 /// the valid header win and never validated the query token, silently admitting
-/// (RED before this fix: the array-schema arrives, no deny frame). A valid Bearer
-/// header exercises the same `real_header` path as an Apikey header.
+/// (RED before this fix: the array-schema arrives, no deny frame). The header is
+/// an Apikey — the only credential the WS Authorization header accepts
+/// (`get_api_key_websocket`) — and exercises the port's `real_header` path.
 #[tokio::test]
 async fn subscribe_valid_header_with_invalid_access_token_query_is_denied() {
-    let (base, _dir) = spawn_auth_stream_server(ScopeSet::read_only(), None).await;
+    let (base, _dir) = spawn_auth_stream_server(
+        ScopeSet::from_iter([Scope::ReadMetadata, Scope::ReadData, Scope::CreateApiKeys]),
+        None,
+    )
+    .await;
     let client = reqwest::Client::new();
     let token = login_token(&client, &base, "alice", "wonderland").await;
+    let apikey = create_apikey(&client, &base, &token, &["read:metadata", "read:data"]).await;
 
-    // Valid Bearer header + garbage query token: upstream denies at connect-time
-    // dependency resolution; the port must deny too, not admit on the header.
-    let mut ws = connect_ws_bearer_and_query(&base, "arr", &token, "not-a-valid-jwt").await;
+    // Valid Apikey header + garbage query token: upstream denies at connect-time
+    // dependency resolution; the port must deny too, not admit on the header. The
+    // header is an Apikey because the WS Authorization header is apikey-only
+    // (upstream `get_api_key_websocket`, authentication.py:283-294).
+    let mut ws = connect_ws_apikey_and_query(&base, "arr", &apikey, "not-a-valid-jwt").await;
     let frame = next_frame_text(&mut ws)
         .await
         .expect("a deny text frame, not a header-wins array-schema admit");
@@ -2268,15 +2323,60 @@ async fn subscribe_valid_header_with_invalid_access_token_query_is_denied() {
 /// the invalid-token deny does not over-fire on a valid coexisting token.
 #[tokio::test]
 async fn subscribe_valid_header_with_valid_access_token_query_admits() {
-    let (base, _dir) = spawn_auth_stream_server(ScopeSet::read_only(), None).await;
+    let (base, _dir) = spawn_auth_stream_server(
+        ScopeSet::from_iter([Scope::ReadMetadata, Scope::ReadData, Scope::CreateApiKeys]),
+        None,
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let token = login_token(&client, &base, "alice", "wonderland").await;
+    let apikey = create_apikey(&client, &base, &token, &["read:metadata", "read:data"]).await;
+
+    // A valid Apikey header + a valid query token — must authenticate.
+    let mut ws = connect_ws_apikey_and_query(&base, "arr", &apikey, &token).await;
+    let schema = next_text_json(&mut ws)
+        .await
+        .expect("array-schema first message with valid Apikey header + valid query token");
+    assert_eq!(schema["type"], "array-schema", "schema: {schema}");
+}
+
+/// COMMIT 5 (F4 family — WS): upstream `get_api_key_websocket`
+/// (authentication.py:283-294) makes the WS Authorization header apikey-ONLY. A
+/// present header whose scheme is not `apikey` — `Bearer` (which reaches WS via
+/// `?access_token=`, never the header) or anything else — raises 400 during WS
+/// dependency resolution, BEFORE the upgrade, rather than silently falling
+/// through to anonymous/handshake. A valid `Apikey` header still authenticates;
+/// an absent header is unchanged (covered by the access_token/handshake tests).
+#[tokio::test]
+async fn ws_non_apikey_authorization_scheme_is_400() {
+    let (base, _dir) = spawn_auth_stream_server(
+        ScopeSet::from_iter([Scope::ReadMetadata, Scope::ReadData, Scope::CreateApiKeys]),
+        None,
+    )
+    .await;
     let client = reqwest::Client::new();
     let token = login_token(&client, &base, "alice", "wonderland").await;
 
-    // Same valid token presented via BOTH transports — must authenticate.
-    let mut ws = connect_ws_bearer_and_query(&base, "arr", &token, &token).await;
+    // A Bearer header on WS is a 400 — bearer belongs in ?access_token=.
+    let status = ws_upgrade_status_with_auth(&base, "arr", &format!("Bearer {token}")).await;
+    assert_eq!(
+        status, 400,
+        "a Bearer Authorization header on WS must be 400 (upstream authentication.py:289)"
+    );
+
+    // A non-auth scheme is likewise a 400.
+    let status = ws_upgrade_status_with_auth(&base, "arr", "Basic dXNlcjpwYXNz").await;
+    assert_eq!(
+        status, 400,
+        "a Basic Authorization header on WS must be 400 (upstream authentication.py:289)"
+    );
+
+    // Positive control: a valid Apikey header authenticates → array-schema.
+    let apikey = create_apikey(&client, &base, &token, &["read:metadata", "read:data"]).await;
+    let mut ws = connect_ws_apikey(&base, "arr", &apikey).await;
     let schema = next_text_json(&mut ws)
         .await
-        .expect("array-schema first message with valid header + valid query token");
+        .expect("array-schema first message via a valid Apikey header");
     assert_eq!(schema["type"], "array-schema", "schema: {schema}");
 }
 
@@ -2297,7 +2397,7 @@ async fn subscribe_node_denied_read_data_is_rejected() {
     let client = reqwest::Client::new();
     let token = login_token(&client, &base, "alice", "wonderland").await;
 
-    let mut ws = connect_ws_bearer(&base, "arr", &token).await;
+    let mut ws = connect_ws_access_token_query(&base, "arr", &token).await;
     let frame = next_frame_text(&mut ws)
         .await
         .expect("a subscription-denied text frame before close");
@@ -2319,7 +2419,7 @@ async fn subscribe_node_grants_read_data_proceeds() {
     let client = reqwest::Client::new();
     let token = login_token(&client, &base, "alice", "wonderland").await;
 
-    let mut ws = connect_ws_bearer(&base, "arr", &token).await;
+    let mut ws = connect_ws_access_token_query(&base, "arr", &token).await;
     let schema = next_text_json(&mut ws)
         .await
         .expect("array-schema first message");
@@ -2705,7 +2805,7 @@ async fn delete_node_delivers_node_deleted_under_access_policy() {
     let client = reqwest::Client::new();
     let token = login_token(&client, &base, "alice", "wonderland").await;
 
-    let mut ws = connect_ws_bearer(&base, "arr", &token).await;
+    let mut ws = connect_ws_access_token_query(&base, "arr", &token).await;
     assert_eq!(
         next_text_json(&mut ws).await.expect("array-schema")["type"],
         "array-schema"

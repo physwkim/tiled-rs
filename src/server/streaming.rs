@@ -92,6 +92,24 @@ pub async fn ws_subscribe(
     headers: axum::http::HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Result<axum::response::Response, ServerError> {
+    // Upstream `get_api_key_websocket` (authentication.py:283-294) makes the WS
+    // Authorization header apikey-ONLY: a present header whose scheme is not
+    // `apikey` (case-insensitive) — including `bearer`, which reaches WS via
+    // `?access_token=`, never the header — raises 400 during dependency
+    // resolution, BEFORE the upgrade and unconditionally (even with a valid
+    // `?access_token=`). Distinct from the HTTP `StrictAPIKeyHeader` rule
+    // (app.rs), which also admits `bearer`. An absent header defers to the
+    // query token / first-message handshake. Return the 400 pre-upgrade so the
+    // WS is never accepted, matching upstream's dependency-raised rejection.
+    if let Some(auth) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
+        let scheme = auth.split(' ').next().unwrap_or("");
+        if !scheme.eq_ignore_ascii_case("apikey") {
+            return Err(ServerError::BadRequest(
+                "Authorization header must be formatted like 'Apikey SECRET'".into(),
+            ));
+        }
+    }
+
     // The route is mounted OUTSIDE the auth middleware (tiled#1351) so
     // browsers — which can't set Authorization on WS — can authenticate
     // via a first JSON message after the upgrade. We still accept
