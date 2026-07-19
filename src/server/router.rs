@@ -6436,7 +6436,7 @@ async fn create_node_core(
             let (_, blob) = policy
                 .init_node(
                     principal,
-                    None, // authn_access_tags: populated in sub-part 3
+                    auth.authn_access_tags.as_deref(),
                     &auth.scopes,
                     Some(&initial_blob),
                 )
@@ -7313,7 +7313,7 @@ pub async fn patch_metadata(
             .modify_node(
                 &node.access_blob,
                 principal,
-                None, // authn_access_tags: populated in sub-part 3
+                auth.authn_access_tags.as_deref(),
                 &auth.scopes,
                 Some(proposed),
             )
@@ -7494,7 +7494,7 @@ pub async fn put_metadata(
             .modify_node(
                 &node.access_blob,
                 principal,
-                None, // authn_access_tags: populated in sub-part 3
+                auth.authn_access_tags.as_deref(),
                 &auth.scopes,
                 Some(proposed),
             )
