@@ -201,9 +201,10 @@ impl TagBasedPolicy {
     }
 
     /// The owning principal UUID if this node carries a `{"user": "..."}`
-    /// claim. A user-owned node is private to that owner: it has no `tags`
-    /// key, so it must be gated on ownership rather than treated as an
-    /// untagged-public node (otherwise every caller could read it).
+    /// claim. A user-owned node is private to that owner and is handled by the
+    /// dedicated owner branch (mirroring upstream's `if "user" in access_blob`,
+    /// distinct from the tag path): it grants the owner their scopes and no one
+    /// else.
     fn node_owner<'a>(ctx: &NodeContext<'a>) -> Option<&'a str> {
         ctx.access_blob.get("user").and_then(|v| v.as_str())
     }
@@ -236,11 +237,14 @@ impl AccessPolicy for TagBasedPolicy {
                 scopes: ScopeSet::default(),
             };
         }
-        // Anonymous sees untagged nodes and nodes carrying the literal
-        // "public" tag (world-readable; mirrors Python is_tag_public for the
-        // built-in public_tag, access_policies.py:354-356).
+        // Anonymous sees only nodes carrying the literal "public" tag
+        // (world-readable; mirrors Python allowed_scopes for the built-in
+        // public_tag, access_policies.py:354-356). An untagged / empty-blob node
+        // yields NO scopes: upstream `allowed_scopes` reaches neither the
+        // `"user"` nor the `"tags"` branch for such a node, so `allowed` stays
+        // the empty set (access_policies.py:345-366). Untagged is NOT public.
         let node_tags = Self::node_tags(&ctx);
-        if node_tags.is_empty() || node_tags.iter().any(|t| t == PUBLIC_TAG) {
+        if node_tags.iter().any(|t| t == PUBLIC_TAG) {
             Decision {
                 scopes: ScopeSet::from_iter([Scope::ReadMetadata, Scope::ReadData]),
             }
@@ -266,9 +270,10 @@ impl AccessPolicy for TagBasedPolicy {
                 scopes: session_scopes.clone(),
             };
         }
-        // User-owned nodes are private to their owner. A {"user": id} blob has
-        // no `tags` key, so the tags path below would otherwise treat it as
-        // untagged-public and leak it to every principal.
+        // User-owned nodes are private to their owner and handled here, before
+        // the tag path — mirroring upstream's `if "user" .. elif "tags"`. The
+        // owner branch grants the owner their scopes; a `{"user": id}` blob has
+        // no `tags` key, so the tag path would grant it to no one.
         //
         // The owner shortcut applies ONLY when the request carries no
         // `authn_access_tags` restriction. Mirrors upstream `allowed_scopes`
@@ -295,36 +300,32 @@ impl AccessPolicy for TagBasedPolicy {
         // principal's effective grant to the intersection — the SAME rule
         // list_filter applies (via narrow_by_key), so this per-node gate matches
         // listing visibility and a narrow key cannot reach an out-of-tag node by
-        // direct path. Untagged/public/owned grants below are intentionally NOT
-        // narrowed (uniform with list_filter's include_untagged + public tag).
+        // direct path. The public-tag grant below is intentionally NOT narrowed
+        // (uniform with list_filter's public tag).
         Self::narrow_by_key(&mut granted, authn_access_tags);
         // Compute effective scopes as union of per-tag scope grants.
-        // Untagged nodes: grant default_scopes to everyone (backward-compat).
-        // "public" tag: grants read_only scopes to everyone.
-        // For each other node tag the principal owns: look up tag_scopes;
-        // if no rows exist fall back to default_scopes (backward-compat).
-        // Mirrors access_policies.py allowed_scopes (354-370).
+        // Untagged / empty-blob nodes grant NO scopes: upstream `allowed_scopes`
+        // reaches neither the `"user"` nor the `"tags"` branch for such a node,
+        // leaving `allowed` empty (access_policies.py:345-366) — untagged is NOT
+        // public. "public" tag grants read_only scopes to everyone. For each
+        // other node tag the principal owns: look up tag_scopes; if no rows exist
+        // fall back to default_scopes (backward-compat). Mirrors
+        // access_policies.py allowed_scopes (349-364).
         let mut effective = ScopeSet::default();
-        if node_tags.is_empty() {
-            for s in self.default_scopes.iter() {
-                effective.insert(s);
-            }
-        } else {
-            for tag in &node_tags {
-                if tag == PUBLIC_TAG {
-                    for s in ScopeSet::read_only().iter() {
-                        effective.insert(s);
-                    }
-                } else if granted.contains(tag) {
-                    let scope_strs = self.auth_db.get_tag_scopes(tag).await.unwrap_or_default();
-                    let tag_scopes = if scope_strs.is_empty() {
-                        self.default_scopes.clone()
-                    } else {
-                        ScopeSet::from_iter(scope_strs.iter().filter_map(|s| Scope::parse(s)))
-                    };
-                    for s in tag_scopes.iter() {
-                        effective.insert(s);
-                    }
+        for tag in &node_tags {
+            if tag == PUBLIC_TAG {
+                for s in ScopeSet::read_only().iter() {
+                    effective.insert(s);
+                }
+            } else if granted.contains(tag) {
+                let scope_strs = self.auth_db.get_tag_scopes(tag).await.unwrap_or_default();
+                let tag_scopes = if scope_strs.is_empty() {
+                    self.default_scopes.clone()
+                } else {
+                    ScopeSet::from_iter(scope_strs.iter().filter_map(|s| Scope::parse(s)))
+                };
+                for s in tag_scopes.iter() {
+                    effective.insert(s);
                 }
             }
         }
@@ -763,22 +764,24 @@ impl AccessPolicy for TagBasedPolicy {
             }
         }
 
-        // The public surface is read-only: the untagged rows and the literal
-        // "public" tag appear only when every requested scope is a read scope.
-        // Mirrors filters() line 400-407 (`get_public_tags()` added only for
-        // `scope in read_scopes`). Adding PUBLIC_TAG here keeps the list filter
-        // consistent with the per-node "public"-tag read grant — a
-        // "public"-tagged node is both listable and readable by everyone. A
-        // write-scoped listing exposes neither.
-        let include_untagged = requested_scopes.is_subset(&ScopeSet::read_only());
-        if include_untagged && !tags.iter().any(|t| t == PUBLIC_TAG) {
+        // The public surface is read-only: the literal "public" tag appears only
+        // when every requested scope is a read scope. Mirrors filters() line
+        // 400-407 (`get_public_tags()` added only for `scope in read_scopes`).
+        // Adding PUBLIC_TAG here keeps the list filter consistent with the
+        // per-node "public"-tag read grant — a "public"-tagged node is both
+        // listable and readable by everyone. Untagged / empty-blob rows are
+        // NEVER listed: upstream's AccessBlobFilter matches only `user_id` OR a
+        // tag in `tags` (queries.py:517-542), with no untagged arm, so untagged
+        // is not public. A write-scoped listing exposes neither.
+        let read_scoped = requested_scopes.is_subset(&ScopeSet::read_only());
+        if read_scoped && !tags.iter().any(|t| t == PUBLIC_TAG) {
             tags.push(PUBLIC_TAG.to_string());
         }
 
         Some(AccessBlobFilter {
             user_id,
             tags,
-            include_untagged,
+            include_untagged: false,
         })
     }
 }
@@ -838,7 +841,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_filter_anonymous_lists_untagged_and_public_tag() {
+    async fn list_filter_anonymous_lists_only_public_tag() {
         let db = setup_auth_db().await;
         let policy = TagBasedPolicy::new(Arc::new(db), ScopeSet::full());
         let f = policy
@@ -847,7 +850,9 @@ mod tests {
             .unwrap();
         assert_eq!(f.user_id, None);
         assert_eq!(f.tags, vec!["public".to_string()]);
-        assert!(f.include_untagged);
+        // Untagged rows are NOT public under tag_based (F3): only the "public"
+        // tag surfaces the public read set.
+        assert!(!f.include_untagged);
     }
 
     #[tokio::test]
@@ -868,7 +873,8 @@ mod tests {
         assert_eq!(f.user_id.as_deref(), Some(alice.uuid.as_str()));
         assert!(f.tags.contains(&"team-a".to_string()));
         assert!(f.tags.contains(&"public".to_string()));
-        assert!(f.include_untagged);
+        // Untagged rows are NOT public under tag_based (F3).
+        assert!(!f.include_untagged);
     }
 
     #[tokio::test]
@@ -989,6 +995,86 @@ mod tests {
         assert!(!d.scopes.contains(Scope::ReadMetadata));
     }
 
+    // ---- F3 (over-permission): untagged / empty-blob nodes are NOT public ----
+    //
+    // Upstream `allowed_scopes` reaches neither the `"user"` nor the `"tags"`
+    // branch for an untagged / empty `{}` blob, so `allowed` stays the empty set
+    // (access_policies.py:345-366); `filters` builds an `AccessBlobFilter` that
+    // matches only `user_id` OR a tag in `tags` (queries.py:517-542), so an
+    // untagged row is never listed. The port previously treated such nodes as
+    // world-readable in all three sites.
+
+    /// Anonymous must NOT read an untagged / empty-blob node.
+    #[tokio::test]
+    async fn anonymous_decision_hides_untagged_node() {
+        let db = setup_auth_db().await;
+        let policy = TagBasedPolicy::new(Arc::new(db), ScopeSet::full());
+        let meta = serde_json::json!({});
+        for blob in [serde_json::json!({}), serde_json::json!({"tags": []})] {
+            let d = policy.anonymous_decision(ctx(&blob, &meta)).await;
+            assert!(
+                !d.scopes.contains(Scope::ReadMetadata),
+                "anonymous must not read an untagged/empty-blob node: {blob}"
+            );
+        }
+    }
+
+    /// A non-admin principal must NOT read an untagged / empty-blob node.
+    #[tokio::test]
+    async fn principal_decision_hides_untagged_node() {
+        let db = setup_auth_db().await;
+        let bob = principal_with_tags(&db, &["team-a"]).await;
+        let policy = TagBasedPolicy::new(Arc::new(db), ScopeSet::full());
+        let session = ScopeSet::for_role("user");
+        let meta = serde_json::json!({});
+        for blob in [serde_json::json!({}), serde_json::json!({"tags": []})] {
+            let d = policy
+                .principal_decision(&principal_from(&bob), &session, None, ctx(&blob, &meta))
+                .await;
+            assert!(
+                !d.scopes.contains(Scope::ReadMetadata),
+                "principal must not read an untagged/empty-blob node: {blob}"
+            );
+        }
+    }
+
+    /// A read-scoped listing must NOT include untagged rows (only the "public"
+    /// tag surfaces the public read set).
+    #[tokio::test]
+    async fn list_filter_excludes_untagged_rows() {
+        let db = setup_auth_db().await;
+        let alice = principal_with_tags(&db, &["team-a"]).await;
+        let policy = TagBasedPolicy::new(Arc::new(db), ScopeSet::full());
+        // Anonymous read listing.
+        let f_anon = policy
+            .list_filter(None, &ScopeSet::default(), &read_metadata(), None)
+            .await
+            .unwrap();
+        assert!(
+            !f_anon.include_untagged,
+            "untagged rows must never be listed under tag_based"
+        );
+        assert_eq!(
+            f_anon.tags,
+            vec!["public".to_string()],
+            "anonymous read listing surfaces only the public tag"
+        );
+        // Authenticated principal read listing.
+        let f_user = policy
+            .list_filter(
+                Some(&principal_from(&alice)),
+                &ScopeSet::for_role("user"),
+                &read_metadata(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !f_user.include_untagged,
+            "untagged rows must never be listed for an authenticated principal"
+        );
+    }
+
     #[tokio::test]
     async fn principal_decision_admin_bypasses_tags_and_ownership() {
         let db = setup_auth_db().await;
@@ -1082,8 +1168,9 @@ mod tests {
     /// `authn_access_tags` restriction must narrow the per-node decision to the
     /// intersection — the same narrowing `list_filter` applies — so a key scoped
     /// to `team-a` cannot reach a `team-b` node by direct path (it would 404),
-    /// not merely be hidden from listings. Untagged/public nodes stay reachable
-    /// under the narrow key, matching `list_filter`'s include_untagged + public.
+    /// not merely be hidden from listings. Public-TAGGED nodes stay reachable
+    /// under the narrow key, matching `list_filter`'s public tag; untagged nodes
+    /// are not public under tag_based (F3) and stay unreachable.
     #[tokio::test]
     async fn principal_decision_honours_authn_access_tags_narrowing() {
         let db = setup_auth_db().await;
@@ -1134,9 +1221,10 @@ mod tests {
             "key scoped to team-a reaches a team-a node"
         );
 
-        // Untagged and public nodes remain reachable under the narrow key —
-        // uniform with list_filter, which keeps include_untagged and the public
-        // tag regardless of authn_access_tags.
+        // Untagged / empty-blob nodes are NOT public under tag_based (F3): they
+        // are unreachable regardless of the key restriction. Public-TAGGED nodes
+        // stay reachable — uniform with list_filter, which keeps the public tag
+        // (but never untagged rows) regardless of authn_access_tags.
         let blob_untagged = serde_json::json!({});
         let d_untagged = policy
             .principal_decision(
@@ -1147,8 +1235,8 @@ mod tests {
             )
             .await;
         assert!(
-            d_untagged.scopes.contains(Scope::ReadMetadata),
-            "untagged nodes stay readable under a narrow key (matches include_untagged)"
+            !d_untagged.scopes.contains(Scope::ReadMetadata),
+            "untagged / empty-blob nodes are not readable under tag_based"
         );
         let blob_public = serde_json::json!({"tags": ["public"]});
         let d_public = policy
@@ -1703,7 +1791,7 @@ mod tests {
     /// Key 1: no tag restriction (empty access_tags) → sees both tags.
     /// Key 2: access_tags = [team-a]                → intersection = [team-a] only.
     /// Key 3: access_tags = [team-c] (no overlap)   → intersection = [] (nothing
-    ///   tagged). Only untagged / public nodes would show.
+    ///   tagged). Only public-tagged nodes would show.
     #[tokio::test]
     async fn apikey_with_narrower_access_tags_sees_fewer_nodes_than_its_principal() {
         let db = setup_auth_db().await;
@@ -1761,7 +1849,7 @@ mod tests {
             )
             .await
             .unwrap();
-        // Intersection is empty, so only untagged + public tags appear.
+        // Intersection is empty, so only the public tag appears.
         assert!(
             !f_empty.tags.contains(&"team-a".to_string()),
             "disjoint key sees no team-a"

@@ -11,7 +11,7 @@
 //! full grandchild cardinality when it may only see a subset.
 //!
 //! Fixture (catalog + `TagBasedPolicy`): a public `parent` whose public plain
-//! child `child` has three grandchildren — `g_pub` (untagged → public) and
+//! child `child` has three grandchildren — `g_pub` (tagged `public`) and
 //! `g_b1`/`g_b2` (tagged `team-b`). Alice is granted `team-a` only, so she may
 //! see exactly one grandchild (`g_pub`). `/search/parent` must report the
 //! `child` entry's `structure.count == 1` (pre-fix: 3), and a direct GET of
@@ -65,13 +65,16 @@ async fn login(app: &axum::Router, username: &str, password: &str) -> String {
     body["access_token"].as_str().unwrap().to_string()
 }
 
+/// A "public" plain container: carries the literal "public" tag so it is
+/// readable by all. (Under tag_based an untagged / empty-blob node is NOT
+/// public — F3 — so a public fixture must be tagged explicitly.)
 fn container(key: &str) -> RegisterRequest {
     RegisterRequest {
         key: key.to_string(),
         structure_family: "container".to_string(),
         metadata: json!({}),
         specs: json!([]),
-        access_blob: json!({}),
+        access_blob: json!({ "tags": ["public"] }),
     }
 }
 
@@ -106,7 +109,7 @@ async fn search_plain_entry_count_is_principal_scoped() {
 
     // parent (plain container, public)
     //   └── child (plain container, public)   ← a per-entry in /search/parent
-    //         ├── g_pub (untagged → public)    ← alice sees
+    //         ├── g_pub (tagged "public")      ← alice sees
     //         ├── g_b1  (team-b)               ← hidden from alice
     //         └── g_b2  (team-b)               ← hidden from alice
     let parent = catalog

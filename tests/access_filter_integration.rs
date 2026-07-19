@@ -1,8 +1,10 @@
 //! Verify that the access-policy list_filter is injected into search queries
 //! so a principal only receives nodes they are permitted to see.
 //!
-//! Uses TagBasedPolicy: nodes with no tags are public; nodes tagged "team-a"
-//! are visible only to principals granted "team-a"; "team-b" analogously.
+//! Uses TagBasedPolicy: nodes carrying the literal "public" tag are
+//! world-readable (untagged / empty-blob nodes are NOT public — F3); nodes
+//! tagged "team-a" are visible only to principals granted "team-a"; "team-b"
+//! analogously.
 
 use std::sync::Arc;
 
@@ -69,7 +71,7 @@ fn result_keys(body: &serde_json::Value) -> Vec<String> {
 }
 
 /// Verify: a logged-in principal with a TagBasedPolicy only sees
-/// public (untagged) nodes and nodes matching their granted tags.
+/// public ("public"-tagged) nodes and nodes matching their granted tags.
 #[tokio::test]
 async fn search_respects_tag_based_access_policy() {
     let dir = tempfile::tempdir().unwrap();
@@ -94,7 +96,11 @@ async fn search_respects_tag_based_access_policy() {
         access_blob,
     };
     catalog
-        .create_node(None, vec![], make_node("public_node", json!({})))
+        .create_node(
+            None,
+            vec![],
+            make_node("public_node", json!({"tags": ["public"]})),
+        )
         .await
         .unwrap();
     catalog
@@ -177,7 +183,7 @@ async fn search_respects_tag_based_access_policy() {
     let token = login(&app, "alice", "wonderland").await;
     let bearer = format!("Bearer {token}");
 
-    // Alice sees public_node (untagged) + team_a_node (matches her tag).
+    // Alice sees public_node (public tag) + team_a_node (matches her tag).
     // team_b_node is NOT visible.
     let (status, body) = search_json(&app, Some(&bearer)).await;
     assert_eq!(status, StatusCode::OK, "search failed: {body}");
@@ -227,7 +233,11 @@ async fn admin_search_sees_all_nodes() {
         access_blob,
     };
     catalog
-        .create_node(None, vec![], make_node("public_node", json!({})))
+        .create_node(
+            None,
+            vec![],
+            make_node("public_node", json!({"tags": ["public"]})),
+        )
         .await
         .unwrap();
     catalog
@@ -453,11 +463,12 @@ async fn array_append_denied_by_tag_policy_returns_404() {
     );
 }
 
-/// Anonymous search: only untagged (public) nodes are visible.
+/// Anonymous search: only "public"-tagged nodes are visible.
 ///
 /// Uses no auth backend (api_key=None, auth_db=None) so the middleware falls
 /// through to the "no auth configured" branch and gives anonymous full scopes.
-/// The access policy list_filter(None) still restricts to untagged nodes.
+/// The access policy list_filter(None) still restricts to the "public" tag
+/// (untagged / empty-blob nodes are NOT public — F3).
 #[tokio::test]
 async fn anonymous_search_shows_only_public_nodes() {
     let dir = tempfile::tempdir().unwrap();
@@ -474,7 +485,11 @@ async fn anonymous_search_shows_only_public_nodes() {
         access_blob,
     };
     catalog
-        .create_node(None, vec![], make_node("public_node", json!({})))
+        .create_node(
+            None,
+            vec![],
+            make_node("public_node", json!({"tags": ["public"]})),
+        )
         .await
         .unwrap();
     catalog
@@ -512,7 +527,7 @@ async fn anonymous_search_shows_only_public_nodes() {
         trust_forwarded_headers: false,
         // No auth backend → middleware's "no_auth_configured" branch →
         // anonymous principal with full scopes. The access policy still
-        // applies list_filter(principal=None) which restricts to untagged.
+        // applies list_filter(principal=None) which restricts to the "public" tag.
         api_key: None,
         catalog: Some(catalog),
         auth_db: None,
@@ -674,12 +689,11 @@ async fn public_tagged_node_is_listable_and_readable_by_anonymous() {
     );
 }
 
-/// Regression (CRITICAL fail-open leak): a user-owned node `{"user": id}` has
-/// no `tags` key. The untagged-public arm must NOT treat it as world-readable,
-/// so anonymous /search must NOT return another user's owned node.
-///
-/// Fails on pre-fix code: the SQL untagged arm `tags IS NULL OR length=0`
-/// matched `{"user": ...}` rows, leaking every owned node to anonymous.
+/// Regression (CRITICAL fail-open leak): a user-owned node `{"user": id}` must
+/// never be returned to anonymous /search. The public fixture carries the
+/// "public" tag; the owned node carries no matching tag and is excluded. (Under
+/// F3 an untagged / empty-blob node is not public either, so the owned node is
+/// excluded regardless of the untagged arm.)
 #[tokio::test]
 async fn anonymous_search_excludes_user_owned_nodes() {
     let dir = tempfile::tempdir().unwrap();
@@ -696,7 +710,11 @@ async fn anonymous_search_excludes_user_owned_nodes() {
         access_blob,
     };
     catalog
-        .create_node(None, vec![], make_node("public_node", json!({})))
+        .create_node(
+            None,
+            vec![],
+            make_node("public_node", json!({"tags": ["public"]})),
+        )
         .await
         .unwrap();
     // A node owned by some user — the normal shape stamped on every
@@ -803,7 +821,11 @@ async fn cross_user_search_excludes_other_users_owned_nodes() {
         access_blob,
     };
     catalog
-        .create_node(None, vec![], make_node("public_node", json!({})))
+        .create_node(
+            None,
+            vec![],
+            make_node("public_node", json!({"tags": ["public"]})),
+        )
         .await
         .unwrap();
     catalog
@@ -924,7 +946,11 @@ async fn metadata_read_excludes_other_users_owned_node() {
         access_blob,
     };
     catalog
-        .create_node(None, vec![], make_node("public_node", json!({})))
+        .create_node(
+            None,
+            vec![],
+            make_node("public_node", json!({"tags": ["public"]})),
+        )
         .await
         .unwrap();
     catalog
@@ -1070,9 +1096,9 @@ async fn zarr_access_app(with_policy: bool) -> (axum::Router, String, tempfile::
         specs: json!([]),
         access_blob,
     };
-    // Top-level: C (public/untagged) and restricted_top (team-b).
+    // Top-level: C (public-tagged) and restricted_top (team-b).
     let c = catalog
-        .create_node(None, vec![], make_node("C", json!({})))
+        .create_node(None, vec![], make_node("C", json!({"tags": ["public"]})))
         .await
         .unwrap();
     catalog
@@ -1083,12 +1109,12 @@ async fn zarr_access_app(with_policy: bool) -> (axum::Router, String, tempfile::
         )
         .await
         .unwrap();
-    // Children of C: visible (public/untagged) and secret (team-b).
+    // Children of C: visible (public-tagged) and secret (team-b).
     catalog
         .create_node(
             Some(c.id),
             vec!["C".to_string()],
-            make_node("visible", json!({})),
+            make_node("visible", json!({"tags": ["public"]})),
         )
         .await
         .unwrap();

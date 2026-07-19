@@ -12,8 +12,8 @@
 //!
 //! Fixture (catalog + `TagBasedPolicy`): a container `ds` carrying the
 //! `xarray_dataset` spec (so it opts into inlining) with two child containers —
-//! `visible` (untagged → public) and `secret` (tagged `team-b`). Alice is
-//! granted `team-a` only. A root `/search/` returns `ds` (untagged) with its
+//! `visible` (tagged `public`) and `secret` (tagged `team-b`). Alice is
+//! granted `team-a` only. A root `/search/` returns `ds` (tagged `public`) with its
 //! children inlined; `secret` must be absent from `ds`'s inlined contents,
 //! exactly as it is absent from a `/search/ds` listing and a direct GET of
 //! `ds/secret`.
@@ -94,7 +94,7 @@ async fn search_inline_walk_routes_through_access_filter() {
         .await
         .unwrap();
 
-    // ds (xarray_dataset, untagged) → { visible (untagged), secret (team-b) }
+    // ds (xarray_dataset, "public") → { visible ("public"), secret (team-b) }
     let ds = catalog
         .create_node(
             None,
@@ -104,7 +104,7 @@ async fn search_inline_walk_routes_through_access_filter() {
                 structure_family: "container".into(),
                 metadata: json!({"kind": "dataset"}),
                 specs: json!(["xarray_dataset"]),
-                access_blob: json!({}),
+                access_blob: json!({"tags": ["public"]}),
             },
         )
         .await
@@ -113,7 +113,11 @@ async fn search_inline_walk_routes_through_access_filter() {
         .create_node(
             Some(ds.id),
             vec!["ds".into()],
-            child_container("visible", json!({"role": "public-child"}), json!({})),
+            child_container(
+                "visible",
+                json!({"role": "public-child"}),
+                json!({"tags": ["public"]}),
+            ),
         )
         .await
         .unwrap();
@@ -186,7 +190,7 @@ async fn search_inline_walk_routes_through_access_filter() {
     let token = login(&app, "alice", "wonderland").await;
     let bearer = format!("Bearer {token}");
 
-    // Root search: `ds` is visible (untagged); its children are inlined. The
+    // Root search: `ds` is visible (tagged "public"); its children are inlined. The
     // inline walk MUST route through alice's access filter, so `visible` appears
     // and `secret` (team-b) does NOT.
     let (status, body) = get_json(
