@@ -95,9 +95,10 @@ pub trait AccessPolicy: Send + Sync {
     ///   - `modified = true` → the returned blob differs from the input.
     ///   - `modified = false` → the blob is used as-is.
     ///
-    /// Errors are surfaced as HTTP 422 (validation error), mirroring Python's
-    /// `ValueError` path in `TagBasedAccessPolicy.init_node`
-    /// (access_policies.py:108-193).
+    /// Errors are surfaced as HTTP 403 (the caller may not set that blob),
+    /// mirroring Python's `ValueError` path in `TagBasedAccessPolicy.init_node`
+    /// (access_policies.py:108-193), which the create route catches and answers
+    /// `HTTP_403_FORBIDDEN` (router.py:1896-1899).
     ///
     /// Default: pass the supplied blob through unchanged (no policy
     /// validation). Mirrors `DummyAccessPolicy.init_node`.
@@ -122,7 +123,9 @@ pub trait AccessPolicy: Send + Sync {
     ///   - `modified = false` → the stored blob is kept unchanged.
     ///
     /// `node_access_blob` is the current stored blob; `proposed_access_blob` is
-    /// what the client sent. Errors are surfaced as HTTP 422.
+    /// what the client sent. Errors are surfaced as HTTP 403 — the PATCH/PUT
+    /// routes catch the policy's `ValueError` and answer `HTTP_403_FORBIDDEN`
+    /// (router.py:2401-2403 / 2477-2479).
     ///
     /// Default: keep the current blob unchanged (no mutation). Mirrors the base
     /// `modify_node` in `AccessPolicy` (protocols.py:20-28).

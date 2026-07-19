@@ -6446,7 +6446,11 @@ async fn create_node_core(
                     Some(&initial_blob),
                 )
                 .await
-                .map_err(ServerError::Validation)?;
+                .map_err(|e| {
+                    ServerError::Forbidden(format!(
+                        "Access policy rejects the provided access blob.\n{e}"
+                    ))
+                })?;
             blob
         } else {
             initial_blob
@@ -7313,8 +7317,9 @@ pub async fn patch_metadata(
     // to policy.modify_node. Mirrors Python router.py:2351 (json-patch) /
     // :2364-2367 (merge-patch), with the policy call at :2397. A null/absent
     // access_blob field means "no change": no patched blob is produced and
-    // modify_node is not consulted, so the stored blob is preserved. Errors
-    // from the policy map to 422 (matching Python's ValueError path).
+    // modify_node is not consulted, so the stored blob is preserved. A policy
+    // that rejects the proposed blob raises 403 (upstream catches the
+    // `ValueError` and answers HTTP_403_FORBIDDEN, router.py:2401-2403).
     let proposed_access_blob = match req.get("access_blob").filter(|v| !v.is_null()) {
         None => None,
         Some(patch_doc) => Some(match mode {
@@ -7340,7 +7345,11 @@ pub async fn patch_metadata(
                 Some(proposed),
             )
             .await
-            .map_err(ServerError::Validation)?;
+            .map_err(|e| {
+                ServerError::Forbidden(format!(
+                    "Access policy rejects the provided access blob.\n{e}"
+                ))
+            })?;
         if modified { Some(blob) } else { None }
     } else {
         None
@@ -7532,7 +7541,11 @@ pub async fn put_metadata(
                 Some(proposed),
             )
             .await
-            .map_err(ServerError::Validation)?;
+            .map_err(|e| {
+                ServerError::Forbidden(format!(
+                    "Access policy rejects the provided access blob.\n{e}"
+                ))
+            })?;
         if modified { Some(blob) } else { None }
     } else {
         None

@@ -150,11 +150,13 @@ async fn post_create(
 async fn restricted_key_cannot_create_out_of_tag_node() {
     let (app, key, catalog) = build().await;
 
-    // team-b: outside the key's restriction → rejected (422), not persisted.
+    // team-b: outside the key's restriction → rejected (403), not persisted.
+    // Upstream catches `init_node`'s rejection and raises HTTP_403_FORBIDDEN
+    // (router.py:1896-1899), not 422.
     let status = post_create(&app, &key, "child_b", json!(["team-b"])).await;
     assert_eq!(
         status,
-        StatusCode::UNPROCESSABLE_ENTITY,
+        StatusCode::FORBIDDEN,
         "a [team-a]-restricted key must NOT create a team-b node"
     );
     assert!(
@@ -218,9 +220,11 @@ async fn restricted_key_cannot_add_out_of_tag_via_patch() {
         .body(Body::from(serde_json::to_vec(&body).unwrap()))
         .unwrap();
     let status = app.clone().oneshot(req).await.unwrap().status();
+    // Upstream catches `modify_node`'s rejection and raises HTTP_403_FORBIDDEN
+    // (router.py:2401-2403), not 422.
     assert_eq!(
         status,
-        StatusCode::UNPROCESSABLE_ENTITY,
+        StatusCode::FORBIDDEN,
         "a [team-a]-restricted key must NOT add a team-b tag via PATCH"
     );
 
