@@ -654,7 +654,9 @@ pub fn construct_resource<'a>(
 ) -> BoxFuture<'a, Result<Resource, ServerError>> {
     Box::pin(async move {
         let family = adapter.structure_family();
-        let node_links = links::links_for_node(family, base_url, path);
+        // `array_ndim()` is `Some(axis count)` for array/sparse leaves (feeding
+        // the `block` link's `?block={0},…` template) and `None` otherwise.
+        let node_links = links::links_for_node(family, adapter.array_ndim(), base_url, path);
 
         let sorting = match adapter {
             AnyAdapter::Container(_) => Some(default_sorting()),
@@ -895,7 +897,8 @@ pub async fn construct_root_resource(
     root: &dyn ContainerAdapter,
     base_url: &str,
 ) -> Result<Resource, ServerError> {
-    let node_links = links::links_for_node(root.structure_family(), base_url, "");
+    // Root is always a container (no `block` link), so `ndim` is `None`.
+    let node_links = links::links_for_node(root.structure_family(), None, base_url, "");
     let ns = NodeStructure {
         contents: None,
         count: root.len().await?,
@@ -1056,6 +1059,9 @@ fn resource_from_entry(entry: SearchEntry, child_path: &str, base_url: &str) -> 
         StructureFamily::Container => Some(default_sorting()),
         _ => None,
     };
+    // Axis count for the array/sparse `block` link template, read from the
+    // entry's structure JSON before it is moved into the Resource below.
+    let ndim = links::array_ndim_from_structure(family, entry.structure.as_ref());
     Resource {
         id: entry.key,
         attributes: NodeAttributes {
@@ -1070,7 +1076,7 @@ fn resource_from_entry(entry: SearchEntry, child_path: &str, base_url: &str) -> 
             // `include_data_sources`; `None` otherwise (omitted on the wire).
             data_sources: entry.data_sources,
         },
-        links: links::links_for_node(family, base_url, child_path),
+        links: links::links_for_node(family, ndim, base_url, child_path),
     }
 }
 
