@@ -18,8 +18,10 @@ use axum::{
 use chrono::{Duration, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::core::links;
 use crate::server::auth_context::AuthContext;
 use crate::server::error::ServerError;
+use crate::server::router::parse_ge0;
 use crate::server::state::AppState;
 
 #[derive(Debug, Deserialize)]
@@ -698,28 +700,34 @@ pub async fn current_apikey_info(
 /// List all principals (users and services), paginated. Requires the
 /// `read:principals` scope — mirrors Python's `principal_list`
 /// (`authentication.py:1243`).
-#[derive(Debug, Deserialize)]
-pub struct PrincipalListQuery {
-    #[serde(rename = "page[offset]", default)]
-    pub offset: i64,
-    #[serde(rename = "page[limit]", default = "default_page_limit")]
-    pub limit: i64,
-}
-
-fn default_page_limit() -> i64 {
-    100
-}
-
 pub async fn list_principals(
     State(state): State<AppState>,
     auth: AuthContext,
-    Query(q): Query<PrincipalListQuery>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> Result<impl IntoResponse, ServerError> {
     auth.require(crate::auth::Scope::ReadPrincipals)?;
     let (db, _) = require_auth_db(&state)?;
-    let limit = q.limit.min(200);
+    // Upstream `principal_list` (authentication.py:1247-1252) uses inline
+    // `Query(0, alias="page[offset]", ge=0)` and
+    // `Query(DEFAULT_PAGE_SIZE, alias="page[limit]", ge=0, le=MAX_PAGE_SIZE)` —
+    // no cursor, no conflict guard, so this does NOT route through the search /
+    // revisions `PaginationParams` owner. But the ge=0 (422) contract is shared:
+    // validate both through the single `parse_ge0` owner instead of accepting
+    // negatives or silently clamping. Absent ⇒ upstream defaults (offset 0,
+    // limit DEFAULT_PAGE_SIZE); a value > MAX_PAGE_SIZE ⇒ 422 (never clamped).
+    let offset = parse_ge0(params.get("page[offset]").map(String::as_str))?.unwrap_or(0);
+    let limit = match parse_ge0(params.get("page[limit]").map(String::as_str))? {
+        Some(n) if n > links::MAX_PAGE_SIZE as i64 => {
+            return Err(ServerError::Validation(format!(
+                "Input should be less than or equal to {}",
+                links::MAX_PAGE_SIZE
+            )));
+        }
+        Some(n) => n,
+        None => links::DEFAULT_PAGE_SIZE as i64,
+    };
     let principals = db
-        .list_principals(q.offset, limit)
+        .list_principals(offset, limit)
         .await
         .map_err(map_auth_err)?;
     Ok(Json(principals))

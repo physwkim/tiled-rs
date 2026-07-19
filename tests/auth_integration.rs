@@ -3470,3 +3470,137 @@ async fn revoke_eight_char_prefix_works_on_all_routes() {
         "admin principal route, 8-char prefix"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Pagination-bounds parity for the principal list (Wave-36, commit 2). Upstream
+// `principal_list` (authentication.py:1247-1252) uses inline
+// `Query(0, alias="page[offset]", ge=0)` +
+// `Query(DEFAULT_PAGE_SIZE, alias="page[limit]", ge=0, le=MAX_PAGE_SIZE)` — NO
+// cursor, NO conflict guard. Out-of-range / non-integer values are 422 (never
+// clamped), and a valid limit <= MAX_PAGE_SIZE (300) is served un-clamped.
+// ---------------------------------------------------------------------------
+
+/// Log in `alice`, promote her to admin, and return an admin bearer token —
+/// the `read:principals` caller the principal-list endpoint requires.
+async fn admin_bearer(app: &axum::Router, auth_db: &AuthDb) -> String {
+    let (_, body) = json_request(
+        app,
+        Method::POST,
+        "/api/v1/auth/dummy/login",
+        &[],
+        Some(json!({"username": "alice", "password": "wonderland"})),
+    )
+    .await;
+    let alice_sub = body["identity"]["id"].as_str().unwrap().to_string();
+    let (alice, _) = auth_db.ensure_principal("dummy", &alice_sub).await.unwrap();
+    auth_db
+        .update_principal_role(alice.id, "admin")
+        .await
+        .unwrap();
+    let (_, body) = json_request(
+        app,
+        Method::POST,
+        "/api/v1/auth/dummy/login",
+        &[],
+        Some(json!({"username": "alice", "password": "wonderland"})),
+    )
+    .await;
+    format!("Bearer {}", body["access_token"].as_str().unwrap())
+}
+
+#[tokio::test]
+async fn list_principals_limit_over_max_returns_422() {
+    let (app, _dir, _cat, auth_db) = build_test_app().await;
+    let bearer = admin_bearer(&app, &auth_db).await;
+    let (status, body) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/auth/principal?page%5Blimit%5D=301",
+        &[("authorization", &bearer)],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(
+        body["error"]["message"], "Input should be less than or equal to 300",
+        "pydantic le message: {body}"
+    );
+}
+
+#[tokio::test]
+async fn list_principals_offset_negative_returns_422() {
+    let (app, _dir, _cat, auth_db) = build_test_app().await;
+    let bearer = admin_bearer(&app, &auth_db).await;
+    let (status, body) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/auth/principal?page%5Boffset%5D=-1",
+        &[("authorization", &bearer)],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(
+        body["error"]["message"], "Input should be greater than or equal to 0",
+        "pydantic ge message: {body}"
+    );
+}
+
+#[tokio::test]
+async fn list_principals_limit_negative_returns_422() {
+    let (app, _dir, _cat, auth_db) = build_test_app().await;
+    let bearer = admin_bearer(&app, &auth_db).await;
+    let (status, body) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/auth/principal?page%5Blimit%5D=-1",
+        &[("authorization", &bearer)],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+}
+
+#[tokio::test]
+async fn list_principals_limit_non_int_returns_422() {
+    let (app, _dir, _cat, auth_db) = build_test_app().await;
+    let bearer = admin_bearer(&app, &auth_db).await;
+    let (status, body) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/auth/principal?page%5Blimit%5D=abc",
+        &[("authorization", &bearer)],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+}
+
+/// A limit of 250 is <= MAX_PAGE_SIZE (300), so upstream SERVES it and passes it
+/// through un-clamped — the port must NOT reduce it to 200 (the deleted
+/// `.min(200)` bug) nor reject it. With few principals the served rows can't
+/// distinguish 250 from 200, so the un-clamp is pinned structurally: 250 serves
+/// (bound is 300, not a 200 ceiling that would 422) while 301 is rejected
+/// (`list_principals_limit_over_max_returns_422` — proving no silent clamp).
+#[tokio::test]
+async fn list_principals_limit_250_is_served_unclamped() {
+    let (app, _dir, _cat, auth_db) = build_test_app().await;
+    let bearer = admin_bearer(&app, &auth_db).await;
+    let (status, body) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/auth/principal?page%5Blimit%5D=250",
+        &[("authorization", &bearer)],
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "limit 250 (<=300) must be served: {body}"
+    );
+    assert!(
+        body.is_array(),
+        "a served principal list is a JSON array, not an error envelope: {body}"
+    );
+}
