@@ -269,8 +269,16 @@ impl AccessPolicy for TagBasedPolicy {
         // User-owned nodes are private to their owner. A {"user": id} blob has
         // no `tags` key, so the tags path below would otherwise treat it as
         // untagged-public and leak it to every principal.
+        //
+        // The owner shortcut applies ONLY when the request carries no
+        // `authn_access_tags` restriction. Mirrors upstream `allowed_scopes`
+        // (access_policies.py:346-348): `if authn_access_tags is None and
+        // identifier == node.access_blob["user"]: allowed = self.scopes`. A
+        // tag-restricted key on a user-owned node therefore yields no scopes —
+        // upstream's `if "user" .. elif "tags"` never reaches the tag path for a
+        // user-owned node, so the result is the empty set, not a tag-scoped grant.
         if let Some(owner) = Self::node_owner(&ctx) {
-            let scopes = if owner == principal.uuid {
+            let scopes = if authn_access_tags.is_none() && owner == principal.uuid {
                 session_scopes.intersect(&self.default_scopes)
             } else {
                 ScopeSet::default()
@@ -1023,6 +1031,51 @@ mod tests {
             .principal_decision(&principal_from(&bob), &session, None, ctx(&blob, &meta))
             .await;
         assert!(!d.scopes.contains(Scope::ReadMetadata));
+    }
+
+    /// F2 (over-permission) regression: an API key carrying an
+    /// `authn_access_tags` restriction must NOT receive full owner scopes on the
+    /// owner's own node. Upstream `allowed_scopes` grants owner scopes only when
+    /// `authn_access_tags is None` (access_policies.py:346-348: `if
+    /// authn_access_tags is None and identifier == node.access_blob["user"]`); a
+    /// tag-restricted key on a user-owned node therefore yields an EMPTY scope
+    /// set. Without the fix the port grants full owner access regardless of the
+    /// key restriction.
+    #[tokio::test]
+    async fn principal_decision_owner_node_denied_under_restricted_key() {
+        let db = setup_auth_db().await;
+        let alice = principal_with_tags(&db, &["team-a"]).await;
+        let policy = TagBasedPolicy::new(Arc::new(db), ScopeSet::full());
+        let session = ScopeSet::for_role("user");
+        let meta = serde_json::json!({});
+        // Node owned by alice.
+        let blob = serde_json::json!({"user": alice.uuid});
+        let key_team_a: &[String] = &["team-a".to_string()];
+
+        // Restricted key on the owner's own node: the owner shortcut does NOT
+        // apply, so scopes are EMPTY (upstream returns the empty set — a
+        // user-owned node never reaches the tag path).
+        let d_restricted = policy
+            .principal_decision(
+                &principal_from(&alice),
+                &session,
+                Some(key_team_a),
+                ctx(&blob, &meta),
+            )
+            .await;
+        assert!(
+            !d_restricted.scopes.contains(Scope::ReadMetadata),
+            "a tag-restricted key must NOT get owner scopes on the owner's own node"
+        );
+
+        // No key restriction on the same node: the owner shortcut applies.
+        let d_unrestricted = policy
+            .principal_decision(&principal_from(&alice), &session, None, ctx(&blob, &meta))
+            .await;
+        assert!(
+            d_unrestricted.scopes.contains(Scope::ReadMetadata),
+            "an unrestricted key retains owner scopes on the owner's own node"
+        );
     }
 
     /// Regression for the access_tags DIRECT-ACCESS bypass: an API key's
