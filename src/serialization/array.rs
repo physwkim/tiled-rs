@@ -159,6 +159,46 @@ fn strip_trailing_nuls(bytes: &[u8]) -> &[u8] {
     &bytes[..end]
 }
 
+/// Render a byte string as Python `str(bytes)` == `bytes.__repr__()`, e.g.
+/// `b'abc'`. numpy `savetxt(fmt="%s")` prints each `S`-dtype element via
+/// `str(numpy.bytes_)` (array.py:41-46), which is exactly this bytes literal —
+/// NOT the raw decoded text. Mirrors CPython `Objects/bytesobject.c`
+/// `bytes_repr`:
+/// - the quote is `'`, switched to `"` only when the bytes contain a `'` and no
+///   `"` (CPython's "smart quotes");
+/// - the quote char and `\` are backslash-escaped; `\t`/`\n`/`\r` become their
+///   two-char escapes;
+/// - bytes `< 0x20` or `>= 0x7f` become `\xNN` (lowercase hex);
+/// - printable ASCII (`0x20..=0x7e`) is emitted verbatim.
+fn py_bytes_repr(bytes: &[u8]) -> String {
+    let quote = if bytes.contains(&b'\'') && !bytes.contains(&b'"') {
+        b'"'
+    } else {
+        b'\''
+    };
+    let mut out = String::with_capacity(bytes.len() + 3);
+    out.push('b');
+    out.push(quote as char);
+    for &c in bytes {
+        match c {
+            // Quote char and backslash are always backslash-escaped. This guard
+            // must precede the printable-range arm (quote/`\` are printable).
+            _ if c == quote || c == b'\\' => {
+                out.push('\\');
+                out.push(c as char);
+            }
+            b'\t' => out.push_str("\\t"),
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            0x20..=0x7e => out.push(c as char),
+            // Other control bytes (< 0x20) and non-ASCII/high bytes (>= 0x7f).
+            _ => out.push_str(&format!("\\x{c:02x}")),
+        }
+    }
+    out.push(quote as char);
+    out
+}
+
 /// CSV serializer for 1-D/2-D arrays (Python `serialize_csv`, array.py:41-46).
 fn serialize_array_csv(
     data: &[u8],
@@ -337,11 +377,12 @@ fn serialize_array_csv(
                 timedelta64_csv_cell(i64::from_le_bytes(b), dt_unit)
             }
             ("S", _) => {
-                // Fixed-length byte string: decode as UTF-8, strip trailing nulls.
-                std::str::from_utf8(bytes)
-                    .unwrap_or("")
-                    .trim_end_matches('\0')
-                    .to_string()
+                // Fixed-length byte string. numpy `savetxt(fmt="%s")` prints
+                // `str(numpy.bytes_)` = the Python bytes literal `b'...'`, not
+                // the raw decoded text. Strip trailing NUL padding first (numpy
+                // treats it as insignificant; `tolist()` drops it), then render
+                // the bytes repr — interior NULs survive as `\x00`.
+                py_bytes_repr(strip_trailing_nuls(bytes))
             }
             // UCS-4 (4 bytes per character); honor byte order per character.
             // Single source of truth with the JSON serializer's `U` arm.
@@ -819,6 +860,58 @@ mod tests {
         let meta2 = serde_json::json!({"itemsize": 8, "kind": "f", "shape": [2, 2]});
         let out2 = ser(&data2, &meta2).unwrap();
         assert_eq!(std::str::from_utf8(&out2).unwrap(), "1.0,2.0\n3.0,4.0\n");
+    }
+
+    /// S1 (byte-parity): a numpy `S`/bytes array CSV cell is `str(numpy.bytes_)`
+    /// = the Python bytes literal `b'...'` (numpy `savetxt(fmt="%s")` →
+    /// `str(element)`, array.py:41-46), NOT the raw decoded text. Before the fix
+    /// this arm emitted `abc`/`de`; upstream emits `b'abc'`/`b'de'`.
+    #[test]
+    fn csv_array_s_dtype_renders_python_bytes_literal() {
+        let ser = csv_serializer();
+        let data = s_buffer(&[b"abc", b"de"], 3); // S3: "abc", "de\0"
+        let meta = serde_json::json!({"itemsize": 3, "kind": "S", "shape": [2]});
+        let out = ser(&data, &meta).unwrap();
+        assert_eq!(std::str::from_utf8(&out).unwrap(), "b'abc'\nb'de'\n");
+    }
+
+    /// S1 escaping: the bytes literal follows CPython `bytes.__repr__` —
+    /// `\t`/`\n`/`\r` and non-printable/high bytes are escaped, interior NULs
+    /// survive as `\x00`, and the quote flips to `"` when the element contains a
+    /// `'` but no `"` (smart quotes).
+    #[test]
+    fn csv_array_s_dtype_bytes_repr_escaping() {
+        let ser = csv_serializer();
+        // Uniform S3 width; shorter elements NUL-pad and strip back.
+        let data = s_buffer(
+            &[
+                b"a\tb",   // tab → \t
+                b"a\"b",   // has " only → quote stays '
+                b"a'b",    // has ' only → quote flips to "
+                b"a\x00b", // interior NUL preserved → \x00
+                b"\xff",   // high byte → \xff (padding stripped)
+            ],
+            3,
+        );
+        let meta = serde_json::json!({"itemsize": 3, "kind": "S", "shape": [5]});
+        let out = ser(&data, &meta).unwrap();
+        let text = std::str::from_utf8(&out).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines,
+            vec![
+                r"b'a\tb'",
+                r#"b'a"b'"#,
+                r#"b"a'b""#,
+                r"b'a\x00b'",
+                r"b'\xff'",
+            ]
+        );
+        // savetxt newline-terminates every row, including the last.
+        assert!(
+            text.ends_with('\n'),
+            "trailing newline like savetxt: {text:?}"
+        );
     }
 
     /// L1: `numpy.savetxt(fmt="%s")` emits "1.0" for 1.0_f64, not "1".
