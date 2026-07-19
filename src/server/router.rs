@@ -6596,8 +6596,16 @@ async fn create_node_core(
             }),
         )
         .await;
+        // ndim for the array/sparse `block` link template comes from the
+        // request's data-source structure (upstream `post_metadata` builds its
+        // links from `body.data_sources[0].structure`, router.py:1873/1912).
+        let ndim = req
+            .data_sources
+            .first()
+            .and_then(|ds| ds.structure.as_ref())
+            .and_then(crate::core::structures::AnyStructure::ndim);
         let links =
-            crate::core::links::links_for_node(req.structure_family, &base_url, &child_path);
+            crate::core::links::links_for_node(req.structure_family, ndim, &base_url, &child_path);
         let resp = crate::core::schemas::PostMetadataResponse {
             id: node.key,
             links: Some(serde_json::to_value(&links).unwrap_or_default()),
@@ -6623,7 +6631,13 @@ async fn create_node_core(
     } else {
         format!("{path}/{id}")
     };
-    let links = crate::core::links::links_for_node(req.structure_family, &base_url, &child_path);
+    let ndim = req
+        .data_sources
+        .first()
+        .and_then(|ds| ds.structure.as_ref())
+        .and_then(crate::core::structures::AnyStructure::ndim);
+    let links =
+        crate::core::links::links_for_node(req.structure_family, ndim, &base_url, &child_path);
     let resp = crate::core::schemas::PostMetadataResponse {
         id,
         links: Some(serde_json::to_value(&links).unwrap_or_default()),
@@ -7360,7 +7374,12 @@ pub async fn patch_metadata(
     )
     .await;
     let family = parse_structure_family(&updated.structure_family)?;
-    let links = crate::core::links::links_for_node(family, &base_url, &path);
+    // Upstream `patch_metadata` emits NO `links` at all (router.py:2417-2421;
+    // `put_metadata` likewise, :2493-2498); the catalog node row carries no
+    // structure, and this response's `links` is a port-only extension never
+    // consumed by the client's write_block. So `ndim = None` (array/sparse block
+    // link stays un-templated here, as before); no upstream template to match.
+    let links = crate::core::links::links_for_node(family, None, &base_url, &path);
     Ok(Json(crate::core::schemas::PostMetadataResponse {
         id: updated.key,
         links: Some(serde_json::to_value(&links).unwrap_or_default()),
@@ -8339,6 +8358,7 @@ async fn catalog_metadata_resource(
             caller_facing_child_count(catalog, None, access_filter, exact_count_limit).await?;
         let links = crate::core::links::links_for_node(
             crate::core::structures::StructureFamily::Container,
+            None,
             base_url,
             "",
         );
@@ -8419,7 +8439,6 @@ async fn catalog_metadata_resource(
     let path = segments.join("/");
     let id = segments.last().cloned().unwrap_or_default();
     let family = parse_structure_family(&node.structure_family)?;
-    let links = crate::core::links::links_for_node(family, base_url, &path);
     let ancestors = if segments.len() > 1 {
         segments[..segments.len() - 1].to_vec()
     } else {
@@ -8530,6 +8549,12 @@ async fn catalog_metadata_resource(
             };
             (sv, ds_list)
         };
+    // Build links after `structure_value`: an array/sparse leaf's `block` link
+    // needs the axis count, read from its data-source structure JSON (a
+    // container's `{contents, count}` has no `shape`, so this is `None` for
+    // containers). Deferred to here so the leaf branch's `sv` is available.
+    let ndim = crate::core::links::array_ndim_from_structure(family, structure_value.as_ref());
+    let links = crate::core::links::links_for_node(family, ndim, base_url, &path);
     let sorting = if matches!(family, crate::core::structures::StructureFamily::Container) {
         Some(vec![SortingItem {
             key: "_".into(),

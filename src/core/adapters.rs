@@ -682,6 +682,20 @@ impl AnyAdapter {
         }
     }
 
+    /// Number of array axes for the `block` link's `?block={0},{1},…` template
+    /// (one placeholder per axis, matching upstream `links_for_array`,
+    /// `tiled/links.py:18-23`). `Some` only for `Array`/`Sparse` leaves — the
+    /// two families whose `block` link is templated; every other family has no
+    /// block link and returns `None`.
+    #[inline]
+    pub fn array_ndim(&self) -> Option<usize> {
+        match self {
+            Self::Array(a) => Some(a.structure().shape.len()),
+            Self::Sparse(s) => Some(s.structure().shape.len()),
+            _ => None,
+        }
+    }
+
     #[inline]
     pub fn metadata(&self) -> &serde_json::Value {
         match self {

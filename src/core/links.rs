@@ -14,8 +14,45 @@ pub const MAX_PAGE_SIZE: usize = 300;
 /// `depth <= DEPTH_LIMIT` clause of the inline gate (core.py:516).
 pub const DEPTH_LIMIT: usize = 5;
 
+/// Number of array axes carried by a raw structure JSON (`{"shape": [...]}`),
+/// for the array/sparse `block` link template. `Some` only for the shaped
+/// families (`Array`/`Sparse`) with a `shape` array; `None` otherwise — a
+/// container's `{contents, count}` and every non-shaped family return `None`.
+/// The JSON-side twin of [`crate::core::adapters::AnyAdapter::array_ndim`] and
+/// [`crate::core::structures::AnyStructure::ndim`], used at call sites that hold
+/// the structure as serialized JSON rather than a typed adapter.
+pub fn array_ndim_from_structure(
+    family: StructureFamily,
+    structure: Option<&serde_json::Value>,
+) -> Option<usize> {
+    match family {
+        StructureFamily::Array | StructureFamily::Sparse => structure
+            .and_then(|s| s.get("shape"))
+            .and_then(|s| s.as_array())
+            .map(|axes| axes.len()),
+        _ => None,
+    }
+}
+
 /// Generate links for a node, returning a `NodeLinks` directly (no JSON round-trip).
-pub fn links_for_node(family: StructureFamily, base_url: &str, path: &str) -> NodeLinks {
+///
+/// `ndim` is the array/sparse axis count used to build the `block` link's
+/// `?block={0},{1},…` template — one `{i}` placeholder per axis, matching
+/// upstream `links_for_array` (`tiled/links.py:18-23`), which the stock Python
+/// client fills via `links["block"].format(*block)` in `write_block`
+/// (`client/array.py:322`, `client/sparse.py:135`). Callers pass `Some(ndim)`
+/// for an array/sparse leaf (the axis count is always in scope where a leaf
+/// resource is built) and `None` for every other family. As a defensive
+/// fallback, an array/sparse node given `ndim = None` emits the un-templated
+/// `block` link (the pre-fix shape) rather than a malformed `?block=` — this is
+/// only reached on the PUT-metadata port extension, whose `links` upstream does
+/// not emit at all and which no client consumes for `write_block`.
+pub fn links_for_node(
+    family: StructureFamily,
+    ndim: Option<usize>,
+    base_url: &str,
+    path: &str,
+) -> NodeLinks {
     let base = base_url.trim_end_matches('/');
     let p = path.trim_start_matches('/');
 
@@ -47,30 +84,48 @@ pub fn links_for_node(family: StructureFamily, base_url: &str, path: &str) -> No
         }
         StructureFamily::Array | StructureFamily::Sparse => {
             links.full = Some(format!("{base}/api/v1/array/full/{p}"));
-            links
-                .extra
-                .insert("block".into(), format!("{base}/api/v1/array/block/{p}"));
+            // `?block={0},{1},…`: one placeholder per axis, so the client's
+            // `links["block"].format(*block)` (write_block) yields the right
+            // chunk coordinate. Upstream `links_for_array` (tiled/links.py:21)
+            // builds the identical template from `structure.shape`; a 0-d array
+            // (ndim 0) matches upstream's empty join → `?block=`.
+            let block = match ndim {
+                Some(n) => {
+                    let template = (0..n)
+                        .map(|i| format!("{{{i}}}"))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    format!("{base}/api/v1/array/block/{p}?block={template}")
+                }
+                None => format!("{base}/api/v1/array/block/{p}"),
+            };
+            links.extra.insert("block".into(), block);
         }
         StructureFamily::Table => {
             links.full = Some(format!("{base}/api/v1/table/full/{p}"));
+            // Fixed `?partition={index}` template (axis-independent), matching
+            // upstream `links_for_table` (tiled/links.py:58); the client fills it
+            // in `dataframe.py`'s partition read/write.
             links.extra.insert(
                 "partition".into(),
-                format!("{base}/api/v1/table/partition/{p}"),
+                format!("{base}/api/v1/table/partition/{p}?partition={{index}}"),
             );
         }
         StructureFamily::Ragged => {
             // Ragged IS servable end-to-end: `AnyAdapter::Ragged` wraps the
             // concrete `RaggedAdapter`, the `/ragged/full` route reads it, and
             // the registry serializes it (JSON/zip/Arrow/Parquet). Mirrors
-            // Python `links_for_ragged` (tiled/links.py:40-45): `full` + `block`.
+            // Python `links_for_ragged` (tiled/links.py:47-53): `full` + `block`
+            // with the fixed single-axis `?block={0}` template.
             links.full = Some(format!("{base}/api/v1/ragged/full/{p}"));
-            links
-                .extra
-                .insert("block".into(), format!("{base}/api/v1/ragged/block/{p}"));
+            links.extra.insert(
+                "block".into(),
+                format!("{base}/api/v1/ragged/block/{p}?block={{0}}"),
+            );
         }
         // Mirrors Python `links_for_awkward` (tiled/links.py:26-30): advertise
         // `full` (GET /awkward/full) and `buffers` (POST /awkward/buffers).
-        // Both routes are wired in app.rs and handled in router.rs.
+        // Both routes are wired in app.rs and handled in router.rs. No template.
         StructureFamily::Awkward => {
             links.full = Some(format!("{base}/api/v1/awkward/full/{p}"));
             links.extra.insert(
@@ -163,8 +218,42 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_array_ndim_from_structure() {
+        // Array/sparse: axis count = length of the `shape` array.
+        let s = serde_json::json!({"shape": [3, 4, 5], "chunks": []});
+        assert_eq!(
+            array_ndim_from_structure(StructureFamily::Array, Some(&s)),
+            Some(3)
+        );
+        assert_eq!(
+            array_ndim_from_structure(StructureFamily::Sparse, Some(&s)),
+            Some(3)
+        );
+        // A container's `{contents, count}` has no `shape` → None.
+        let c = serde_json::json!({"contents": null, "count": 2});
+        assert_eq!(
+            array_ndim_from_structure(StructureFamily::Container, Some(&c)),
+            None
+        );
+        // Non-shaped families and absent structure → None.
+        assert_eq!(
+            array_ndim_from_structure(StructureFamily::Table, Some(&s)),
+            None
+        );
+        assert_eq!(
+            array_ndim_from_structure(StructureFamily::Array, None),
+            None
+        );
+    }
+
+    #[test]
     fn test_links_for_container_root() {
-        let links = links_for_node(StructureFamily::Container, "http://localhost:8000", "");
+        let links = links_for_node(
+            StructureFamily::Container,
+            None,
+            "http://localhost:8000",
+            "",
+        );
         assert_eq!(
             links.self_link.as_deref(),
             Some("http://localhost:8000/api/v1/metadata/")
@@ -177,23 +266,119 @@ mod tests {
 
     #[test]
     fn test_links_for_array() {
-        let links = links_for_node(StructureFamily::Array, "http://localhost:8000", "my_array");
+        // A 2-D array advertises `?block={0},{1}` (one placeholder per axis),
+        // matching upstream `links_for_array` (tiled/links.py:18-23). The stock
+        // client fills it via `links["block"].format(*block)` in write_block.
+        let links = links_for_node(
+            StructureFamily::Array,
+            Some(2),
+            "http://localhost:8000",
+            "my_array",
+        );
         assert_eq!(
             links.self_link.as_deref(),
             Some("http://localhost:8000/api/v1/metadata/my_array")
         );
         assert_eq!(
             links.extra.get("block").map(|s| s.as_str()),
-            Some("http://localhost:8000/api/v1/array/block/my_array")
+            Some("http://localhost:8000/api/v1/array/block/my_array?block={0},{1}")
+        );
+    }
+
+    #[test]
+    fn test_links_for_array_1d_and_scalar() {
+        // 1-D: single `{0}` placeholder.
+        let links = links_for_node(
+            StructureFamily::Array,
+            Some(1),
+            "http://localhost:8000",
+            "vec",
+        );
+        assert_eq!(
+            links.extra.get("block").map(|s| s.as_str()),
+            Some("http://localhost:8000/api/v1/array/block/vec?block={0}")
+        );
+        // 0-D (scalar): empty join → `?block=`, matching upstream's
+        // `",".join(... range(0))` == "".
+        let links = links_for_node(
+            StructureFamily::Array,
+            Some(0),
+            "http://localhost:8000",
+            "scal",
+        );
+        assert_eq!(
+            links.extra.get("block").map(|s| s.as_str()),
+            Some("http://localhost:8000/api/v1/array/block/scal?block=")
+        );
+    }
+
+    #[test]
+    fn test_links_for_sparse_templated_like_array() {
+        // Sparse shares the array `block` template (upstream maps
+        // StructureFamily.sparse -> links_for_array, tiled/links.py:69).
+        let links = links_for_node(
+            StructureFamily::Sparse,
+            Some(3),
+            "http://localhost:8000",
+            "coo",
+        );
+        assert_eq!(
+            links.extra.get("block").map(|s| s.as_str()),
+            Some("http://localhost:8000/api/v1/array/block/coo?block={0},{1},{2}")
+        );
+    }
+
+    #[test]
+    fn test_block_template_format_yields_correct_chunk() {
+        // End-to-end: the emitted template, filled the way the stock Python
+        // client fills it (`str.format(*block)` positional substitution),
+        // yields the addressed chunk coordinate — not the origin. This is the
+        // exact contract write_block depends on.
+        let links = links_for_node(
+            StructureFamily::Array,
+            Some(2),
+            "http://localhost:8000",
+            "a",
+        );
+        let template = links.extra.get("block").unwrap();
+        // "...?block={0},{1}" with block=(2,3) -> "...?block=2,3"
+        let filled = template.replace("{0}", "2").replace("{1}", "3");
+        assert_eq!(
+            filled, "http://localhost:8000/api/v1/array/block/a?block=2,3",
+            "filled template must address chunk (2,3), not (0,0)"
+        );
+    }
+
+    #[test]
+    fn test_links_for_array_no_ndim_falls_back_untemplated() {
+        // Defensive fallback: an array/sparse node with unknown ndim emits the
+        // un-templated block link (the pre-fix shape), never a malformed
+        // `?block=`. Only reachable on the PUT-metadata port extension.
+        let links = links_for_node(
+            StructureFamily::Array,
+            None,
+            "http://localhost:8000",
+            "unknown",
+        );
+        assert_eq!(
+            links.extra.get("block").map(|s| s.as_str()),
+            Some("http://localhost:8000/api/v1/array/block/unknown")
         );
     }
 
     #[test]
     fn test_links_for_table() {
-        let links = links_for_node(StructureFamily::Table, "http://localhost:8000", "my_table");
+        // Fixed `?partition={index}` template (upstream links_for_table,
+        // tiled/links.py:56-60).
+        let links = links_for_node(
+            StructureFamily::Table,
+            None,
+            "http://localhost:8000",
+            "my_table",
+        );
         assert_eq!(
             links.extra.get("partition").map(|s| s.as_str()),
-            Some("http://localhost:8000/api/v1/table/partition/my_table")
+            Some("http://localhost:8000/api/v1/table/partition/my_table?partition={index}")
         );
     }
 
@@ -201,9 +386,11 @@ mod tests {
     fn test_links_for_ragged_advertises_full_and_block() {
         // Ragged is servable end-to-end (AnyAdapter::Ragged + /ragged/full +
         // serializers), so it advertises full + block like an array, on the
-        // /ragged/ route (parity with Python links_for_ragged).
+        // /ragged/ route (parity with Python links_for_ragged). Fixed single-
+        // axis `?block={0}` template (tiled/links.py:47-53).
         let links = links_for_node(
             StructureFamily::Ragged,
+            None,
             "http://localhost:8000",
             "my_ragged",
         );
@@ -217,7 +404,7 @@ mod tests {
         );
         assert_eq!(
             links.extra.get("block").map(|s| s.as_str()),
-            Some("http://localhost:8000/api/v1/ragged/block/my_ragged")
+            Some("http://localhost:8000/api/v1/ragged/block/my_ragged?block={0}")
         );
     }
 
@@ -228,6 +415,7 @@ mod tests {
         // `links_for_awkward` (tiled/links.py:26-30): `full` + `buffers`.
         let links = links_for_node(
             StructureFamily::Awkward,
+            None,
             "http://localhost:8000",
             "my_awkward",
         );

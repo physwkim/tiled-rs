@@ -624,6 +624,19 @@ impl AnyStructure {
             StructureFamily::Container => None,
         })
     }
+
+    /// Number of array axes, for the `?block={0},{1},…` link template that the
+    /// array/sparse `block` link carries (one placeholder per axis, mirroring
+    /// upstream `links_for_array`, `tiled/links.py:18-23`). `Some` only for the
+    /// shaped families (`Array`/`Sparse`); every other family has no block link
+    /// and returns `None`.
+    pub fn ndim(&self) -> Option<usize> {
+        match self {
+            Self::Array(a) => Some(a.shape.len()),
+            Self::Sparse(s) => Some(s.shape.len()),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]

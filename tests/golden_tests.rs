@@ -338,8 +338,16 @@ async fn test_array_metadata() {
     assert!(structure.is_object());
     assert_eq!(structure["shape"], serde_json::json!([10]));
 
-    // links must have block and full
-    assert!(data["links"]["block"].is_string());
+    // links must have block and full. The `block` link carries the upstream
+    // `?block={i}` template — one placeholder per axis (shape [10] is 1-D, so a
+    // single `{0}`), matching upstream `links_for_array` (tiled/links.py:18-23).
+    // The stock client fills it via `links["block"].format(*block)` in
+    // write_block, so a missing template would silently write the origin chunk.
+    let block = data["links"]["block"].as_str().unwrap();
+    assert!(
+        block.ends_with("/api/v1/array/block/some_array?block={0}"),
+        "block link must carry the 1-axis template, got: {block}"
+    );
     assert!(data["links"]["full"].is_string());
 }
 
