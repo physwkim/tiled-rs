@@ -353,13 +353,16 @@ fn serialize_array_csv(
     let num_elements = data.len() / itemsize;
     let mut output = String::new();
 
+    // `numpy.savetxt` writes `fmt % row + '\n'` for EVERY row, so each row —
+    // including the last — is terminated by a newline (array.py:41-46). Push the
+    // `\n` after each row uniformly rather than joining between rows, so the CSV
+    // body ends with a trailing newline and matches `savetxt(...).getvalue()`.
+    // This is the single output owner, so the html-from-csv fallback inherits it.
+
     // 2-D: rows × cols layout.
     if shape.len() == 2 {
         let cols = shape[1];
         for row in 0..shape[0] {
-            if row > 0 {
-                output.push('\n');
-            }
             for col in 0..cols {
                 if col > 0 {
                     output.push(',');
@@ -372,6 +375,7 @@ fn serialize_array_csv(
                 }
                 output.push_str(&format_value(&data[start..end]));
             }
+            output.push('\n');
         }
     } else {
         // 1-D or fallback: one value per line, row-major.
@@ -381,10 +385,8 @@ fn serialize_array_csv(
             if end > data.len() {
                 break;
             }
-            if i > 0 {
-                output.push('\n');
-            }
             output.push_str(&format_value(&data[start..end]));
+            output.push('\n');
         }
     }
 
@@ -791,6 +793,34 @@ mod tests {
         reg.dispatch(StructureFamily::Array, mime::CSV).unwrap()
     }
 
+    /// FAILING-TEST-FIRST (Finding 3, byte-parity): the array CSV output must end
+    /// with a trailing newline, matching `numpy.savetxt(...).getvalue()`
+    /// (array.py:41-46). savetxt's row loop writes `fmt % row + '\n'` for EVERY
+    /// row including the last, so a 1-D `[1.0, 2.0, 3.0]` is `b"1.0\n2.0\n3.0\n"`.
+    /// Before the fix this serializer joined rows with `\n` BETWEEN only, dropping
+    /// the trailing newline.
+    #[test]
+    fn csv_array_ends_with_trailing_newline_like_savetxt() {
+        let ser = csv_serializer();
+        // 1-D: one value per row, trailing newline after the last.
+        let data: Vec<u8> = [1.0f64, 2.0, 3.0]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let meta = serde_json::json!({"itemsize": 8, "kind": "f", "shape": [3]});
+        let out = ser(&data, &meta).unwrap();
+        assert_eq!(std::str::from_utf8(&out).unwrap(), "1.0\n2.0\n3.0\n");
+
+        // 2-D: every row (incl. the last) is newline-terminated.
+        let data2: Vec<u8> = [1.0f64, 2.0, 3.0, 4.0]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let meta2 = serde_json::json!({"itemsize": 8, "kind": "f", "shape": [2, 2]});
+        let out2 = ser(&data2, &meta2).unwrap();
+        assert_eq!(std::str::from_utf8(&out2).unwrap(), "1.0,2.0\n3.0,4.0\n");
+    }
+
     /// L1: `numpy.savetxt(fmt="%s")` emits "1.0" for 1.0_f64, not "1".
     /// Rust Display (Ryu) emits "1"; the fix appends ".0" when the output
     /// contains no decimal point, 'e', or letter (NaN/inf excluded).
@@ -820,7 +850,7 @@ mod tests {
             &serde_json::json!({"itemsize": 8, "kind": "f", "shape": [1]}),
         )
         .unwrap();
-        assert_eq!(std::str::from_utf8(&out_frac).unwrap(), "1.5");
+        assert_eq!(std::str::from_utf8(&out_frac).unwrap(), "1.5\n");
     }
 
     /// Finding 1: the array CSV serializer must match `str(np.float64(x))` /
@@ -842,7 +872,12 @@ mod tests {
                 &serde_json::json!({"itemsize": 8, "kind": "f", "shape": [1]}),
             )
             .unwrap();
-            String::from_utf8(out.to_vec()).unwrap()
+            // savetxt terminates every row with a newline; strip it so these
+            // assertions stay focused on the single cell's float formatting.
+            let s = String::from_utf8(out.to_vec()).unwrap();
+            s.strip_suffix('\n')
+                .expect("array CSV must end with a trailing newline")
+                .to_string()
         };
         let cell_f32 = |v: f32| -> String {
             let out = ser(
@@ -850,7 +885,12 @@ mod tests {
                 &serde_json::json!({"itemsize": 4, "kind": "f", "shape": [1]}),
             )
             .unwrap();
-            String::from_utf8(out.to_vec()).unwrap()
+            // savetxt terminates every row with a newline; strip it so these
+            // assertions stay focused on the single cell's float formatting.
+            let s = String::from_utf8(out.to_vec()).unwrap();
+            s.strip_suffix('\n')
+                .expect("array CSV must end with a trailing newline")
+                .to_string()
         };
 
         // (value, expected str(np.float64(value)) == expected str(np.float32(value)))
@@ -891,7 +931,12 @@ mod tests {
                 &serde_json::json!({"itemsize": 8, "kind": "f", "shape": [1]}),
             )
             .unwrap();
-            String::from_utf8(out.to_vec()).unwrap()
+            // savetxt terminates every row with a newline; strip it so these
+            // assertions stay focused on the single cell's float formatting.
+            let s = String::from_utf8(out.to_vec()).unwrap();
+            s.strip_suffix('\n')
+                .expect("array CSV must end with a trailing newline")
+                .to_string()
         };
         let cell_f32 = |v: f32| -> String {
             let out = ser(
@@ -899,7 +944,12 @@ mod tests {
                 &serde_json::json!({"itemsize": 4, "kind": "f", "shape": [1]}),
             )
             .unwrap();
-            String::from_utf8(out.to_vec()).unwrap()
+            // savetxt terminates every row with a newline; strip it so these
+            // assertions stay focused on the single cell's float formatting.
+            let s = String::from_utf8(out.to_vec()).unwrap();
+            s.strip_suffix('\n')
+                .expect("array CSV must end with a trailing newline")
+                .to_string()
         };
 
         assert_eq!(cell_f64(f64::NAN), "nan");
@@ -972,7 +1022,10 @@ mod tests {
             &serde_json::json!({"itemsize": 2, "kind": "f", "shape": [1]}),
         )
         .unwrap();
-        let cell = std::str::from_utf8(&out01).unwrap();
+        let cell = std::str::from_utf8(&out01)
+            .unwrap()
+            .strip_suffix('\n')
+            .expect("array CSV must end with a trailing newline");
         assert_eq!(
             cell.parse::<f32>().unwrap(),
             half::f16::from_f32(0.1).to_f32(),
@@ -991,15 +1044,16 @@ mod tests {
     #[test]
     fn csv_array_bool_is_title_case_like_numpy_savetxt() {
         let ser = csv_serializer();
-        // 1-D [3]: one bool per row (column vector), no trailing newline.
+        // 1-D [3]: one bool per row (column vector), each row newline-terminated
+        // (incl. the last), matching numpy.savetxt.
         let out = ser(
             &[1u8, 0, 1],
             &serde_json::json!({"itemsize": 1, "kind": "b", "byteorder": "<", "shape": [3]}),
         )
         .unwrap();
-        assert_eq!(std::str::from_utf8(&out).unwrap(), "True\nFalse\nTrue");
+        assert_eq!(std::str::from_utf8(&out).unwrap(), "True\nFalse\nTrue\n");
 
-        // 2-D [2,2]: comma-separated cells per row.
+        // 2-D [2,2]: comma-separated cells per row, trailing newline after each row.
         let out2 = ser(
             &[1u8, 0, 0, 1],
             &serde_json::json!({"itemsize": 1, "kind": "b", "byteorder": "<", "shape": [2, 2]}),
@@ -1007,7 +1061,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             std::str::from_utf8(&out2).unwrap(),
-            "True,False\nFalse,True"
+            "True,False\nFalse,True\n"
         );
     }
 
@@ -1564,7 +1618,11 @@ mod tests {
                 "itemsize": 8, "kind": "M", "byteorder": "<", "dt_units": unit, "shape": [1]
             });
             let out = ser(&data, &meta).unwrap();
-            assert_eq!(std::str::from_utf8(&out).unwrap(), *expected, "unit {unit}");
+            assert_eq!(
+                std::str::from_utf8(&out).unwrap(),
+                format!("{expected}\n"),
+                "unit {unit}"
+            );
         }
     }
 
@@ -1578,7 +1636,7 @@ mod tests {
             "itemsize": 8, "kind": "M", "byteorder": "<", "dt_units": "[s]", "shape": [1]
         });
         let out = ser(&data, &meta).unwrap();
-        assert_eq!(std::str::from_utf8(&out).unwrap(), "NaT");
+        assert_eq!(std::str::from_utf8(&out).unwrap(), "NaT\n");
     }
 
     /// CSV datetime64 lays out 2-D as comma-separated rows, one date per cell.
@@ -1594,7 +1652,7 @@ mod tests {
         assert_eq!(
             std::str::from_utf8(&out).unwrap(),
             "2021-01-01T00:00:00,1970-01-01T00:00:00\n\
-             1970-01-01T00:00:00,2021-01-01T00:00:00"
+             1970-01-01T00:00:00,2021-01-01T00:00:00\n"
         );
     }
 
@@ -1630,7 +1688,7 @@ mod tests {
             let out = ser(&data, &meta).unwrap();
             assert_eq!(
                 std::str::from_utf8(&out).unwrap(),
-                *expected,
+                format!("{expected}\n"),
                 "unit {unit} value {value}"
             );
         }
@@ -1646,6 +1704,6 @@ mod tests {
             "itemsize": 8, "kind": "m", "byteorder": "<", "dt_units": "[s]", "shape": [1]
         });
         let out = ser(&data, &meta).unwrap();
-        assert_eq!(std::str::from_utf8(&out).unwrap(), "NaT");
+        assert_eq!(std::str::from_utf8(&out).unwrap(), "NaT\n");
     }
 }
