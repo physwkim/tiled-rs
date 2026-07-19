@@ -62,7 +62,12 @@ pub(crate) async fn resolve_entry(
     } else {
         resolve_entry_tree(state, auth, segments).await?
     };
-    narrowed.require(required_scope)?;
+    // PER-NODE gate (upstream `get_entry`, dependencies.py:117-133): a node the
+    // caller can see (`read:metadata` already passed during narrowing) but for
+    // which the access policy narrowed away `required_scope` → 403. The GLOBAL
+    // route-scope gate (401) is the handler-head `auth.require(...)` == upstream
+    // `check_scopes`; do NOT conflate the two.
+    narrowed.require_on_node(required_scope)?;
     Ok(narrowed)
 }
 
@@ -7159,6 +7164,9 @@ pub async fn patch_metadata(
         .get("drop_revision")
         .map(|v| matches!(v.as_str(), "true" | "True" | "1" | "yes"))
         .unwrap_or(false);
+    // GLOBAL route-scope gate (upstream `check_scopes(["write:metadata"])`,
+    // router.py:2328) → 401, on the un-narrowed credential, before any lookup.
+    auth.require(crate::auth::Scope::WriteMetadata)?;
     let segments = segments_from_uri(&uri, "/api/v1/metadata/");
     let catalog = state.catalog.as_ref().ok_or_else(|| {
         ServerError::Validation("server has no catalog DB; PATCH not supported".into())
@@ -7168,10 +7176,10 @@ pub async fn patch_metadata(
             "cannot PATCH the catalog root".into(),
         ));
     }
-    // Per-ancestor auth gate: narrows at every prefix and requires
-    // WriteMetadata on the narrowed set — same invariant as the read gate.
-    // Capture the narrowed auth so its principal + scopes are available for
-    // the modify_node call below.
+    // PER-NODE auth gate (upstream `get_entry(path, ["write:metadata"])`,
+    // router.py:2330) → 403: narrows at every prefix and requires WriteMetadata
+    // on the narrowed set. Capture the narrowed auth so its principal + scopes
+    // are available for the modify_node call below.
     let auth = resolve_entry(&state, auth, &segments, crate::auth::Scope::WriteMetadata).await?;
     let node = catalog
         .lookup(&segments)
@@ -7413,6 +7421,11 @@ pub async fn put_metadata(
         .get("drop_revision")
         .map(|v| matches!(v.as_str(), "true" | "True" | "1" | "yes"))
         .unwrap_or(false);
+    // GLOBAL route-scope gate (upstream `check_scopes(["write:metadata"])`,
+    // router.py:2436) → 401, on the un-narrowed credential. Runs before the
+    // no-catalog 405 below, matching upstream: `check_scopes` is a Security
+    // dependency evaluated before the handler body raises 405.
+    auth.require(crate::auth::Scope::WriteMetadata)?;
     let segments = segments_from_uri(&uri, "/api/v1/metadata/");
     // A node that cannot persist metadata (no catalog → in-memory tree) does
     // not support `replace_metadata` → 405, matching Python's "This node does
@@ -7427,8 +7440,9 @@ pub async fn put_metadata(
             "cannot PUT the catalog root".into(),
         ));
     }
-    // Per-ancestor auth gate: narrows at every prefix and requires
-    // WriteMetadata on the narrowed set — same invariant as PATCH.
+    // PER-NODE auth gate (upstream `get_entry(path, ["write:metadata"])`,
+    // router.py:2438) → 403: narrows at every prefix and requires WriteMetadata
+    // on the narrowed set — same invariant as PATCH.
     let auth = resolve_entry(&state, auth, &segments, crate::auth::Scope::WriteMetadata).await?;
     let node = catalog
         .lookup(&segments)
@@ -7829,6 +7843,9 @@ pub async fn get_asset_bytes(
     headers: HeaderMap,
     auth: crate::server::AuthContext,
 ) -> Result<impl IntoResponse, ServerError> {
+    // GLOBAL route-scope gate (upstream `Security(check_scopes, ["read:data"])`,
+    // router.py:2586) → 401. `resolve_asset` applies the per-node gate (403).
+    auth.require(crate::auth::Scope::ReadData)?;
     let segments = segments_from_uri(&uri, "/api/v1/asset/bytes/");
     let asset_id = parse_asset_id(&params)?;
     let asset = resolve_asset(&state, auth, &segments, asset_id).await?;
@@ -7924,6 +7941,9 @@ pub async fn get_asset_manifest(
     Query(params): Query<HashMap<String, String>>,
     auth: crate::server::AuthContext,
 ) -> Result<impl IntoResponse, ServerError> {
+    // GLOBAL route-scope gate (upstream `Security(check_scopes, ["read:data"])`,
+    // router.py:2677) → 401. `resolve_asset` applies the per-node gate (403).
+    auth.require(crate::auth::Scope::ReadData)?;
     let segments = segments_from_uri(&uri, "/api/v1/asset/manifest/");
     let asset_id = parse_asset_id(&params)?;
     let asset = resolve_asset(&state, auth, &segments, asset_id).await?;
@@ -8008,6 +8028,17 @@ pub async fn put_data_source(
     auth: crate::server::AuthContext,
     Json(req): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, ServerError> {
+    // Rewriting a node's storage mapping requires BOTH write:metadata AND
+    // register, matching upstream (router.py:1944/1948:
+    // `Security(check_scopes, ["write:metadata","register"])` +
+    // `get_entry(path, ["write:metadata","register"])`). register is what keeps
+    // a plain `user` — who holds write:data/write:metadata but not register —
+    // from repointing a node at different storage.
+    //
+    // GLOBAL route-scope gate (upstream `check_scopes`) → 401, before any
+    // lookup, for each required scope on the un-narrowed credential.
+    auth.require(crate::auth::Scope::WriteMetadata)?;
+    auth.require(crate::auth::Scope::Register)?;
     let segments = segments_from_uri(&uri, "/api/v1/data_source/");
     let catalog = state.catalog.as_ref().ok_or_else(|| {
         ServerError::Validation("server has no catalog DB; PUT not supported".into())
@@ -8017,15 +8048,10 @@ pub async fn put_data_source(
             "PUT /data_source requires a node path".into(),
         ));
     }
-    // Rewriting a node's storage mapping requires BOTH write:metadata AND
-    // register, matching upstream (router.py:1944/1948:
-    // `Security(check_scopes, ["write:metadata","register"])` +
-    // `get_entry(path, ["write:metadata","register"])`). register is what keeps
-    // a plain `user` — who holds write:data/write:metadata but not register —
-    // from repointing a node at different storage.
+    // PER-NODE gate (upstream `get_entry`) → 403 on the narrowed context.
     let auth = resolve_entry_catalog(&state, auth, &segments).await?;
-    auth.require(crate::auth::Scope::WriteMetadata)?;
-    auth.require(crate::auth::Scope::Register)?;
+    auth.require_on_node(crate::auth::Scope::WriteMetadata)?;
+    auth.require_on_node(crate::auth::Scope::Register)?;
     let node = catalog
         .lookup(&segments)
         .await
@@ -8149,6 +8175,11 @@ pub async fn delete_metadata(
         .get("recursive")
         .map(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes"))
         .unwrap_or(false);
+    // GLOBAL route-scope gate (upstream `check_scopes(["delete:node",
+    // "delete:revision"])`, router.py:1995) → 401, on the un-narrowed credential,
+    // for BOTH required scopes before any lookup.
+    auth.require(crate::auth::Scope::DeleteNode)?;
+    auth.require(crate::auth::Scope::DeleteRevision)?;
     let catalog = state.catalog.as_ref().ok_or_else(|| {
         ServerError::Validation("server has no catalog DB; DELETE not supported".into())
     })?;
@@ -8157,15 +8188,15 @@ pub async fn delete_metadata(
             "cannot DELETE the catalog root".into(),
         ));
     }
-    // Per-ancestor auth gate: narrow at every prefix, require DeleteNode on the
-    // fully-narrowed set, then DeleteRevision on that same context. Deleting a
-    // node cascade-destroys its revision history, so upstream gates this route
-    // with BOTH delete:node AND delete:revision (router.py:1995 global Security +
-    // :1999 get_entry, both scopes, both layers). The built-in roles bundle the
-    // two (for_role), so this only tightens a custom AccessPolicy that grants
-    // delete:node without delete:revision.
+    // PER-NODE auth gate (upstream `get_entry(path, ["delete:node",
+    // "delete:revision"])`, router.py:1997-1999) → 403: narrow at every prefix,
+    // require DeleteNode on the fully-narrowed set, then DeleteRevision on that
+    // same context. Deleting a node cascade-destroys its revision history, so
+    // upstream gates this route with BOTH scopes at both layers. The built-in
+    // roles bundle the two (for_role), so this only tightens a custom
+    // AccessPolicy that grants delete:node without delete:revision.
     let auth = resolve_entry(&state, auth, &segments, crate::auth::Scope::DeleteNode).await?;
-    auth.require(crate::auth::Scope::DeleteRevision)?;
+    auth.require_on_node(crate::auth::Scope::DeleteRevision)?;
     let node = catalog
         .lookup(&segments)
         .await
@@ -8245,6 +8276,10 @@ pub async fn close_stream(
     OriginalUri(uri): OriginalUri,
     auth: crate::server::AuthContext,
 ) -> Result<impl IntoResponse, ServerError> {
+    // GLOBAL route-scope gate (upstream `Security(check_scopes, ["write:data"])`,
+    // router.py:734) → 401, before any node/catalog lookup. `resolve_entry`
+    // below applies the per-node gate (403).
+    auth.require(crate::auth::Scope::WriteData)?;
     let segments = segments_from_uri(&uri, "/api/v1/stream/close/");
     let catalog = state.catalog.as_ref().ok_or_else(|| {
         ServerError::Validation("server has no catalog DB; stream close not supported".into())

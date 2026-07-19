@@ -95,7 +95,10 @@ async fn authorize_node(
 ) -> Result<crate::catalog::orm::Node, ServerError> {
     let catalog = require_catalog(state)?;
     let auth = crate::server::router::resolve_entry_catalog(state, auth, segments).await?;
-    auth.require(scope)?;
+    // PER-NODE gate on the post-narrow context (upstream `get_entry`) → 403.
+    // The GLOBAL 401 gate is the handler-head `auth.require(scope)` above,
+    // which runs on the un-narrowed credential before this resolve.
+    auth.require_on_node(scope)?;
     catalog
         .lookup(segments)
         .await

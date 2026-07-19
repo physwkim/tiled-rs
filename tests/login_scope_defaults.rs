@@ -91,8 +91,9 @@ async fn status_of(app: &axum::Router, req: Request<Body>) -> StatusCode {
 
 /// Log in alice (a `user`-role principal — `for_role("user")` includes
 /// `create:apikeys`) and try to create an API key. Returns the create status.
-/// The only variable is `default_login_scopes`, so a 403 here means the
-/// default capped `create:apikeys` out of the session.
+/// The only variable is `default_login_scopes`, so a 401 here means the
+/// default capped `create:apikeys` out of the session (the route-level
+/// `check_scopes(["create:apikeys"])` gate raises 401 for the missing scope).
 async fn login_then_create_apikey_status(default_login_scopes: ScopeSet) -> StatusCode {
     let (app, _dir) = make_app(default_login_scopes).await;
 
@@ -129,12 +130,13 @@ async fn login_then_create_apikey_status(default_login_scopes: ScopeSet) -> Stat
 /// does not — role scopes pass through, matching upstream.
 #[tokio::test]
 async fn shipped_default_passes_role_scopes_through_readonly_would_cap() {
-    // read_only() (the pre-fix production value) strips create:apikeys → 403.
+    // read_only() (the pre-fix production value) strips create:apikeys → 401.
     let capped = login_then_create_apikey_status(ScopeSet::read_only()).await;
     assert_eq!(
         capped,
-        StatusCode::FORBIDDEN,
-        "read_only() default caps a user's role scopes below create:apikeys"
+        StatusCode::UNAUTHORIZED,
+        "read_only() default caps a user's role scopes below create:apikeys \
+         (upstream check_scopes → 401)"
     );
 
     // The shipped default imposes no cap → create:apikeys passes through → 200.

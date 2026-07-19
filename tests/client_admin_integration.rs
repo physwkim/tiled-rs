@@ -279,9 +279,13 @@ async fn mint_and_revoke_apikey_for_principal() {
 }
 
 /// A non-admin caller hitting an admin endpoint is authenticated but lacks the
-/// scope, so the server's 403 maps to `ClientError::PermissionDenied`.
+/// route scope. Upstream gates `GET /auth/principal` with
+/// `Security(check_scopes, ["read:principals"])`, which raises 401 (not 403) for
+/// insufficient route scope. The client maps that 401 to
+/// `ClientError::AuthRequired` (utils.rs: `status == 401`), so a non-admin
+/// admin call surfaces `AuthRequired`, not `PermissionDenied`.
 #[tokio::test]
-async fn non_admin_admin_call_is_permission_denied() {
+async fn non_admin_admin_call_is_auth_required() {
     let (base, auth_db, _dir) = spawn_auth_server().await;
     let ctx = user_context(&base, &auth_db).await;
 
@@ -289,9 +293,9 @@ async fn non_admin_admin_call_is_permission_denied() {
         .admin()
         .list_principals(0, 100)
         .await
-        .expect_err("a user-role caller must be forbidden from listing principals");
+        .expect_err("a user-role caller must be refused from listing principals");
     assert!(
-        matches!(err, tiled_rs::client::ClientError::PermissionDenied(_)),
-        "non-admin admin call → PermissionDenied, got {err:?}"
+        matches!(err, tiled_rs::client::ClientError::AuthRequired(_)),
+        "non-admin admin call → AuthRequired (server check_scopes → 401), got {err:?}"
     );
 }

@@ -1,6 +1,6 @@
 //! Server error types and Axum error response conversion.
 
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 
 use crate::core::schemas;
@@ -25,6 +25,22 @@ pub enum ServerError {
     NotAcceptable(String),
     Unauthorized(String),
     Forbidden(String),
+    /// The request's (global) scopes do not include a scope the route
+    /// requires. Maps to HTTP 401 with a
+    /// `WWW-Authenticate: Bearer scope="<scope>"` header, matching Python
+    /// tiled's `check_scopes` (authentication.py:544-570 +
+    /// `headers_for_401`, authentication.py:202-213), which raises
+    /// `HTTP_401_UNAUTHORIZED` for the *route-level* scope gate. This is the
+    /// GLOBAL gate: the un-narrowed credential lacks the scope. Distinct from
+    /// [`Self::Forbidden`] (403), which is the PER-NODE gate — a node the
+    /// caller can see (`read:metadata` present) but cannot perform the
+    /// operation on (`get_entry`, dependencies.py:117-133). `detail` is the
+    /// response body message; `scopes` is the space-joined scope string that
+    /// goes into the `WWW-Authenticate` header.
+    InsufficientScope {
+        detail: String,
+        scopes: String,
+    },
     /// Decoded response payload exceeds the configured
     /// `response_bytesize_limit`. Maps to 400 to match Python tiled
     /// (router.py raises HTTP_400_BAD_REQUEST before serialization).
@@ -81,6 +97,7 @@ impl std::fmt::Display for ServerError {
             Self::NotAcceptable(msg) => write!(f, "Not acceptable: {msg}"),
             Self::Unauthorized(msg) => write!(f, "Unauthorized: {msg}"),
             Self::Forbidden(msg) => write!(f, "Forbidden: {msg}"),
+            Self::InsufficientScope { detail, .. } => write!(f, "Insufficient scope: {detail}"),
             Self::ResponseTooLarge(msg) => write!(f, "Response too large: {msg}"),
             Self::UnsupportedQuery(msg) => write!(f, "Unsupported query: {msg}"),
             Self::InvalidQuery(msg) => write!(f, "Invalid query: {msg}"),
@@ -93,6 +110,26 @@ impl std::fmt::Display for ServerError {
 
 impl IntoResponse for ServerError {
     fn into_response(self) -> Response {
+        // The 401 route-scope gate carries a `WWW-Authenticate` header the
+        // uniform body path below cannot attach, so handle it first.
+        if let Self::InsufficientScope { detail, scopes } = self {
+            let body = schemas::Response::<()> {
+                data: None,
+                error: Some(schemas::Error {
+                    code: 401,
+                    message: detail,
+                }),
+                links: None,
+                meta: None,
+            };
+            let mut resp = (StatusCode::UNAUTHORIZED, axum::Json(body)).into_response();
+            let value = format!("Bearer scope=\"{scopes}\"");
+            let header_value = HeaderValue::from_str(&value)
+                .unwrap_or_else(|_| HeaderValue::from_static("Bearer"));
+            resp.headers_mut()
+                .insert(header::WWW_AUTHENTICATE, header_value);
+            return resp;
+        }
         // Consume self — no clone needed.
         let (status, code, message) = match self {
             Self::NotFound(msg) => (StatusCode::NOT_FOUND, 404, msg),
@@ -114,6 +151,10 @@ impl IntoResponse for ServerError {
             Self::NotAcceptable(msg) => (StatusCode::NOT_ACCEPTABLE, 406, msg),
             Self::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, 401, msg),
             Self::Forbidden(msg) => (StatusCode::FORBIDDEN, 403, msg),
+            // Handled by the early return above (which also attaches the
+            // `WWW-Authenticate` header); this arm exists only for match
+            // exhaustiveness and still yields the correct 401 status.
+            Self::InsufficientScope { detail, .. } => (StatusCode::UNAUTHORIZED, 401, detail),
             Self::ResponseTooLarge(msg) => (StatusCode::BAD_REQUEST, 400, msg),
             Self::UnsupportedQuery(msg) => (StatusCode::BAD_REQUEST, 400, msg),
             Self::InvalidQuery(msg) => (StatusCode::BAD_REQUEST, 400, msg),

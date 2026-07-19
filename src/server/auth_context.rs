@@ -46,13 +46,39 @@ impl AuthContext {
         }
     }
 
+    /// GLOBAL route-scope gate — the analog of upstream's
+    /// `Security(check_scopes, scopes=[scope])` (authentication.py:544-570).
+    /// The un-narrowed credential must carry `scope`; if not, this yields a
+    /// **401** with `WWW-Authenticate: Bearer scope="<scope>"`, exactly as
+    /// upstream's `check_scopes` does for the route-level gate. Distinct from
+    /// [`Self::require_on_node`] (403), the per-node gate.
     pub fn require(&self, scope: Scope) -> Result<(), ServerError> {
         if self.scopes.contains(scope) {
             Ok(())
         } else {
+            Err(ServerError::InsufficientScope {
+                detail: format!("Not enough permissions. Requires scope {}.", scope.as_str()),
+                scopes: scope.as_str().to_string(),
+            })
+        }
+    }
+
+    /// PER-NODE scope gate — the analog of upstream `get_entry`'s
+    /// `allowed_scopes` check on a *visible* node (dependencies.py:117-133):
+    /// the caller can see this node (`read:metadata` already passed) but the
+    /// access policy narrowed away `scope` on it. Yields **403** with
+    /// upstream's detail wording. Call this on the post-`narrow_for_node`
+    /// context; use [`Self::require`] (401) for the route-level global gate.
+    pub fn require_on_node(&self, scope: Scope) -> Result<(), ServerError> {
+        if self.scopes.contains(scope) {
+            Ok(())
+        } else {
+            let had: Vec<&str> = self.scopes.iter().map(|s| s.as_str()).collect();
             Err(ServerError::Forbidden(format!(
-                "missing scope: {}",
-                scope.as_str()
+                "Not enough permissions to perform this action on this node. \
+                 Requires scopes {}. Principal had scopes {:?} on this node.",
+                scope.as_str(),
+                had
             )))
         }
     }
@@ -104,5 +130,79 @@ impl<S: Send + Sync> FromRequestParts<S> for AuthContext {
             .cloned()
             .unwrap_or_else(AuthContext::anonymous);
         std::future::ready(Ok(ctx))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::{StatusCode, header};
+    use axum::response::IntoResponse;
+
+    fn ctx_with(scopes: ScopeSet) -> AuthContext {
+        AuthContext {
+            principal: None,
+            scopes,
+            kind: AuthKind::Anonymous,
+            authn_access_tags: None,
+        }
+    }
+
+    // F1: the GLOBAL route-scope gate (upstream `check_scopes`) must be 401,
+    // NOT 403, and must carry a `WWW-Authenticate: Bearer scope="..."` header.
+    #[test]
+    fn require_missing_scope_is_401_with_www_authenticate() {
+        let ctx = ctx_with(ScopeSet::read_only()); // read:metadata + read:data only
+        let err = ctx.require(Scope::WriteMetadata).unwrap_err();
+        assert!(
+            matches!(err, ServerError::InsufficientScope { .. }),
+            "expected InsufficientScope, got {err:?}"
+        );
+        let resp = err.into_response();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "global route-scope gate must be 401 (upstream check_scopes)"
+        );
+        let wa = resp
+            .headers()
+            .get(header::WWW_AUTHENTICATE)
+            .expect("401 must carry WWW-Authenticate")
+            .to_str()
+            .unwrap();
+        assert!(
+            wa.contains("Bearer") && wa.contains("write:metadata"),
+            "WWW-Authenticate should name the required scope, got {wa}"
+        );
+    }
+
+    #[test]
+    fn require_present_scope_ok() {
+        let ctx = ctx_with(ScopeSet::read_only());
+        assert!(ctx.require(Scope::ReadMetadata).is_ok());
+    }
+
+    // F1: the PER-NODE gate (upstream `get_entry` on a visible node) must
+    // STAY 403 — a caller that can see the node but lacks the operation scope.
+    #[test]
+    fn require_on_node_missing_scope_is_403() {
+        let ctx = ctx_with(ScopeSet::read_only());
+        let err = ctx.require_on_node(Scope::WriteMetadata).unwrap_err();
+        assert!(
+            matches!(err, ServerError::Forbidden(_)),
+            "expected Forbidden, got {err:?}"
+        );
+        let resp = err.into_response();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "per-node scope denial must stay 403 (upstream get_entry)"
+        );
+    }
+
+    #[test]
+    fn require_on_node_present_scope_ok() {
+        let ctx = ctx_with(ScopeSet::read_only());
+        assert!(ctx.require_on_node(Scope::ReadData).is_ok());
     }
 }

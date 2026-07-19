@@ -10,7 +10,9 @@
 //! Boundaries pinned here:
 //! * flag OFF + no creds  → 401 (unchanged, default posture)
 //! * flag ON  + no creds  → 200 on a public read route, with public scopes only
-//! * flag ON  + no creds  → 403 on a write route AND on apikey-create
+//! * flag ON  + no creds  → 401 on a write route AND on apikey-create (admitted
+//!   anonymously, then the route-level `check_scopes` gate raises 401 for the
+//!   scope the public scope set lacks)
 //! * flag ON  + valid creds → authenticated principal wins over anon
 //! * no_auth_configured    → full anonymous scope, independent of the flag
 
@@ -234,11 +236,13 @@ async fn flag_on_anonymous_read_gets_public_scopes_only() {
     assert_eq!(body["scopes"], json!(["read:metadata", "read:data"]));
 }
 
-/// Flag on, no creds → a write route is 403 (admitted, but public scopes lack
-/// the write/create/register scopes). NOT 401: the request is admitted, then
-/// scope-checked.
+/// Flag on, no creds → a write route is 401. The request is admitted anonymously
+/// (public scopes), then the route-level `check_scopes(["write:metadata",
+/// "create:node","register"])` gate raises HTTP_401_UNAUTHORIZED because the
+/// public scope set lacks those write scopes — upstream returns 401 for
+/// insufficient route scope regardless of whether the caller is authenticated.
 #[tokio::test]
-async fn flag_on_anonymous_write_is_forbidden() {
+async fn flag_on_anonymous_write_is_unauthorized() {
     let (app, _dir) = build_multi_user_app(true).await;
     let (status, _) = json_request(
         &app,
@@ -248,13 +252,14 @@ async fn flag_on_anonymous_write_is_forbidden() {
         Some(container_body()),
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
-/// Flag on, no creds → apikey-create is 403 (admitted, but public scopes lack
-/// `create:apikeys`). An anonymous caller must never mint credentials.
+/// Flag on, no creds → apikey-create is 401 (admitted, but public scopes lack
+/// `create:apikeys`, so the route-level `check_scopes(["create:apikeys"])` gate
+/// raises 401). An anonymous caller must never mint credentials.
 #[tokio::test]
-async fn flag_on_anonymous_apikey_create_is_forbidden() {
+async fn flag_on_anonymous_apikey_create_is_unauthorized() {
     let (app, _dir) = build_multi_user_app(true).await;
     let (status, _) = json_request(
         &app,
@@ -264,7 +269,7 @@ async fn flag_on_anonymous_apikey_create_is_forbidden() {
         Some(json!({"note": "x", "scopes": ["read:metadata"]})),
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
 /// Flag on, but valid credentials present → the authenticated principal wins

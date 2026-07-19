@@ -2547,10 +2547,12 @@ async fn close_stream_disconnects_subscriber_and_fires_webhook() {
     assert_eq!(payload["data"]["key"], "arr", "payload: {payload}");
 }
 
-/// DELETE /stream/close without write:data is refused (403). An authenticated
-/// principal capped to read-only session scopes lacks write:data.
+/// DELETE /stream/close without write:data is refused (401). An authenticated
+/// principal capped to read-only session scopes lacks write:data. The route-level
+/// `check_scopes(["write:data"])` gate (upstream router.py:734) raises 401 for the
+/// missing scope, before the per-node `get_entry` gate is reached.
 #[tokio::test]
-async fn close_stream_without_write_data_is_forbidden() {
+async fn close_stream_without_write_data_is_unauthorized() {
     let (base, _dir) = spawn_auth_stream_server(ScopeSet::read_only(), None).await;
     let client = reqwest::Client::new();
     let token = login_token(&client, &base, "alice", "wonderland").await;
@@ -2563,8 +2565,8 @@ async fn close_stream_without_write_data_is_forbidden() {
         .unwrap();
     assert_eq!(
         resp.status().as_u16(),
-        403,
-        "read-only principal must be forbidden from closing a stream"
+        401,
+        "read-only principal must be refused (upstream check_scopes → 401) closing a stream"
     );
 }
 
