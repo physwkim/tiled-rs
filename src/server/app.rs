@@ -723,7 +723,7 @@ async fn resolve_auth_inner(
     // Auth0, Keycloak, …) when one is configured.
     if state.auth_db.is_some()
         && let Some(auth) = headers.get("authorization").and_then(|v| v.to_str().ok())
-        && let Some(token) = auth.strip_prefix("Bearer ")
+        && let Some(token) = strip_scheme_ci(auth, "Bearer")
     {
         return validate_bearer(state, token)
             .await
@@ -844,7 +844,7 @@ fn resolve_api_key_scopes(
 
 fn extract_api_key(headers: &axum::http::HeaderMap, query: &str) -> Option<String> {
     if let Some(auth) = headers.get("authorization").and_then(|v| v.to_str().ok())
-        && let Some(key) = auth.strip_prefix("Apikey ")
+        && let Some(key) = strip_scheme_ci(auth, "Apikey")
     {
         return Some(key.to_string());
     }
@@ -862,6 +862,17 @@ fn unauthorized(msg: &str) -> axum::response::Response {
 
 fn bad_request(msg: &str) -> axum::response::Response {
     (StatusCode::BAD_REQUEST, msg.to_string()).into_response()
+}
+
+/// Strip a case-INSENSITIVE `"{scheme} "` prefix from an Authorization header
+/// value, returning the credential verbatim (its case is preserved). Mirrors
+/// upstream `get_authorization_scheme_param` (Starlette), which partitions on
+/// the first space and compares `scheme.lower()` — so `Bearer`, `bearer`, and
+/// `BEARER` are all the same scheme. Single owner for every request-scheme
+/// match across the server (bearer + apikey header detection).
+pub(crate) fn strip_scheme_ci<'a>(value: &'a str, scheme: &str) -> Option<&'a str> {
+    let (found, credential) = value.split_once(' ')?;
+    found.eq_ignore_ascii_case(scheme).then_some(credential)
 }
 
 /// Request timeout middleware.

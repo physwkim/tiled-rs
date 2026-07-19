@@ -696,7 +696,7 @@ pub async fn current_apikey_info(
     let key = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.strip_prefix("Apikey "))
+        .and_then(|s| crate::server::app::strip_scheme_ci(s, "Apikey"))
         .ok_or_else(|| {
             ServerError::Unauthorized("No API key was provided with this request.".into())
         })?

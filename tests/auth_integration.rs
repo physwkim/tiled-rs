@@ -1479,9 +1479,10 @@ async fn unrecognized_auth_scheme_is_400() {
     );
 
     // Lowercase `bearer` is a recognized scheme (upstream compares case-
-    // insensitively), so it must NOT 400. Here it falls to the anonymous denial
-    // → 401 (the port's Bearer match is case-sensitive, a distinct pre-existing
-    // divergence outside F4's scope); the F4-relevant claim is simply "not 400".
+    // insensitively), so it must NOT 400. `whatever` is not a valid JWT, so it
+    // stays 401 — after COMMIT 6 the lowercase scheme is matched and the token
+    // is validated-then-rejected (was: dropped to the anonymous denial). Either
+    // way the F4-relevant claim holds: recognized scheme → not 400.
     let (status, _) = json_request(
         &app,
         Method::GET,
@@ -1494,6 +1495,92 @@ async fn unrecognized_auth_scheme_is_400() {
         status,
         StatusCode::UNAUTHORIZED,
         "lowercase 'bearer' is a recognized scheme (case-insensitive) → not 400"
+    );
+}
+
+/// COMMIT 6: the Authorization scheme is matched case-INSENSITIVELY, mirroring
+/// upstream `get_authorization_scheme_param` (which compares `scheme.lower()`).
+/// A lowercase `bearer <jwt>` / `apikey <key>` authenticates identically to
+/// `Bearer` / `Apikey`; before this fix the case-sensitive `strip_prefix`
+/// dropped a lowercase scheme to the anonymous fallback (401 here). Only the
+/// scheme token is case-folded — the credential after the space is matched
+/// verbatim.
+#[tokio::test]
+async fn authorization_scheme_is_case_insensitive() {
+    let (app, _dir, _cat, _auth_db) = build_test_app().await;
+
+    // A valid bearer token from login.
+    let (_, body) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/auth/dummy/login",
+        &[],
+        Some(json!({"username": "alice", "password": "wonderland"})),
+    )
+    .await;
+    let token = body["access_token"].as_str().unwrap().to_string();
+
+    // Canonical `Bearer` → 200 (control).
+    let (status, _) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/metadata/",
+        &[("authorization", &format!("Bearer {token}"))],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "Bearer <valid> authenticates");
+
+    // Lowercase `bearer` → 200 (the fix).
+    let (status, _) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/metadata/",
+        &[("authorization", &format!("bearer {token}"))],
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "lowercase 'bearer <valid>' must authenticate the same as 'Bearer'"
+    );
+
+    // Create a read-only API key (alice's full default scopes carry create:apikeys).
+    let (_, body) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/auth/apikeys",
+        &[("authorization", &format!("Bearer {token}"))],
+        Some(json!({"note": "ci", "scopes": ["read:metadata", "read:data"]})),
+    )
+    .await;
+    let secret = body["secret"].as_str().unwrap().to_string();
+
+    // Canonical `Apikey` → 200 (control).
+    let (status, _) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/metadata/",
+        &[("authorization", &format!("Apikey {secret}"))],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "Apikey <valid> authenticates");
+
+    // Lowercase `apikey` → 200 (the fix).
+    let (status, _) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/metadata/",
+        &[("authorization", &format!("apikey {secret}"))],
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "lowercase 'apikey <valid>' must authenticate the same as 'Apikey'"
     );
 }
 
