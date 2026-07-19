@@ -313,39 +313,31 @@ async fn api_keys_create(
         )
         .await;
     }
-    let scopes = if form.scopes.trim().is_empty() {
-        session.scopes.clone()
+    // Resolve requested scopes through the shared owner
+    // (`resolve_apikey_scopes`) so this self-service form matches the JSON
+    // `POST /auth/apikeys` route and upstream `generate_apikey`: an empty box
+    // defaults to `["inherit"]` (NOT a frozen snapshot of the caller's current
+    // session scopes), and each named scope is capped by the principal's ROLE
+    // ceiling (NOT the caller's possibly-narrower session scopes).
+    let requested: Option<Vec<String>> = if form.scopes.trim().is_empty() {
+        None
     } else {
-        let mut set = ScopeSet::default();
-        for token in form.scopes.split(',') {
-            let name = token.trim();
-            if name.is_empty() {
-                continue;
-            }
-            let Some(scope) = Scope::parse(name) else {
-                return render_api_keys(
-                    &state,
-                    &session,
-                    Some(format!("unknown scope: {name}")),
-                    None,
-                )
-                .await;
-            };
-            if !session.scopes.contains(scope) {
-                return render_api_keys(
-                    &state,
-                    &session,
-                    Some(format!(
-                        "cannot grant a scope ({name}) the caller doesn't hold"
-                    )),
-                    None,
-                )
-                .await;
-            }
-            set.insert(scope);
-        }
-        set
+        Some(
+            form.scopes
+                .split(',')
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+                .collect(),
+        )
     };
+    let scopes =
+        match crate::server::auth_router::resolve_apikey_scopes(requested, &session.principal.role)
+        {
+            Ok(set) => set,
+            Err(e) => {
+                return render_api_keys(&state, &session, Some(e.to_string()), None).await;
+            }
+        };
     // Empty means "never expires". A non-empty value MUST parse to a
     // positive number of seconds — previously any parse error (a typo like
     // "30d", or a stray word) silently fell through to None, minting a

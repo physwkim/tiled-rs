@@ -416,6 +416,48 @@ pub struct ApiKeyCreateRequest {
     pub access_tags: Option<Vec<String>>,
 }
 
+/// Resolve the scope set for a new API key, mirroring upstream
+/// `generate_apikey` (`authentication.py:1174`), the single function both the
+/// self route (`new_apikey`) and the admin route (`apikey_for_principal`) call:
+///
+/// - omitted `scopes` default to `["inherit"]` (the metascope that expands to
+///   the principal's role scopes at use time) — NOT a frozen snapshot of the
+///   caller's current session scopes;
+/// - each requested scope must be within the principal's ROLE ceiling
+///   (`principal_scopes | {"inherit"}`), where the ceiling is the principal's
+///   role — NOT the caller's (possibly narrower) session scopes.
+///
+/// Returns 422 for an unknown scope name and 403 when a requested scope exceeds
+/// the role ceiling.
+pub(crate) fn resolve_apikey_scopes(
+    requested: Option<Vec<String>>,
+    role: &str,
+) -> Result<ScopeSet, ServerError> {
+    let role_scopes = crate::auth::ScopeSet::for_role(role);
+    match requested {
+        None => {
+            // Default: inherit — expands to role scopes at use time.
+            let mut set = ScopeSet::default();
+            set.insert(crate::auth::Scope::Inherit);
+            Ok(set)
+        }
+        Some(names) => {
+            let mut set = ScopeSet::default();
+            for name in names {
+                let s = crate::auth::Scope::parse(&name)
+                    .ok_or_else(|| ServerError::Validation(format!("unknown scope: {name}")))?;
+                if s != crate::auth::Scope::Inherit && !role_scopes.contains(s) {
+                    return Err(ServerError::Forbidden(format!(
+                        "Requested scopes {name:?} must be a subset of the principal's scopes."
+                    )));
+                }
+                set.insert(s);
+            }
+            Ok(set)
+        }
+    }
+}
+
 pub async fn api_key_create(
     State(state): State<AppState>,
     auth: AuthContext,
@@ -427,24 +469,7 @@ pub async fn api_key_create(
         .clone()
         .ok_or_else(|| ServerError::Unauthorized("login required to create an api key".into()))?;
     let (db, _) = require_auth_db(&state)?;
-    let scopes = match req.scopes {
-        None => auth.scopes.clone(),
-        Some(names) => {
-            let mut set = ScopeSet::default();
-            for name in names {
-                let s = crate::auth::Scope::parse(&name)
-                    .ok_or_else(|| ServerError::Validation(format!("unknown scope: {name}")))?;
-                if !auth.scopes.contains(s) {
-                    return Err(ServerError::Forbidden(format!(
-                        "cannot grant a scope ({}) you don't hold",
-                        s.as_str()
-                    )));
-                }
-                set.insert(s);
-            }
-            set
-        }
-    };
+    let scopes = resolve_apikey_scopes(req.scopes, &principal.role)?;
     let exp = req
         .expires_in_seconds
         .map(|s| Utc::now() + Duration::seconds(s));
@@ -842,29 +867,7 @@ pub async fn admin_create_principal_apikey(
         })?;
     // Validate requested scopes against target principal's role ceiling
     // (mirrors Python generate_apikey: `scopes must be a subset of principal_scopes | {"inherit"}`).
-    let role_scopes = crate::auth::ScopeSet::for_role(&target_principal.role);
-    let scopes = match req.scopes {
-        None => {
-            // Default: inherit — expands to role scopes at use time.
-            let mut set = ScopeSet::default();
-            set.insert(crate::auth::Scope::Inherit);
-            set
-        }
-        Some(names) => {
-            let mut set = ScopeSet::default();
-            for name in names {
-                let s = crate::auth::Scope::parse(&name)
-                    .ok_or_else(|| ServerError::Validation(format!("unknown scope: {name}")))?;
-                if s != crate::auth::Scope::Inherit && !role_scopes.contains(s) {
-                    return Err(ServerError::Forbidden(format!(
-                        "Requested scopes {name:?} must be a subset of the principal's scopes."
-                    )));
-                }
-                set.insert(s);
-            }
-            set
-        }
-    };
+    let scopes = resolve_apikey_scopes(req.scopes, &target_principal.role)?;
     let exp = req
         .expires_in_seconds
         .map(|s| chrono::Utc::now() + Duration::seconds(s));
