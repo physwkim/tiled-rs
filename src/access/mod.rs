@@ -748,6 +748,25 @@ impl AccessPolicy for TagBasedPolicy {
             }
         };
 
+        // A tag-restricted API key nulls the owner (`user_id`) arm of the
+        // caller-facing filter. Mirrors upstream `filters()`
+        // (access_policies.py:410-413): `if authn_access_tags is not None:
+        // identifier = None`. This is the LISTING half of the same rule
+        // `principal_decision`'s owner branch enforces at direct-access time
+        // (the `authn_access_tags.is_none()` gate above); without it a restricted
+        // delegated key's `AccessBlobFilter` would still match the principal's own
+        // `{"user": …}` private rows via the `user_id` arm and leak them on
+        // `/search`, inlined `/metadata`, and the `/container/full` DATA export
+        // (which trusts this filter, doing no per-child `principal_decision`).
+        // Enforced here at the single filter-building owner so every caller-facing
+        // listing path inherits it. The tag arm was already narrowed by the key
+        // (`narrow_by_key`); this closes the owner arm so the two stay symmetric.
+        let user_id = if authn_access_tags.is_some() {
+            None
+        } else {
+            user_id
+        };
+
         // Per-tag scope filtering: include only tags that grant ALL requested
         // scopes. Tags with no tag_scopes rows fall back to default_scopes.
         // The NO_ACCESS guard above confirmed requested_scopes ⊆ default_scopes,
@@ -1164,6 +1183,83 @@ mod tests {
         assert!(
             d_unrestricted.scopes.contains(Scope::ReadMetadata),
             "an unrestricted key retains owner scopes on the owner's own node"
+        );
+    }
+
+    /// LISTING/EXPORT half of the F2 owner-node family (symmetric with
+    /// `principal_decision_owner_node_denied_under_restricted_key` above): a
+    /// tag-restricted API key must null the `user_id` (owner) arm of the
+    /// caller-facing filter, mirroring upstream `filters()`
+    /// (access_policies.py:410-413: `if authn_access_tags is not None:
+    /// identifier = None`). Without the null, the restricted key's
+    /// `AccessBlobFilter` still matches the principal's own `{"user": …}` private
+    /// rows via the owner arm and leaks them on `/search`, inlined `/metadata`,
+    /// and the `/container/full` DATA export. The nulling must hold for BOTH the
+    /// read:metadata listing path (search / metadata inline) AND the read:data
+    /// export path (container_full / wide-table), since both build the filter
+    /// through this single owner. An unrestricted key retains the owner arm.
+    #[tokio::test]
+    async fn list_filter_restricted_key_nulls_owner_arm() {
+        let db = setup_auth_db().await;
+        let alice = principal_with_tags(&db, &["team-a"]).await;
+        let policy = TagBasedPolicy::new(Arc::new(db), ScopeSet::full());
+        let session = ScopeSet::for_role("user");
+        let key_team_a: &[String] = &["team-a".to_string()];
+        let read_data = ScopeSet::from_iter([Scope::ReadData]);
+
+        // Restricted key on the read:metadata (search / inline) path: owner arm
+        // nulled → the AccessBlobFilter cannot match a `{"user": alice}` row, so
+        // Alice's private nodes are excluded from listings.
+        let f_meta = policy
+            .list_filter(
+                Some(&principal_from(&alice)),
+                &session,
+                &read_metadata(),
+                Some(key_team_a),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            f_meta.user_id, None,
+            "restricted key must null the owner arm on the listing path"
+        );
+        assert!(
+            f_meta.tags.contains(&"team-a".to_string()),
+            "the key's authorized tag survives the narrowing"
+        );
+
+        // Restricted key on the read:data (container_full / wide-table export)
+        // path: owner arm nulled → the DATA export excludes the owner's rows.
+        let f_data = policy
+            .list_filter(
+                Some(&principal_from(&alice)),
+                &session,
+                &read_data,
+                Some(key_team_a),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            f_data.user_id, None,
+            "restricted key must null the owner arm on the data-export path"
+        );
+
+        // Unrestricted key: the owner arm is retained (Alice's own key still
+        // lists Alice's own nodes). This is the contrast that made the missing
+        // null a real leak for a restricted delegated key.
+        let f_unrestricted = policy
+            .list_filter(
+                Some(&principal_from(&alice)),
+                &session,
+                &read_metadata(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            f_unrestricted.user_id.as_deref(),
+            Some(alice.uuid.as_str()),
+            "an unrestricted key keeps the owner arm"
         );
     }
 
