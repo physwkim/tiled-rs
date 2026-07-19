@@ -624,18 +624,18 @@ pub async fn session_revoke_by_token(
     let claims = issuer
         .verify_refresh(&body.refresh_token)
         .map_err(map_auth_err)?;
-    let session = db.lookup_session(&claims.sid).await.map_err(|e| match e {
+    // Confirm the session exists. Upstream `revoke_session`
+    // (authentication.py:1452-1459) looks it up with `lookup_valid_session`,
+    // which returns None only for a missing (or expired) session → 409, and
+    // otherwise returns the row regardless of its `revoked` flag. A found row —
+    // even one already revoked — is re-marked revoked and answered 204, so
+    // re-revoking is idempotent. We therefore only distinguish not-found here.
+    db.lookup_session(&claims.sid).await.map_err(|e| match e {
         crate::auth::AuthError::NotFound(_) => {
-            ServerError::Validation(format!("No session {}", claims.sid))
+            ServerError::Conflict(format!("No session {}", claims.sid))
         }
         other => map_auth_err(other),
     })?;
-    if session.revoked {
-        return Err(ServerError::Validation(format!(
-            "No session {}",
-            claims.sid
-        )));
-    }
     db.revoke_session(&claims.sid).await.map_err(map_auth_err)?;
     Ok(StatusCode::NO_CONTENT)
 }

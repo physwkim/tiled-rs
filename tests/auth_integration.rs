@@ -1346,7 +1346,10 @@ async fn session_revoke_by_token_revokes_session() {
         "refresh on revoked session must be 401"
     );
 
-    // Second revoke call must also return an error (already revoked).
+    // Second revoke on an already-revoked session is idempotent → 204. Upstream
+    // `revoke_session` (authentication.py:1452-1459) looks the session up with
+    // `lookup_valid_session`, which does NOT filter revoked rows, then re-marks
+    // it revoked and returns 204 — there is no already-revoked rejection.
     let (status, _) = json_request(
         &app,
         Method::POST,
@@ -1355,10 +1358,42 @@ async fn session_revoke_by_token_revokes_session() {
         Some(json!({"refresh_token": refresh})),
     )
     .await;
-    assert_ne!(
+    assert_eq!(
         status,
         StatusCode::NO_CONTENT,
-        "second revoke on already-revoked session must not succeed silently"
+        "second revoke on an already-revoked session must be idempotent 204 (upstream authentication.py:1452)"
+    );
+}
+
+/// `POST /api/v1/auth/session/revoke` with a valid refresh token whose session
+/// row does not exist → 409 Conflict. Upstream `revoke_session`
+/// (authentication.py:1452-1456): `lookup_valid_session` returns None for a
+/// missing session, which raises `HTTPException(HTTP_409_CONFLICT,
+/// "No session {session_id}")`.
+#[tokio::test]
+async fn session_revoke_by_token_missing_session_is_409() {
+    let (app, _dir, _cat, _auth_db) = build_test_app().await;
+
+    // Mint a well-formed refresh token whose session UUID was never inserted.
+    // Same secret as build_test_app's issuer, so `verify_refresh` accepts it and
+    // the handler reaches the (empty) session lookup.
+    let issuer = Issuer::new(b"this-is-a-test-secret-32-bytes-long!!").unwrap();
+    let refresh = issuer
+        .issue_refresh("no-such-principal", "00000000-0000-0000-0000-000000000000")
+        .unwrap();
+
+    let (status, _) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/auth/session/revoke",
+        &[],
+        Some(json!({"refresh_token": refresh})),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "revoke of a nonexistent session must be 409 (upstream authentication.py:1455)"
     );
 }
 
