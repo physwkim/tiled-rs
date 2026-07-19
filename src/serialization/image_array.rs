@@ -43,14 +43,13 @@ fn jpeg_serializer() -> SerializerFn {
 }
 
 fn tiff_serializer() -> SerializerFn {
-    Box::new(|data, meta| encode_image(data, meta, ImageFormat::Tiff))
+    Box::new(encode_tiff)
 }
 
 #[derive(Debug, Clone, Copy)]
 enum ImageFormat {
     Png,
     Jpeg,
-    Tiff,
 }
 
 fn encode_image(
@@ -81,27 +80,18 @@ fn encode_image(
         .unwrap_or("<")
         == ">";
 
-    let (h, w) = match shape.len() {
-        2 => (shape[0], shape[1]),
-        n if n >= 1 => {
-            // Flatten to (rows*..., cols).
-            let cols = *shape.last().unwrap();
-            let rows: usize = shape[..n - 1].iter().product();
-            (rows, cols)
-        }
-        _ => {
-            return Err("array has zero rank — can't render as image".into());
-        }
-    };
+    let (h, w) = image_dims(&shape)?;
 
-    // Convert the pixel buffer to u8 grayscale. Mirrors upstream
-    // `save_to_buffer_PIL` (array.py:76), which widens EVERY numeric dtype to
-    // float32 (`array.astype(numpy.float32)`) before scaling: a single uniform
-    // "decode element → f32 → normalize" path serves u/i/f at any width and
-    // complex (real part), so no integer width can fall through to a raw-byte
-    // reinterpretation. Non-renderable kinds (U/S/M/m/…) are a loud error,
-    // matching upstream where `.astype(numpy.float32)` raises and `serialize_html`
-    // then falls back to CSV (array.py:143-153).
+    // Convert the pixel buffer to u8 grayscale. This scaling path serves only
+    // PNG/JPEG, which upstream routes through `save_to_buffer_PIL` (array.py:76)
+    // — it widens EVERY numeric dtype to float32 (`array.astype(numpy.float32)`)
+    // before percentile-scaling: a single uniform "decode element → f32 →
+    // normalize" path serves u/i/f at any width and complex (real part), so no
+    // integer width can fall through to a raw-byte reinterpretation. TIFF is NOT
+    // handled here — upstream `save_to_buffer_tifffile` writes the NATIVE dtype
+    // losslessly, so TIFF has its own [`encode_tiff`] path. Non-renderable kinds
+    // (U/S/M/m/…) are a loud error, matching upstream where `.astype(numpy.float32)`
+    // raises and `serialize_html` then falls back to CSV (array.py:143-153).
     let pixels: Vec<u8> = if kind == "b" {
         // Booleans map directly to 0/255. Upstream `astype(float32)` yields the
         // {0.0, 1.0} two-level array, which percentile-scales to the same two
@@ -142,12 +132,136 @@ fn encode_image(
             )
             .map_err(|e| format!("jpeg encode: {e}"))?;
         }
-        ImageFormat::Tiff => {
-            // image crate's TIFF encoder works through DynamicImage.
-            let dyn_img = image::DynamicImage::ImageLuma8(img);
-            dyn_img
-                .write_to(&mut out, image::ImageFormat::Tiff)
-                .map_err(|e| format!("tiff encode: {e}"))?;
+    }
+    Ok(Bytes::from(out.into_inner()))
+}
+
+/// Collapse an N-D `shape` to the `(height, width)` of a 2-D grayscale image,
+/// squeezing every axis past the last into "rows" — the fallback the PNG/JPEG
+/// and TIFF paths share. A zero-rank shape cannot be rendered.
+fn image_dims(
+    shape: &[usize],
+) -> Result<(usize, usize), crate::serialization::registry::SerializeError> {
+    match shape.len() {
+        2 => Ok((shape[0], shape[1])),
+        n if n >= 1 => {
+            let cols = *shape.last().unwrap();
+            let rows: usize = shape[..n - 1].iter().product();
+            Ok((rows, cols))
+        }
+        _ => Err("array has zero rank — can't render as image".into()),
+    }
+}
+
+/// Read `N`-byte elements from `data` (reversing each element's bytes when the
+/// source is big-endian) and map each through `conv` to a native value `T`. The
+/// typed analogue of `decode_numeric_to_f32`'s `map_le`, used to feed the TIFF
+/// encoder native samples instead of scaled `f32`.
+fn decode_elems<const N: usize, T>(
+    data: &[u8],
+    big_endian: bool,
+    conv: impl Fn([u8; N]) -> T,
+) -> Vec<T> {
+    data.chunks_exact(N)
+        .map(|c| {
+            let mut b: [u8; N] = c.try_into().expect("chunks_exact(N) yields N bytes");
+            if big_endian {
+                b.reverse();
+            }
+            conv(b)
+        })
+        .collect()
+}
+
+/// Lossless TIFF serializer — mirrors upstream `save_to_buffer_tifffile`
+/// (array.py:113-136): `tifffile.imwrite(file, numpy.atleast_2d(array))` writes
+/// the array in its NATIVE dtype with NO scaling, so the magnitudes round-trip
+/// exactly. This is deliberately unlike the PNG/JPEG path ([`encode_image`]),
+/// which upstream routes through `save_to_buffer_PIL`'s percentile scale-to-u8
+/// preview — the shared scaling was silent data loss for TIFF.
+///
+/// The `image` crate's `DynamicImage` only models u8/u16, so we drive the
+/// underlying `tiff` crate's `TiffEncoder` directly, emitting a single-channel
+/// grayscale image whose sample format/width matches the numpy dtype:
+/// u8/u16/u32/u64 (`Uint`), i8/i16/i32/i64 (`Int`), f32/f64 (`IEEEFP`). float16
+/// has no grayscale sample type in tiff 0.9, so it is WIDENED to f32 — value-
+/// lossless (f16 → f32 is exact), consistent with how the CSV/JSON array
+/// serializers widen f16; the only divergence is the on-disk BitsPerSample (32
+/// vs tifffile's 16). Any other kind (bool/complex/datetime/unicode/…) is a loud
+/// error rather than a silently scaled preview (correctness over completeness).
+fn encode_tiff(
+    data: &[u8],
+    metadata: &serde_json::Value,
+) -> Result<Bytes, crate::serialization::registry::SerializeError> {
+    use tiff::encoder::{TiffEncoder, colortype};
+
+    let itemsize = metadata
+        .get("itemsize")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(8) as usize;
+    if itemsize == 0 {
+        return Err("itemsize must be > 0 to render an image".into());
+    }
+    let kind = metadata.get("kind").and_then(|v| v.as_str()).unwrap_or("f");
+    let shape: Vec<usize> = metadata
+        .get("shape")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_u64().map(|n| n as usize))
+                .collect()
+        })
+        .unwrap_or_default();
+    let big_endian = metadata
+        .get("byteorder")
+        .and_then(|v| v.as_str())
+        .unwrap_or("<")
+        == ">";
+
+    let (h, w) = image_dims(&shape)?;
+    let want = h.checked_mul(w).ok_or("h*w overflow")?;
+    let width = u32::try_from(w).map_err(|_| "image width exceeds u32")?;
+    let height = u32::try_from(h).map_err(|_| "image height exceeds u32")?;
+
+    let mut out = Cursor::new(Vec::new());
+    {
+        let mut enc = TiffEncoder::new(&mut out).map_err(|e| format!("tiff init: {e}"))?;
+        // Decode the raw buffer into native samples (honoring source byte order),
+        // pad/truncate to the expected pixel count, and write one grayscale IFD.
+        macro_rules! write_native {
+            ($ct:ident, $t:ty, $n:literal) => {{
+                let mut v: Vec<$t> = decode_elems::<$n, $t>(data, big_endian, <$t>::from_le_bytes);
+                v.resize(want, <$t>::default());
+                enc.write_image::<colortype::$ct>(width, height, &v)
+                    .map_err(|e| format!("tiff encode: {e}"))?;
+            }};
+        }
+        match (kind, itemsize) {
+            ("u", 1) => write_native!(Gray8, u8, 1),
+            ("u", 2) => write_native!(Gray16, u16, 2),
+            ("u", 4) => write_native!(Gray32, u32, 4),
+            ("u", 8) => write_native!(Gray64, u64, 8),
+            ("i", 1) => write_native!(GrayI8, i8, 1),
+            ("i", 2) => write_native!(GrayI16, i16, 2),
+            ("i", 4) => write_native!(GrayI32, i32, 4),
+            ("i", 8) => write_native!(GrayI64, i64, 8),
+            ("f", 4) => write_native!(Gray32Float, f32, 4),
+            ("f", 8) => write_native!(Gray64Float, f64, 8),
+            // float16: no 16-bit-float grayscale sample type in tiff 0.9 → widen
+            // to f32 (value-lossless), the same convention the CSV/JSON serializers use.
+            ("f", 2) => {
+                let mut v: Vec<f32> = decode_elems::<2, f32>(data, big_endian, |b| {
+                    half::f16::from_bits(u16::from_le_bytes(b)).to_f32()
+                });
+                v.resize(want, 0.0);
+                enc.write_image::<colortype::Gray32Float>(width, height, &v)
+                    .map_err(|e| format!("tiff encode: {e}"))?;
+            }
+            _ => {
+                return Err(
+                    format!("cannot encode dtype {kind}{itemsize} as lossless TIFF").into(),
+                );
+            }
         }
     }
     Ok(Bytes::from(out.into_inner()))
@@ -320,6 +434,158 @@ pub(crate) fn encode_array_png(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Dispatch through the registered `image/tiff` serializer, mirroring a real
+    /// `GET /array/full/x?format=tiff`, and return the encoded TIFF bytes.
+    fn tiff_bytes(data: &[u8], meta: &serde_json::Value) -> Bytes {
+        let reg = SerializationRegistry::new();
+        register_image_serializers(&reg);
+        let ser = reg
+            .dispatch(StructureFamily::Array, "image/tiff")
+            .expect("image/tiff must be registered for array");
+        ser(data, meta).expect("tiff serialize")
+    }
+
+    /// FAILING-TEST-FIRST (Finding 2, silent data loss): `image/tiff` must be a
+    /// LOSSLESS native-dtype encode — mirroring upstream `save_to_buffer_tifffile`
+    /// (`tifffile.imwrite(numpy.atleast_2d(array))`, array.py:113-136), which
+    /// writes the array in its native dtype with NO scaling. Before the fix, TIFF
+    /// shared the PNG percentile-scale-to-u8 path, so an f64 `[[100,200],[300,400]]`
+    /// came back as an 8-bit preview (≈`[[0,85],[170,255]]`, decoded as `U8`) with
+    /// the real magnitudes gone. The fix must round-trip the exact f64 values.
+    #[test]
+    fn tiff_is_lossless_native_f64_not_scaled_preview() {
+        let vals = [100.0f64, 200.0, 300.0, 400.0];
+        let data: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let meta =
+            serde_json::json!({"itemsize": 8, "kind": "f", "byteorder": "<", "shape": [2, 2]});
+        let out = tiff_bytes(&data, &meta);
+        let mut dec = tiff::decoder::Decoder::new(Cursor::new(out.to_vec())).unwrap();
+        assert_eq!(dec.dimensions().unwrap(), (2, 2), "width, height");
+        match dec.read_image().unwrap() {
+            tiff::decoder::DecodingResult::F64(v) => assert_eq!(
+                v,
+                vals.to_vec(),
+                "f64 TIFF must preserve native magnitudes, not an 8-bit preview"
+            ),
+            other => panic!("expected lossless F64 samples, got {other:?}"),
+        }
+    }
+
+    /// uint16 (`Gray16`) round-trips losslessly with values far outside u8 range.
+    #[test]
+    fn tiff_is_lossless_native_u16() {
+        let vals = [0u16, 1000, 40000, 65535];
+        let data: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let meta =
+            serde_json::json!({"itemsize": 2, "kind": "u", "byteorder": "<", "shape": [2, 2]});
+        let out = tiff_bytes(&data, &meta);
+        let mut dec = tiff::decoder::Decoder::new(Cursor::new(out.to_vec())).unwrap();
+        match dec.read_image().unwrap() {
+            tiff::decoder::DecodingResult::U16(v) => assert_eq!(v, vals.to_vec()),
+            other => panic!("expected U16, got {other:?}"),
+        }
+    }
+
+    /// int32 (`GrayI32`) round-trips losslessly, including negatives (Int sample
+    /// format) — the scaling path would have clamped these to a u8 grey ramp.
+    #[test]
+    fn tiff_is_lossless_native_i32() {
+        let vals = [-2_000_000i32, -1, 0, 2_000_000];
+        let data: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let meta =
+            serde_json::json!({"itemsize": 4, "kind": "i", "byteorder": "<", "shape": [2, 2]});
+        let out = tiff_bytes(&data, &meta);
+        let mut dec = tiff::decoder::Decoder::new(Cursor::new(out.to_vec())).unwrap();
+        match dec.read_image().unwrap() {
+            tiff::decoder::DecodingResult::I32(v) => assert_eq!(v, vals.to_vec()),
+            other => panic!("expected I32, got {other:?}"),
+        }
+    }
+
+    /// float32 (`Gray32Float`) round-trips losslessly.
+    #[test]
+    fn tiff_is_lossless_native_f32() {
+        let vals = [-1.5f32, 0.0, 3.25, 1e6];
+        let data: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let meta =
+            serde_json::json!({"itemsize": 4, "kind": "f", "byteorder": "<", "shape": [2, 2]});
+        let out = tiff_bytes(&data, &meta);
+        let mut dec = tiff::decoder::Decoder::new(Cursor::new(out.to_vec())).unwrap();
+        match dec.read_image().unwrap() {
+            tiff::decoder::DecodingResult::F32(v) => assert_eq!(v, vals.to_vec()),
+            other => panic!("expected F32, got {other:?}"),
+        }
+    }
+
+    /// A big-endian source is decoded to the true values before the (little-endian)
+    /// TIFF is written: a BE and LE buffer of the same u16 image produce identical
+    /// TIFF bytes and decode to the same samples.
+    #[test]
+    fn tiff_honors_source_byteorder() {
+        let vals = [1u16, 258, 4660, 65535];
+        let le: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let be: Vec<u8> = vals.iter().flat_map(|v| v.to_be_bytes()).collect();
+        let meta_le =
+            serde_json::json!({"itemsize": 2, "kind": "u", "byteorder": "<", "shape": [2, 2]});
+        let meta_be =
+            serde_json::json!({"itemsize": 2, "kind": "u", "byteorder": ">", "shape": [2, 2]});
+        let tiff_le = tiff_bytes(&le, &meta_le);
+        let tiff_be = tiff_bytes(&be, &meta_be);
+        assert_eq!(
+            tiff_le, tiff_be,
+            "BE and LE sources must encode identically"
+        );
+        let mut dec = tiff::decoder::Decoder::new(Cursor::new(tiff_be.to_vec())).unwrap();
+        match dec.read_image().unwrap() {
+            tiff::decoder::DecodingResult::U16(v) => assert_eq!(v, vals.to_vec()),
+            other => panic!("expected U16, got {other:?}"),
+        }
+    }
+
+    /// float16 has no 16-bit-float grayscale sample type in tiff 0.9, so it is
+    /// WIDENED to f32 (`Gray32Float`) — value-lossless (f16 → f32 is exact),
+    /// consistent with how the CSV/JSON array serializers widen f16. This is a
+    /// documented on-disk-dtype divergence (BitsPerSample=32 vs tifffile's 16),
+    /// NOT the silent scale-to-u8 preview it replaced.
+    #[test]
+    fn tiff_float16_widens_to_f32_lossless() {
+        // Values exact in float16.
+        let vals = [0.0f32, 0.25, 0.5, 1.0];
+        let data: Vec<u8> = vals
+            .iter()
+            .flat_map(|&v| half::f16::from_f32(v).to_bits().to_le_bytes())
+            .collect();
+        let meta =
+            serde_json::json!({"itemsize": 2, "kind": "f", "byteorder": "<", "shape": [2, 2]});
+        let out = tiff_bytes(&data, &meta);
+        let mut dec = tiff::decoder::Decoder::new(Cursor::new(out.to_vec())).unwrap();
+        match dec.read_image().unwrap() {
+            tiff::decoder::DecodingResult::F32(v) => assert_eq!(v, vals.to_vec()),
+            other => panic!("expected widened F32, got {other:?}"),
+        }
+    }
+
+    /// A dtype the tiff crate cannot express losslessly (complex here) is a loud
+    /// error, NOT a silently scaled 8-bit preview (correctness over completeness).
+    #[test]
+    fn tiff_rejects_non_native_dtype_instead_of_scaling() {
+        // complex64: 8 bytes/element, 2×2.
+        let data = vec![0u8; 8 * 4];
+        let meta =
+            serde_json::json!({"itemsize": 8, "kind": "c", "byteorder": "<", "shape": [2, 2]});
+        let reg = SerializationRegistry::new();
+        register_image_serializers(&reg);
+        let ser = reg
+            .dispatch(StructureFamily::Array, "image/tiff")
+            .expect("image/tiff must be registered");
+        let err =
+            ser(&data, &meta).expect_err("non-native dtype must error, not emit a scaled preview");
+        assert!(
+            err.to_string().contains("c8"),
+            "error must name the unsupported dtype: {err}"
+        );
+    }
 
     /// Finding 3 (updated for the unified decoder): a big-endian decode must read
     /// the true value, not a byte-swapped one. 0x1234 decodes to 4660.0 as both
