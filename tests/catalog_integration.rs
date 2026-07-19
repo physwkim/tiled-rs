@@ -2397,3 +2397,196 @@ async fn container_structure_always_carries_explicit_contents_null() {
         "/search entry structure count: {structure}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Pagination-bounds parity (Wave-36): the `page[offset]`/`page[cursor]`/
+// `page[limit]` window is validated by a single owner mirroring upstream's
+// `PaginationParams` dependency (dependencies.py:258-278). Out-of-range or
+// non-integer values are 422 (pydantic `ge`/`le`), and `page[cursor]` +
+// `page[offset]` together is a 400 — never silently clamped/defaulted.
+// Exercised on BOTH paginated routes (`/search`, `/revisions`).
+// ---------------------------------------------------------------------------
+
+/// Build a test app holding one node (`key`) with at least one metadata
+/// revision, so `GET /revisions/{key}` returns a 200 page for a valid request —
+/// the baseline the pagination-bounds tests perturb.
+async fn app_with_revisioned_node(key: &str) -> (axum::Router, tempfile::TempDir) {
+    let (app, dir) = build_test_app().await;
+    let (status, _) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/metadata/",
+        serde_json::json!({
+            "key": key,
+            "structure_family": "container",
+            "metadata": {"v": 1},
+            "specs": [],
+            "data_sources": [],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = json_request(
+        &app,
+        Method::PUT,
+        &format!("/api/v1/metadata/{key}"),
+        serde_json::json!({"metadata": {"v": 2}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "PUT to generate a revision");
+    (app, dir)
+}
+
+// --- /search ---------------------------------------------------------------
+
+#[tokio::test]
+async fn search_page_limit_over_max_returns_422() {
+    let (app, _dir) = build_test_app().await;
+    let (status, body) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/search/?page[limit]=301",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(
+        body["error"]["message"], "Input should be less than or equal to 300",
+        "pydantic le message: {body}"
+    );
+}
+
+#[tokio::test]
+async fn search_page_offset_negative_returns_422() {
+    let (app, _dir) = build_test_app().await;
+    let (status, body) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/search/?page[offset]=-1",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(
+        body["error"]["message"], "Input should be greater than or equal to 0",
+        "pydantic ge message: {body}"
+    );
+}
+
+#[tokio::test]
+async fn search_page_offset_non_int_returns_422() {
+    let (app, _dir) = build_test_app().await;
+    let (status, body) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/search/?page[offset]=abc",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+}
+
+#[tokio::test]
+async fn search_page_limit_negative_returns_422() {
+    let (app, _dir) = build_test_app().await;
+    let (status, body) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/search/?page[limit]=-1",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+}
+
+#[tokio::test]
+async fn search_page_limit_non_int_returns_422() {
+    let (app, _dir) = build_test_app().await;
+    let (status, body) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/search/?page[limit]=abc",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+}
+
+#[tokio::test]
+async fn search_page_cursor_and_offset_conflict_returns_400() {
+    let (app, _dir) = build_test_app().await;
+    let (status, body) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/search/?page[cursor]=1&page[offset]=1",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        body["error"]["message"], "Cannot specify both page[cursor] and page[offset]",
+        "upstream conflict detail: {body}"
+    );
+}
+
+// --- /revisions ------------------------------------------------------------
+
+#[tokio::test]
+async fn revisions_page_limit_over_max_returns_422() {
+    let (app, _dir) = app_with_revisioned_node("rev").await;
+    let (status, body) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/revisions/rev?page[limit]=301",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(
+        body["error"]["message"], "Input should be less than or equal to 300",
+        "pydantic le message: {body}"
+    );
+}
+
+#[tokio::test]
+async fn revisions_page_offset_negative_returns_422() {
+    let (app, _dir) = app_with_revisioned_node("rev").await;
+    let (status, body) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/revisions/rev?page[offset]=-1",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+}
+
+#[tokio::test]
+async fn revisions_page_limit_non_int_returns_422() {
+    let (app, _dir) = app_with_revisioned_node("rev").await;
+    let (status, body) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/revisions/rev?page[limit]=abc",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+}
+
+#[tokio::test]
+async fn revisions_page_cursor_and_offset_conflict_returns_400() {
+    let (app, _dir) = app_with_revisioned_node("rev").await;
+    let (status, body) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/revisions/rev?page[cursor]=1&page[offset]=1",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        body["error"]["message"], "Cannot specify both page[cursor] and page[offset]",
+        "upstream conflict detail: {body}"
+    );
+}

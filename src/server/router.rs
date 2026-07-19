@@ -637,6 +637,90 @@ fn parse_max_depth(raw: Option<&str>) -> Result<Option<usize>, ServerError> {
     Ok(Some(n as usize))
 }
 
+/// Parse a `Query(None, ge=0)` non-negative-integer query value, mirroring
+/// pydantic v2. The value is parsed as a SIGNED integer first, so a negative
+/// value fails the `ge=0` bound (422 "greater than or equal to 0") rather than
+/// integer parsing — the same precedence as [`parse_max_depth`]. Absent ⇒
+/// `None`; a non-integer ⇒ 422 with pydantic's verbatim parse message.
+fn parse_ge0(raw: Option<&str>) -> Result<Option<i64>, ServerError> {
+    let Some(s) = raw else {
+        return Ok(None);
+    };
+    let n: i64 = s.parse().map_err(|_| {
+        ServerError::Validation(
+            "Input should be a valid integer, unable to parse string as an integer".into(),
+        )
+    })?;
+    if n < 0 {
+        return Err(ServerError::Validation(
+            "Input should be greater than or equal to 0".into(),
+        ));
+    }
+    Ok(Some(n))
+}
+
+/// Parsed, validated pagination window — the single owner of the
+/// `page[offset]` / `page[cursor]` / `page[limit]` contract for every paginated
+/// route (`search`, `get_revisions`), mirroring upstream's `PaginationParams`
+/// dependency (dependencies.py:258-278). Each field is validated with the SAME
+/// precedence FastAPI/pydantic applies before the route body runs, and the
+/// messages mirror pydantic v2 / the upstream detail verbatim:
+///
+/// - `page[offset]` = `Query(None, ge=0)`  → `< 0` or non-int ⇒ 422
+/// - `page[cursor]` = `Query(None, ge=0)`  → `< 0` or non-int ⇒ 422
+/// - `page[limit]`  = `Query(DEFAULT_PAGE_SIZE, ge=0, le=MAX_PAGE_SIZE)`
+///   → `< 0`, `> MAX_PAGE_SIZE`, or non-int ⇒ 422
+/// - `page[cursor]` AND `page[offset]` both present ⇒ 400 "Cannot specify both
+///   page[cursor] and page[offset]" (upstream's explicit guard).
+///
+/// The per-param 422s take precedence over the conflict 400, matching FastAPI:
+/// pydantic validates every query param before `PaginationParams.__init__` runs
+/// the conflict guard. When neither offset nor cursor is given, offset defaults
+/// to 0 (and limit to `DEFAULT_PAGE_SIZE`). Routing both paginated endpoints
+/// through this owner is what stops the old per-route `.min()` clamp / silent
+/// `unwrap_or` divergence from recurring.
+struct PaginationParams {
+    offset: usize,
+    cursor: Option<i64>,
+    limit: usize,
+}
+
+impl PaginationParams {
+    /// Validate the three raw `page[*]` values (already extracted from the
+    /// route's own param container — a `Vec<(K,V)>` for search, a `HashMap` for
+    /// revisions) into a bounded window, or return the matching 422/400.
+    fn parse(
+        raw_offset: Option<&str>,
+        raw_cursor: Option<&str>,
+        raw_limit: Option<&str>,
+    ) -> Result<Self, ServerError> {
+        // Validate every param first (422) — upstream's conflict 400 only runs
+        // after pydantic has accepted all three.
+        let offset = parse_ge0(raw_offset)?;
+        let cursor = parse_ge0(raw_cursor)?;
+        let limit = match parse_ge0(raw_limit)? {
+            Some(n) if n > links::MAX_PAGE_SIZE as i64 => {
+                return Err(ServerError::Validation(format!(
+                    "Input should be less than or equal to {}",
+                    links::MAX_PAGE_SIZE
+                )));
+            }
+            Some(n) => n as usize,
+            None => links::DEFAULT_PAGE_SIZE,
+        };
+        if cursor.is_some() && offset.is_some() {
+            return Err(ServerError::BadRequest(
+                "Cannot specify both page[cursor] and page[offset]".into(),
+            ));
+        }
+        Ok(Self {
+            offset: offset.unwrap_or(0) as usize,
+            cursor,
+            limit,
+        })
+    }
+}
+
 pub async fn search_root(
     state: State<AppState>,
     // Vec<(K,V)> preserves repeated keys so multiple same-type filters all survive.
@@ -673,23 +757,28 @@ pub async fn search(
     )?;
     let segments = segments_from_uri(&uri, "/api/v1/search/");
 
-    let offset: usize = params
-        .iter()
-        .find(|(k, _)| k == "page[offset]")
-        .and_then(|(_, v)| v.parse().ok())
-        .unwrap_or(0);
-    let limit: usize = params
-        .iter()
-        .find(|(k, _)| k == "page[limit]")
-        .and_then(|(_, v)| v.parse().ok())
-        .unwrap_or(links::DEFAULT_PAGE_SIZE)
-        .min(links::MAX_PAGE_SIZE);
-    // Keyset cursor (a node id) the client got from a previous `next` link.
-    // Present ⇒ serve the page after it instead of the offset window.
-    let cursor: Option<i64> = params
-        .iter()
-        .find(|(k, _)| k == "page[cursor]")
-        .and_then(|(_, v)| v.parse().ok());
+    // Validated pagination window (single owner, PaginationParams). Out-of-range
+    // or non-integer `page[*]` values are 422; `page[cursor]` present ⇒ serve
+    // the keyset page after that node id instead of the `[offset, offset+limit)`
+    // window, and `page[cursor]` + `page[offset]` together is a 400.
+    let PaginationParams {
+        offset,
+        cursor,
+        limit,
+    } = PaginationParams::parse(
+        params
+            .iter()
+            .find(|(k, _)| k == "page[offset]")
+            .map(|(_, v)| v.as_str()),
+        params
+            .iter()
+            .find(|(k, _)| k == "page[cursor]")
+            .map(|(_, v)| v.as_str()),
+        params
+            .iter()
+            .find(|(k, _)| k == "page[limit]")
+            .map(|(_, v)| v.as_str()),
+    )?;
 
     // Parse `sort` before consuming `params`: comma-separated keys, leading
     // `-` descending. Threaded into the catalog ORDER BY below. A duplicate key
@@ -7474,15 +7563,15 @@ pub async fn get_revisions(
 ) -> Result<impl IntoResponse, ServerError> {
     auth.require(crate::auth::Scope::ReadMetadata)?;
     let segments = segments_from_uri(&uri, "/api/v1/revisions/");
-    let offset: usize = params
-        .get("page[offset]")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-    let limit: usize = params
-        .get("page[limit]")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(links::DEFAULT_PAGE_SIZE)
-        .min(links::MAX_PAGE_SIZE);
+    // Same validated pagination window as `search` (single owner). Upstream's
+    // `construct_revisions_response` reads only offset+limit, but the shared
+    // `PaginationParams` guard still rejects `page[cursor]` + `page[offset]`
+    // together (400) and any out-of-range/non-integer value (422).
+    let PaginationParams { offset, limit, .. } = PaginationParams::parse(
+        params.get("page[offset]").map(String::as_str),
+        params.get("page[cursor]").map(String::as_str),
+        params.get("page[limit]").map(String::as_str),
+    )?;
 
     // A node that does not persist revisions (no catalog → in-memory tree)
     // does not support them → 405, matching Python's "This node does not
