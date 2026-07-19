@@ -642,7 +642,12 @@ fn parse_max_depth(raw: Option<&str>) -> Result<Option<usize>, ServerError> {
 /// value fails the `ge=0` bound (422 "greater than or equal to 0") rather than
 /// integer parsing — the same precedence as [`parse_max_depth`]. Absent ⇒
 /// `None`; a non-integer ⇒ 422 with pydantic's verbatim parse message.
-fn parse_ge0(raw: Option<&str>) -> Result<Option<i64>, ServerError> {
+///
+/// `pub(crate)` so every `Query(..., ge=0)` query param across the server —
+/// pagination here, `principal_list`'s inline `page[offset]`/`page[limit]` in
+/// [`crate::server::auth_router`] — validates through ONE owner rather than
+/// re-deriving the ge=0/non-int contract per route.
+pub(crate) fn parse_ge0(raw: Option<&str>) -> Result<Option<i64>, ServerError> {
     let Some(s) = raw else {
         return Ok(None);
     };
