@@ -17,7 +17,7 @@ use tiled_rs::core::adapters::ContainerAdapter;
 use tiled_rs::core::data_source::{DataSource, Management};
 use tiled_rs::core::dtype::{BuiltinDType, DType, Endianness, Kind};
 use tiled_rs::core::queries::Query;
-use tiled_rs::core::structures::{AnyStructure, ArrayStructure, StructureFamily};
+use tiled_rs::core::structures::{AnyStructure, ArrayStructure, StructureFamily, TableStructure};
 use tiled_rs::server::file_resolver::FileLeafResolver;
 
 /// Build an app whose catalog has `writable_dir` configured as writable
@@ -253,11 +253,13 @@ async fn write_rejects_wrong_body_length() {
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
 }
 
-#[tokio::test]
-async fn managed_create_without_writable_storage_makes_metadata_only_node() {
-    // Without --writable-storage, a managed create persists a metadata-only
-    // node (no generated storage): the GET /array/full then 404s because the
-    // data source has no resolvable asset. Confirms the opt-in gate.
+/// Build an app whose catalog has NO writable storage configured (the
+/// `with_writable_storage` opt-in omitted) and a resolver over no roots.
+/// Mirrors `build_write_app` minus writable storage — the state under which a
+/// create carrying data sources must be refused (upstream router.py:1800-1804,
+/// `entry.writable == bool(context.writable_storage)`). Returns the router plus
+/// the catalog TempDir (keep it alive — the SQLite pool lives inside it).
+async fn build_no_writable_app() -> (axum::Router, tempfile::TempDir) {
     let db_dir = tempfile::tempdir().unwrap();
     let uri = format!("sqlite://{}", db_dir.path().join("catalog.db").display());
     let catalog = Catalog::connect(&uri).await.unwrap();
@@ -306,7 +308,17 @@ async fn managed_create_without_writable_storage_makes_metadata_only_node() {
         background_tasks: tiled_rs::server::state::BackgroundTasks::new(),
         validation: Default::default(),
     };
-    let app = tiled_rs::server::build_app(state);
+    (tiled_rs::server::build_app(state), db_dir)
+}
+
+#[tokio::test]
+async fn create_with_data_sources_rejected_without_writable_storage() {
+    // A catalog with no writable storage cannot generate managed storage, so a
+    // POST /metadata carrying data sources must be refused up front with 405 —
+    // upstream parity (router.py:1800-1804). Before the guard this create
+    // returned 201 and persisted a junk metadata-only node whose GET /array/full
+    // then 422'd forever. RED-first: assert 405 AND that no node was persisted.
+    let (app, _db_dir) = build_no_writable_app().await;
 
     let ds = DataSource {
         structure_family: StructureFamily::Array,
@@ -318,7 +330,7 @@ async fn managed_create_without_writable_storage_makes_metadata_only_node() {
         assets: vec![],
         management: Management::Writable,
     };
-    let (status, _) = json_request(
+    let (status, body) = json_request(
         &app,
         Method::POST,
         "/api/v1/metadata/",
@@ -330,22 +342,73 @@ async fn managed_create_without_writable_storage_makes_metadata_only_node() {
     .await;
     assert_eq!(
         status,
-        StatusCode::CREATED,
-        "create should still succeed (metadata-only)"
+        StatusCode::METHOD_NOT_ALLOWED,
+        "array create carrying data sources without writable storage must 405: {body}"
     );
 
-    // No storage was generated, so a write has nothing writable to target.
-    let (status, _) = bytes_request(
+    // No half-baked node may be persisted — the node must not exist.
+    let (status, _) = json_request(
         &app,
-        Method::PUT,
-        "/api/v1/array/full/arr",
-        None,
-        vec![0u8; 32],
+        Method::GET,
+        "/api/v1/metadata/arr",
+        serde_json::Value::Null,
     )
     .await;
-    assert_ne!(
+    assert_eq!(
         status,
-        StatusCode::OK,
-        "write must not succeed without writable storage"
+        StatusCode::NOT_FOUND,
+        "no node may be persisted when the array create is refused"
+    );
+}
+
+#[tokio::test]
+async fn create_table_with_data_sources_rejected_without_writable_storage() {
+    // The guard keys on data-source presence, not structure family: a table
+    // create is refused for the same reason as an array create, and likewise
+    // persists no node.
+    let (app, _db_dir) = build_no_writable_app().await;
+
+    let ds = DataSource {
+        structure_family: StructureFamily::Table,
+        structure: Some(AnyStructure::Table(TableStructure {
+            arrow_schema: String::new(),
+            npartitions: 1,
+            columns: vec!["x".into(), "y".into()],
+            resizable: Default::default(),
+        })),
+        id: None,
+        mimetype: Some("text/csv".into()),
+        parameters: serde_json::json!({}),
+        properties: serde_json::json!({}),
+        assets: vec![],
+        management: Management::Writable,
+    };
+    let (status, body) = json_request(
+        &app,
+        Method::POST,
+        "/api/v1/metadata/",
+        serde_json::json!({
+            "key": "t", "structure_family": "table",
+            "metadata": {}, "specs": [], "data_sources": [ds],
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::METHOD_NOT_ALLOWED,
+        "table create carrying data sources without writable storage must 405: {body}"
+    );
+
+    let (status, _) = json_request(
+        &app,
+        Method::GET,
+        "/api/v1/metadata/t",
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "no node may be persisted when the table create is refused"
     );
 }
