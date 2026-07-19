@@ -7,9 +7,14 @@
 //! `context.rs` does not balloon and the admin surface stays cohesive.
 //!
 //! Every call requires the caller to hold the relevant admin scope
-//! (`read:principals`, `write:principals`, `admin:apikeys`); the server answers
-//! 403 (surfaced as [`ClientError::PermissionDenied`](crate::client::ClientError::PermissionDenied))
-//! otherwise. Like the API-key methods on `Context`, these requests bypass the
+//! (`read:principals`, `write:principals`, `admin:apikeys`). These are
+//! route-level scope gates — upstream `Security(check_scopes, [scope])` — which
+//! answer **401** for insufficient route scope (with a `WWW-Authenticate`
+//! header), surfaced as
+//! [`ClientError::AuthRequired`](crate::client::ClientError::AuthRequired).
+//! (A per-node access-policy denial on a *visible* node is the distinct 403 /
+//! [`ClientError::PermissionDenied`](crate::client::ClientError::PermissionDenied)
+//! case.) Like the API-key methods on `Context`, these requests bypass the
 //! response cache — administrative state must never be served from cache.
 
 use reqwest::Method;

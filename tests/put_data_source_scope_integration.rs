@@ -6,9 +6,12 @@
 //!
 //! These tests pin the scope contract at the HTTP boundary: a default
 //! `user`-role principal (write:data + write:metadata, no register) is denied
-//! (403), while an `admin` (which carries register) succeeds (200). With no
+//! (401), while an `admin` (which carries register) succeeds (200). With no
 //! access policy wired, session scopes are exactly `for_role(role)`, so the
-//! only thing under test is the handler's scope gate.
+//! only thing under test is the handler's scope gate. The refusal is the
+//! *route-level* `check_scopes(["write:metadata","register"])` gate (:1944),
+//! which raises HTTP_401_UNAUTHORIZED for the missing `register` scope — the
+//! per-node `get_entry` (403) gate is only reached once the route gate passes.
 
 use std::sync::Arc;
 
@@ -202,7 +205,9 @@ async fn put_data_source(
 }
 
 /// A default `user` (write:data + write:metadata, no register) must be REFUSED:
-/// rewriting a storage mapping is a register-scoped operation upstream.
+/// rewriting a storage mapping is a register-scoped operation upstream. With no
+/// access policy wired, the refusal is the route-level `check_scopes` gate →
+/// 401 (the un-narrowed credential lacks `register`).
 #[tokio::test]
 async fn put_data_source_denied_for_user_without_register() {
     let (app, ds_id) = build_app().await;
@@ -211,8 +216,8 @@ async fn put_data_source_denied_for_user_without_register() {
     let (status, body) = put_data_source(&app, &bearer, ds_id).await;
     assert_eq!(
         status,
-        StatusCode::FORBIDDEN,
-        "user without `register` must be denied PUT /data_source: {body}"
+        StatusCode::UNAUTHORIZED,
+        "user without `register` must be denied PUT /data_source (upstream check_scopes → 401): {body}"
     );
 }
 

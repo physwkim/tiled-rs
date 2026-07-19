@@ -225,7 +225,9 @@ async fn api_key_via_db_grants_scope_subset() {
     .await;
     assert_eq!(status, StatusCode::OK);
 
-    // POST register using the api key — should be 403 (read-only scope).
+    // POST register using the api key — should be 401 (read-only scope). The
+    // route-scope gate is upstream `check_scopes(["write:metadata","create:node",
+    // "register"])`, which raises HTTP_401_UNAUTHORIZED for insufficient scope.
     let (status, _) = json_request(
         &app,
         Method::POST,
@@ -240,7 +242,7 @@ async fn api_key_via_db_grants_scope_subset() {
         })),
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
 
     // Revoke the api key — must use the original bearer (which has
     // ApiKeyRevoke scope via full scopes).
@@ -382,8 +384,9 @@ async fn inherit_api_key_dynamically_inherits_current_role() {
     .await;
     assert_eq!(
         status,
-        StatusCode::FORBIDDEN,
-        "role downgrade must revoke register on the next request"
+        StatusCode::UNAUTHORIZED,
+        "role downgrade must revoke register on the next request \
+         (upstream check_scopes → 401 for insufficient route scope)"
     );
 }
 
@@ -677,9 +680,12 @@ async fn write_endpoint_demands_write_scope() {
 }
 
 /// Security gate: POST /api/v1/auth/principal requires `write:principals`
-/// scope. A regular user (role="user") lacks that scope and must be rejected
-/// with 403, not 401, because they ARE authenticated — they just don't hold
-/// the required scope.
+/// scope. A regular user (role="user") lacks that scope and must be rejected.
+/// Upstream gates this route with `Security(check_scopes, ["write:principals"])`
+/// (authentication.py:1295), which raises HTTP_401_UNAUTHORIZED for insufficient
+/// route scope — even for an authenticated caller — with a `WWW-Authenticate`
+/// header. The route-level scope gate is 401; the per-node (visible-node) gate
+/// is the 403 case.
 #[tokio::test]
 async fn create_service_principal_non_admin_rejected() {
     let (app, _dir, _cat, _auth_db) = build_test_app().await;
@@ -696,7 +702,7 @@ async fn create_service_principal_non_admin_rejected() {
     let access = body["access_token"].as_str().unwrap().to_string();
     let bearer = format!("Bearer {access}");
 
-    // POST /auth/principal — must be 403 (authenticated but missing scope).
+    // POST /auth/principal — must be 401 (check_scopes route-scope gate).
     let (status, _) = json_request(
         &app,
         Method::POST,
@@ -707,8 +713,8 @@ async fn create_service_principal_non_admin_rejected() {
     .await;
     assert_eq!(
         status,
-        StatusCode::FORBIDDEN,
-        "non-admin must be rejected with 403"
+        StatusCode::UNAUTHORIZED,
+        "non-admin must be rejected with 401 (upstream check_scopes)"
     );
 }
 
@@ -1721,8 +1727,9 @@ async fn apikey_create_persists_access_tags_and_rejects_broad_scope() {
 }
 
 /// `GET /api/v1/auth/principal` (list) requires `read:principals` scope (admin
-/// role only). A user-role caller → 403. An admin caller receives a paginated
-/// list of all principals (Python authentication.py:1247-1286 parity).
+/// role only). A user-role caller → 401 (upstream `check_scopes(["read:principals"])`,
+/// authentication.py:1254). An admin caller receives a paginated list of all
+/// principals (Python authentication.py:1247-1286 parity).
 #[tokio::test]
 async fn list_principals_admin_only_and_paginated() {
     let (app, _dir, _cat, auth_db) = build_test_app().await;
@@ -1740,7 +1747,7 @@ async fn list_principals_admin_only_and_paginated() {
     let user_bearer = format!("Bearer {}", body["access_token"].as_str().unwrap());
     let (alice, _) = auth_db.ensure_principal("dummy", &alice_sub).await.unwrap();
 
-    // User role → 403.
+    // User role → 401 (check_scopes route-scope gate).
     let (status, _) = json_request(
         &app,
         Method::GET,
@@ -1749,7 +1756,7 @@ async fn list_principals_admin_only_and_paginated() {
         None,
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "user must be 403 on list");
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "user must be 401 on list");
 
     // Promote alice to admin, re-login.
     auth_db
@@ -1813,7 +1820,9 @@ async fn list_principals_admin_only_and_paginated() {
 /// Admin can create an API key for another principal
 /// (`POST /api/v1/auth/principal/{uuid}/apikey`) and then revoke it
 /// (`DELETE /api/v1/auth/principal/{uuid}/apikey?first_eight=...`).
-/// Attempting the same operations as a non-admin → 403.
+/// Attempting the same operations as a non-admin → 401 (upstream check_scopes
+/// route-scope gate: `write:principals` for create-principal, `admin:apikeys`
+/// for apikey-for-principal).
 /// Attempting to revoke a key that doesn't belong to the target principal → 404.
 #[tokio::test]
 async fn admin_create_and_revoke_principal_apikey() {
@@ -1832,7 +1841,7 @@ async fn admin_create_and_revoke_principal_apikey() {
     let (alice, _) = auth_db.ensure_principal("dummy", &alice_sub).await.unwrap();
     let user_bearer = format!("Bearer {}", body["access_token"].as_str().unwrap());
 
-    // Non-admin creates a service principal — must fail.
+    // Non-admin creates a service principal — must fail with 401 (check_scopes).
     let (status, _) = json_request(
         &app,
         Method::POST,
@@ -1841,7 +1850,7 @@ async fn admin_create_and_revoke_principal_apikey() {
         None,
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
 
     auth_db
         .update_principal_role(alice.id, "admin")
@@ -1880,8 +1889,9 @@ async fn admin_create_and_revoke_principal_apikey() {
     .await;
     assert_eq!(
         status,
-        StatusCode::FORBIDDEN,
-        "non-admin must not create keys for other principals"
+        StatusCode::UNAUTHORIZED,
+        "non-admin must not create keys for other principals \
+         (upstream check_scopes(['admin:apikeys']) → 401)"
     );
 
     // Admin creates a key for bot.
@@ -1963,7 +1973,8 @@ async fn admin_create_and_revoke_principal_apikey() {
 /// linked identities (Python `schemas.Principal.identities` via
 /// `selectinload`, authentication.py:1325-1361). The identity `id` is the
 /// upstream subject and the internal row id / `principal_id` never leak. The
-/// endpoint is `read:principals`-gated, so a `user`-role caller is forbidden.
+/// endpoint is `read:principals`-gated via `check_scopes` (authentication.py:1332),
+/// so a `user`-role caller is refused with 401 at the route-scope gate.
 #[tokio::test]
 async fn get_principal_returns_identities_admin_only() {
     let (app, _dir, _cat, auth_db) = build_test_app().await;
@@ -1981,7 +1992,7 @@ async fn get_principal_returns_identities_admin_only() {
     let user_bearer = format!("Bearer {}", body["access_token"].as_str().unwrap());
     let (alice, _) = auth_db.ensure_principal("dummy", &alice_sub).await.unwrap();
 
-    // A user-role caller lacks read:principals → 403.
+    // A user-role caller lacks read:principals → 401 (check_scopes route gate).
     let (status, _) = json_request(
         &app,
         Method::GET,
@@ -1992,8 +2003,8 @@ async fn get_principal_returns_identities_admin_only() {
     .await;
     assert_eq!(
         status,
-        StatusCode::FORBIDDEN,
-        "read:principals is required to read a principal"
+        StatusCode::UNAUTHORIZED,
+        "read:principals is required to read a principal (upstream check_scopes → 401)"
     );
 
     // Promote alice to admin and re-login for an admin session.
