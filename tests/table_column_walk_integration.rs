@@ -437,8 +437,9 @@ async fn csv_of_string_column_renders_cell_text() {
 
     let (status, body) = get(&app, "/api/v1/array/full/str_table/name?format=text/csv").await;
     assert_eq!(status, StatusCode::OK);
-    // 1-D array → one cell per line, no trailing newline; null → "None".
-    assert_eq!(String::from_utf8(body).unwrap(), "al\nNone\ncharlie");
+    // 1-D array → one cell per line, trailing newline per numpy.savetxt;
+    // null → "None".
+    assert_eq!(String::from_utf8(body).unwrap(), "al\nNone\ncharlie\n");
 }
 
 #[tokio::test]
@@ -512,9 +513,10 @@ async fn csv_of_timestamp_column_renders_iso_cells() {
     let (status, body) = get(&app, "/api/v1/array/full/ts_table/t?format=text/csv").await;
     assert_eq!(status, StatusCode::OK);
     // ms unit → `str(numpy.datetime64)` ISO with a 3-digit fraction; NaT → "NaT".
+    // Trailing newline after the last row, matching numpy.savetxt.
     assert_eq!(
         String::from_utf8(body).unwrap(),
-        "1970-01-01T00:00:01.000\nNaT\n1970-01-01T00:00:03.000"
+        "1970-01-01T00:00:01.000\nNaT\n1970-01-01T00:00:03.000\n"
     );
 }
 
